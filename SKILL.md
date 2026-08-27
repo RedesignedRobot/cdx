@@ -15,11 +15,11 @@ sessions.
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--effort E] [--cd <dir>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... "<brief>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... "<brief>"
 cdx resume <lane> [--bg] "<follow-up>"
-cdx fork   <newLane> <fromLane|sessionId> [--effort E] [--bg] "<brief>"
-cdx review <lane> [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--cd <dir>]
+cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
+cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx wait   <lane>... [--timeout <sec>]
 cdx tail   <lane> [-n N]
@@ -50,9 +50,9 @@ labels.
   cdx prints the summary and report when the lane exits.
 - For independent lanes, start each with `--bg`, then run one
   `cdx wait lane-a lane-b`. The wait exits 1 if any named lane fails.
-- Use `cdx status` for lane state, tokens, idle time, and the last action:
-  running lanes first, then the 10 newest finished ones (`--all` for the rest). Use
-  `cdx tail <lane>` for the rendered event log.
+- Use `cdx status` for structured lane blocks with owner, state, timing, tokens,
+  and last activity. It shows running lanes first, then the 10 newest finished
+  ones (`--all` for the rest). Use `cdx tail <lane>` for the rendered event log.
 - Use `cdx tail -f <lane>` for one worker's live transcript. It exits with the
   lane's outcome. Use `cdx tail -f` for all running lanes with `[lane]`
   prefixes. It follows new rounds and attaches new lanes. Any terminal or agent
@@ -69,6 +69,15 @@ want completion notifications from the bundled monitor. `cdx wait` is for
 cases where the caller must block until a set of lanes finishes. A running lane
 also writes a feed warning after five quiet minutes, repeats it no more than
 once every ten minutes, and writes an active-again line when events resume.
+
+Every lane feed line ends in `owner=`. Compare it with the first eight
+characters of your own `CLAUDE_CODE_SESSION_ID`. A different owner belongs to
+another Claude session. Treat that event as information. Do not act on, resume,
+or close that lane unless the user asks.
+
+When a `[cdx] WARNING: OpenAI Codex usage` line arrives in the session feed,
+tell the user plainly that their OpenAI Codex usage is consumed. Include the
+reset time and whether a reset credit is available.
 
 ## Configuration
 
@@ -91,6 +100,11 @@ when that effort remains allowed. A raw session ID fork and an adopted lane use
 `defaultEffort`. If a stored source effort is no longer allowed, pass an
 allowed `--effort`. Resume keeps the lane's stored effort. A malformed config
 fails with a message that names the config file.
+
+When `config.json` defines accounts, cdx gives each login its own `CODEX_HOME`.
+Spawn and review choose the first account with capacity. `--account NAME`
+forces one. Resume and lane-based fork keep the lane's recorded account. Adopt
+and raw-session-ID fork accept `--account` and otherwise use the primary.
 
 cdx appends each `rules` entry to the built-in brief rules. It then appends the
 contents of `.cdx-rules.md` from the lane's working directory when that file
