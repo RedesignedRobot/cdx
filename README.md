@@ -1,39 +1,41 @@
+<div align="center">
+
 # cdx
 
-Codex execution lanes for Claude Code.
+**Codex execution lanes for Claude Code.**
 
-cdx is a single-file CLI that lets a Claude Code session drive [OpenAI Codex CLI](https://github.com/openai/codex) workers as parallel, detached background lanes. Claude stays the head: it briefs workers, watches their progress, reviews their output, and integrates the results. Codex does the execution. cdx is the contract between the two.
+Claude thinks. Codex executes. cdx keeps the books.
 
-It is also a Claude Code plugin. Installed as one, lane completions stream back into the Claude session as notifications, a session opener shows any live or failed lanes, and a hook blocks raw Codex work commands.
+[![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
+[![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
+[![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
+[![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-d97757?logo=claude&logoColor=white)](#claude-code-integration)
 
-## Why
+<img src="assets/demo.svg" alt="cdx spawning two detached Codex workers, checking status, and collecting both reports" width="760">
 
-Running one Codex command from an agent is easy. Running six of them in parallel, surviving the parent shell, knowing which session ID belongs to which task, resuming a thread with its context intact, getting the final report without scraping a transcript, and noticing when a worker died silently is not. cdx owns that bookkeeping in one place:
+</div>
 
-- One ledger entry per lane: session ID, working directory, state, rounds, token spend, last activity.
-- Detached background lanes that keep running after the shell exits.
-- Reports captured per round, from `--output-last-message` where the CLI supports it and salvaged from the transcript where it does not.
-- Success requires three gates: exit code zero, a drained event log, and a nonempty report. A clean exit without a report is a failure, not a success.
-- Reviews run in fresh sessions with a sandbox-enforced read-only policy, so the author never grades itself and the reviewer cannot edit.
+cdx is a single-file CLI that lets a [Claude Code](https://claude.com/claude-code) session drive [OpenAI Codex CLI](https://github.com/openai/codex) workers as parallel, detached background lanes. Claude stays the head: it briefs workers, watches their progress, reviews their output, and integrates the results. Codex does the execution. cdx is the contract between the two.
 
-## Requirements
+Running one Codex command from an agent is easy. Running six in parallel, surviving the parent shell, knowing which session ID belongs to which task, resuming a thread with its context intact, getting the final report without scraping a transcript, and noticing when a worker died silently is not. cdx owns that bookkeeping in one place.
 
-- [Bun](https://bun.sh) (cdx is a single TypeScript file with no package dependencies)
-- [Codex CLI](https://github.com/openai/codex) 0.149 or newer, logged in (`codex login`)
-- Claude Code, if you want the plugin integration (monitor, hooks, skill)
-- macOS, Linux, or WSL. The monitor and doctor use `touch`, `tail`, and `pgrep`.
+## Setup in 60 seconds
 
-## Install
+You need [Bun](https://bun.sh) and [Codex CLI](https://github.com/openai/codex) 0.149+, logged in (`codex login`). Then:
 
 ```bash
-git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx
-ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
+git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
+```
+
+Verify the whole chain, including a real Codex round-trip:
+
+```bash
 cdx doctor --probe
 ```
 
-Cloning into `~/.claude/skills/` makes Claude Code pick it up as a skills-directory plugin automatically. The `/cdx` skill, lane-completion monitor, and hooks load in the next session. The symlink makes `cdx` a normal terminal command. Skip it if you only call the script by path. The hooks run the plugin copy of `cdx.ts`, so they do not depend on the symlink.
+`doctor` checks the binary, login, model, guard, monitor, and ledger, and prints a remedy for anything that fails. Cloning into `~/.claude/skills/` makes Claude Code load cdx as a plugin automatically in the next session; the symlink makes `cdx` a normal terminal command. Not a Claude Code user? The CLI works standalone, skip the skills directory and clone anywhere.
 
-`cdx doctor` checks the Codex binary, login status, model setting, guard file, monitor process, and ledger. It prints a remedy for failed checks. `--probe` additionally runs a real `codex exec` round-trip.
+Works on macOS, Linux, and WSL.
 
 ## Quickstart
 
@@ -48,9 +50,8 @@ cdx spawn dead-code  --cd ~/code/myapp --bg "Find and delete unreachable code. L
 cdx spawn slow-query --cd ~/code/myapp --bg --effort high "Profile the /search endpoint and fix the N+1."
 cdx wait api-docs dead-code slow-query
 
-# Check on things
-cdx status          # table: state, tokens, idle time, last action per lane
-cdx tail slow-query # rendered event log of the latest round
+# Watch a worker think, live
+cdx tail -f slow-query
 
 # Continue a thread with its context intact
 cdx resume dead-code "Also remove the now-unused imports."
@@ -63,27 +64,66 @@ cdx report slow-query
 cdx close slow-query "landed in a1b2c3d"
 ```
 
+## How it works
+
+```mermaid
+flowchart LR
+    head["Claude Code session<br/><i>the head</i>"] -->|spawn · resume · fork · review| cdx["cdx"]
+    cdx -.->|detached| w1["Codex worker<br/><i>lane: api-docs</i>"]
+    cdx -.->|detached| w2["Codex worker<br/><i>lane: dead-code</i>"]
+    cdx -.->|read-only| w3["Codex reviewer<br/><i>fresh session</i>"]
+    w1 --> state[("ledger · logs<br/>reports · briefs")]
+    w2 --> state
+    w3 --> state
+    state -->|feed.log → monitor| head
+```
+
+- **One ledger entry per lane**: session ID, working directory, state, rounds, token spend, last activity.
+- **Detached lanes** keep running after your shell exits.
+- **Reports captured per round**, from `--output-last-message` where the CLI supports it and salvaged from the transcript where it does not.
+- **Three gates for success**: exit code zero, a drained event log, and a nonempty report. A clean exit without a report is a failure, not a success.
+- **Reviews run in fresh sessions** with a sandbox-enforced read-only policy, so the author never grades itself and the reviewer cannot edit.
+- **Stall detection**: a lane quiet for five minutes writes a feed warning, repeated at most every ten minutes, with an active-again line when events resume.
+
 ## Commands
+
+| Command | What it does |
+|---|---|
+| `cdx spawn <lane> "<brief>"` | Start a worker in its own lane |
+| `cdx resume <lane> "<follow-up>"` | Continue a lane's thread, context intact |
+| `cdx fork <new> <lane> "<brief>"` | Branch a thread into a new lane |
+| `cdx review <lane>` | Review a lane's diff in a fresh read-only session |
+| `cdx status` | Running lanes first, then the 10 newest finished |
+| `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed |
+| `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
+| `cdx report <lane>` | Print a lane's final report |
+| `cdx doctor --probe` | Health check with remedies, plus a live Codex round-trip |
+| `cdx adopt` · `cdx close` · `cdx clean` · `cdx log` · `cdx brief` | Bookkeeping |
+
+<details>
+<summary><b>Full flag reference</b></summary>
 
 ```
 cdx spawn  <lane> [--effort E] [--cd D] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
-cdx resume <lane> [--bg] "<follow-up>"        continue a lane's thread, context intact
-cdx fork   <new> <lane|sessionId> [--effort E] [--bg] "<brief>"   branch a thread into a new lane
+cdx resume <lane> [--bg] "<follow-up>"
+cdx fork   <new> <lane|sessionId> [--effort E] [--bg] "<brief>"
 cdx review <lane> [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--cd D]        register an existing codex session as a lane
-cdx status [--all] [--json]                   running lanes, then last 10 finished; --all for full history
-cdx wait   <lane>... [--timeout S]            block until lanes finish; exit 1 if any failed
-cdx tail   <lane> [-n N]                      human-rendered tail of the latest round
-cdx tail -f [lane]                            live transcript; omit lane for all running lanes
-cdx report <lane> [round]                     print a lane's report
-cdx log    <lane> [round]                     print the log path
-cdx close  <lane> ["note"]                    mark closed with an outcome note
-cdx clean  [--days N]                         prune closed lanes older than N days
-cdx doctor [--fix] [--probe]                  health check with remedies; --probe runs a live round-trip
-cdx brief                                     running/failed lanes only; silent when all settled
+cdx adopt  <lane> <sessionId> [--cd D]
+cdx status [--all] [--json]
+cdx wait   <lane>... [--timeout S]
+cdx tail   <lane> [-n N]
+cdx tail   -f [lane]
+cdx report <lane> [round]
+cdx log    <lane> [round]
+cdx close  <lane> ["note"]
+cdx clean  [--days N]
+cdx doctor [--fix] [--probe]
+cdx brief
 ```
 
 `review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE. Both are fresh sessions, both sandbox-enforced read-only.
+
+</details>
 
 ## Orchestration patterns
 
@@ -93,13 +133,20 @@ cdx brief                                     running/failed lanes only; silent 
 
 **Watch live.** `cdx tail -f <lane>` streams one worker's transcript and exits with the lane's outcome. `cdx tail -f` shows all running lanes with `[lane]` prefixes and follows new rounds and lanes. Any terminal or agent session can use either form against the shared state, which is how parallel Claude sessions see each other's workers.
 
-**No polling.** With the plugin installed, every lane completion appends a line to the feed that the monitor tails, and Claude Code surfaces it as a notification. `cdx wait` is only for deliberately blocking on a wave. A running lane also writes a feed warning after five quiet minutes, repeats it no more than once every ten minutes, and writes an active-again line when events resume.
+**Iterate or branch.** `resume` continues a worker with everything it already knows. `fork` branches that knowledge into a new lane when you want two directions explored from the same starting point.
 
-**Iterate or branch.** `resume` continues a worker with everything it already knows. `fork` branches that knowledge into a new lane when you want two directions explored from the same starting point. A fork keeps the source session's working directory.
+## Claude Code integration
+
+Installed as a plugin (the clone into `~/.claude/skills/` above), cdx wires itself into the session:
+
+- **No polling.** Every lane completion appends a line to `$HOME/.cdx/feed.log`; a monitor tails it and Claude Code surfaces completions and stall warnings as notifications.
+- **Session opener.** A SessionStart hook runs `cdx brief`, which prints only running or failed lanes and stays silent when everything is settled.
+- **Guard rail.** A PreToolUse hook blocks raw `codex exec` / `review` / `resume` / `fork` invocations and points the caller to `cdx`, so all Codex work flows through the ledger. Quoted mentions, `codex login`, and version checks pass through.
+- **`/cdx` skill.** The playbook that teaches the session the commands and patterns above.
 
 ## Configuration
 
-Everything lives under `$CDX_HOME`, which defaults to `~/.cdx`. The optional `$CDX_HOME/config.json` has this shape and these defaults:
+Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/config.json`:
 
 ```json
 {
@@ -110,28 +157,27 @@ Everything lives under `$CDX_HOME`, which defaults to `~/.cdx`. The optional `$C
 }
 ```
 
-- `model` is passed to Codex for spawn, fork, review, and doctor probe commands.
-- `efforts` lists the accepted values for `--effort`. cdx rejects any other value and names the config file in the error.
-- `defaultEffort` applies to spawn and review when `--effort` is absent. Fork keeps the source lane's effort while it remains allowed. Raw session ID forks and adopted lanes use `defaultEffort`. If a stored source effort is no longer allowed, pass an allowed `--effort`. Resume keeps the lane's stored effort.
-- `rules` entries are appended to every injected brief. cdx then appends `.cdx-rules.md` from the lane's working directory when that file exists.
+- `model` is passed to Codex for spawn, fork, review, and doctor probes.
+- `efforts` is the allowlist for `--effort`; cdx rejects anything else and names the config file in the error.
+- `defaultEffort` applies when `--effort` is absent. Resume and fork keep the lane's stored effort while it remains allowed.
+- `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 
-If `config.json` is absent, cdx uses the values shown above. Malformed JSON, wrong value types, an empty effort list, or a `defaultEffort` absent from `efforts` stops the command with a message that names the file.
+If `config.json` is absent, the defaults above apply. Malformed JSON or an inconsistent shape stops the command with a message that names the file.
 
-## What the harness injects
+> [!IMPORTANT]
+> Work lanes pass Codex's `--dangerously-bypass-approvals-and-sandbox` flag so workers can edit and run tests unattended. The injected brief (no commit, no push, no deploy, no extra servers) is the only restriction on those lanes. Review lanes are different: sandbox-enforced read-only, no approval prompts. Point cdx only at code you would let Codex loose on.
+
+<details>
+<summary><b>What the harness injects</b></summary>
 
 Every work brief says that workers must not commit, push, deploy, or start extra long-running servers. It includes the report contract and asks workers to use subagent threads when independent work can run in parallel. Review lanes receive a read-only rule and an adversarial review frame. cdx appends `config.json` rules after those built-ins, then appends the lane working directory's `.cdx-rules.md`.
 
-Work lanes pass Codex's `--dangerously-bypass-approvals-and-sandbox` flag. The prompt policy is the only commit, push, and deploy restriction for those lanes. Review lanes use a read-only sandbox and disable approval prompts.
-
 The Codex CLI handles context compaction. cdx does not set a fixed context size or override the CLI's compaction limit.
 
-## Plugin hooks
+</details>
 
-The lane monitor tails `$HOME/.cdx/feed.log`. Each finalized lane writes one line there when `CDX_HOME` uses its default. The SessionStart hook runs the plugin copy of `cdx.ts brief`, which prints only running or failed lanes.
-
-The Bun guard strips single-quoted and double-quoted command segments before it checks for raw Codex calls. It blocks `codex` followed by `e`, `exec`, `review`, `resume`, `fork`, `cloud`, or `apply` as a command word and points the caller to `cdx`. Login, logout, `--version`, features, debug, other Codex commands, quoted mentions, and `cdx` commands pass through.
-
-## State layout
+<details>
+<summary><b>State layout</b></summary>
 
 ```
 $CDX_HOME/
@@ -145,6 +191,8 @@ $CDX_HOME/
 
 Everything is plain files. `cat` works on all of it.
 
+</details>
+
 ## License
 
-MIT
+[MIT](LICENSE)
