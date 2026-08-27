@@ -6,7 +6,7 @@
 //   cdx fork   <newLane> <fromLane|sessionId> [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> [--cd <dir>]
-//   cdx status [--json]
+//   cdx status [--all] [--json]
 //   cdx wait   <lane>... [--timeout <sec>]
 //   cdx tail   <lane> [-n <lines>]
 //   cdx report <lane> [round]
@@ -244,7 +244,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 
 const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -647,16 +647,26 @@ function fmtAge(iso?: string): string {
   return `${(seconds / 3600).toFixed(1)}h`;
 }
 
+const FINISHED_SHOWN = 10;
+
 function statusCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["json"]);
+  const parsed = parseArgs(argv, ["json", "all"]);
   const ledger = readLedger();
-  const lanes = Object.entries(ledger);
+  const all = Object.entries(ledger);
   if (parsed.bools.has("json")) {
-    const enriched = Object.fromEntries(lanes.map(([lane, entry]) => [lane, { ...entry, alive: entry.state === "running" ? pidAlive(entry.pid) : undefined }]));
+    const enriched = Object.fromEntries(all.map(([lane, entry]) => [lane, { ...entry, alive: entry.state === "running" ? pidAlive(entry.pid) : undefined }]));
     console.log(JSON.stringify(enriched, null, 2));
     return;
   }
-  if (lanes.length === 0) { console.log("cdx: no lanes"); return; }
+  if (all.length === 0) { console.log("cdx: no lanes"); return; }
+  // Running lanes first (most recent activity on top), then finished ones
+  // newest first, capped unless --all.
+  const byRecency = (a: [string, Lane], b: [string, Lane]) =>
+    Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
+  const running = all.filter(([, entry]) => entry.state === "running").sort(byRecency);
+  const finished = all.filter(([, entry]) => entry.state !== "running").sort(byRecency);
+  const hidden = parsed.bools.has("all") ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
+  const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
   const rows = lanes.map(([lane, entry]) => {
     const stale = entry.state === "running" && !pidAlive(entry.pid);
     return [
@@ -677,6 +687,7 @@ function statusCommand(argv: string[]) {
   const render = (row: string[]) => row.map((cell, col) => cell.padEnd(widths[col]!)).join("  ").trimEnd();
   console.log(render(header));
   for (const row of rows) console.log(render(row));
+  if (hidden > 0) console.log(`… ${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`);
 }
 
 async function waitCommand(argv: string[]) {
