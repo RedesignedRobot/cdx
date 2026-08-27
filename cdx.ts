@@ -472,15 +472,16 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   if (!jsonMode && !existsSync(reportPath)) {
     const lines = readFileSync(logPath, "utf8").split("\n");
     const start = lines.lastIndexOf("codex");
-    if (start >= 0) {
-      let end = lines.indexOf("tokens used", start);
-      if (end === -1) end = lines.length;
-      let message = lines.slice(start + 1, end).join("\n").trim();
-      // codex echoes the final message twice in the transcript; collapse exact doubling.
-      const doubled = /^([\s\S]+?)\s*\1$/.exec(message);
-      if (doubled) message = doubled[1]!;
-      if (message) writeFileSync(reportPath, `${message}\n`);
-    }
+    // With stderr split into its own file the transcript decorations (the bare
+    // "codex" marker, "tokens used") land there, leaving stdout as the final
+    // message alone; salvage the whole log when the marker is absent.
+    let end = start >= 0 ? lines.indexOf("tokens used", start) : lines.indexOf("tokens used");
+    if (end === -1) end = lines.length;
+    let message = lines.slice(start + 1, end).join("\n").trim();
+    // codex echoes the final message twice in the transcript; collapse exact doubling.
+    const doubled = /^([\s\S]+?)\s*\1$/.exec(message);
+    if (doubled) message = doubled[1]!;
+    if (message) writeFileSync(reportPath, `${message}\n`);
   }
   // Success needs all three gates: exit 0, a nonempty report, and (implicitly)
   // the drained event log. The report is the lane's contract with its caller;
