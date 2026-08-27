@@ -20,7 +20,7 @@ cdx resume <lane> [--bg] "<follow-up>"
 cdx fork   <newLane> <fromLane|sessionId> [--effort E] [--bg] "<brief>"
 cdx review <lane> [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--cd <dir>]
-cdx status [--json]
+cdx status [--all] [--json]
 cdx wait   <lane>... [--timeout <sec>]
 cdx tail   <lane> [-n N]
 cdx tail -f [lane]
@@ -50,7 +50,8 @@ labels.
   cdx prints the summary and report when the lane exits.
 - For independent lanes, start each with `--bg`, then run one
   `cdx wait lane-a lane-b`. The wait exits 1 if any named lane fails.
-- Use `cdx status` for lane state, tokens, idle time, and the last action. Use
+- Use `cdx status` for lane state, tokens, idle time, and the last action:
+  running lanes first, then the 10 newest finished ones (`--all` for the rest). Use
   `cdx tail <lane>` for the rendered event log.
 - Use `cdx tail -f <lane>` for one worker's live transcript. It exits with the
   lane's outcome. Use `cdx tail -f` for all running lanes with `[lane]`

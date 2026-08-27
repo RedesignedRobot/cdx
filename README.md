@@ -71,7 +71,7 @@ cdx resume <lane> [--bg] "<follow-up>"        continue a lane's thread, context 
 cdx fork   <new> <lane|sessionId> [--effort E] [--bg] "<brief>"   branch a thread into a new lane
 cdx review <lane> [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--cd D]        register an existing codex session as a lane
-cdx status [--json]                           live table of every lane
+cdx status [--all] [--json]                   running lanes, then last 10 finished; --all for full history
 cdx wait   <lane>... [--timeout S]            block until lanes finish; exit 1 if any failed
 cdx tail   <lane> [-n N]                      human-rendered tail of the latest round
 cdx tail -f [lane]                            live transcript; omit lane for all running lanes
