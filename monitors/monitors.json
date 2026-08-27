@@ -1,0 +1,7 @@
+[
+  {
+    "name": "cdx-lanes",
+    "command": "touch \"$HOME/.cdx/feed.log\" && exec tail -n 0 -F \"$HOME/.cdx/feed.log\"",
+    "description": "cdx lane completions"
+  }
+]

@@ -1,0 +1,5 @@
+{
+  "name": "cdx",
+  "description": "Run OpenAI Codex CLI work and review lanes from Claude Code, with completion notifications and a guard against raw work commands",
+  "version": "2.0.0"
+}
