@@ -93,7 +93,7 @@ flowchart LR
 | `cdx resume <lane> "<follow-up>"` | Continue a lane's thread, context intact |
 | `cdx fork <new> <lane> "<brief>"` | Branch a thread into a new lane |
 | `cdx review <lane>` | Review a lane's diff in a fresh read-only session |
-| `cdx status` | Running lanes first, then the 10 newest finished |
+| `cdx status` | Show structured lane blocks with owner, state, timing, tokens, and last activity |
 | `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
 | `cdx report <lane>` | Print a lane's final report |
@@ -104,11 +104,11 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--effort E] [--cd D] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
 cdx resume <lane> [--bg] "<follow-up>"
-cdx fork   <new> <lane|sessionId> [--effort E] [--bg] "<brief>"
-cdx review <lane> [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--cd D]
+cdx fork   <new> <lane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
+cdx review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> [--account NAME] [--cd D]
 cdx status [--all] [--json]
 cdx wait   <lane>... [--timeout S]
 cdx tail   <lane> [-n N]
@@ -140,6 +140,7 @@ cdx brief
 Installed as a plugin (the clone into `~/.claude/skills/` above), cdx wires itself into the session:
 
 - **No polling.** Every lane completion appends a line to `$HOME/.cdx/feed.log`; a monitor tails it and Claude Code surfaces completions and stall warnings as notifications.
+- **Session attribution.** Every lane feed event ends with `owner=<session prefix>`, so parallel Claude Code sessions can identify which lane events belong to them.
 - **Session opener.** A SessionStart hook runs `cdx brief`, which prints only running or failed lanes and stays silent when everything is settled.
 - **Guard rail.** A PreToolUse hook blocks raw `codex exec` / `review` / `resume` / `fork` invocations and points the caller to `cdx`, so all Codex work flows through the ledger. Quoted mentions, `codex login`, and version checks pass through.
 - **`/cdx` skill.** The playbook that teaches the session the commands and patterns above.
@@ -161,6 +162,25 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 - `efforts` is the allowlist for `--effort`; cdx rejects anything else and names the config file in the error.
 - `defaultEffort` applies when `--effort` is absent. Resume and fork keep the lane's stored effort while it remains allowed.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
+
+### Two accounts, automatic failover
+
+Each account needs its own Codex home. cdx sets `CODEX_HOME` for every Codex process in a lane, which keeps login data and session files tied to that account.
+
+```json
+{
+  "accounts": {
+    "codex-1": "~/.codex",
+    "codex-2": "~/.codex-2"
+  }
+}
+```
+
+The first entry is primary. Spawn and review choose the first account with capacity. Pass `--account codex-2` to force one. Resume and lane-based fork keep the recorded account. Adopt and a raw-session-ID fork use the primary unless `--account` names another account.
+
+Keep each account name tied to one home. Use a new name when a home path changes so its cached usage cannot belong to the previous login.
+
+Do not swap authentication files inside one Codex home while parallel lanes run. A lane can then resume a session under the wrong login.
 
 If `config.json` is absent, the defaults above apply. Malformed JSON or an inconsistent shape stops the command with a message that names the file.
 
