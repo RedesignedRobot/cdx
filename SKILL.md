@@ -15,15 +15,17 @@ sessions.
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... "<brief>"
-cdx resume <lane> [--bg] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... "<brief>"
+cdx resume <lane> [--effort E] [--bg] "<follow-up>"
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
-cdx wait   <lane>... [--timeout <sec>]
+cdx usage  [--json]
+cdx wait   <lane>... [--timeout <sec>] [--json]
 cdx tail   <lane> [-n N]
 cdx tail -f [lane]
+cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round]
 cdx close  <lane> ["note"]
@@ -32,10 +34,22 @@ cdx doctor [--fix] [--probe]
 cdx brief
 ```
 
+A brief of `-` reads the brief from stdin. Use it for long prompts with quotes
+or backticks: `cdx spawn big-task --bg - < /tmp/brief.md`. It works for spawn,
+resume, fork, and the review intent.
+
+`spawn --worktree <path>` creates a git worktree at that path on branch
+`lane/<lane>` from the repo at `--cd` (or the current directory), runs the
+optional `worktreeSetup` config command inside it, and runs the lane there.
+Use it whenever parallel lanes touch the same repository, so each worker owns
+its files exclusively. `status` shows the branch; `close` prints the removal
+commands and never deletes anything itself.
+
 `resume` keeps the lane's session and working directory. It does not accept
-`--cd`, `--json`, or `--output-last-message`. `fork` branches an existing lane
-or session and keeps the source session's working directory, so it does not
-accept `--cd`.
+`--cd`, `--json`, or `--output-last-message`. `resume --effort E` overrides
+the stored effort for that round onward; without it the session keeps its own
+settings. `fork` branches an existing lane or session and keeps the source
+session's working directory, so it does not accept `--cd`.
 
 Native review uses one of `--uncommitted`, `--base`, or `--commit` and cannot
 take a custom intent. Without a target flag, review needs an intent and may
@@ -50,6 +64,14 @@ labels.
   cdx prints the summary and report when the lane exits.
 - For independent lanes, start each with `--bg`, then run one
   `cdx wait lane-a lane-b`. The wait exits 1 if any named lane fails.
+  `cdx wait --json` prints one JSON object per finished lane (state, exit
+  code, tokens, report path, note, session ID) for machine parsing.
+- Use `cdx usage` to answer capacity questions: per-account plan, rate-limit
+  windows with reset dates, reset credits, and all-time lane and token totals
+  from the ledger. `--json` returns the raw structures.
+- Use `cdx feed -n 30` to replay recent completion and stall lines after a
+  context compaction or an away stretch; the live monitor only delivers lines
+  to open sessions.
 - Use `cdx status` for structured lane blocks with owner, state, timing, tokens,
   and last activity. It shows running lanes first, then the 10 newest finished
   ones (`--all` for the rest). Use `cdx tail <lane>` for the rendered event log.
@@ -89,17 +111,23 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
   "model": "gpt-5.6-sol",
   "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
-  "rules": []
+  "rules": [],
+  "worktreeSetup": "bun install"
 }
 ```
+
+`worktreeSetup` is optional: a shell command run inside every new `--worktree`
+before the lane starts. A nonzero exit aborts the spawn and leaves the
+worktree in place for inspection.
 
 cdx passes `model` to Codex for spawn, fork, review, and doctor probe commands.
 It accepts only effort values listed in `efforts`. Spawn and review use
 `defaultEffort` when `--effort` is absent. Fork keeps the source lane's effort
 when that effort remains allowed. A raw session ID fork and an adopted lane use
 `defaultEffort`. If a stored source effort is no longer allowed, pass an
-allowed `--effort`. Resume keeps the lane's stored effort. A malformed config
-fails with a message that names the config file.
+allowed `--effort`. Resume keeps the lane's stored effort unless `--effort`
+overrides it. A malformed config fails with a message that names the config
+file.
 
 When `config.json` defines accounts, cdx gives each login its own `CODEX_HOME`.
 Spawn and review choose the first account with capacity. `--account NAME`

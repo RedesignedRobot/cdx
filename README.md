@@ -44,17 +44,17 @@ Works on macOS, Linux, and WSL.
 cdx spawn fix-flaky-test --cd ~/code/myapp "The test in auth.test.ts fails
 intermittently. Find the race, fix it, and prove it with 20 green runs."
 
-# Three workers in parallel, detached
-cdx spawn api-docs   --cd ~/code/myapp --bg "Document every public endpoint in openapi.yaml."
-cdx spawn dead-code  --cd ~/code/myapp --bg "Find and delete unreachable code. List every deletion."
-cdx spawn slow-query --cd ~/code/myapp --bg --effort high "Profile the /search endpoint and fix the N+1."
+# Three workers in parallel, detached, each in its own git worktree
+cdx spawn api-docs   --cd ~/code/myapp --worktree ~/code/myapp-docs --bg "Document every public endpoint in openapi.yaml."
+cdx spawn dead-code  --cd ~/code/myapp --worktree ~/code/myapp-dead --bg "Find and delete unreachable code. List every deletion."
+cdx spawn slow-query --cd ~/code/myapp --worktree ~/code/myapp-perf --bg --effort high "Profile the /search endpoint and fix the N+1."
 cdx wait api-docs dead-code slow-query
 
 # Watch a worker think, live
 cdx tail -f slow-query
 
-# Continue a thread with its context intact
-cdx resume dead-code "Also remove the now-unused imports."
+# Continue a thread with its context intact, harder this time
+cdx resume dead-code --effort high "Also remove the now-unused imports."
 
 # Review a worker's diff in a fresh, read-only session
 cdx review slow-query --uncommitted
@@ -94,8 +94,10 @@ flowchart LR
 | `cdx fork <new> <lane> "<brief>"` | Branch a thread into a new lane |
 | `cdx review <lane>` | Review a lane's diff in a fresh read-only session |
 | `cdx status` | Show structured lane blocks with owner, state, timing, tokens, and last activity |
+| `cdx usage` | Per-account plan, rate-limit windows, reset credits, and all-time ledger totals |
 | `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
+| `cdx feed` | Replay recent completion and stall lines from the feed |
 | `cdx report <lane>` | Print a lane's final report |
 | `cdx doctor --probe` | Health check with remedies, plus a live Codex round-trip |
 | `cdx adopt` · `cdx close` · `cdx clean` · `cdx log` · `cdx brief` | Bookkeeping |
@@ -104,15 +106,17 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
-cdx resume <lane> [--bg] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
+cdx resume <lane> [--effort E] [--bg] "<follow-up>"
 cdx fork   <new> <lane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd D]
 cdx status [--all] [--json]
-cdx wait   <lane>... [--timeout S]
+cdx usage  [--json]
+cdx wait   <lane>... [--timeout S] [--json]
 cdx tail   <lane> [-n N]
 cdx tail   -f [lane]
+cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round]
 cdx close  <lane> ["note"]
@@ -123,13 +127,19 @@ cdx brief
 
 `review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE. Both are fresh sessions, both sandbox-enforced read-only.
 
+A brief of `-` reads the brief from stdin (`cdx spawn big-task --bg - < brief.md`), so long prompts with quotes and backticks never fight the shell. Works for spawn, resume, fork, and the review intent.
+
+`spawn --worktree <path>` creates a git worktree at that path on a new branch `lane/<lane>` from the repo at `--cd` (or the current directory), runs the optional `worktreeSetup` command from config inside it, and runs the lane there. The worktree and branch are recorded in the ledger and shown by `status`; `close` prints the removal commands but never deletes anything itself. This gives each parallel worker exclusive files without sharing a dirty tree.
+
+`wait --json` prints one JSON object per finished lane, in completion order: state, exit code, tokens, report path, note, session ID.
+
 </details>
 
 ## Orchestration patterns
 
 **Single lane, report on completion.** Run `cdx spawn` in the foreground from a background shell. The harness prints a summary line plus the full report at exit, so one notification carries everything.
 
-**Fan-out.** Fire each lane with `--bg` (they detach and survive the shell), then one `cdx wait a b c` blocks until the wave lands.
+**Fan-out.** Fire each lane with `--bg` (they detach and survive the shell), then one `cdx wait a b c` blocks until the wave lands. Give each lane `--worktree` when they touch the same repo, so no worker sees another's dirty files.
 
 **Watch live.** `cdx tail -f <lane>` streams one worker's transcript and exits with the lane's outcome. `cdx tail -f` shows all running lanes with `[lane]` prefixes and follows new rounds and lanes. Any terminal or agent session can use either form against the shared state, which is how parallel Claude sessions see each other's workers.
 
@@ -154,14 +164,16 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
   "model": "gpt-5.6-sol",
   "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
-  "rules": []
+  "rules": [],
+  "worktreeSetup": "bun install"
 }
 ```
 
 - `model` is passed to Codex for spawn, fork, review, and doctor probes.
 - `efforts` is the allowlist for `--effort`; cdx rejects anything else and names the config file in the error.
-- `defaultEffort` applies when `--effort` is absent. Resume and fork keep the lane's stored effort while it remains allowed.
+- `defaultEffort` applies when `--effort` is absent. Resume and fork keep the lane's stored effort while it remains allowed; `resume --effort` overrides it for that round onward.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
+- `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection.
 
 ### Two accounts, automatic failover
 
