@@ -29,7 +29,7 @@
 
 import {
   closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync,
-  readdirSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync,
+  readdirSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 
@@ -285,6 +285,89 @@ const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${ro
 function pidAlive(pid?: number): boolean {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+const SESSION_UUID = /^[0-9a-f-]{36}$/i;
+
+interface RolloutSessionMeta {
+  id: string;
+  timestamp: string;
+  cwd: string;
+  source?: unknown;
+}
+
+function rolloutDateDirs(sessionsRoot: string, startedAt: Date): string[] {
+  const dirs: string[] = [];
+  for (const offset of [-1, 0, 1]) {
+    const date = new Date(startedAt);
+    date.setDate(date.getDate() + offset);
+    const year = String(date.getFullYear());
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    dirs.push(`${sessionsRoot}/${year}/${month}/${day}`);
+  }
+  return dirs;
+}
+
+function readRolloutSessionMeta(path: string): RolloutSessionMeta | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, "r");
+    const chunks: Buffer[] = [];
+    let length = 0;
+    while (length < 1_048_576) {
+      const chunk = Buffer.alloc(4096);
+      const count = readSync(fd, chunk, 0, chunk.length, length);
+      if (count === 0) break;
+      const newline = chunk.subarray(0, count).indexOf(10);
+      chunks.push(chunk.subarray(0, newline >= 0 ? newline : count));
+      length += newline >= 0 ? newline : count;
+      if (newline >= 0) break;
+    }
+    const event = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+      type?: string;
+      payload?: Partial<RolloutSessionMeta>;
+    };
+    const meta = event.type === "session_meta" ? event.payload : undefined;
+    if (!meta || typeof meta.id !== "string" || !SESSION_UUID.test(meta.id)
+      || typeof meta.timestamp !== "string" || typeof meta.cwd !== "string") return undefined;
+    return meta as RolloutSessionMeta;
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): string | undefined {
+  if (!roundStartedAt) return undefined;
+  const startedMs = Date.parse(roundStartedAt);
+  if (!Number.isFinite(startedMs)) return undefined;
+  const codexHome = spec.codexHome || process.env.CODEX_HOME || `${HOME}/.codex`;
+  const candidates: Array<{ id: string; distance: number; topLevel: boolean }> = [];
+  for (const dir of rolloutDateDirs(`${codexHome}/sessions`, new Date(startedMs))) {
+    let files: string[];
+    try { files = readdirSync(dir); } catch { continue; }
+    for (const file of files) {
+      if (!/^rollout-.*-[0-9a-f-]{36}\.jsonl$/i.test(file)) continue;
+      const meta = readRolloutSessionMeta(`${dir}/${file}`);
+      if (!meta) continue;
+      let cwdMatches = meta.cwd === spec.cwd;
+      try { cwdMatches ||= realpathSync(meta.cwd) === realpathSync(spec.cwd); } catch { /* compare the stored paths only */ }
+      if (!cwdMatches) continue;
+      const timestampMs = Date.parse(meta.timestamp);
+      if (!Number.isFinite(timestampMs) || timestampMs < startedMs - 5000 || timestampMs > startedMs + 60_000) continue;
+      candidates.push({
+        id: meta.id,
+        distance: Math.abs(timestampMs - startedMs),
+        topLevel: meta.source === "exec",
+      });
+    }
+  }
+  const topLevel = candidates.filter((candidate) => candidate.topLevel);
+  const matches = topLevel.length > 0 ? topLevel : candidates;
+  matches.sort((left, right) => left.distance - right.distance);
+  return matches[0]?.id;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,12 +720,16 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const stderrText = (() => {
     try { return readFileSync(`${ROOT}/logs/${lane}-r${round}.stderr.log`, "utf8"); } catch { return ""; }
   })();
+  const beforeFinalize = readLedger()[lane];
+  const capturedSessionId = beforeFinalize?.sessionId;
+  const textSessionId = !jsonMode
+    ? /session id: ([0-9a-f-]{36})/i.exec(`${readFileSync(logPath, "utf8")}\n${stderrText}`)?.[1]
+    : undefined;
+  const resolvedSessionId = capturedSessionId || textSessionId
+    || resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
-    if (!jsonMode && !item.sessionId) {
-      const match = /session id: ([0-9a-f-]{36})/.exec(readFileSync(logPath, "utf8"));
-      if (match) item.sessionId = match[1];
-    }
+    if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
     item.state = exitCode === 0 && reportOk ? "done" : "failed";
     if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
     else if (exitCode !== 0 && /login|auth|401|unauthorized|token.*expired/i.test(stderrText)) {
