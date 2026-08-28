@@ -1,19 +1,24 @@
 #!/usr/bin/env bun
 // cdx runs tracked Codex execution lanes for Claude Code and Codex CLI users.
 //
-//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... "<brief>"
-//   cdx resume <lane> [--bg] "<follow-up>"
+//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... "<brief>"
+//   cdx resume <lane> [--effort <effort>] [--bg] "<follow-up>"
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> [--account <name>] [--cd <dir>]
 //   cdx status [--all] [--json]
-//   cdx wait   <lane>... [--timeout <sec>]
+//   cdx usage  [--json]
+//   cdx wait   <lane>... [--timeout <sec>] [--json]
 //   cdx tail   <lane> [-n <lines>]
+//   cdx feed   [-n <lines>]
 //   cdx report <lane> [round]
 //   cdx log    <lane> [round]
 //   cdx close  <lane> ["note"]
 //   cdx clean  [--days <n>]
 //   cdx doctor [--fix] [--probe]
+//
+// A brief of "-" reads the brief from stdin, which sidesteps shell quoting for
+// long prompts.
 //
 // cdx policy comes from $CDX_HOME/config.json. Work lanes cannot commit, push,
 // or deploy, and reviews always get a fresh read-only session.
@@ -73,6 +78,7 @@ interface Config {
   defaultEffort: string;
   rules: string[];
   accounts?: Record<string, string>;
+  worktreeSetup?: string;
 }
 
 interface Tokens { input: number; cached: number; output: number }
@@ -96,6 +102,9 @@ interface Lane {
   lastEventAt?: string;
   exitCode?: number;
   note?: string;
+  worktreePath?: string;
+  worktreeRepo?: string;
+  branch?: string;
   createdAt: string;
   updatedAt: string;
   roundStartedAt?: string;
@@ -161,7 +170,7 @@ function readConfig(skipFile = false): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "efforts", "defaultEffort", "rules", "accounts"]);
+  const allowed = new Set(["model", "efforts", "defaultEffort", "rules", "accounts", "worktreeSetup"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -204,7 +213,18 @@ function readConfig(skipFile = false): Config {
     accounts = Object.fromEntries(parsedAccounts);
   }
 
-  return { model, efforts: efforts as string[], defaultEffort, rules: rules as string[], ...(accounts ? { accounts } : {}) };
+  let worktreeSetup: string | undefined;
+  if (Object.hasOwn(input, "worktreeSetup")) {
+    if (typeof input.worktreeSetup !== "string" || input.worktreeSetup.trim().length === 0) {
+      configError("worktreeSetup must be a nonempty string (a shell command run inside each new worktree)");
+    }
+    worktreeSetup = input.worktreeSetup;
+  }
+
+  return {
+    model, efforts: efforts as string[], defaultEffort, rules: rules as string[],
+    ...(accounts ? { accounts } : {}), ...(worktreeSetup ? { worktreeSetup } : {}),
+  };
 }
 
 const config = readConfig(process.argv[2] === "_run");
@@ -400,7 +420,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account"]);
+const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all"]);
 
@@ -490,11 +510,46 @@ function storedOwnership(lane: Lane): LaneOwner | undefined {
   return { ...(lane.ownerSession ? { ownerSession: lane.ownerSession } : {}), ownerCwd: lane.ownerCwd };
 }
 
+// A brief of "-" reads stdin, so long prompts with quotes and backticks never
+// fight the shell.
+async function resolveBrief(text: string | undefined): Promise<string | undefined> {
+  if (text !== "-") return text;
+  const stdin = (await Bun.stdin.text()).trim();
+  if (!stdin) fail("brief was '-' but stdin is empty");
+  return stdin;
+}
+
+interface WorktreeInfo { path: string; repo: string; branch: string }
+
+function createWorktree(repo: string, target: string, lane: string): WorktreeInfo {
+  const top = Bun.spawnSync({ cmd: ["git", "-C", repo, "rev-parse", "--show-toplevel"] });
+  if (!top.success) fail(`--worktree needs a git repository at ${repo}`);
+  const repoRoot = top.stdout.toString().trim();
+  const path = target.startsWith("/") ? target : `${process.cwd()}/${target}`;
+  if (existsSync(path)) fail(`worktree target already exists: ${path}`);
+  const branch = `lane/${lane}`;
+  const add = Bun.spawnSync({ cmd: ["git", "-C", repoRoot, "worktree", "add", path, "-b", branch] });
+  if (!add.success) {
+    fail(`git worktree add failed: ${(add.stderr.toString() || add.stdout.toString()).trim().split("\n").at(-1)}`);
+  }
+  console.log(`cdx: worktree ${displayPath(path)} on branch ${branch} (from ${displayPath(repoRoot)})`);
+  if (config.worktreeSetup) {
+    console.log(`cdx: worktree setup: ${config.worktreeSetup}`);
+    const setup = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", config.worktreeSetup], cwd: path, env: uncoloredChildEnv() });
+    if (!setup.success) {
+      const tail = (setup.stderr.toString() || setup.stdout.toString()).trim().split("\n").at(-1) ?? "";
+      // Leave the worktree in place for inspection; the caller decides.
+      fail(`worktree setup failed in ${path}${tail ? `: ${tail}` : ""}`);
+    }
+  }
+  return { path, repo: repoRoot, branch };
+}
+
 // ---------------------------------------------------------------------------
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
@@ -509,6 +564,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
     const ownerCwd = opts?.preserveOwner ? existing?.ownerCwd : opts?.owner?.ownerCwd;
     ledger[lane] = {
       ...(existing ?? {}),
+      ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
       codexHome,
       ownerSession,
@@ -763,11 +819,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 // ---------------------------------------------------------------------------
 
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "cd", "bg", "add-dir", "image", "schema", "account"]);
-  const [lane, brief] = parsed.rest;
-  if (!lane || !brief) fail('usage: cdx spawn <lane> [--effort <effort>] [--cd <dir>] [--bg] "<brief>"');
+  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account"]);
+  const [lane, briefArg] = parsed.rest;
+  const brief = await resolveBrief(briefArg);
+  if (!lane || !brief) fail('usage: cdx spawn <lane> [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] "<brief>"');
   validLane(lane);
-  const cwd = parsed.flags.cd ?? process.cwd();
+  let cwd = parsed.flags.cd ?? process.cwd();
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = effortOf(parsed);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
@@ -776,11 +833,16 @@ async function spawnCommand(argv: string[]) {
   if (existingLane?.state === "running" && pidAlive(existingLane.pid)) {
     fail(`lane "${lane}" is already running (pid ${existingLane.pid}); pick a new name or wait`);
   }
+  let worktree: WorktreeInfo | undefined;
+  if (parsed.flags.worktree) {
+    worktree = createWorktree(cwd, parsed.flags.worktree, lane);
+    cwd = worktree.path;
+  }
   const selection = await selectAccount(parsed.flags.account);
   if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
   const account = selection.choice;
   const owner = callerOwnership();
-  const { round } = openRound(lane, "work", cwd, effort, { account, owner });
+  const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree });
   announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
   const codexArgs = [
@@ -795,29 +857,34 @@ async function spawnCommand(argv: string[]) {
   return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
-function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["bg"]);
-  const [lane, followUp] = parsed.rest;
-  if (!lane || !followUp) fail('usage: cdx resume <lane> [--bg] "<follow-up>"');
+async function resumeCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["effort", "bg"]);
+  const [lane, followUpArg] = parsed.rest;
+  const followUp = await resolveBrief(followUpArg);
+  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] "<follow-up>"');
   const before = readLane(lane);
   const account = laneAccount(before);
   warnCachedUsageBeforeLaunch(account);
   const owner = storedOwnership(before);
-  const { round, sessionId } = openRound(lane, before.kind, before.cwd, before.effort, { requireSession: true, preserveAccount: true, preserveOwner: true });
+  const effort = parsed.flags.effort ? configuredEffort(parsed.flags.effort) : before.effort;
+  const { round, sessionId } = openRound(lane, before.kind, before.cwd, effort, { requireSession: true, preserveAccount: true, preserveOwner: true });
   const reviewResume = before.kind === "review";
   const reportInstruction = reviewResume
     ? "Print your final report. cdx captures it from the transcript."
     : `Write your final report to ${reportPathOf(lane, round)} as well as printing it.`;
   const prompt = `Ground rules:\n${houseRules(before.cwd, reviewResume)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
+  // The session keeps its own settings; only an explicit --effort overrides.
+  const effortArgs = parsed.flags.effort ? ["-c", `model_reasoning_effort=${effort}`] : [];
   const codexArgs = reviewResume
-    ? ["exec", "resume", "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
-    : ["exec", "resume", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
+    ? ["exec", "resume", ...effortArgs, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
+    : ["exec", "resume", ...effortArgs, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
   return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
-function forkCommand(argv: string[]) {
+async function forkCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["effort", "bg", "account"]);
-  const [newLane, source, brief] = parsed.rest;
+  const [newLane, source, briefArg] = parsed.rest;
+  const brief = await resolveBrief(briefArg);
   if (!newLane || !source || !brief) fail('usage: cdx fork <newLane> <fromLane|sessionId> [--bg] "<brief>"');
   validLane(newLane);
   const ledger = readLedger();
@@ -857,7 +924,8 @@ function forkCommand(argv: string[]) {
 
 async function reviewCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account"]);
-  const [lane, intent] = parsed.rest;
+  const [lane, intentArg] = parsed.rest;
+  const intent = await resolveBrief(intentArg);
   if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
   validLane(lane);
   const cwd = parsed.flags.cd ?? process.cwd();
@@ -952,7 +1020,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const timing = entry.state === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
     : `finished ${fmtAge(entry.updatedAt)} ago`;
-  const laneDetail = `cwd ${displayPath(entry.cwd)} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
+  const laneDetail = `cwd ${displayPath(entry.cwd)}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
   const tokenDetail = `${fmtTokens(entry.tokens)} · codex session ${entry.sessionId?.slice(0, 8) ?? "-"}`;
   const report = entry.reports.at(-1);
   const last = entry.state === "running" ? entry.lastAction ?? "-"
@@ -985,13 +1053,20 @@ function statusCommand(argv: string[]) {
 }
 
 async function waitCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["timeout"]);
+  const parsed = parseArgs(argv, ["timeout", "json"]);
+  const json = parsed.bools.has("json");
   const lanes = parsed.rest;
-  if (lanes.length === 0) fail("usage: cdx wait <lane>... [--timeout <sec>]");
+  if (lanes.length === 0) fail("usage: cdx wait <lane>... [--timeout <sec>] [--json]");
   for (const lane of lanes) readLane(lane);
   const timeoutMs = Number(parsed.flags.timeout ?? 7200) * 1000;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
+  // --json prints one JSON object per finished lane, in completion order.
+  const emitJson = (lane: string, entry: Lane, error?: string) => console.log(JSON.stringify({
+    lane, state: entry.state, exitCode: entry.exitCode ?? null, tokens: entry.tokens ?? null,
+    report: entry.reports.at(-1) ?? null, note: entry.note ?? null, sessionId: entry.sessionId ?? null,
+    rounds: entry.rounds, ...(error ? { error } : {}),
+  }));
   let failed = false;
   while (pending.size > 0) {
     const ledger = readLedger();
@@ -999,10 +1074,12 @@ async function waitCommand(argv: string[]) {
       const entry = ledger[lane]!;
       if (entry.state === "running" && pidAlive(entry.pid)) continue;
       if (entry.state === "running") {
-        console.log(`cdx: lane=${color.magenta(lane)} ${color.red("runner died without finalizing")} (see cdx doctor)`);
+        if (json) emitJson(lane, entry, "runner died without finalizing");
+        else console.log(`cdx: lane=${color.magenta(lane)} ${color.red("runner died without finalizing")} (see cdx doctor)`);
         failed = true;
       } else {
-        console.log(`cdx: lane=${color.magenta(lane)} state=${coloredState(entry.state)} exit=${entry.exitCode ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${entry.reports.at(-1) ?? "-"}`);
+        if (json) emitJson(lane, entry);
+        else console.log(`cdx: lane=${color.magenta(lane)} state=${coloredState(entry.state)} exit=${entry.exitCode ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${entry.reports.at(-1) ?? "-"}`);
         if (entry.state === "failed") failed = true;
       }
       pending.delete(lane);
@@ -1537,6 +1614,71 @@ function formatAccountUsage(usage: AccountUsage): { detail: string; usedPercent:
   };
 }
 
+function fmtTokensFull(tokens: Tokens): string {
+  const k = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n);
+  return `${k(tokens.input)} in (${k(tokens.cached)} cached) / ${k(tokens.output)} out`;
+}
+
+async function usageCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["json"]);
+  const json = parsed.bools.has("json");
+  const accounts: (AccountChoice | undefined)[] = config.accounts
+    ? Object.entries(config.accounts).map(([name, home]) => ({ name, home }))
+    : [undefined];
+
+  // All-time lane and token totals from the ledger, grouped by account.
+  // Tokens only accrue on JSONL rounds (spawn, exec review); text rounds
+  // (resume, fork, native review) report none.
+  const totals = new Map<string, { lanes: number; tokens: Tokens }>();
+  for (const entry of Object.values(readLedger())) {
+    const key = entry.account ?? "default";
+    const bucket = totals.get(key) ?? { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } };
+    bucket.lanes += 1;
+    if (entry.tokens) {
+      bucket.tokens.input += entry.tokens.input;
+      bucket.tokens.cached += entry.tokens.cached;
+      bucket.tokens.output += entry.tokens.output;
+    }
+    totals.set(key, bucket);
+  }
+
+  const refreshed = await Promise.all(accounts.map((account) => refreshUsageSnapshot({ account })));
+  if (json) {
+    const rows = accounts.map((account, index) => {
+      const key = account?.name ?? "default";
+      const ledgerTotals = totals.get(key);
+      return {
+        account: key,
+        home: account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`,
+        usage: refreshed[index]?.usage ?? null,
+        checkedAt: refreshed[index]?.snapshot.checkedAt ?? null,
+        lanes: ledgerTotals?.lanes ?? 0,
+        ledgerTokens: ledgerTotals?.tokens ?? null,
+      };
+    });
+    console.log(JSON.stringify(rows, null, 2));
+    return;
+  }
+  for (const [index, account] of accounts.entries()) {
+    const key = account?.name ?? "default";
+    const label = account ? `${color.bold(account.name)} ${color.dim(`(${displayPath(account.home)})`)}` : color.bold("codex");
+    const result = refreshed[index];
+    if (!result) {
+      const cached = readUsageSnapshot(account);
+      const detail = cached && cached.planType !== "unknown"
+        ? ` · cached ${fmtAge(cached.checkedAt)} ago: ${cached.planType.toLowerCase()} plan, ${cached.usedPercent}% used, resets ${rateLimitResetDate(cached.resetsAt)}`
+        : "";
+      console.log(`${label}: ${color.yellow("probe failed (codex login?)")}${color.dim(detail)}`);
+    } else {
+      const formatted = formatAccountUsage(result.usage);
+      const paint = formatted.usedPercent >= 95 ? color.red : formatted.usedPercent >= 75 ? color.yellow : color.green;
+      console.log(`${label}: ${paint(formatted.detail)}`);
+    }
+    const ledgerTotals = totals.get(key);
+    if (ledgerTotals) console.log(color.dim(`  lanes ${ledgerTotals.lanes} · ledger tokens ${fmtTokensFull(ledgerTotals.tokens)}`));
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -1718,6 +1860,16 @@ function briefCommand() {
   if (lanes.length > 0) console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
 }
 
+// Replay recent feed lines: what completed, stalled, or warned while the
+// caller was away (the live monitor only delivers lines to open sessions).
+function feedCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["n"]);
+  const path = `${ROOT}/feed.log`;
+  if (!existsSync(path)) { console.log("cdx: no feed yet"); return; }
+  const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
+  console.log(lines.slice(-Number(parsed.flags.n ?? 20)).join("\n"));
+}
+
 function cleanCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["days"]);
   const days = Number(parsed.flags.days ?? 14);
@@ -1744,19 +1896,23 @@ function cleanCommand(argv: string[]) {
 const USAGE = `cdx tracks Codex execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
-  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
-  resume <lane> [--bg] "<follow-up>"
+  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
+  resume <lane> [--effort E] [--bg] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   adopt  <lane> <sessionId> [--account NAME] [--cd D]
-  status [--json]         wait <lane>... [--timeout S]
+  status [--json]         wait <lane>... [--timeout S] [--json]
+  usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
+  feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
   close  <lane> ["note"]  clean [--days N]         doctor [--fix] [--probe]
   brief                   # running/failed lanes only; silent when all settled
 
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
-one blocking call over many lanes. Foreground lanes print the report on exit.`;
+one blocking call over many lanes. Foreground lanes print the report on exit.
+--worktree P creates a git worktree at P on branch lane/<lane> from the repo at
+--cd (or the current directory) and runs the lane there. A "-" brief reads stdin.`;
 
 // ---------------------------------------------------------------------------
 
@@ -1802,7 +1958,9 @@ switch (command) {
     break;
   }
   case "status": statusCommand(argv); break;
+  case "usage": await usageCommand(argv); break;
   case "wait": await waitCommand(argv); break;
+  case "feed": feedCommand(argv); break;
   case "tail": {
     const parsed = parseArgs(argv, ["n", "follow"]);
     const [lane] = parsed.rest;
@@ -1840,7 +1998,7 @@ switch (command) {
   case "close": {
     const [lane, note] = argv;
     if (!lane) fail('usage: cdx close <lane> ["note"]');
-    readLane(lane);
+    const entry = readLane(lane);
     withLedger((ledger) => {
       const item = ledger[lane]!;
       item.state = "closed";
@@ -1848,6 +2006,10 @@ switch (command) {
       item.updatedAt = new Date().toISOString();
     });
     console.log(`cdx: closed lane=${lane}`);
+    // Never auto-remove: the branch may be unmerged. Print the cleanup instead.
+    if (entry.worktreePath && existsSync(entry.worktreePath)) {
+      console.log(`cdx: worktree remains; after merging: git -C ${entry.worktreeRepo ?? entry.worktreePath} worktree remove ${entry.worktreePath}${entry.branch ? ` && git -C ${entry.worktreeRepo ?? entry.worktreePath} branch -d ${entry.branch}` : ""}`);
+    }
     break;
   }
   case "clean": cleanCommand(argv); break;
