@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 // cdx runs tracked Codex execution lanes for Claude Code and Codex CLI users.
 //
-//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] "<brief>"
-//   cdx resume <lane> [--effort <effort>] [--bg] "<follow-up>"
+//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] [--max-runtime <min>] "<brief>"
+//   cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> [--account <name>] [--cd <dir>]
@@ -130,6 +130,7 @@ interface Spec {
   ownerSession?: string;
   ownerCwd?: string;
   gate?: string;
+  maxRuntimeMins?: number;
 }
 
 type Ledger = Record<string, Lane>;
@@ -438,7 +439,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate"]);
+const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all"]);
 
@@ -477,6 +478,14 @@ function configuredEffort(effort: string): Effort {
 
 function effortOf(parsed: Parsed): Effort {
   return configuredEffort(parsed.flags.effort ?? config.defaultEffort);
+}
+
+function maxRuntimeOf(parsed: Parsed): number | undefined {
+  const raw = parsed.flags["max-runtime"];
+  if (raw === undefined) return undefined;
+  const minutes = Number(raw);
+  if (!Number.isFinite(minutes) || minutes <= 0) fail("--max-runtime must be a positive number of minutes");
+  return minutes;
 }
 
 interface AccountChoice { name: string; home: string }
@@ -721,6 +730,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     lastStallWarn = 0;
     lastEventMs = Date.now();
   };
+  // --max-runtime is a hard cap: past it, kill the codex child and fail the
+  // round. The exitCode guard closes the race where the timer fires after a
+  // clean exit but before it is cleared.
+  let maxRuntimeHit = false;
+  const maxRuntimeTimer = spec.maxRuntimeMins
+    ? setTimeout(() => {
+        if (proc.exitCode !== null) return;
+        maxRuntimeHit = true;
+        try { proc.kill(); } catch { /* already gone */ }
+      }, spec.maxRuntimeMins * 60_000)
+    : undefined;
   const watchdog = setInterval(() => {
     const quiet = Date.now() - lastEventMs;
     if (quiet >= 300_000 && Date.now() - lastStallWarn >= 600_000) {
@@ -777,6 +797,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   await Promise.all([jsonMode ? pumpJson(proc.stdout) : pumpRaw(proc.stdout, log), pumpRaw(proc.stderr, errLog)]);
   clearInterval(watchdog);
   const exitCode = await proc.exited;
+  if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
   log.end();
   errLog.end();
 
@@ -831,8 +852,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     // Ledger kind, not spec.mode, decides work vs review: intent reviews
     // launch with mode "spawn" but must never become the resume target.
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
-    item.state = exitCode === 0 && reportOk && !gateFailed ? "done" : "failed";
+    item.state = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit ? "done" : "failed";
     if (gateFailed) item.note = `gate failed (exit ${gateExit}): ${spec.gate}`;
+    else if (maxRuntimeHit) item.note = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.
@@ -884,7 +906,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 // ---------------------------------------------------------------------------
 
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate"]);
+  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "max-runtime"]);
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
   if (!lane || !brief) fail('usage: cdx spawn <lane> [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] "<brief>"');
@@ -892,6 +914,7 @@ async function spawnCommand(argv: string[]) {
   let cwd = parsed.flags.cd ?? process.cwd();
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = effortOf(parsed);
+  const maxRuntime = maxRuntimeOf(parsed);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
   // probes; openRound re-checks under the ledger lock.
   const existingLane = readLedger()[lane];
@@ -919,14 +942,15 @@ async function spawnCommand(argv: string[]) {
   for (const image of parsed.lists.image ?? []) codexArgs.push("--image", image);
   if (parsed.flags.schema) codexArgs.push("--output-schema", parsed.flags.schema);
   codexArgs.push(fullBrief);
-  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "bg"]);
+  const parsed = parseArgs(argv, ["effort", "bg", "max-runtime"]);
   const [lane, followUpArg] = parsed.rest;
   const followUp = await resolveBrief(followUpArg);
-  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] "<follow-up>"');
+  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"');
+  const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
   const account = laneAccount(before);
   warnCachedUsageBeforeLaunch(account);
@@ -949,7 +973,7 @@ async function resumeCommand(argv: string[]) {
   const codexArgs = reviewResume
     ? ["exec", "resume", ...effortArgs, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : ["exec", "resume", ...effortArgs, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
-  return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...(!reviewResume && before.gate ? { gate: before.gate } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...(!reviewResume && before.gate ? { gate: before.gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function forkCommand(argv: string[]) {
@@ -2030,8 +2054,8 @@ async function killCommand(argv: string[]) {
 const USAGE = `cdx tracks Codex execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
-  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] "<brief>"
-  resume <lane> [--effort E] [--bg] "<follow-up>"
+  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--max-runtime MIN] "<brief>"
+  resume <lane> [--effort E] [--bg] [--max-runtime MIN] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   adopt  <lane> <sessionId> [--account NAME] [--cd D]
@@ -2049,7 +2073,8 @@ one blocking call over many lanes. Foreground lanes print the report on exit.
 --worktree P creates a git worktree at P on branch lane/<lane> from the repo at
 --cd (or the current directory) and runs the lane there. A "-" brief reads stdin.
 --gate CMD runs after a green work round (sh -lc, lane cwd); a nonzero exit
-fails the round. Work resumes rerun the lane's stored gate; reviews never do.`;
+fails the round. Work resumes rerun the lane's stored gate; reviews never do.
+--max-runtime MIN kills the round past the cap and marks it failed.`;
 
 // ---------------------------------------------------------------------------
 
