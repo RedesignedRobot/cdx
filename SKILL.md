@@ -15,20 +15,21 @@ sessions.
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... "<brief>"
-cdx resume <lane> [--effort E] [--bg] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--max-runtime <min>] "<brief>"
+cdx resume <lane> [--effort E] [--bg] [--max-runtime <min>] "<follow-up>"
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
-cdx wait   <lane>... [--timeout <sec>] [--json]
+cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
 cdx tail   <lane> [-n N]
 cdx tail -f [lane]
 cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round]
-cdx close  <lane> ["note"]
+cdx kill   <lane> ["note"]
+cdx close  <lane> [--remove-worktree] ["note"]
 cdx clean  [--days N]
 cdx doctor [--fix] [--probe]
 cdx brief
@@ -45,18 +46,40 @@ Use it whenever parallel lanes touch the same repository, so each worker owns
 its files exclusively. `status` shows the branch; `close` prints the removal
 commands and never deletes anything itself.
 
-`resume` keeps the lane's session and working directory. It does not accept
-`--cd`, `--json`, or `--output-last-message`. `resume --effort E` overrides
-the stored effort for that round onward; without it the session keeps its own
-settings. `fork` branches an existing lane or session and keeps the source
-session's working directory, so it does not accept `--cd`.
+`resume` keeps the lane's working directory and always reattaches to the
+lane's work thread, recorded as `workSessionId` in the ledger, even when the
+latest round was a review. Only a lane that never had a work session resumes
+as a read-only review follow-up. `resume` does not accept `--cd`, `--json`,
+or `--output-last-message`. `resume --effort E` overrides the stored effort
+for that round onward; without it the session keeps its own settings. `fork`
+branches an existing lane or session and keeps the source session's working
+directory, so it does not accept `--cd`; a raw-session-ID fork reads that
+directory from the session's rollout file.
+
+`spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work
+round exits 0 with a report, cdx runs the gate with `/bin/sh -lc` in the lane
+cwd. Exit 0 appends a `## Gate` section to the report; nonzero fails the
+round with `gate failed (exit N)` and still appends the output. Work resumes
+rerun the stored gate; reviews never run one. Full gate output lands in
+`logs/<lane>-r<n>.gate.log`. The gate is the harness's own verification, so
+a worker's optimistic done claim cannot finalize green.
+
+`--max-runtime <min>` (spawn and resume) kills the codex child past the cap
+and fails the round with `max runtime exceeded (Nm)`.
+
+`cdx kill <lane>` stops a running lane: SIGTERM lets the runner reap its
+codex child and finalize with a signal note; a runner still silent after 10s,
+or a dead runner with a live codex orphan, gets SIGKILL and a direct ledger
+finalize with note `killed`. Exit codes 130, 137, and 143 always finalize as
+`terminated by signal`, never as auth failures.
 
 Native review uses one of `--uncommitted`, `--base`, or `--commit` and cannot
 take a custom intent. Without a target flag, review needs an intent and may
 take `--scope`. Native and intent-based reviews always start fresh, read-only
 sessions. Intent-based reviews receive an adversarial brief that asks for
-severity-ranked findings, concrete failure cases, and CONFIRMED or PLAUSIBLE
-labels.
+severity-ranked findings, concrete failure cases, CONFIRMED or PLAUSIBLE
+labels, and a closing fenced json findings block; cdx parses that block into
+`reports/<lane>-r<n>.findings.json` (best effort, empty array when clean).
 
 ## Orchestration
 
@@ -66,6 +89,8 @@ labels.
   `cdx wait lane-a lane-b`. The wait exits 1 if any named lane fails.
   `cdx wait --json` prints one JSON object per finished lane (state, exit
   code, tokens, report path, note, session ID) for machine parsing.
+  `--report` also prints each finished lane's report content (a `reportText`
+  field under `--json`).
 - Use `cdx usage` to answer capacity questions: per-account plan, rate-limit
   windows with reset dates, reset credits, and all-time lane and token totals
   from the ledger. `--json` returns the raw structures.
@@ -73,8 +98,10 @@ labels.
   context compaction or an away stretch; the live monitor only delivers lines
   to open sessions.
 - Use `cdx status` for structured lane blocks with owner, state, timing, tokens,
-  and last activity. It shows running lanes first, then the 10 newest finished
-  ones (`--all` for the rest). Use `cdx tail <lane>` for the rendered event log.
+  and last activity. Running lanes show round and cumulative tokens; each round
+  starts with cleared last-activity fields, so `last` never shows the previous
+  round's final message. It shows running lanes first, then the 10 newest
+  finished ones (`--all` for the rest). Use `cdx tail <lane>` for the rendered event log.
 - Use `cdx tail -f <lane>` for one worker's live transcript. It exits with the
   lane's outcome. Use `cdx tail -f` for all running lanes with `[lane]`
   prefixes. It follows new rounds and attaches new lanes. Any terminal or agent
@@ -82,8 +109,13 @@ labels.
   sessions can see each other's workers.
 - Use `cdx resume` to continue a lane. Use `cdx fork` when two lanes should
   start with the same session context.
-- Close finished lanes with an outcome note. `cdx clean` removes closed lanes
-  older than the selected age, which defaults to 14 days.
+- Use `cdx kill <lane> ["note"]` to stop a lane that is running down a wrong
+  path instead of waiting it out.
+- Close finished lanes with an outcome note. `close --remove-worktree` also
+  removes the lane worktree and branch, but only when the branch is merged
+  into the repo's HEAD and the worktree is clean; otherwise it prints the
+  manual commands. `cdx clean` removes closed lanes older than the selected
+  age, which defaults to 14 days.
 
 Each finalized lane appends one line to `$CDX_HOME/feed.log`. The plugin
 monitor tails `$HOME/.cdx/feed.log`, so use the default `CDX_HOME` when you
