@@ -14,7 +14,7 @@
 //   cdx report <lane> [round]
 //   cdx log    <lane> [round]
 //   cdx kill   <lane> ["note"]
-//   cdx close  <lane> ["note"]
+//   cdx close  <lane> [--remove-worktree] ["note"]
 //   cdx clean  [--days <n>]
 //   cdx doctor [--fix] [--probe]
 //
@@ -570,6 +570,36 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
     }
   }
   return { path, repo: repoRoot, branch };
+}
+
+function printWorktreeCleanup(entry: Lane) {
+  const repo = entry.worktreeRepo ?? entry.worktreePath;
+  console.log(`cdx: worktree remains; after merging: git -C ${repo} worktree remove ${entry.worktreePath}${entry.branch ? ` && git -C ${repo} branch -d ${entry.branch}` : ""}`);
+}
+
+// Removal only when provably safe: the lane branch is merged into the repo's
+// HEAD and the worktree has no uncommitted changes. Anything else refuses
+// with the reason and prints the manual commands instead.
+function removeWorktree(entry: Lane) {
+  const repo = entry.worktreeRepo ?? entry.worktreePath!;
+  const refuse = (reason: string) => {
+    console.log(color.yellow(`cdx: not removing worktree: ${reason}`));
+    printWorktreeCleanup(entry);
+  };
+  if (!entry.branch) return refuse("the lane has no recorded branch");
+  const merged = Bun.spawnSync({ cmd: ["git", "-C", repo, "branch", "--merged", "HEAD"] });
+  if (!merged.success) return refuse(`git branch --merged failed in ${repo}`);
+  const branches = merged.stdout.toString().split("\n").map((line) => line.replace(/^[*+]\s*/, "").trim());
+  if (!branches.includes(entry.branch)) return refuse(`branch ${entry.branch} is not merged into HEAD of ${repo}`);
+  const status = Bun.spawnSync({ cmd: ["git", "-C", entry.worktreePath!, "status", "--porcelain"] });
+  if (!status.success) return refuse(`git status failed in ${entry.worktreePath}`);
+  if (status.stdout.toString().trim() !== "") return refuse(`worktree ${entry.worktreePath} has uncommitted changes`);
+  const remove = Bun.spawnSync({ cmd: ["git", "-C", repo, "worktree", "remove", entry.worktreePath!] });
+  if (!remove.success) return refuse(`git worktree remove failed: ${(remove.stderr.toString() || remove.stdout.toString()).trim().split("\n").at(-1)}`);
+  console.log(`cdx: removed worktree ${displayPath(entry.worktreePath!)}`);
+  const del = Bun.spawnSync({ cmd: ["git", "-C", repo, "branch", "-d", entry.branch] });
+  if (del.success) console.log(`cdx: deleted branch ${entry.branch}`);
+  else console.log(color.yellow(`cdx: branch ${entry.branch} not deleted: ${(del.stderr.toString() || del.stdout.toString()).trim().split("\n").at(-1)}`));
 }
 
 // ---------------------------------------------------------------------------
@@ -2081,7 +2111,8 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
   feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
   kill   <lane> ["note"]  # SIGTERM the runner; force-finalize if it hangs
-  close  <lane> ["note"]  clean [--days N]         doctor [--fix] [--probe]
+  close  <lane> [--remove-worktree] ["note"]       clean [--days N]
+  doctor [--fix] [--probe]
   brief                   # running/failed lanes only; silent when all settled
 
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
@@ -2174,8 +2205,9 @@ switch (command) {
     break;
   }
   case "close": {
-    const [lane, note] = argv;
-    if (!lane) fail('usage: cdx close <lane> ["note"]');
+    const parsed = parseArgs(argv, ["remove-worktree"]);
+    const [lane, note] = parsed.rest;
+    if (!lane) fail('usage: cdx close <lane> [--remove-worktree] ["note"]');
     const entry = readLane(lane);
     withLedger((ledger) => {
       const item = ledger[lane]!;
@@ -2184,9 +2216,11 @@ switch (command) {
       item.updatedAt = new Date().toISOString();
     });
     console.log(`cdx: closed lane=${lane}`);
-    // Never auto-remove: the branch may be unmerged. Print the cleanup instead.
+    // Default: never auto-remove, the branch may be unmerged. --remove-worktree
+    // deletes only a merged branch with a clean worktree; otherwise it refuses.
     if (entry.worktreePath && existsSync(entry.worktreePath)) {
-      console.log(`cdx: worktree remains; after merging: git -C ${entry.worktreeRepo ?? entry.worktreePath} worktree remove ${entry.worktreePath}${entry.branch ? ` && git -C ${entry.worktreeRepo ?? entry.worktreePath} branch -d ${entry.branch}` : ""}`);
+      if (parsed.bools.has("remove-worktree")) removeWorktree(entry);
+      else printWorktreeCleanup(entry);
     }
     break;
   }
