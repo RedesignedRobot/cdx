@@ -432,7 +432,7 @@ function houseRules(cwd: string, reviewOnly: boolean): string {
   return sections.join("\n");
 }
 
-const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, test gaps. Severity-rank findings, each with a concrete failure scenario, and mark each CONFIRMED (you traced the code path) or PLAUSIBLE (you could not fully trace it). If clean, say clean and list exactly what you checked.`;
+const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, test gaps. Severity-rank findings, each with a concrete failure scenario, and mark each CONFIRMED (you traced the code path) or PLAUSIBLE (you could not fully trace it). If clean, say clean and list exactly what you checked. End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
 
 // ---------------------------------------------------------------------------
 // Flag parsing
@@ -851,6 +851,21 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     item.updatedAt = new Date().toISOString();
     return item;
   });
+  // Structured verdict: reviewers end reports with a fenced json findings
+  // block. Persist the last parsable one for machine consumers; a malformed
+  // block leaves the markdown report as the only artifact, never a failure.
+  if (beforeFinalize?.kind === "review" && reportOk) {
+    const blocks = [...readFileSync(reportPath, "utf8").matchAll(/```(?:json)?[^\n]*\n([\s\S]*?)```/g)];
+    for (let index = blocks.length - 1; index >= 0; index -= 1) {
+      try {
+        const verdict = JSON.parse(blocks[index]![1]!) as { findings?: unknown };
+        if (Array.isArray(verdict.findings)) {
+          writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify(verdict, null, 2)}\n`);
+          break;
+        }
+      } catch { /* not the verdict block */ }
+    }
+  }
   feedOwned(`[cdx] lane=${lane} round=${round} state=${entry.state} exit=${exitCode}${entry.note ? ` note=${entry.note}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} state=${coloredState(entry.state)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
   if (entry.note) console.log(`note: ${entry.note}`);
