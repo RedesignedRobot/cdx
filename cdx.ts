@@ -8,7 +8,7 @@
 //   cdx adopt  <lane> <sessionId> [--account <name>] [--cd <dir>]
 //   cdx status [--all] [--json]
 //   cdx usage  [--json]
-//   cdx wait   <lane>... [--timeout <sec>] [--json]
+//   cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
 //   cdx tail   <lane> [-n <lines>]
 //   cdx feed   [-n <lines>]
 //   cdx report <lane> [round]
@@ -441,7 +441,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 
 const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -1162,19 +1162,25 @@ function statusCommand(argv: string[]) {
 }
 
 async function waitCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["timeout", "json"]);
+  const parsed = parseArgs(argv, ["timeout", "json", "report"]);
   const json = parsed.bools.has("json");
+  const showReport = parsed.bools.has("report");
   const lanes = parsed.rest;
-  if (lanes.length === 0) fail("usage: cdx wait <lane>... [--timeout <sec>] [--json]");
+  if (lanes.length === 0) fail("usage: cdx wait <lane>... [--timeout <sec>] [--json] [--report]");
   for (const lane of lanes) readLane(lane);
   const timeoutMs = Number(parsed.flags.timeout ?? 7200) * 1000;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
+  const reportTextOf = (entry: Lane): string | undefined => {
+    const path = entry.reports.at(-1);
+    try { return path ? readFileSync(path, "utf8") : undefined; } catch { return undefined; }
+  };
   // --json prints one JSON object per finished lane, in completion order.
   const emitJson = (lane: string, entry: Lane, error?: string) => console.log(JSON.stringify({
     lane, state: entry.state, exitCode: entry.exitCode ?? null, tokens: entry.tokens ?? null,
     report: entry.reports.at(-1) ?? null, note: entry.note ?? null, sessionId: entry.sessionId ?? null,
-    rounds: entry.rounds, ...(error ? { error } : {}),
+    rounds: entry.rounds, ...(showReport ? { reportText: reportTextOf(entry) ?? null } : {}),
+    ...(error ? { error } : {}),
   }));
   let failed = false;
   while (pending.size > 0) {
@@ -1188,7 +1194,17 @@ async function waitCommand(argv: string[]) {
         failed = true;
       } else {
         if (json) emitJson(lane, entry);
-        else console.log(`cdx: lane=${color.magenta(lane)} state=${coloredState(entry.state)} exit=${entry.exitCode ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${entry.reports.at(-1) ?? "-"}`);
+        else {
+          console.log(`cdx: lane=${color.magenta(lane)} state=${coloredState(entry.state)} exit=${entry.exitCode ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${entry.reports.at(-1) ?? "-"}`);
+          if (showReport) {
+            const text = reportTextOf(entry);
+            if (text) {
+              console.log(`--- report ${color.magenta(lane)} ---`);
+              console.log(text.trimEnd());
+              console.log(`--- end ${color.magenta(lane)} ---`);
+            }
+          }
+        }
         if (entry.state === "failed") failed = true;
       }
       pending.delete(lane);
@@ -2059,7 +2075,7 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   adopt  <lane> <sessionId> [--account NAME] [--cd D]
-  status [--json]         wait <lane>... [--timeout S] [--json]
+  status [--json]         wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   feed   [-n N]           # replay recent completion/stall lines
