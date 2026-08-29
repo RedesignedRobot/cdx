@@ -89,6 +89,9 @@ interface Lane {
   ownerSession?: string;
   ownerCwd?: string;
   sessionId?: string;
+  // Review rounds overwrite sessionId with the read-only review session; the
+  // work thread survives here so resume always reattaches to it.
+  workSessionId?: string;
   cwd: string;
   effort: Effort;
   state: "running" | "done" | "failed" | "adopted" | "closed";
@@ -549,14 +552,14 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
     if (existing?.state === "running" && pidAlive(existing.pid)) {
       throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
     }
-    if (opts?.requireSession && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
+    if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
     const rounds = (existing?.rounds ?? 0) + 1;
     const account = opts?.preserveAccount ? existing?.account : opts?.account?.name;
     const codexHome = opts?.preserveAccount ? existing?.codexHome : opts?.account?.home;
@@ -569,7 +572,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       codexHome,
       ownerSession,
       ownerCwd,
-      sessionId: opts?.requireSession ? existing?.sessionId : undefined,
+      sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
       cwd,
       effort,
       state: "running",
@@ -585,7 +588,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
-    return { round: rounds, sessionId: existing?.sessionId };
+    return { round: rounds, sessionId: opts?.sessionOverride ?? existing?.sessionId };
   });
 }
 
@@ -786,6 +789,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
     if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
+    // Ledger kind, not spec.mode, decides work vs review: intent reviews
+    // launch with mode "spawn" but must never become the resume target.
+    if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     item.state = exitCode === 0 && reportOk ? "done" : "failed";
     if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
     else if (exitCode !== 0 && /login|auth|401|unauthorized|token.*expired/i.test(stderrText)) {
@@ -867,8 +873,14 @@ async function resumeCommand(argv: string[]) {
   warnCachedUsageBeforeLaunch(account);
   const owner = storedOwnership(before);
   const effort = parsed.flags.effort ? configuredEffort(parsed.flags.effort) : before.effort;
-  const { round, sessionId } = openRound(lane, before.kind, before.cwd, effort, { requireSession: true, preserveAccount: true, preserveOwner: true });
-  const reviewResume = before.kind === "review";
+  // Resume targets the lane's work thread even when the latest round was a
+  // review; only a lane that never had a work session continues read-only.
+  const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
+  const reviewResume = workThread === undefined;
+  const { round, sessionId } = openRound(lane, reviewResume ? "review" : "work", before.cwd, effort, {
+    requireSession: true, preserveAccount: true, preserveOwner: true,
+    ...(workThread ? { sessionOverride: workThread } : {}),
+  });
   const reportInstruction = reviewResume
     ? "Print your final report. cdx captures it from the transcript."
     : `Write your final report to ${reportPathOf(lane, round)} as well as printing it.`;
