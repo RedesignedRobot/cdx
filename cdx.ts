@@ -364,6 +364,16 @@ function readRolloutSessionMeta(path: string): RolloutSessionMeta | undefined {
   }
 }
 
+// A raw-session fork has no lane to borrow a cwd from; the rollout file named
+// by the UUID holds the session's real workdir.
+function rolloutCwdForSession(codexHome: string, sessionId: string): string | undefined {
+  let files: string[];
+  try { files = readdirSync(`${codexHome}/sessions`, { recursive: true }) as string[]; } catch { return undefined; }
+  const suffix = `-${sessionId.toLowerCase()}.jsonl`;
+  const match = files.find((file) => file.toLowerCase().endsWith(suffix));
+  return match ? readRolloutSessionMeta(`${codexHome}/sessions/${match}`)?.cwd : undefined;
+}
+
 function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): string | undefined {
   if (!roundStartedAt) return undefined;
   const startedMs = Date.parse(roundStartedAt);
@@ -918,8 +928,6 @@ async function forkCommand(argv: string[]) {
   const sourceLane = ledger[source];
   const sessionId = sourceLane?.sessionId ?? source;
   if (!/^[0-9a-f-]{36}$/.test(sessionId)) fail(`"${source}" is neither a lane with a session nor a session UUID`);
-  // exec fork keeps the source session's workdir; --cd would be a lie.
-  const cwd = sourceLane?.cwd ?? process.cwd();
   const effort = parsed.flags.effort
     ? effortOf(parsed)
     : configuredEffort(sourceLane?.effort ?? config.defaultEffort);
@@ -939,6 +947,19 @@ async function forkCommand(argv: string[]) {
     account = primaryAccount(parsed.flags.account);
   }
   warnCachedUsageBeforeLaunch(account);
+  // exec fork keeps the source session's workdir; --cd would be a lie. For a
+  // raw session id the truth lives in the rollout's session_meta.
+  let cwd: string;
+  if (sourceLane) {
+    cwd = sourceLane.cwd;
+  } else {
+    const codexHome = account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`;
+    const sessionCwd = rolloutCwdForSession(codexHome, sessionId);
+    if (!sessionCwd) {
+      console.error(color.yellow(`cdx: warning: could not resolve the session's workdir under ${displayPath(codexHome)}/sessions; recording ${process.cwd()}`));
+    }
+    cwd = sessionCwd ?? process.cwd();
+  }
   const owner = callerOwnership();
   const { round } = openRound(newLane, "work", cwd, effort, { account, owner });
   const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nWrite your final report to ${reportPathOf(newLane, round)} as well as printing it.`;
