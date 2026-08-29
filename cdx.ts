@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // cdx runs tracked Codex execution lanes for Claude Code and Codex CLI users.
 //
-//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... "<brief>"
+//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] "<brief>"
 //   cdx resume <lane> [--effort <effort>] [--bg] "<follow-up>"
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
@@ -101,6 +101,8 @@ interface Lane {
   reports: string[];
   tokens?: Tokens;
   roundTokens?: Tokens;
+  // Acceptance gate command; work rounds rerun it at finalize, reviews never.
+  gate?: string;
   pid?: number;
   codexPid?: number;
   lastAction?: string;
@@ -127,6 +129,7 @@ interface Spec {
   multiAccountUsage?: true;
   ownerSession?: string;
   ownerCwd?: string;
+  gate?: string;
 }
 
 type Ledger = Record<string, Lane>;
@@ -435,7 +438,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree"]);
+const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all"]);
 
@@ -564,7 +567,7 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
@@ -585,6 +588,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       ownerSession,
       ownerCwd,
       sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
+      gate: opts?.preserveGate ? existing?.gate : opts?.gate,
       cwd,
       effort,
       state: "running",
@@ -807,14 +811,29 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     : undefined;
   const resolvedSessionId = capturedSessionId || textSessionId
     || resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt);
+  // The gate is the harness's own verification: a worker's optimistic done
+  // claim cannot finalize green unless the gate command also passes. Work
+  // rounds only (ledger kind, since intent reviews launch with mode "spawn").
+  let gateExit: number | undefined;
+  if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk) {
+    const gate = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", spec.gate], cwd: spec.cwd, env: uncoloredChildEnv() });
+    gateExit = gate.exitCode ?? 1;
+    const output = `${gate.stdout.toString()}${gate.stderr.toString()}`;
+    writeFileSync(`${ROOT}/logs/${lane}-r${round}.gate.log`, output);
+    const trimmed = output.trim();
+    const stored = trimmed.length > 4000 ? `...${trimmed.slice(-4000)}` : trimmed;
+    writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${stored}\n\`\`\`\n`);
+  }
+  const gateFailed = gateExit !== undefined && gateExit !== 0;
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
     if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
     // Ledger kind, not spec.mode, decides work vs review: intent reviews
     // launch with mode "spawn" but must never become the resume target.
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
-    item.state = exitCode === 0 && reportOk ? "done" : "failed";
-    if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
+    item.state = exitCode === 0 && reportOk && !gateFailed ? "done" : "failed";
+    if (gateFailed) item.note = `gate failed (exit ${gateExit}): ${spec.gate}`;
+    else if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.
     else if (exitCode === 130 || exitCode === 137 || exitCode === 143) {
@@ -850,7 +869,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 // ---------------------------------------------------------------------------
 
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account"]);
+  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate"]);
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
   if (!lane || !brief) fail('usage: cdx spawn <lane> [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] "<brief>"');
@@ -873,7 +892,7 @@ async function spawnCommand(argv: string[]) {
   if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
   const account = selection.choice;
   const owner = callerOwnership();
-  const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree });
+  const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree, gate: parsed.flags.gate });
   announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
   const codexArgs = [
@@ -885,7 +904,7 @@ async function spawnCommand(argv: string[]) {
   for (const image of parsed.lists.image ?? []) codexArgs.push("--image", image);
   if (parsed.flags.schema) codexArgs.push("--output-schema", parsed.flags.schema);
   codexArgs.push(fullBrief);
-  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 async function resumeCommand(argv: string[]) {
@@ -903,7 +922,7 @@ async function resumeCommand(argv: string[]) {
   const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
   const reviewResume = workThread === undefined;
   const { round, sessionId } = openRound(lane, reviewResume ? "review" : "work", before.cwd, effort, {
-    requireSession: true, preserveAccount: true, preserveOwner: true,
+    requireSession: true, preserveAccount: true, preserveOwner: true, preserveGate: true,
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
   const reportInstruction = reviewResume
@@ -915,7 +934,7 @@ async function resumeCommand(argv: string[]) {
   const codexArgs = reviewResume
     ? ["exec", "resume", ...effortArgs, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : ["exec", "resume", ...effortArgs, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
-  return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...(!reviewResume && before.gate ? { gate: before.gate } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function forkCommand(argv: string[]) {
@@ -991,7 +1010,7 @@ async function reviewCommand(argv: string[]) {
     if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
     const account = selection.choice;
     const owner = callerOwnership();
-    const { round } = openRound(lane, "review", cwd, effort, { account, owner });
+    const { round } = openRound(lane, "review", cwd, effort, { account, owner, preserveGate: true });
     announceAccountSelection(lane, selection, owner.ownerSession);
     const codexArgs = [
       "review", "-c", `review_model=${JSON.stringify(config.model)}`, "-c", `model_reasoning_effort=${effort}`,
@@ -1009,7 +1028,7 @@ async function reviewCommand(argv: string[]) {
   if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
   const account = selection.choice;
   const owner = callerOwnership();
-  const { round } = openRound(lane, "review", cwd, effort, { account, owner });
+  const { round } = openRound(lane, "review", cwd, effort, { account, owner, preserveGate: true });
   announceAccountSelection(lane, selection, owner.ownerSession);
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
@@ -1996,7 +2015,7 @@ async function killCommand(argv: string[]) {
 const USAGE = `cdx tracks Codex execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
-  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
+  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] "<brief>"
   resume <lane> [--effort E] [--bg] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
@@ -2013,7 +2032,9 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
 one blocking call over many lanes. Foreground lanes print the report on exit.
 --worktree P creates a git worktree at P on branch lane/<lane> from the repo at
---cd (or the current directory) and runs the lane there. A "-" brief reads stdin.`;
+--cd (or the current directory) and runs the lane there. A "-" brief reads stdin.
+--gate CMD runs after a green work round (sh -lc, lane cwd); a nonzero exit
+fails the round. Work resumes rerun the lane's stored gate; reviews never do.`;
 
 // ---------------------------------------------------------------------------
 
