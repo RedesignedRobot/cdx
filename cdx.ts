@@ -13,6 +13,7 @@
 //   cdx feed   [-n <lines>]
 //   cdx report <lane> [round]
 //   cdx log    <lane> [round]
+//   cdx kill   <lane> ["note"]
 //   cdx close  <lane> ["note"]
 //   cdx clean  [--days <n>]
 //   cdx doctor [--fix] [--probe]
@@ -804,7 +805,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     item.state = exitCode === 0 && reportOk ? "done" : "failed";
     if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
-    else if (exitCode !== 0 && /login|auth|401|unauthorized|token.*expired/i.test(stderrText)) {
+    // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
+    // words in stderr and a kill must never read as a login failure.
+    else if (exitCode === 130 || exitCode === 137 || exitCode === 143) {
+      item.note = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
+    } else if (exitCode !== 0 && /login|auth|401|unauthorized|token.*expired/i.test(stderrText)) {
       item.note = "auth failure: run `codex login`, then `cdx resume` this lane";
     } else if (exitCode !== 0) {
       const errTail = stderrText.trim().split("\n").at(-1);
@@ -1918,6 +1923,55 @@ function cleanCommand(argv: string[]) {
   console.log(removed.length > 0 ? `cdx: pruned closed lanes older than ${days}d: ${removed.join(", ")}` : `cdx: nothing to prune (closed lanes older than ${days}d)`);
 }
 
+// SIGTERM first: the runner's reap handler kills its codex child and finalizes
+// the round itself (signal note, feed line). Only a runner that fails to
+// finalize within 10s, or a dead runner with a live codex orphan, gets the
+// force path: SIGKILL what remains and finalize the ledger here.
+async function killCommand(argv: string[]) {
+  const [lane, note] = argv;
+  if (!lane) fail('usage: cdx kill <lane> ["note"]');
+  const entry = readLane(lane);
+  if (entry.state !== "running") fail(`lane "${lane}" is not running (state ${entry.state})`);
+  const runnerAlive = pidAlive(entry.pid);
+  if (!runnerAlive && !pidAlive(entry.codexPid)) {
+    fail(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
+  }
+  if (runnerAlive) {
+    try { process.kill(entry.pid!, "SIGTERM"); } catch { /* exited between check and kill */ }
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      const current = readLedger()[lane];
+      if (current && current.state !== "running") {
+        if (note) {
+          withLedger((ledger) => {
+            const item = ledger[lane];
+            if (item) { item.note = item.note ? `${item.note}; ${note}` : note; item.updatedAt = new Date().toISOString(); }
+          });
+        }
+        console.log(`cdx: lane=${color.magenta(lane)} stopped; runner finalized state=${coloredState(current.state)}${current.note ? ` note=${current.note}` : ""}`);
+        return;
+      }
+      await Bun.sleep(250);
+    }
+  }
+  const current = readLedger()[lane] ?? entry;
+  for (const pid of [current.codexPid, current.pid]) {
+    if (pidAlive(pid)) { try { process.kill(pid!, "SIGKILL"); } catch { /* exited between check and kill */ } }
+  }
+  const finalized = withLedger((ledger) => {
+    const item = ledger[lane]!;
+    item.state = "failed";
+    item.exitCode = undefined;
+    item.note = note ? `killed: ${note}` : "killed";
+    item.pid = undefined;
+    item.codexPid = undefined;
+    item.updatedAt = new Date().toISOString();
+    return item;
+  });
+  feedOwned(`[cdx] lane=${lane} round=${finalized.rounds} state=failed note=${finalized.note}`, finalized.ownerSession);
+  console.log(`cdx: lane=${color.magenta(lane)} killed; state=${coloredState("failed")} note=${finalized.note}`);
+}
+
 const USAGE = `cdx tracks Codex execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
@@ -1931,6 +1985,7 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
+  kill   <lane> ["note"]  # SIGTERM the runner; force-finalize if it hangs
   close  <lane> ["note"]  clean [--days N]         doctor [--fix] [--probe]
   brief                   # running/failed lanes only; silent when all settled
 
@@ -2037,6 +2092,7 @@ switch (command) {
     }
     break;
   }
+  case "kill": await killCommand(argv); break;
   case "clean": cleanCommand(argv); break;
   case "doctor": await doctorCommand(argv); break;
   case "brief": briefCommand(); break;
