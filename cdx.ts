@@ -99,6 +99,7 @@ interface Lane {
   rounds: number;
   reports: string[];
   tokens?: Tokens;
+  roundTokens?: Tokens;
   pid?: number;
   codexPid?: number;
   lastAction?: string;
@@ -584,6 +585,12 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       rounds,
       reports: existing?.reports ?? [],
       tokens: existing?.tokens ?? { input: 0, cached: 0, output: 0 },
+      roundTokens: { input: 0, cached: 0, output: 0 },
+      // A fresh round must never display the previous round's final message
+      // or note as its own.
+      lastAction: undefined,
+      lastEventAt: undefined,
+      note: undefined,
       exitCode: undefined,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -716,10 +723,13 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       touchLedger((item) => { item.sessionId = event.thread_id; item.lastEventAt = now; }, true);
     } else if (event.type === "turn.completed" && event.usage) {
       touchLedger((item) => {
-        const tokens = (item.tokens ??= { input: 0, cached: 0, output: 0 });
-        tokens.input += event.usage.input_tokens ?? 0;
-        tokens.cached += event.usage.cached_input_tokens ?? 0;
-        tokens.output += event.usage.output_tokens ?? 0;
+        const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+        const round = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+        for (const tokens of [cumulative, round]) {
+          tokens.input += event.usage.input_tokens ?? 0;
+          tokens.cached += event.usage.cached_input_tokens ?? 0;
+          tokens.output += event.usage.output_tokens ?? 0;
+        }
         item.lastEventAt = now;
       }, true);
     } else if (event.type === "item.completed" && event.item) {
@@ -807,7 +817,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     item.updatedAt = new Date().toISOString();
     return item;
   });
-  feedOwned(`[cdx] lane=${lane} round=${round} state=${entry.state} exit=${exitCode}${entry.note ? ` note=${entry.note}` : ""} tokens=${fmtTokens(entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
+  feedOwned(`[cdx] lane=${lane} round=${round} state=${entry.state} exit=${exitCode}${entry.note ? ` note=${entry.note}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} state=${coloredState(entry.state)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
   if (entry.note) console.log(`note: ${entry.note}`);
   if (reportOk) {
@@ -1033,7 +1043,10 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
     : `finished ${fmtAge(entry.updatedAt)} ago`;
   const laneDetail = `cwd ${displayPath(entry.cwd)}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
-  const tokenDetail = `${fmtTokens(entry.tokens)} · codex session ${entry.sessionId?.slice(0, 8) ?? "-"}`;
+  const tokenLabel = entry.state === "running" && entry.roundTokens
+    ? `${fmtTokens(entry.roundTokens)} round / ${fmtTokens(entry.tokens)} total`
+    : fmtTokens(entry.tokens);
+  const tokenDetail = `${tokenLabel} · codex session ${entry.sessionId?.slice(0, 8) ?? "-"}`;
   const report = entry.reports.at(-1);
   const last = entry.state === "running" ? entry.lastAction ?? "-"
     : [entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean).join(" · ") || "-";
