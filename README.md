@@ -95,10 +95,11 @@ flowchart LR
 | `cdx review <lane>` | Review a lane's diff in a fresh read-only session |
 | `cdx status` | Show structured lane blocks with owner, state, timing, tokens, and last activity |
 | `cdx usage` | Per-account plan, rate-limit windows, reset credits, and all-time ledger totals |
-| `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed |
+| `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed; `--report` prints the reports too |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
 | `cdx feed` | Replay recent completion and stall lines from the feed |
 | `cdx report <lane>` | Print a lane's final report |
+| `cdx kill <lane>` | Stop a running lane: SIGTERM the runner, force-finalize if it hangs |
 | `cdx doctor --probe` | Health check with remedies, plus a live Codex round-trip |
 | `cdx adopt` · `cdx close` · `cdx clean` · `cdx log` · `cdx brief` | Bookkeeping |
 
@@ -106,26 +107,35 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... "<brief>"
-cdx resume <lane> [--effort E] [--bg] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--max-runtime MIN] "<brief>"
+cdx resume <lane> [--effort E] [--bg] [--max-runtime MIN] "<follow-up>"
 cdx fork   <new> <lane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd D]
 cdx status [--all] [--json]
 cdx usage  [--json]
-cdx wait   <lane>... [--timeout S] [--json]
+cdx wait   <lane>... [--timeout S] [--json] [--report]
 cdx tail   <lane> [-n N]
 cdx tail   -f [lane]
 cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round]
-cdx close  <lane> ["note"]
+cdx kill   <lane> ["note"]
+cdx close  <lane> [--remove-worktree] ["note"]
 cdx clean  [--days N]
 cdx doctor [--fix] [--probe]
 cdx brief
 ```
 
-`review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE. Both are fresh sessions, both sandbox-enforced read-only.
+`review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE, ending in a fenced json findings block that cdx parses into `reports/<lane>-r<n>.findings.json`. Both are fresh sessions, both sandbox-enforced read-only.
+
+`spawn --gate "<cmd>"` stores an acceptance gate on the lane: after a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in the lane cwd. Exit 0 appends a `## Gate` section to the report; nonzero fails the round with `gate failed (exit N)`. Work resumes rerun the stored gate; reviews never run one. The gate is the harness's own verification, so a worker's optimistic done claim cannot finalize green.
+
+`resume` always reattaches to the lane's work thread (`workSessionId` in the ledger), even after review rounds recorded a newer read-only session. Only a lane that never had a work session resumes as a review follow-up.
+
+`kill` sends SIGTERM to the runner, which reaps its codex child and finalizes the round with a signal note; a runner still silent after 10s is force-killed and the ledger finalized directly with note `killed`. `--max-runtime MIN` on spawn and resume kills the round past the cap.
+
+`close --remove-worktree` removes the lane worktree and deletes its branch only when the branch is merged into the repo's HEAD and the worktree is clean; otherwise it refuses with the reason and prints the manual commands.
 
 A brief of `-` reads the brief from stdin (`cdx spawn big-task --bg - < brief.md`), so long prompts with quotes and backticks never fight the shell. Works for spawn, resume, fork, and the review intent.
 
