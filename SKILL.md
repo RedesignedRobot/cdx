@@ -15,8 +15,9 @@ sessions.
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--max-runtime <min>] "<brief>"
-cdx resume <lane> [--effort E] [--bg] [--max-runtime <min>] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
+cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime <min>] "<follow-up>"
+cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
@@ -51,7 +52,9 @@ lane's work thread, recorded as `workSessionId` in the ledger, even when the
 latest round was a review. Only a lane that never had a work session resumes
 as a read-only review follow-up. `resume` does not accept `--cd`, `--json`,
 or `--output-last-message`. `resume --effort E` overrides the stored effort
-for that round onward; without it the session keeps its own settings. `fork`
+for that round onward; without it the session keeps its own settings.
+`resume --gate "<cmd>"` replaces the lane's stored gate before the round and
+keeps it for later resumes. `fork`
 branches an existing lane or session and keeps the source session's working
 directory, so it does not accept `--cd`; a raw-session-ID fork reads that
 directory from the session's rollout file.
@@ -63,6 +66,16 @@ round with `gate failed (exit N)` and still appends the output. Work resumes
 rerun the stored gate; reviews never run one. Full gate output lands in
 `logs/<lane>-r<n>.gate.log`. The gate is the harness's own verification, so
 a worker's optimistic done claim cannot finalize green.
+
+A worktree spawn with `--gate` runs the gate once in the untouched baseline
+tree before the worker starts. For a non-worktree spawn, add
+`--gate-baseline-check` to run the same check. A baseline failure stops the
+round as `gate-invalid` and identifies the command as the defect. A final
+gate failure that had no baseline check suggests `--gate-baseline-check`.
+
+`cdx gate <lane> "<cmd>"` sets or replaces the stored gate. Use
+`cdx gate <lane> --clear` to remove it. Both forms print the old and new gate.
+They refuse to change a lane while it is active.
 
 `--max-runtime <min>` (spawn and resume) kills the codex child past the cap
 and fails the round with `max runtime exceeded (Nm)`.
@@ -80,6 +93,8 @@ sessions. Intent-based reviews receive an adversarial brief that asks for
 severity-ranked findings, concrete failure cases, CONFIRMED or PLAUSIBLE
 labels, and a closing fenced json findings block; cdx parses that block into
 `reports/<lane>-r<n>.findings.json` (best effort, empty array when clean).
+Review defaults to the lane's recorded worktree or working directory. `--cd`
+overrides it. The launch output prints the resolved review directory.
 
 ## Orchestration
 
@@ -100,8 +115,10 @@ labels, and a closing fenced json findings block; cdx parses that block into
 - Use `cdx status` for structured lane blocks with owner, state, timing, tokens,
   and last activity. Running lanes show round and cumulative tokens; each round
   starts with cleared last-activity fields, so `last` never shows the previous
-  round's final message. It shows running lanes first, then the 10 newest
-  finished ones (`--all` for the rest). Use `cdx tail <lane>` for the rendered event log.
+  round's final message. Lane state and cwd stay tied to the latest work round.
+  Review outcome and target directory appear on a separate review line. Status
+  shows running lanes first, then the 10 newest finished ones (`--all` for the
+  rest). Use `cdx tail <lane>` for the rendered event log.
 - Use `cdx tail -f <lane>` for one worker's live transcript. It exits with the
   lane's outcome. Use `cdx tail -f` for all running lanes with `[lane]`
   prefixes. It follows new rounds and attaches new lanes. Any terminal or agent
