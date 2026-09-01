@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 // cdx runs tracked Codex execution lanes for Claude Code and Codex CLI users.
 //
-//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] [--max-runtime <min>] "<brief>"
-//   cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"
+//   cdx spawn  <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
+//   cdx resume <lane> [--effort <effort>] [--gate <cmd>] [--bg] [--max-runtime <min>] "<follow-up>"
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> [--account <name>] [--cd <dir>]
@@ -13,6 +13,7 @@
 //   cdx feed   [-n <lines>]
 //   cdx report <lane> [round]
 //   cdx log    <lane> [round]
+//   cdx gate   <lane> "<cmd>" | --clear
 //   cdx kill   <lane> ["note"]
 //   cdx close  <lane> [--remove-worktree] ["note"]
 //   cdx clean  [--days <n>]
@@ -84,6 +85,17 @@ interface Config {
 
 interface Tokens { input: number; cached: number; output: number }
 
+type WorkState = "running" | "done" | "failed" | "gate-invalid" | "adopted" | "closed";
+type ReviewState = "running" | "done" | "failed";
+
+interface GateBaseline {
+  round: number;
+  command: string;
+  cwd: string;
+  exitCode: number;
+  checkedAt: string;
+}
+
 interface Lane {
   account?: string;
   codexHome?: string;
@@ -93,9 +105,15 @@ interface Lane {
   // Review rounds overwrite sessionId with the read-only review session; the
   // work thread survives here so resume always reattaches to it.
   workSessionId?: string;
+  // cwd and state remain the stable work values for old ledger consumers.
   cwd: string;
+  workCwd?: string;
   effort: Effort;
-  state: "running" | "done" | "failed" | "adopted" | "closed";
+  state: WorkState;
+  workState?: WorkState;
+  workRound?: number;
+  workUpdatedAt?: string;
+  workReport?: string;
   kind: "work" | "review";
   rounds: number;
   reports: string[];
@@ -103,6 +121,14 @@ interface Lane {
   roundTokens?: Tokens;
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
+  gateBaseline?: GateBaseline;
+  reviewState?: ReviewState;
+  reviewCwd?: string;
+  reviewRound?: number;
+  reviewExitCode?: number;
+  reviewNote?: string;
+  reviewReport?: string;
+  reviewUpdatedAt?: string;
   pid?: number;
   codexPid?: number;
   lastAction?: string;
@@ -130,6 +156,8 @@ interface Spec {
   ownerSession?: string;
   ownerCwd?: string;
   gate?: string;
+  gateBaselineChecked?: true;
+  reviewDir?: string;
   maxRuntimeMins?: number;
 }
 
@@ -137,7 +165,7 @@ type Ledger = Record<string, Lane>;
 
 function coloredState(state: string, text = state): string {
   if (state === "running") return color.yellow(text);
-  if (state === "running(dead?)" || state === "failed") return color.red(text);
+  if (state === "running(dead?)" || state === "failed" || state === "gate-invalid") return color.red(text);
   if (state === "done") return color.green(text);
   if (state === "closed") return color.dim(text);
   return text;
@@ -302,6 +330,43 @@ function readLane(lane: string): Lane {
   return entry;
 }
 
+function workCwdOf(entry: Lane): string {
+  return entry.workCwd ?? entry.worktreePath ?? entry.cwd;
+}
+
+function workStateOf(entry: Lane): WorkState {
+  if (entry.workState) return entry.workState;
+  // Old ledgers used state for the active review. A recorded work session
+  // proves that a work round completed before that review started.
+  if (entry.kind === "review" && entry.state === "running") return entry.workSessionId ? "done" : "adopted";
+  return entry.state;
+}
+
+function activeStateOf(entry: Lane): WorkState | ReviewState {
+  if (entry.kind === "review") return entry.reviewState ?? entry.state;
+  return entry.state;
+}
+
+function laneRunning(entry: Lane): boolean {
+  return activeStateOf(entry) === "running";
+}
+
+function roundStateOf(entry: Lane): WorkState | ReviewState {
+  return entry.kind === "review" ? entry.reviewState ?? entry.state : entry.state;
+}
+
+function roundExitCodeOf(entry: Lane): number | undefined {
+  return entry.kind === "review" ? entry.reviewExitCode : entry.exitCode;
+}
+
+function roundNoteOf(entry: Lane): string | undefined {
+  return entry.kind === "review" ? entry.reviewNote : entry.note;
+}
+
+function roundReportOf(entry: Lane): string | undefined {
+  return entry.kind === "review" ? entry.reviewReport ?? entry.reports.at(-1) : entry.workReport ?? entry.reports.at(-1);
+}
+
 function validLane(lane: string): string {
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(lane)) fail(`lane name "${lane}" must be alphanumeric with . _ - only`);
   return lane;
@@ -441,7 +506,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 
 const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -610,7 +675,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
-    if (existing?.state === "running" && pidAlive(existing.pid)) {
+    if (existing && laneRunning(existing) && pidAlive(existing.pid)) {
       throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
     }
     if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
@@ -619,6 +684,8 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
     const codexHome = opts?.preserveAccount ? existing?.codexHome : opts?.account?.home;
     const ownerSession = opts?.preserveOwner ? existing?.ownerSession : opts?.owner?.ownerSession;
     const ownerCwd = opts?.preserveOwner ? existing?.ownerCwd : opts?.owner?.ownerCwd;
+    const workCwd = kind === "work" ? cwd : existing ? workCwdOf(existing) : cwd;
+    const workState = kind === "work" ? "running" : existing ? workStateOf(existing) : "adopted";
     ledger[lane] = {
       ...(existing ?? {}),
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
@@ -627,10 +694,24 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       ownerSession,
       ownerCwd,
       sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
+      workSessionId: kind === "review"
+        ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
+        : existing?.workSessionId,
       gate: opts?.preserveGate ? existing?.gate : opts?.gate,
-      cwd,
+      cwd: workCwd,
+      workCwd,
       effort,
-      state: "running",
+      state: workState,
+      workState,
+      workRound: kind === "work" ? rounds : existing?.workRound,
+      workUpdatedAt: kind === "work" ? now : existing?.workUpdatedAt,
+      reviewState: kind === "review" ? "running" : existing?.reviewState,
+      reviewCwd: kind === "review" ? cwd : existing?.reviewCwd,
+      reviewRound: kind === "review" ? rounds : existing?.reviewRound,
+      reviewExitCode: kind === "review" ? undefined : existing?.reviewExitCode,
+      reviewNote: kind === "review" ? undefined : existing?.reviewNote,
+      reviewReport: kind === "review" ? undefined : existing?.reviewReport,
+      reviewUpdatedAt: kind === "review" ? now : existing?.reviewUpdatedAt,
       roundStartedAt: now,
       // Reserve the lane with the parent's pid so a concurrent launch is
       // rejected before the runner records its own pid.
@@ -644,8 +725,8 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       // or note as its own.
       lastAction: undefined,
       lastEventAt: undefined,
-      note: undefined,
-      exitCode: undefined,
+      note: kind === "work" ? undefined : existing?.note,
+      exitCode: kind === "work" ? undefined : existing?.exitCode,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -657,6 +738,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
   const jsonMode = spec.mode === "spawn";
+  if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
   console.log(`cdx: log=${logPathOf(spec.lane, spec.round, jsonMode)} report=${reportPathOf(spec.lane, spec.round)}`);
   if (background) {
@@ -686,6 +768,66 @@ function excerpt(item: Record<string, unknown>): string {
   return label.length > 160 ? `${label.slice(0, 157)}...` : label;
 }
 
+interface GateResult { exitCode: number; output: string }
+
+function executeGate(command: string, cwd: string, logPath: string): GateResult {
+  const gate = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", command], cwd, env: uncoloredChildEnv() });
+  const exitCode = gate.exitCode ?? 1;
+  const output = `${gate.stdout.toString()}${gate.stderr.toString()}`;
+  writeFileSync(logPath, output);
+  return { exitCode, output };
+}
+
+function gateOutputForReport(output: string): string {
+  const trimmed = output.trim();
+  return trimmed.length > 4000 ? `...${trimmed.slice(-4000)}` : trimmed;
+}
+
+function finishInvalidBaseline(lane: string, round: number, command: string, cwd: string, result: GateResult): void {
+  const checkedAt = new Date().toISOString();
+  const reportPath = reportPathOf(lane, round);
+  const note = `gate invalid on baseline (exit ${result.exitCode}): ${command}`;
+  writeFileSync(reportPath, `# Gate baseline\n\n\`${command}\` exited ${result.exitCode} in ${cwd} before worker startup.\n\n\`\`\`\n${gateOutputForReport(result.output)}\n\`\`\`\n`);
+  const entry = withLedger((ledger) => {
+    const item = ledger[lane]!;
+    item.state = "gate-invalid";
+    item.workState = "gate-invalid";
+    item.gateBaseline = { round, command, cwd, exitCode: result.exitCode, checkedAt };
+    item.exitCode = result.exitCode;
+    item.note = note;
+    item.workReport = reportPath;
+    item.workUpdatedAt = checkedAt;
+    item.pid = undefined;
+    item.codexPid = undefined;
+    item.reports.push(reportPath);
+    item.updatedAt = checkedAt;
+    return item;
+  });
+  feedOwned(`[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath}`, entry.ownerSession);
+  console.error(`cdx: lane=${color.magenta(lane)} state=${color.red("gate-invalid")} review the gate command before starting work`);
+  console.error(`cdx: ${note}`);
+  console.error(`cdx: gate log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log`);
+}
+
+function failActiveRound(item: Lane, note: string): void {
+  const now = new Date().toISOString();
+  if (item.kind === "review") {
+    item.reviewState = "failed";
+    item.reviewNote = note;
+    item.reviewUpdatedAt = now;
+    item.state = workStateOf(item);
+    item.workState = item.state;
+  } else {
+    item.state = "failed";
+    item.workState = "failed";
+    item.note = note;
+    item.workUpdatedAt = now;
+  }
+  item.pid = undefined;
+  item.codexPid = undefined;
+  item.updatedAt = now;
+}
+
 async function runRound(lane: string, round: number): Promise<number> {
   let spec: Spec | undefined;
   try { spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec; } catch { /* handled by runner */ }
@@ -695,15 +837,12 @@ async function runRound(lane: string, round: number): Promise<number> {
     withLedger((ledger) => {
       const item = ledger[lane];
       if (item) {
-        item.state = "failed";
-        item.pid = undefined;
-        item.note = `runner error: ${String(error).slice(0, 200)}`;
-        item.updatedAt = new Date().toISOString();
+        failActiveRound(item, `runner error: ${String(error).slice(0, 200)}`);
       }
     });
-    console.error(`cdx: lane=${color.magenta(lane)} state=${color.red("failed")} runner error: ${error}`);
+    console.error(`cdx: lane=${color.magenta(lane)} round-state=${color.red("failed")} runner error: ${error}`);
     const ownerSession = spec?.ownerSession ?? readLedger()[lane]?.ownerSession;
-    feedOwned(`[cdx] lane=${lane} state=failed (runner error)`, ownerSession);
+    feedOwned(`[cdx] lane=${lane} round=${round} round-state=failed (runner error)`, ownerSession);
     return 1;
   } finally {
     if (process.argv[2] === "_run" && spec) {
@@ -722,7 +861,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const jsonMode = spec.mode === "spawn";
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
-  withLedger((ledger) => { ledger[lane]!.pid = process.pid; ledger[lane]!.state = "running"; });
+  withLedger((ledger) => {
+    const item = ledger[lane]!;
+    item.pid = process.pid;
+    if (item.kind === "review") item.reviewState = "running";
+    else { item.state = "running"; item.workState = "running"; }
+  });
 
   const proc = Bun.spawn({
     cmd: ["codex", ...spec.codexArgs],
@@ -867,36 +1011,51 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   // rounds only (ledger kind, since intent reviews launch with mode "spawn").
   let gateExit: number | undefined;
   if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk) {
-    const gate = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", spec.gate], cwd: spec.cwd, env: uncoloredChildEnv() });
-    gateExit = gate.exitCode ?? 1;
-    const output = `${gate.stdout.toString()}${gate.stderr.toString()}`;
-    writeFileSync(`${ROOT}/logs/${lane}-r${round}.gate.log`, output);
-    const trimmed = output.trim();
-    const stored = trimmed.length > 4000 ? `...${trimmed.slice(-4000)}` : trimmed;
-    writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${stored}\n\`\`\`\n`);
+    const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
+    gateExit = gate.exitCode;
+    writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
   }
   const gateFailed = gateExit !== undefined && gateExit !== 0;
+  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit ? "done" : "failed";
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
     if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
     // Ledger kind, not spec.mode, decides work vs review: intent reviews
     // launch with mode "spawn" but must never become the resume target.
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
-    item.state = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit ? "done" : "failed";
-    if (gateFailed) item.note = `gate failed (exit ${gateExit}): ${spec.gate}`;
-    else if (maxRuntimeHit) item.note = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
-    else if (exitCode === 0 && !reportOk) item.note = "exit 0 but no report produced; inspect the log";
+    let roundNote: string | undefined;
+    if (gateFailed) {
+      roundNote = spec.gateBaselineChecked
+        ? `gate failed after work; baseline passed (exit ${gateExit}): ${spec.gate}`
+        : `gate failed (exit ${gateExit}): ${spec.gate}; baseline was not checked, use --gate-baseline-check on spawn`;
+    } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
+    else if (exitCode === 0 && !reportOk) roundNote = "exit 0 but no report produced; inspect the log";
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.
     else if (exitCode === 130 || exitCode === 137 || exitCode === 143) {
-      item.note = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
+      roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
     } else if (exitCode !== 0 && /login|auth|401|unauthorized|token.*expired/i.test(stderrText)) {
-      item.note = "auth failure: run `codex login`, then `cdx resume` this lane";
+      roundNote = "auth failure: run `codex login`, then `cdx resume` this lane";
     } else if (exitCode !== 0) {
       const errTail = stderrText.trim().split("\n").at(-1);
-      if (errTail) item.note = `stderr: ${errTail.slice(0, 200)}`;
+      if (errTail) roundNote = `stderr: ${errTail.slice(0, 200)}`;
     }
-    item.exitCode = exitCode;
+    if (item.kind === "review") {
+      item.reviewState = roundState;
+      item.reviewExitCode = exitCode;
+      item.reviewNote = roundNote;
+      item.reviewReport = existsSync(reportPath) ? reportPath : undefined;
+      item.reviewUpdatedAt = new Date().toISOString();
+      item.state = workStateOf(item);
+      item.workState = item.state;
+    } else {
+      item.state = roundState;
+      item.workState = roundState;
+      item.exitCode = exitCode;
+      item.note = roundNote;
+      item.workReport = existsSync(reportPath) ? reportPath : undefined;
+      item.workUpdatedAt = new Date().toISOString();
+    }
     item.pid = undefined;
     item.codexPid = undefined;
     if (existsSync(reportPath)) item.reports.push(reportPath);
@@ -918,9 +1077,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       } catch { /* not the verdict block */ }
     }
   }
-  feedOwned(`[cdx] lane=${lane} round=${round} state=${entry.state} exit=${exitCode}${entry.note ? ` note=${entry.note}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
-  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} state=${coloredState(entry.state)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
-  if (entry.note) console.log(`note: ${entry.note}`);
+  const finalRoundState = roundStateOf(entry);
+  const finalRoundNote = entry.kind === "review" ? entry.reviewNote : entry.note;
+  feedOwned(`[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
+  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
+  if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
     console.log("--- report ---");
     console.log(readFileSync(reportPath, "utf8"));
@@ -928,15 +1089,42 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     console.log(`--- no report; log tail (${logPath}) ---`);
     console.log(renderTail(logPath, 40));
   }
-  return entry.state === "done" ? 0 : exitCode || 1;
+  return finalRoundState === "done" ? 0 : exitCode || 1;
 }
 
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
+function gateLabel(command?: string): string {
+  return command ?? "<none>";
+}
+
+function printGateChange(lane: string, oldGate: string | undefined, newGate: string | undefined): void {
+  console.log(`cdx: lane=${color.magenta(lane)} gate old=${gateLabel(oldGate)}`);
+  console.log(`cdx: lane=${color.magenta(lane)} gate new=${gateLabel(newGate)}`);
+}
+
+function gateCommand(argv: string[]): void {
+  const parsed = parseArgs(argv, ["clear"]);
+  const [lane, command, extra] = parsed.rest;
+  if (!lane || extra || (parsed.bools.has("clear") ? command !== undefined : command === undefined)) {
+    fail('usage: cdx gate <lane> "<cmd>" | cdx gate <lane> --clear');
+  }
+  if (!parsed.bools.has("clear") && command!.trim() === "") fail("gate command cannot be empty; use --clear");
+  const before = readLane(lane);
+  if (laneRunning(before) && pidAlive(before.pid)) fail(`lane "${lane}" is running; stop it before changing the gate`);
+  const next = parsed.bools.has("clear") ? undefined : command;
+  withLedger((ledger) => {
+    const item = ledger[lane]!;
+    item.gate = next;
+    item.updatedAt = new Date().toISOString();
+  });
+  printGateChange(lane, before.gate, next);
+}
+
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "max-runtime"]);
+  const parsed = parseArgs(argv, ["effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime"]);
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
   if (!lane || !brief) fail('usage: cdx spawn <lane> [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] "<brief>"');
@@ -945,10 +1133,12 @@ async function spawnCommand(argv: string[]) {
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = effortOf(parsed);
   const maxRuntime = maxRuntimeOf(parsed);
+  if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
+  if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
   // Cheap pre-check so a doomed launch is rejected before paying for usage
   // probes; openRound re-checks under the ledger lock.
   const existingLane = readLedger()[lane];
-  if (existingLane?.state === "running" && pidAlive(existingLane.pid)) {
+  if (existingLane && laneRunning(existingLane) && pidAlive(existingLane.pid)) {
     fail(`lane "${lane}" is already running (pid ${existingLane.pid}); pick a new name or wait`);
   }
   let worktree: WorktreeInfo | undefined;
@@ -963,6 +1153,23 @@ async function spawnCommand(argv: string[]) {
   const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree, gate: parsed.flags.gate });
   announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
+  const gateBaselineChecked = Boolean(parsed.flags.gate && (worktree || parsed.bools.has("gate-baseline-check")));
+  if (gateBaselineChecked) {
+    const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
+    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${parsed.flags.gate}`);
+    const result = executeGate(parsed.flags.gate!, cwd, baselineLog);
+    const checkedAt = new Date().toISOString();
+    withLedger((ledger) => {
+      ledger[lane]!.gateBaseline = { round, command: parsed.flags.gate!, cwd, exitCode: result.exitCode, checkedAt };
+    });
+    if (result.exitCode !== 0) {
+      writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, fullBrief);
+      finishInvalidBaseline(lane, round, parsed.flags.gate!, cwd, result);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`cdx: gate baseline passed cwd=${cwd}`);
+  }
   const codexArgs = [
     "exec", "--json", "-m", config.model, "-c", `model_reasoning_effort=${effort}`,
     "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--cd", cwd,
@@ -972,16 +1179,17 @@ async function spawnCommand(argv: string[]) {
   for (const image of parsed.lists.image ?? []) codexArgs.push("--image", image);
   if (parsed.flags.schema) codexArgs.push("--output-schema", parsed.flags.schema);
   codexArgs.push(fullBrief);
-  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "bg", "max-runtime"]);
+  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime"]);
   const [lane, followUpArg] = parsed.rest;
   const followUp = await resolveBrief(followUpArg);
   if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"');
   const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
+  if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   const account = laneAccount(before);
   warnCachedUsageBeforeLaunch(account);
   const owner = storedOwnership(before);
@@ -990,20 +1198,25 @@ async function resumeCommand(argv: string[]) {
   // review; only a lane that never had a work session continues read-only.
   const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
   const reviewResume = workThread === undefined;
-  const { round, sessionId } = openRound(lane, reviewResume ? "review" : "work", before.cwd, effort, {
-    requireSession: true, preserveAccount: true, preserveOwner: true, preserveGate: true,
+  const cwd = workCwdOf(before);
+  const { round, sessionId } = openRound(lane, reviewResume ? "review" : "work", cwd, effort, {
+    requireSession: true, preserveAccount: true, preserveOwner: true,
+    preserveGate: parsed.flags.gate === undefined,
+    ...(parsed.flags.gate !== undefined ? { gate: parsed.flags.gate } : {}),
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
+  if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const reportInstruction = reviewResume
     ? "Print your final report. cdx captures it from the transcript."
     : `Write your final report to ${reportPathOf(lane, round)} as well as printing it.`;
-  const prompt = `Ground rules:\n${houseRules(before.cwd, reviewResume)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
+  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
   // The session keeps its own settings; only an explicit --effort overrides.
   const effortArgs = parsed.flags.effort ? ["-c", `model_reasoning_effort=${effort}`] : [];
   const codexArgs = reviewResume
     ? ["exec", "resume", ...effortArgs, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : ["exec", "resume", ...effortArgs, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
-  return launch({ mode: "resume", lane, round, cwd: before.cwd, prompt, codexArgs, ...(!reviewResume && before.gate ? { gate: before.gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  const gate = parsed.flags.gate ?? before.gate;
+  return launch({ mode: "resume", lane, round, cwd, prompt, codexArgs, ...(!reviewResume && gate ? { gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function forkCommand(argv: string[]) {
@@ -1039,7 +1252,7 @@ async function forkCommand(argv: string[]) {
   // raw session id the truth lives in the rollout's session_meta.
   let cwd: string;
   if (sourceLane) {
-    cwd = sourceLane.cwd;
+    cwd = workCwdOf(sourceLane);
   } else {
     const codexHome = account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`;
     const sessionCwd = rolloutCwdForSession(codexHome, sessionId);
@@ -1064,7 +1277,8 @@ async function reviewCommand(argv: string[]) {
   const intent = await resolveBrief(intentArg);
   if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
   validLane(lane);
-  const cwd = parsed.flags.cd ?? process.cwd();
+  const existing = readLedger()[lane];
+  const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = effortOf(parsed);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
@@ -1089,7 +1303,7 @@ async function reviewCommand(argv: string[]) {
     if (parsed.flags.base) codexArgs.push("--base", parsed.flags.base);
     if (parsed.flags.commit) codexArgs.push("--commit", parsed.flags.commit);
     const label = parsed.bools.has("uncommitted") ? "uncommitted changes" : parsed.flags.base ? `diff vs ${parsed.flags.base}` : `commit ${parsed.flags.commit}`;
-    return launch({ mode: "review-native", lane, round, cwd, prompt: `native review of ${label}`, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
+    return launch({ mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
   }
 
   if (!intent) fail("exec review needs an intent (or pass a native target flag)");
@@ -1109,7 +1323,7 @@ async function reviewCommand(argv: string[]) {
     "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ];
-  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 function fmtTokens(tokens?: Tokens): string {
@@ -1141,10 +1355,13 @@ function fmtCreated(iso: string): string {
 }
 
 function renderLaneBlock(lane: string, entry: Lane): string {
-  const stale = entry.state === "running" && !pidAlive(entry.pid);
-  const state = stale ? "running(dead?)" : entry.state;
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.kind} r${entry.rounds} ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}`;
-  const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(9)}`)}${value}`;
+  const active = laneRunning(entry);
+  const stale = active && !pidAlive(entry.pid);
+  const workState = workStateOf(entry);
+  const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
+  const workRound = entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined);
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""} ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}`;
+  const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd) {
     const currentSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
@@ -1153,18 +1370,29 @@ function renderLaneBlock(lane: string, entry: Lane): string {
       : entry.ownerSession === currentSession ? "(this session)" : "(other session)";
     owner = `${ownerId} ${relation}  from ${displayPath(entry.ownerCwd)}`;
   }
-  const timing = entry.state === "running"
+  const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
-    : `finished ${fmtAge(entry.updatedAt)} ago`;
-  const laneDetail = `cwd ${displayPath(entry.cwd)}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
-  const tokenLabel = entry.state === "running" && entry.roundTokens
+    : `finished ${fmtAge(entry.workUpdatedAt ?? entry.updatedAt)} ago`;
+  const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
+  const tokenLabel = active && entry.roundTokens
     ? `${fmtTokens(entry.roundTokens)} round / ${fmtTokens(entry.tokens)} total`
     : fmtTokens(entry.tokens);
-  const tokenDetail = `${tokenLabel} · codex session ${entry.sessionId?.slice(0, 8) ?? "-"}`;
-  const report = entry.reports.at(-1);
-  const last = entry.state === "running" ? entry.lastAction ?? "-"
+  const tokenDetail = `${tokenLabel} · codex session ${(entry.workSessionId ?? entry.sessionId)?.slice(0, 8) ?? "-"}`;
+  const report = entry.workReport ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
+  const last = entry.kind === "work" && active ? entry.lastAction ?? "-"
     : [entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean).join(" · ") || "-";
-  return [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)].join("\n");
+  const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
+  if (entry.reviewState) {
+    const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.reviewState;
+    const reviewTiming = entry.reviewState === "running"
+      ? `running ${fmtAge(entry.roundStartedAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt)}`
+      : `finished ${fmtAge(entry.reviewUpdatedAt)} ago`;
+    const reviewLast = entry.reviewState === "running" ? entry.lastAction ?? "-"
+      : [entry.reviewNote, entry.reviewReport ? `report ${displayPath(entry.reviewReport)}` : undefined].filter(Boolean).join(" · ") || "-";
+    lines.push(line("review", `${coloredState(reviewState)}${entry.reviewRound ? ` r${entry.reviewRound}` : ""} · cwd ${displayPath(entry.reviewCwd ?? workCwdOf(entry))} · ${reviewTiming}`));
+    lines.push(line("review last", reviewLast));
+  }
+  return lines.join("\n");
 }
 
 const FINISHED_SHOWN = 10;
@@ -1174,7 +1402,7 @@ function statusCommand(argv: string[]) {
   const ledger = readLedger();
   const all = Object.entries(ledger);
   if (parsed.bools.has("json")) {
-    const enriched = Object.fromEntries(all.map(([lane, entry]) => [lane, { ...entry, alive: entry.state === "running" ? pidAlive(entry.pid) : undefined }]));
+    const enriched = Object.fromEntries(all.map(([lane, entry]) => [lane, { ...entry, alive: laneRunning(entry) ? pidAlive(entry.pid) : undefined }]));
     console.log(JSON.stringify(enriched, null, 2));
     return;
   }
@@ -1183,8 +1411,8 @@ function statusCommand(argv: string[]) {
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
-  const running = all.filter(([, entry]) => entry.state === "running").sort(byRecency);
-  const finished = all.filter(([, entry]) => entry.state !== "running").sort(byRecency);
+  const running = all.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
+  const finished = all.filter(([, entry]) => !laneRunning(entry)).sort(byRecency);
   const hidden = parsed.bools.has("all") ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
   const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
   console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
@@ -1202,13 +1430,14 @@ async function waitCommand(argv: string[]) {
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
   const reportTextOf = (entry: Lane): string | undefined => {
-    const path = entry.reports.at(-1);
+    const path = roundReportOf(entry);
     try { return path ? readFileSync(path, "utf8") : undefined; } catch { return undefined; }
   };
   // --json prints one JSON object per finished lane, in completion order.
   const emitJson = (lane: string, entry: Lane, error?: string) => console.log(JSON.stringify({
-    lane, state: entry.state, exitCode: entry.exitCode ?? null, tokens: entry.tokens ?? null,
-    report: entry.reports.at(-1) ?? null, note: entry.note ?? null, sessionId: entry.sessionId ?? null,
+    lane, state: entry.state, roundState: roundStateOf(entry), kind: entry.kind,
+    exitCode: roundExitCodeOf(entry) ?? null, tokens: entry.tokens ?? null,
+    report: roundReportOf(entry) ?? null, note: roundNoteOf(entry) ?? null, sessionId: entry.sessionId ?? null,
     rounds: entry.rounds, ...(showReport ? { reportText: reportTextOf(entry) ?? null } : {}),
     ...(error ? { error } : {}),
   }));
@@ -1217,15 +1446,15 @@ async function waitCommand(argv: string[]) {
     const ledger = readLedger();
     for (const lane of [...pending]) {
       const entry = ledger[lane]!;
-      if (entry.state === "running" && pidAlive(entry.pid)) continue;
-      if (entry.state === "running") {
+      if (laneRunning(entry) && pidAlive(entry.pid)) continue;
+      if (laneRunning(entry)) {
         if (json) emitJson(lane, entry, "runner died without finalizing");
         else console.log(`cdx: lane=${color.magenta(lane)} ${color.red("runner died without finalizing")} (see cdx doctor)`);
         failed = true;
       } else {
         if (json) emitJson(lane, entry);
         else {
-          console.log(`cdx: lane=${color.magenta(lane)} state=${coloredState(entry.state)} exit=${entry.exitCode ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${entry.reports.at(-1) ?? "-"}`);
+          console.log(`cdx: lane=${color.magenta(lane)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${roundReportOf(entry) ?? "-"}`);
           if (showReport) {
             const text = reportTextOf(entry);
             if (text) {
@@ -1235,7 +1464,7 @@ async function waitCommand(argv: string[]) {
             }
           }
         }
-        if (entry.state === "failed") failed = true;
+        if (roundStateOf(entry) === "failed" || roundStateOf(entry) === "gate-invalid") failed = true;
       }
       pending.delete(lane);
     }
@@ -1324,9 +1553,12 @@ async function followLane(lane: string) {
     if (cursor && entry.rounds > cursor.round) cursor = openCursor(lane, entry, false) ?? cursor;
     if (!cursor) cursor = openCursor(lane, entry, false);
     if (cursor) drainCursor(cursor, "");
-    if (entry.state !== "running") {
-      console.log(`--- lane ${color.magenta(lane)} ${coloredState(entry.state)}${entry.exitCode !== undefined ? ` (exit ${entry.exitCode})` : ""}${entry.note ? `: ${entry.note}` : ""} report=${entry.reports.at(-1) ?? "-"} ---`);
-      process.exit(entry.state === "failed" ? 1 : 0);
+    if (!laneRunning(entry)) {
+      const state = roundStateOf(entry);
+      const exitCode = roundExitCodeOf(entry);
+      const note = roundNoteOf(entry);
+      console.log(`--- lane ${color.magenta(lane)} ${entry.kind} ${coloredState(state)}${exitCode !== undefined ? ` (exit ${exitCode})` : ""}${note ? `: ${note}` : ""} report=${roundReportOf(entry) ?? "-"} ---`);
+      process.exit(state === "failed" || state === "gate-invalid" ? 1 : 0);
     }
     if (!pidAlive(entry.pid)) {
       console.log(`--- lane ${color.magenta(lane)} ${color.red("marked running but its runner is dead")} (cdx doctor --fix) ---`);
@@ -1342,27 +1574,27 @@ async function followAll() {
   while (true) {
     const ledger = readLedger();
     for (const [lane, entry] of Object.entries(ledger)) {
-      if (entry.state !== "running" || cursors.has(lane)) continue;
+      if (!laneRunning(entry) || cursors.has(lane)) continue;
       const cursor = openCursor(lane, entry, true);
       if (cursor) {
         cursors.set(lane, cursor);
-        console.log(`${color.magenta(`[${lane}]`)} --- attached (round ${cursor.round}, ${entry.effort}, ${entry.cwd}) ---`);
+        console.log(`${color.magenta(`[${lane}]`)} --- attached (round ${cursor.round}, ${entry.effort}, ${entry.kind === "review" ? entry.reviewCwd ?? workCwdOf(entry) : workCwdOf(entry)}) ---`);
       }
     }
     for (const [lane, cursor] of cursors) {
       const entry = ledger[lane];
-      if (entry && entry.state === "running" && entry.rounds > cursor.round) {
+      if (entry && laneRunning(entry) && entry.rounds > cursor.round) {
         cursors.set(lane, openCursor(lane, entry, false) ?? cursor);
         continue;
       }
       drainCursor(cursor, `${color.magenta(`[${lane}]`)} `);
-      if (!entry || entry.state !== "running") {
-        console.log(`${color.magenta(`[${lane}]`)} --- ${entry ? coloredState(entry.state) : "gone"}${entry?.note ? `: ${entry.note}` : ""} ---`);
+      if (!entry || !laneRunning(entry)) {
+        console.log(`${color.magenta(`[${lane}]`)} --- ${entry ? coloredState(roundStateOf(entry)) : "gone"}${entry && roundNoteOf(entry) ? `: ${roundNoteOf(entry)}` : ""} ---`);
         cursors.delete(lane);
       }
     }
     if (cursors.size === 0) {
-      const running = Object.values(readLedger()).some((entry) => entry.state === "running");
+      const running = Object.values(readLedger()).some((entry) => laneRunning(entry));
       if (!running) await Bun.sleep(2000);
     }
     await Bun.sleep(1000);
@@ -1938,10 +2170,10 @@ async function doctorCommand(argv: string[]) {
 
   good(`ledger: ${LEDGER} (${Object.keys(readLedger()).length} lanes)`);
   if (existsSync(`${ROOT}/.lock`)) warn("warning: ledger lock present (breaks automatically after 30s if stale)");
-  const stale = Object.entries(readLedger()).filter(([, entry]) => entry.state === "running" && !pidAlive(entry.pid));
+  const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {
     const orphan = pidAlive(entry.codexPid) ? ` and its codex child (pid ${entry.codexPid}) is STILL RUNNING` : "";
-    console.log(color.red(`stale: lane "${lane}" marked running but its runner is dead${orphan}`));
+    console.log(color.red(`stale: lane "${lane}" has a running ${entry.kind} round but its runner is dead${orphan}`));
   }
   if (stale.length > 0 && parsed.bools.has("fix")) {
     for (const [lane, entry] of stale) {
@@ -1951,13 +2183,10 @@ async function doctorCommand(argv: string[]) {
     }
     withLedger((ledger) => {
       for (const [lane] of stale) {
-        ledger[lane]!.state = "failed";
-        ledger[lane]!.pid = undefined;
-        ledger[lane]!.codexPid = undefined;
-        ledger[lane]!.updatedAt = new Date().toISOString();
+        failActiveRound(ledger[lane]!, "runner died without finalizing; repaired by cdx doctor --fix");
       }
     });
-    good(`fixed: marked ${stale.length} stale lane(s) failed`);
+    good(`fixed: marked ${stale.length} stale round(s) failed`);
   } else if (stale.length > 0) {
     warn("run `cdx doctor --fix` to mark them failed (kills orphaned codex children)");
   }
@@ -2009,8 +2238,8 @@ function briefCommand() {
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
   const entries = Object.entries(readLedger());
-  const running = entries.filter(([, entry]) => entry.state === "running").sort(byRecency);
-  const failed = entries.filter(([, entry]) => entry.state === "failed").sort(byRecency);
+  const running = entries.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
+  const failed = entries.filter(([, entry]) => !laneRunning(entry) && (entry.state === "failed" || entry.state === "gate-invalid" || entry.reviewState === "failed")).sort(byRecency);
   const lanes = [...running, ...failed];
   if (lanes.length > 0) console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
 }
@@ -2056,7 +2285,7 @@ async function killCommand(argv: string[]) {
   const [lane, note] = argv;
   if (!lane) fail('usage: cdx kill <lane> ["note"]');
   const entry = readLane(lane);
-  if (entry.state !== "running") fail(`lane "${lane}" is not running (state ${entry.state})`);
+  if (!laneRunning(entry)) fail(`lane "${lane}" is not running (latest ${entry.kind} state ${roundStateOf(entry)})`);
   const runnerAlive = pidAlive(entry.pid);
   if (!runnerAlive && !pidAlive(entry.codexPid)) {
     fail(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
@@ -2066,14 +2295,18 @@ async function killCommand(argv: string[]) {
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       const current = readLedger()[lane];
-      if (current && current.state !== "running") {
+      if (current && !laneRunning(current)) {
         if (note) {
           withLedger((ledger) => {
             const item = ledger[lane];
-            if (item) { item.note = item.note ? `${item.note}; ${note}` : note; item.updatedAt = new Date().toISOString(); }
+            if (item) {
+              if (item.kind === "review") item.reviewNote = item.reviewNote ? `${item.reviewNote}; ${note}` : note;
+              else item.note = item.note ? `${item.note}; ${note}` : note;
+              item.updatedAt = new Date().toISOString();
+            }
           });
         }
-        console.log(`cdx: lane=${color.magenta(lane)} stopped; runner finalized state=${coloredState(current.state)}${current.note ? ` note=${current.note}` : ""}`);
+        console.log(`cdx: lane=${color.magenta(lane)} stopped; runner finalized ${current.kind} state=${coloredState(roundStateOf(current))}${roundNoteOf(current) ? ` note=${roundNoteOf(current)}` : ""}`);
         return;
       }
       await Bun.sleep(250);
@@ -2085,23 +2318,20 @@ async function killCommand(argv: string[]) {
   }
   const finalized = withLedger((ledger) => {
     const item = ledger[lane]!;
-    item.state = "failed";
-    item.exitCode = undefined;
-    item.note = note ? `killed: ${note}` : "killed";
-    item.pid = undefined;
-    item.codexPid = undefined;
-    item.updatedAt = new Date().toISOString();
+    failActiveRound(item, note ? `killed: ${note}` : "killed");
+    if (item.kind === "review") item.reviewExitCode = undefined;
+    else item.exitCode = undefined;
     return item;
   });
-  feedOwned(`[cdx] lane=${lane} round=${finalized.rounds} state=failed note=${finalized.note}`, finalized.ownerSession);
-  console.log(`cdx: lane=${color.magenta(lane)} killed; state=${coloredState("failed")} note=${finalized.note}`);
+  feedOwned(`[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)}`, finalized.ownerSession);
+  console.log(`cdx: lane=${color.magenta(lane)} killed; ${finalized.kind} state=${coloredState("failed")} note=${roundNoteOf(finalized)}`);
 }
 
 const USAGE = `cdx tracks Codex execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
-  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--max-runtime MIN] "<brief>"
-  resume <lane> [--effort E] [--bg] [--max-runtime MIN] "<follow-up>"
+  spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
+  resume <lane> [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   adopt  <lane> <sessionId> [--account NAME] [--cd D]
@@ -2110,6 +2340,7 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
+  gate   <lane> "<cmd>" | gate <lane> --clear
   kill   <lane> ["note"]  # SIGTERM the runner; force-finalize if it hangs
   close  <lane> [--remove-worktree] ["note"]       clean [--days N]
   doctor [--fix] [--probe]
@@ -2121,6 +2352,8 @@ one blocking call over many lanes. Foreground lanes print the report on exit.
 --cd (or the current directory) and runs the lane there. A "-" brief reads stdin.
 --gate CMD runs after a green work round (sh -lc, lane cwd); a nonzero exit
 fails the round. Work resumes rerun the lane's stored gate; reviews never do.
+Worktree spawns check the gate before worker startup. Use --gate-baseline-check
+to do the same in a non-worktree spawn. A baseline failure is gate-invalid.
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 // ---------------------------------------------------------------------------
@@ -2158,15 +2391,16 @@ switch (command) {
       ledger[lane] = {
         ...(account ? { account: account.name, codexHome: account.home } : {}),
         ...owner,
-        sessionId, cwd: parsed.flags.cd ?? process.cwd(), effort: config.defaultEffort, state: "adopted",
-        kind: "work", rounds: ledger[lane]?.rounds ?? 0, reports: ledger[lane]?.reports ?? [],
-        createdAt: ledger[lane]?.createdAt ?? now, updatedAt: now,
+        sessionId, workSessionId: sessionId, cwd: parsed.flags.cd ?? process.cwd(), workCwd: parsed.flags.cd ?? process.cwd(), effort: config.defaultEffort,
+        state: "adopted", workState: "adopted", kind: "work", rounds: ledger[lane]?.rounds ?? 0,
+        reports: ledger[lane]?.reports ?? [], createdAt: ledger[lane]?.createdAt ?? now, updatedAt: now, workUpdatedAt: now,
       };
     });
     console.log(`cdx: adopted lane=${lane} session=${sessionId}`);
     break;
   }
   case "status": statusCommand(argv); break;
+  case "gate": gateCommand(argv); break;
   case "usage": await usageCommand(argv); break;
   case "wait": await waitCommand(argv); break;
   case "feed": feedCommand(argv); break;
@@ -2212,6 +2446,7 @@ switch (command) {
     withLedger((ledger) => {
       const item = ledger[lane]!;
       item.state = "closed";
+      item.workState = "closed";
       if (note) item.note = note;
       item.updatedAt = new Date().toISOString();
     });
