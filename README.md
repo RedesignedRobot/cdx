@@ -91,6 +91,7 @@ flowchart LR
 |---|---|
 | `cdx spawn <lane> "<brief>"` | Start a worker in its own lane |
 | `cdx resume <lane> "<follow-up>"` | Continue a lane's thread, context intact |
+| `cdx gate <lane> "<cmd>"` | Set or replace an inactive lane's acceptance gate |
 | `cdx fork <new> <lane> "<brief>"` | Branch a thread into a new lane |
 | `cdx review <lane>` | Review a lane's diff in a fresh read-only session |
 | `cdx status` | Show structured lane blocks with owner, state, timing, tokens, and last activity |
@@ -107,8 +108,9 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--max-runtime MIN] "<brief>"
-cdx resume <lane> [--effort E] [--bg] [--max-runtime MIN] "<follow-up>"
+cdx spawn  <lane> [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
+cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime MIN] "<follow-up>"
+cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <new> <lane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
 cdx review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd D]
@@ -127,11 +129,17 @@ cdx doctor [--fix] [--probe]
 cdx brief
 ```
 
-`review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE, ending in a fenced json findings block that cdx parses into `reports/<lane>-r<n>.findings.json`. Both are fresh sessions, both sandbox-enforced read-only.
+`review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE, ending in a fenced json findings block that cdx parses into `reports/<lane>-r<n>.findings.json`. Both are fresh sessions, both sandbox-enforced read-only. Review defaults to the lane's recorded worktree or working directory. `--cd` overrides that directory. The launch output prints the resolved review directory before Codex starts.
 
-`spawn --gate "<cmd>"` stores an acceptance gate on the lane: after a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in the lane cwd. Exit 0 appends a `## Gate` section to the report; nonzero fails the round with `gate failed (exit N)`. Work resumes rerun the stored gate; reviews never run one. The gate is the harness's own verification, so a worker's optimistic done claim cannot finalize green.
+`spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in the lane cwd. Exit 0 appends a `## Gate` section to the report. A nonzero exit fails the round with `gate failed (exit N)`. Work resumes rerun the stored gate. Reviews never run one. The gate is the harness's own verification, so a worker's optimistic done claim cannot finalize green.
+
+A worktree spawn with `--gate` runs the gate once in the untouched baseline tree before the worker starts. A non-worktree spawn runs this check when you also pass `--gate-baseline-check`. A baseline failure stops the round as `gate-invalid` and identifies the gate command as the defect. A final gate failure that had no baseline check suggests `--gate-baseline-check` for the next run.
+
+`cdx gate <lane> "<cmd>"` sets or replaces the stored gate. `cdx gate <lane> --clear` removes it. Both forms print the old and new value and refuse to change an active lane. `resume --gate "<cmd>"` replaces the stored gate before that work round and keeps it for later resumes.
 
 `resume` always reattaches to the lane's work thread (`workSessionId` in the ledger), even after review rounds recorded a newer read-only session. Only a lane that never had a work session resumes as a review follow-up.
+
+`status` keeps the lane state and cwd tied to the latest work round. A review does not replace either value. When a lane has review history, `status` prints the review outcome and target directory on a separate review line.
 
 `kill` sends SIGTERM to the runner, which reaps its codex child and finalizes the round with a signal note; a runner still silent after 10s is force-killed and the ledger finalized directly with note `killed`. `--max-runtime MIN` on spawn and resume kills the round past the cap.
 
