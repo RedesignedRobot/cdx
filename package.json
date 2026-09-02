@@ -1,13 +1,13 @@
 {
   "name": "cdx-lanes",
-  "version": "2.2.0",
+  "version": "3.0.0",
   "license": "MIT",
   "type": "module",
   "bin": {
     "cdx": "./cdx.ts"
   },
   "repository": "github:RedesignedRobot/cdx",
-  "description": "Codex execution lanes for Claude Code.",
+  "description": "OpenAI Codex and Google Antigravity execution lanes for Claude Code.",
   "scripts": {
     "check": "bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts"
   }
