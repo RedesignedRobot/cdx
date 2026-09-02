@@ -149,7 +149,7 @@ cdx brief
 
 `review` with a target flag (`--uncommitted`, `--base`, `--commit`) uses Codex's native reviewer on the diff. `review` with an intent string instead runs an adversarial exec-based review: severity-ranked findings, each marked CONFIRMED or PLAUSIBLE, ending in a fenced json findings block that cdx parses into `reports/<lane>-r<n>.findings.json`. Both are fresh sessions, both sandbox-enforced read-only. Review defaults to the lane's recorded worktree or working directory. `--cd` overrides that directory. The launch output prints the resolved review directory before Codex starts.
 
-Work spawn, resume, and fork rounds each own one `codex app-server` child. cdx initializes the child with experimental API access, then starts, resumes, or forks the thread with `approvalPolicy: "never"` and `sandbox: "danger-full-access"`. Each turn uses `sandboxPolicy: { type: "dangerFullAccess" }`. Spawn sends `config.model`. Resume and fork send no model on either the thread request or `turn/start`, so the stored thread keeps its model. Each notification lands in the round's JSONL log. A report must be the last `agentMessage` with `phase: "final_answer"`, or an unphased `agentMessage` from an older server. Commentary never becomes a report. Once the report and `turn/completed` have both arrived, cdx writes the report before it unsubscribes or stops the child. A later cleanup failure becomes a warning and does not discard the completed round. Work rounds do not use `--output-last-message`. Spawn options map to app-server fields: `--image` adds `localImage` input items, `--schema` sets the turn's `outputSchema`, and `--add-dir` adds writable roots to the thread configuration.
+Work spawn, resume, and fork rounds each own one `codex app-server` child. cdx initializes the child with experimental API access, then starts, resumes, or forks the thread with `approvalPolicy: "never"` and `sandbox: "danger-full-access"`. Each turn uses `sandboxPolicy: { type: "dangerFullAccess" }`. Spawn sends `config.model`. Resume and fork send no model on either the thread request or `turn/start`, so the stored thread keeps its model. Resume uses the lane's recorded account and Codex home for its app-server child. A lane-based fork inherits both values and records them on the new lane. Each notification lands in the round's JSONL log. A report must be the last `agentMessage` with `phase: "final_answer"`, or an unphased `agentMessage` from an older server. Commentary never becomes a report. Once the report and `turn/completed` have both arrived, cdx writes the report before it unsubscribes or stops the child. A later cleanup failure becomes a warning and does not discard the completed round. Work rounds do not use `--output-last-message`. Spawn options map to app-server fields: `--image` adds `localImage` input items, `--schema` sets the turn's `outputSchema`, and `--add-dir` adds writable roots to the thread configuration.
 
 When a turn fails, cdx writes its `turn.error` message or `turn/failed` details to the lane note and the completion feed line.
 
@@ -167,7 +167,7 @@ A worktree spawn with `--gate` runs the gate once in the untouched baseline tree
 
 `cdx gate <lane> "<cmd>"` sets or replaces the stored gate. `cdx gate <lane> --clear` removes it. Both forms print the old and new value and refuse to change an active lane. `resume --gate "<cmd>"` replaces the stored gate before that work round and keeps it for later resumes.
 
-`resume` always reattaches to the lane's work thread (`workSessionId` in the ledger), even after review rounds recorded a newer read-only session. Only a lane that never had a work session resumes as a review follow-up.
+`resume` always reattaches to the lane's work thread (`workSessionId` in the ledger), even after review rounds recorded a newer read-only session. Only a lane that never had a work session resumes as a review follow-up. It also reuses the lane's recorded account and Codex home. A lane never changes account after spawn.
 
 `status` keeps the lane state and cwd tied to the latest work round. A review does not replace either value. When a lane has review history, `status` prints the review outcome and target directory on a separate review line.
 
@@ -237,7 +237,11 @@ Each account needs its own Codex home. cdx sets `CODEX_HOME` for every Codex pro
 }
 ```
 
-The first entry is primary. Spawn and review choose the first account with capacity. Pass `--account codex-2` to force one. Resume and lane-based fork keep the recorded account. Adopt and a raw-session-ID fork use the primary unless `--account` names another account.
+The first entry is primary. A new spawn or review chooses the first account with capacity. Pass `--account codex-2` to force one. Every command that reopens or inspects an existing lane uses the account and Codex home recorded in its ledger row before it touches Codex. This includes resume, lane-based fork, review, send, ask, reply, tail, report, and wait where those commands need the app-server. A lane never changes account after spawn. When an existing-lane command accepts `--account` for another mode, it rejects the flag and names the lane's pinned account.
+
+A lane-based fork inherits the parent's account and Codex home, and records both on the new lane. A raw-session-ID fork has no source ledger row, so it still accepts `--account` and otherwise uses the primary account. Adopt also accepts `--account` and otherwise uses the primary.
+
+For a pre-upgrade lane whose ledger row has no account data, cdx falls back to the default Codex home and writes that fallback to the feed.
 
 Keep each account name tied to one home. Use a new name when a home path changes so its cached usage cannot belong to the previous login.
 

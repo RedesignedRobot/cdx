@@ -50,7 +50,10 @@ const ignoreSigterm = ${Boolean(options.ignoreSigterm)};
 const threadId = "11111111-1111-4111-8111-111111111111";
 if (args[0] === "--version") { console.log("codex-cli 0.149.1"); process.exit(0); }
 if (args[0] === "login" && args[1] === "status") { console.log("Logged in using ChatGPT"); process.exit(0); }
-if (args[0] !== "app-server") process.exit(0);
+if (args[0] !== "app-server") {
+  if (process.env.FAKE_ENV_TRACE) appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
+  process.exit(0);
+}
 let buffer = "";
 let activeTurn = "";
 let turnNumber = 0;
@@ -404,6 +407,136 @@ describe("cdx messaging", () => {
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
     expect(runCli(["spawn", "account", "--account", "paid", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(accountHome);
+  });
+
+  test("resume uses the lane account home and lane-based fork inherits it", () => {
+    const root = tempPath("reopen-account-home");
+    const state = `${root}/state`;
+    const primaryHome = `${root}/codex-1`;
+    const pinnedHome = `${root}/codex-2`;
+    const envTrace = `${root}/env.trace`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(primaryHome, { recursive: true });
+    mkdirSync(pinnedHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [],
+      accounts: { "codex-1": primaryHome, "codex-2": pinnedHome },
+    }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
+    expect(runCli(["spawn", "pinned", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+
+    writeFileSync(envTrace, "");
+    expect(runCli(["resume", "pinned", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
+
+    writeFileSync(envTrace, "");
+    expect(runCli(["fork", "pinned-fork", "pinned", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
+    const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["pinned-fork"];
+    expect(fork.account).toBe("codex-2");
+    expect(fork.codexHome).toBe(pinnedHome);
+  });
+
+  test("raw-session fork accepts an account and records its home", () => {
+    const root = tempPath("raw-fork-account-home");
+    const state = `${root}/state`;
+    const pinnedHome = `${root}/codex-2`;
+    const envTrace = `${root}/env.trace`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(pinnedHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [],
+      accounts: { "codex-2": pinnedHome },
+    }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
+    const source = "22222222-2222-4222-8222-222222222222";
+    expect(runCli(["fork", "raw-fork", source, "--account", "codex-2", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
+    const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["raw-fork"];
+    expect(fork.account).toBe("codex-2");
+    expect(fork.codexHome).toBe(pinnedHome);
+  });
+
+  test("existing-lane commands refuse --account and name the pinned account", () => {
+    const root = tempPath("pinned-account-refusal");
+    const state = `${root}/state`;
+    const pinnedHome = `${root}/codex-2`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(pinnedHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [],
+      accounts: { "codex-2": pinnedHome },
+    }));
+    const env = baseEnv(state, installFakeCodex(root));
+    expect(runCli(["spawn", "pinned", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+
+    const resume = runCli(["resume", "pinned", "--account", "codex-2", "REPORT_ONLY"], env);
+    expect(resume.exitCode).toBe(1);
+    expect(`${resume.stdout}${resume.stderr}`).toContain('lane "pinned" is pinned to account "codex-2"');
+
+    const fork = runCli(["fork", "copy", "pinned", "--account", "codex-2", "REPORT_ONLY"], env);
+    expect(fork.exitCode).toBe(1);
+    expect(`${fork.stdout}${fork.stderr}`).toContain('lane "pinned" is pinned to account "codex-2"');
+
+    const review = runCli(["review", "pinned", "--account", "codex-2", "review this"], env);
+    expect(review.exitCode).toBe(1);
+    expect(`${review.stdout}${review.stderr}`).toContain('lane "pinned" is pinned to account "codex-2"');
+
+    const respawn = runCli(["spawn", "pinned", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env);
+    expect(respawn.exitCode).toBe(1);
+    expect(`${respawn.stdout}${respawn.stderr}`).toContain('lane "pinned" is pinned to account "codex-2"');
+  });
+
+  test("review of an existing lane uses its recorded account home", () => {
+    const root = tempPath("review-account-home");
+    const state = `${root}/state`;
+    const primaryHome = `${root}/codex-1`;
+    const pinnedHome = `${root}/codex-2`;
+    const envTrace = `${root}/env.trace`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(primaryHome, { recursive: true });
+    mkdirSync(pinnedHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [],
+      accounts: { "codex-1": primaryHome, "codex-2": pinnedHome },
+    }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
+    expect(runCli(["spawn", "review-pinned", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+
+    writeFileSync(envTrace, "");
+    expect(runCli(["review", "review-pinned", "review this"], env).exitCode).toBe(1);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["review-pinned"];
+    expect(lane.account).toBe("codex-2");
+    expect(lane.codexHome).toBe(pinnedHome);
+  });
+
+  test("pre-upgrade lane resumes with the default Codex home and writes a feed note", () => {
+    const root = tempPath("legacy-account-fallback");
+    const state = `${root}/state`;
+    const pinnedHome = `${root}/codex-2`;
+    const envTrace = `${root}/env.trace`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(pinnedHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [],
+      accounts: { "codex-2": pinnedHome },
+    }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
+    delete env.CODEX_HOME;
+    expect(runCli(["spawn", "legacy", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    delete ledger.legacy.account;
+    delete ledger.legacy.codexHome;
+    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+
+    writeFileSync(envTrace, "");
+    expect(runCli(["resume", "legacy", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(`${env.HOME}/.codex`);
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain("lane=legacy");
+    expect(feed).toContain("pre-upgrade lane has no recorded account");
+    expect(feed).toContain(`${env.HOME}/.codex`);
   });
 
   test("fails doctor promptly when the app-server dies before completion", () => {

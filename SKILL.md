@@ -70,13 +70,17 @@ gate. Work rounds do not use `--output-last-message`. `--image` maps to
 lane's work thread, recorded as `workSessionId` in the ledger, even when the
 latest round was a review. Only a lane that never had a work session resumes
 as a read-only review follow-up. `resume` does not accept `--cd` or `--json`.
+It uses the lane's recorded account and Codex home for the app-server child.
 `resume --effort E` overrides the stored effort for that round onward; without
 it the session keeps its own settings.
 `resume --gate "<cmd>"` replaces the lane's stored gate before the round and
 keeps it for later resumes. `fork`
 branches an existing lane or session and keeps the source session's working
 directory, so it does not accept `--cd`; a raw-session-ID fork reads that
-directory from the session's rollout file.
+directory from the session's rollout file. A lane-based fork inherits the
+parent lane's recorded account and Codex home and records both on the new lane.
+A raw-session-ID fork has no ledger row to inherit from, so it accepts
+`--account` and otherwise uses the primary account.
 
 Spawn sends the configured model. Resume and fork omit the model from their
 thread request and `turn/start`, so each stored thread keeps its model.
@@ -258,9 +262,17 @@ overrides it. A malformed config fails with a message that names the config
 file.
 
 When `config.json` defines accounts, cdx gives each login its own `CODEX_HOME`.
-Spawn and review choose the first account with capacity. `--account NAME`
-forces one. Resume and lane-based fork keep the lane's recorded account. Adopt
-and raw-session-ID fork accept `--account` and otherwise use the primary.
+New spawn and review lanes choose the first account with capacity. Their
+`--account NAME` flag forces one. Every command that reopens or inspects an
+existing lane reads the account and Codex home from its ledger row before it
+touches Codex. This includes resume, lane-based fork, review, send, ask, reply,
+tail, report, and wait where those commands need the app-server. A lane never
+changes account after spawn.
+When an existing-lane command accepts `--account` for another mode, it rejects
+the flag and names the pinned account. Lane-based fork records the inherited
+account on the new lane. Adopt and raw-session-ID fork accept `--account` and
+otherwise use the primary. A pre-upgrade lane without account data falls back
+to the default Codex home and writes a feed note about the fallback.
 
 cdx appends each `rules` entry to the built-in brief rules. It then appends the
 contents of `.cdx-rules.md` from the lane's working directory when that file
