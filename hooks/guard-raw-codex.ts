@@ -167,7 +167,12 @@ try {
   const command = (toolInput as Record<string, unknown>).command;
   if (typeof command !== "string") process.exit(0);
   const unquoted = stripQuotedSegments(command);
-  const engine = invokedRawEngine(stripHeredocBodies(unquoted, command));
+  // Second pass with quotes and backslash escapes collapsed, so agy "--print=x",
+  // "agy" --print=x, and \agy --print=x still read as a headless call. Only a
+  // segment whose first word is the binary matches, so quoted prose stays free.
+  const collapsed = command.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  const engine = invokedRawEngine(stripHeredocBodies(unquoted, command))
+    ?? invokedRawEngine(stripHeredocBodies(collapsed, command));
   if (!engine) process.exit(0);
 
   console.error(engine === "gemini"

@@ -1516,6 +1516,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
           proc.exited.then(() => "exit" as const),
         ]);
         if (outcome === "exit") break;
+        // Grace window, same as the Codex path: a send that raced the result still joins this round.
         await queueControlDrain();
         await Bun.sleep(1100);
         await queueControlDrain();
@@ -2378,8 +2379,11 @@ async function reviewCommand(argv: string[]) {
     if (engine === "gemini") {
       const target = parsed.bools.has("uncommitted") ? "HEAD"
         : parsed.flags.base ? `${parsed.flags.base}...HEAD`
-        : `${parsed.flags.commit}^ ${parsed.flags.commit}`;
-      const task = `Review the diff shown by \`git diff ${target}\` in this repository.`;
+        : undefined;
+      // git show covers a root commit; <sha>^ has no parent there.
+      const task = target
+        ? `Review the diff shown by \`git diff ${target}\` in this repository.`
+        : `Review the diff shown by \`git show ${parsed.flags.commit}\` in this repository.`;
       const fullBrief = [REVIEW_FRAME, `Ground rules:\n${houseRules(cwd, true)}`, `Task:\n${task}`].join("\n\n");
       const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true });
       return launch({ engine, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
