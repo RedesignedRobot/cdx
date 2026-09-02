@@ -856,7 +856,8 @@ describe("cdx execution engines", () => {
     expect(isAgyCancellationTemplate("Task interrupted: Execution stopped per your cancellation request")).toBe(true);
     expect(isAgyCancellationTemplate("An execution step was interrupted by the user while running tool")).toBe(true);
     expect(isAgyCancellationTemplate("Finished inspecting the files; report complete.")).toBe(false);
-    expect(isAgyCancellationTemplate(`Audit of cancellation handling. The runner prints "User initiated cancellation" when a turn is aborted. ${"Details follow. ".repeat(20)}`)).toBe(false);
+    expect(isAgyCancellationTemplate(`An execution step was interrupted by the user while running tool run_command with ${"x".repeat(400)}`)).toBe(true);
+    expect(isAgyCancellationTemplate('# Lane report\n\nThe runner prints "User initiated cancellation" when a turn is aborted.')).toBe(false);
 
     const root = tempPath("gemini-cancel-template");
     const state = tempPath("gemini-cancel-state");
