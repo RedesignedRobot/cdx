@@ -641,11 +641,28 @@ function laneAccount(lane: Lane): AccountChoice | undefined {
   return { name: lane.account, home: lane.codexHome };
 }
 
-function accountSpec(account?: AccountChoice): Pick<Spec, "account" | "codexHome" | "multiAccountUsage"> {
+function defaultCodexHome(): string {
+  return process.env.CODEX_HOME || `${HOME}/.codex`;
+}
+
+function accountSpec(account?: AccountChoice, fallbackHome?: string): Pick<Spec, "account" | "codexHome" | "multiAccountUsage"> {
   return {
-    ...(account ? { account: account.name, codexHome: account.home } : {}),
+    ...(account ? { account: account.name, codexHome: account.home } : fallbackHome ? { codexHome: fallbackHome } : {}),
     ...(config.accounts ? { multiAccountUsage: true as const } : {}),
   };
+}
+
+function rejectPinnedAccountFlag(laneName: string, lane: Lane, requested?: string): void {
+  if (requested === undefined) return;
+  const pinned = lane.account ? `account "${lane.account}"` : `the default account at ${displayPath(defaultCodexHome())}`;
+  fail(`--account is not valid for lane "${laneName}"; lane "${laneName}" is pinned to ${pinned}`);
+}
+
+function legacyAccountFallback(laneName: string, lane: Lane, ownerSession?: string): string | undefined {
+  if (lane.account !== undefined || lane.codexHome !== undefined) return undefined;
+  const home = defaultCodexHome();
+  feedOwned(`[cdx] lane=${laneName} account=default codex-home=${home} note=pre-upgrade lane has no recorded account; using default`, ownerSession);
+  return home;
 }
 
 interface LaneOwner { ownerSession?: string; ownerCwd: string }
@@ -1776,14 +1793,16 @@ async function spawnCommand(argv: string[]) {
   if (existingLane && laneRunning(existingLane) && pidAlive(existingLane.pid)) {
     fail(`lane "${lane}" is already running (pid ${existingLane.pid}); pick a new name or wait`);
   }
+  if (existingLane) rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   let worktree: WorktreeInfo | undefined;
   if (parsed.flags.worktree) {
     worktree = createWorktree(cwd, parsed.flags.worktree, lane);
     cwd = worktree.path;
   }
-  const selection = await selectAccount(parsed.flags.account);
-  if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
-  const account = selection.choice;
+  const selection = existingLane ? undefined : await selectAccount(parsed.flags.account);
+  const account = existingLane ? laneAccount(existingLane) : selection!.choice;
+  const fallbackHome = existingLane ? legacyAccountFallback(lane, existingLane, existingLane.ownerSession) : undefined;
+  if (existingLane || !config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(account);
   const owner = callerOwnership();
   const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
     if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
@@ -1798,8 +1817,10 @@ async function spawnCommand(argv: string[]) {
     try { outputSchema = JSON.parse(readFileSync(parsed.flags.schema, "utf8")); }
     catch (error) { fail(`--schema must name valid JSON: ${error instanceof Error ? error.message : String(error)}`); }
   }
-  const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree, gate: parsed.flags.gate });
-  announceAccountSelection(lane, selection, owner.ownerSession);
+  const { round } = openRound(lane, "work", cwd, effort, {
+    ...(existingLane ? { preserveAccount: true as const } : { account }), owner, worktree, gate: parsed.flags.gate,
+  });
+  if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
   const gateBaselineChecked = Boolean(parsed.flags.gate && (worktree || parsed.bools.has("gate-baseline-check")));
   if (gateBaselineChecked) {
@@ -1826,19 +1847,21 @@ async function spawnCommand(argv: string[]) {
     ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}),
     ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
-    ...accountSpec(account), ...ownershipSpec(owner),
+    ...accountSpec(account, fallbackHome), ...ownershipSpec(owner),
   }, fullBrief, parsed.bools.has("bg"));
 }
 
 async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime"]);
+  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account"]);
   const [lane, followUpArg] = parsed.rest;
   const followUp = await resolveBrief(followUpArg);
   if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"');
   const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
+  rejectPinnedAccountFlag(lane, before, parsed.flags.account);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   const account = laneAccount(before);
+  const fallbackHome = legacyAccountFallback(lane, before, before.ownerSession);
   warnCachedUsageBeforeLaunch(account);
   const owner = storedOwnership(before);
   const effort = parsed.flags.effort ? configuredEffort(parsed.flags.effort) : before.effort;
@@ -1869,7 +1892,7 @@ async function resumeCommand(argv: string[]) {
     ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
     ...(!reviewResume && gate ? { gate } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
-    ...accountSpec(account), ...ownershipSpec(owner),
+    ...accountSpec(account, fallbackHome), ...ownershipSpec(owner),
   }, prompt, parsed.bools.has("bg"));
 }
 
@@ -1889,17 +1912,11 @@ async function forkCommand(argv: string[]) {
     ? effortOf(parsed)
     : configuredEffort(sourceLane?.effort ?? config.defaultEffort);
   let account: AccountChoice | undefined;
+  let fallbackHome: string | undefined;
   if (sourceLane) {
+    rejectPinnedAccountFlag(source, sourceLane, parsed.flags.account);
     account = laneAccount(sourceLane);
-    if (parsed.flags.account !== undefined && parsed.flags.account !== sourceLane.account) {
-      // A pre-account lane's session lives in the default Codex home, so
-      // naming the account that maps there is a no-op, not a switch.
-      const requested = configuredAccount(parsed.flags.account);
-      if (account !== undefined || requested.home !== `${HOME}/.codex`) {
-        fail("--account cannot switch a lane-based fork; the source session belongs to its recorded Codex home");
-      }
-      account = requested;
-    }
+    fallbackHome = legacyAccountFallback(source, sourceLane, sourceLane.ownerSession);
   } else {
     account = primaryAccount(parsed.flags.account);
   }
@@ -1920,7 +1937,7 @@ async function forkCommand(argv: string[]) {
   const owner = callerOwnership();
   const { round } = openRound(newLane, "work", cwd, effort, { account, owner });
   const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nPrint your final report. cdx captures the last final agent message.`;
-  return launch({ mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({ mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function reviewCommand(argv: string[]) {
@@ -1935,18 +1952,23 @@ async function reviewCommand(argv: string[]) {
   const effort = effortOf(parsed);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
+  if (targets.length === 1 && intent) fail("native review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
+  if (targets.length === 1 && parsed.flags.scope) fail("--scope only applies to exec review (native review always covers the whole target diff)");
+  if (targets.length === 0 && !intent) fail("exec review needs an intent (or pass a native target flag)");
+  if (existing) rejectPinnedAccountFlag(lane, existing, parsed.flags.account);
+
+  const selection = existing ? undefined : await selectAccount(parsed.flags.account);
+  const account = existing ? laneAccount(existing) : selection!.choice;
+  const fallbackHome = existing ? legacyAccountFallback(lane, existing, existing.ownerSession) : undefined;
+  if (existing || !config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(account);
+  const roundAccount = existing ? { preserveAccount: true as const } : { account };
 
   if (targets.length === 1) {
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
-    if (intent) fail("native review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
-    if (parsed.flags.scope) fail("--scope only applies to exec review (native review always covers the whole target diff)");
-    const selection = await selectAccount(parsed.flags.account);
-    if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
-    const account = selection.choice;
     const owner = callerOwnership();
-    const { round } = openRound(lane, "review", cwd, effort, { account, owner, preserveGate: true });
-    announceAccountSelection(lane, selection, owner.ownerSession);
+    const { round } = openRound(lane, "review", cwd, effort, { ...roundAccount, owner, preserveGate: true });
+    if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
     const codexArgs = [
       "review", "-c", `review_model=${JSON.stringify(config.model)}`, "-c", `model_reasoning_effort=${effort}`,
       "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
@@ -1955,16 +1977,12 @@ async function reviewCommand(argv: string[]) {
     if (parsed.flags.base) codexArgs.push("--base", parsed.flags.base);
     if (parsed.flags.commit) codexArgs.push("--commit", parsed.flags.commit);
     const label = parsed.bools.has("uncommitted") ? "uncommitted changes" : parsed.flags.base ? `diff vs ${parsed.flags.base}` : `commit ${parsed.flags.commit}`;
-    return launch({ mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
+    return launch({ mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
   }
 
-  if (!intent) fail("exec review needs an intent (or pass a native target flag)");
-  const selection = await selectAccount(parsed.flags.account);
-  if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
-  const account = selection.choice;
   const owner = callerOwnership();
-  const { round } = openRound(lane, "review", cwd, effort, { account, owner, preserveGate: true });
-  announceAccountSelection(lane, selection, owner.ownerSession);
+  const { round } = openRound(lane, "review", cwd, effort, { ...roundAccount, owner, preserveGate: true });
+  if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
     : "";
@@ -1975,7 +1993,7 @@ async function reviewCommand(argv: string[]) {
     "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ];
-  return launch({ mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, codexArgs, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 function fmtTokens(tokens?: Tokens): string {
