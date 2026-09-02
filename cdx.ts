@@ -706,6 +706,16 @@ function laneEngine(lane: Pick<Lane, "engine"> | undefined): Engine {
   return lane?.engine ?? "gpt";
 }
 
+// The engine a round actually ran on: reviews record their own beside the
+// work engine, so status and wait name the runtime that produced the report.
+function roundEngine(lane: Lane): Engine {
+  return lane.kind === "review" ? lane.reviewEngine ?? laneEngine(lane) : laneEngine(lane);
+}
+
+function hasWorkThread(lane: Lane): boolean {
+  return Boolean(lane.workSessionId) || lane.kind === "work";
+}
+
 function engineEffort(engine: Engine, parsed: Parsed, inherited?: Effort): Effort {
   if (engine === "gemini") {
     if (parsed.flags.effort !== undefined) {
@@ -906,7 +916,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       // The work engine belongs to the work thread. A review round on an
       // existing lane records its own engine beside it, so a later resume
       // still reattaches to the right runtime.
-      engine: opts?.preserveEngine || (kind === "review" && existing) ? laneEngine(existing) : opts?.engine ?? laneEngine(existing),
+      engine: opts?.preserveEngine || (kind === "review" && existing && hasWorkThread(existing)) ? laneEngine(existing) : opts?.engine ?? laneEngine(existing),
       reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
@@ -1233,15 +1243,13 @@ async function runRound(lane: string, round: number): Promise<number> {
   }
 }
 
-// The template is a short stock message. A real report that quotes the
-// same words runs far longer, so length bounds the match.
-const AGY_CANCELLATION_TEMPLATE_MAX = 300;
+// The stock message opens with the cancellation line; a real report opens
+// with its own heading, so only the first line decides.
 function isAgyCancellationTemplate(text: string): boolean {
-  const trimmed = text.trim();
-  if (trimmed.length > AGY_CANCELLATION_TEMPLATE_MAX) return false;
-  return trimmed.includes("User initiated cancellation")
-    || trimmed.includes("Execution stopped per your cancellation request")
-    || trimmed.startsWith("An execution step was interrupted by the user");
+  const firstLine = text.trim().split("\n", 1)[0] ?? "";
+  return firstLine.includes("User initiated cancellation")
+    || firstLine.includes("Execution stopped per your cancellation request")
+    || firstLine.startsWith("An execution step was interrupted by the user");
 }
 
 async function runRoundInner(lane: string, round: number): Promise<number> {
@@ -2609,7 +2617,7 @@ async function waitCommand(argv: string[]) {
   };
   // --json prints one JSON object per finished lane, in completion order.
   const emitJson = (lane: string, entry: Lane, error?: string) => console.log(JSON.stringify({
-    lane, engine: laneEngine(entry), state: entry.state, roundState: roundStateOf(entry), kind: entry.kind,
+    lane, engine: roundEngine(entry), state: entry.state, roundState: roundStateOf(entry), kind: entry.kind,
     exitCode: roundExitCodeOf(entry) ?? null, tokens: entry.tokens ?? null,
     report: roundReportOf(entry) ?? null, note: roundNoteOf(entry) ?? null, sessionId: entry.sessionId ?? null,
     rounds: entry.rounds, ...(showReport ? { reportText: reportTextOf(entry) ?? null } : {}),
@@ -2628,7 +2636,7 @@ async function waitCommand(argv: string[]) {
       } else {
         if (json) emitJson(lane, entry);
         else {
-          console.log(`cdx: lane=${color.magenta(lane)} engine=${laneEngine(entry)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${roundReportOf(entry) ?? "-"}`);
+          console.log(`cdx: lane=${color.magenta(lane)} engine=${roundEngine(entry)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${roundReportOf(entry) ?? "-"}`);
           if (showReport) {
             const text = reportTextOf(entry);
             if (text) {
