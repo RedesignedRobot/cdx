@@ -712,8 +712,10 @@ function roundEngine(lane: Lane): Engine {
   return lane.kind === "review" ? lane.reviewEngine ?? laneEngine(lane) : laneEngine(lane);
 }
 
+// A work lane that died before its runtime handed back a session has no
+// thread to protect; its engine may follow the next round.
 function hasWorkThread(lane: Lane): boolean {
-  return Boolean(lane.workSessionId) || lane.kind === "work";
+  return Boolean(lane.workSessionId) || (lane.kind === "work" && Boolean(lane.sessionId));
 }
 
 function engineEffort(engine: Engine, parsed: Parsed, inherited?: Effort): Effort {
@@ -1243,12 +1245,13 @@ async function runRound(lane: string, round: number): Promise<number> {
   }
 }
 
-// The stock message opens with the cancellation line; a real report opens
-// with its own heading, so only the first line decides.
+// The stock message opens with one of these sentences on its own line; a
+// real report opens with its own heading, so only the first line decides,
+// and it must be the sentence, not a heading that quotes it.
 function isAgyCancellationTemplate(text: string): boolean {
-  const firstLine = text.trim().split("\n", 1)[0] ?? "";
-  return firstLine.includes("User initiated cancellation")
-    || firstLine.includes("Execution stopped per your cancellation request")
+  const firstLine = (text.trim().split("\n", 1)[0] ?? "").trim().replace(/\.$/, "");
+  return firstLine === "User initiated cancellation"
+    || firstLine === "Execution stopped per your cancellation request"
     || firstLine.startsWith("An execution step was interrupted by the user");
 }
 
