@@ -65,7 +65,7 @@ const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.0.0";
+const VERSION = "3.1.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
