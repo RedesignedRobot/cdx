@@ -51,6 +51,7 @@ import {
 } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { isatty } from "node:tty";
 import { join, relative } from "node:path";
 
 const HOME = process.env.HOME ?? "";
@@ -67,7 +68,9 @@ const VERSION = "3.0.0";
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
     ? process.env.FORCE_COLOR !== "0"
-    : Boolean(process.stdout.isTTY && process.stderr.isTTY));
+    // tty.isatty, not process.stdout.isTTY: touching process.stdout under Bun
+    // 1.4 flips fd 1 non-blocking and console.log then truncates piped output at 64KB.
+    : isatty(1) && isatty(2));
 const style = (code: number) => (text: string) => COLOR_ENABLED ? `\x1b[${code}m${text}\x1b[0m` : text;
 const color = {
   bold: style(1),
@@ -1333,6 +1336,26 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       touchLedger((item) => { item.sessionId = event.conversation_id; item.lastEventAt = now; }, true);
     } else if (event.event === "step_update" && event.step_update) {
       const update = event.step_update;
+      const stepUsage = update.usage;
+      if (stepUsage && typeof stepUsage === "object") {
+        const delta: Tokens = {
+          input: stepUsage.input_tokens ?? 0,
+          cached: stepUsage.cache_read_tokens ?? 0,
+          output: stepUsage.output_tokens ?? 0,
+        };
+        if (delta.input || delta.cached || delta.output) {
+          touchLedger((item) => {
+            const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+            const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+            for (const tokens of [cumulative, roundTokens]) {
+              tokens.input += delta.input;
+              tokens.cached += delta.cached;
+              tokens.output += delta.output;
+            }
+            item.lastEventAt = now;
+          }, true);
+        }
+      }
       if (update.step_type === "tool") {
         const tool = update.tool_name ?? update.tool_info?.name ?? "tool";
         const params = update.tool_info?.parameters;
@@ -1343,25 +1366,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       }
     } else if (event.event === "result" && event.result) {
       const result = event.result;
-      const usage = result.usage ?? {};
-      const delta: Tokens = {
-        input: usage.input_tokens ?? 0,
-        cached: usage.cache_read_tokens ?? 0,
-        output: usage.output_tokens ?? 0,
-      };
+      // result.usage is cumulative over the whole conversation (verified live:
+      // turn 2 reported turn 1 plus its own steps), so tokens come from step_update.
       if (typeof result.conversation_id === "string") {
-        touchLedger((item) => { item.sessionId = result.conversation_id; }, true);
+        touchLedger((item) => { item.sessionId = result.conversation_id; item.lastEventAt = now; }, true);
       }
-      touchLedger((item) => {
-        const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
-        const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
-        for (const tokens of [cumulative, roundTokens]) {
-          tokens.input += delta.input;
-          tokens.cached += delta.cached;
-          tokens.output += delta.output;
-        }
-        item.lastEventAt = now;
-      }, true);
       if (typeof result.response === "string" && result.response.trim()) {
         writeFileSync(reportPath, `${result.response.trim()}\n`);
       }
@@ -2584,7 +2593,7 @@ function renderEventLine(line: string): string | undefined {
     }
     if (event.event === "result" && event.result) {
       const usage = event.result.usage;
-      return `[gemini turn ${String(event.result.status ?? "?").toLowerCase()}: ${usage?.input_tokens ?? "?"} in / ${usage?.output_tokens ?? "?"} out]`;
+      return `[gemini turn ${String(event.result.status ?? "?").toLowerCase()}: conversation total ${usage?.input_tokens ?? "?"} in / ${usage?.output_tokens ?? "?"} out]`;
     }
     if (event.method === "thread/started") return `[session ${event.params?.thread?.id ?? "?"}]`;
     if (event.method === "turn/completed") return `[turn ${event.params?.turn?.status ?? "done"}]`;

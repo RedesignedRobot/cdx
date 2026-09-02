@@ -192,12 +192,13 @@ const result = (status, response) => send({
     conversation_id: conversationId,
     status,
     response,
+    // Cumulative over the conversation, like the real agy; cdx must not add it.
     usage: {
-      input_tokens: 11,
-      output_tokens: 5,
-      thinking_tokens: 3,
-      cache_read_tokens: 2,
-      total_tokens: 19,
+      input_tokens: 999 * turn,
+      output_tokens: 999 * turn,
+      thinking_tokens: 999 * turn,
+      cache_read_tokens: 999 * turn,
+      total_tokens: 3996 * turn,
     },
     num_turns: turn,
   },
@@ -212,6 +213,7 @@ async function runTurn(content) {
     step_index: turn,
     state: "ACTIVE",
     step_type: "tool",
+    usage: { input_tokens: 11, output_tokens: 5, thinking_tokens: 3, cache_read_tokens: 2 },
     tool_name: "list_dir",
     tool_info: { name: "list_dir", parameters: { directoryPath: process.cwd() }, output: "ok" },
   } });
@@ -746,6 +748,20 @@ describe("cdx messaging", () => {
     const waited = runCli(["wait", "stale-report", "--report"], env);
     expect(waited.exitCode).toBe(0);
     expect(waited.stdout).not.toContain("final report from app-server");
+  });
+
+  test("prints a status --json larger than a pipe buffer in full", () => {
+    const root = tempPath("big-status");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeCodex(root));
+    expect(runCli(["spawn", "seed", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    for (let index = 0; index < 200; index += 1) ledger[`copy-${index}`] = { ...ledger.seed };
+    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    const result = runCli(["status", "--json"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.length).toBeGreaterThan(70_000);
+    expect(Object.keys(JSON.parse(result.stdout)).length).toBe(201);
   });
 
   test("truncates feed.log to its last 2000 lines during clean", () => {
