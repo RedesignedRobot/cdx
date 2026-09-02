@@ -10,6 +10,10 @@ const CODEX_GLOBAL_VALUE_OPTIONS = new Set([
   "-s", "--sandbox", "-C", "--cd", "--add-dir", "-a", "--ask-for-approval",
 ]);
 const CODEX_TERMINAL_OPTIONS = new Set(["-h", "--help", "-V", "--version", "--"]);
+const AGY_HEADLESS_OPTIONS = new Set([
+  "--print", "-p", "--prompt", "--prompt-interactive", "-i", "--input-format",
+  "--continue", "-c", "--conversation",
+]);
 
 function stripQuotedSegments(command: string): string {
   return command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/gs, "");
@@ -104,9 +108,12 @@ function skipPrefixes(words: string[], start: number): number {
   }
 }
 
-function invokesRawCodex(command: string): boolean {
+type RawEngine = "gpt" | "gemini";
+
+function invokedRawEngine(command: string): RawEngine | undefined {
   for (const match of command.matchAll(/\$\(([^()]*)\)|`([^`]*)`/gs)) {
-    if (invokesRawCodex(match[1] ?? match[2] ?? "")) return true;
+    const nested = invokedRawEngine(match[1] ?? match[2] ?? "");
+    if (nested) return nested;
   }
   const withoutArrayData = command.replace(/\b[A-Za-z_][A-Za-z0-9_]*=\([^)]*\)/gs, "");
   for (const segment of withoutArrayData.split(/[;&|()`\n]+/)) {
@@ -141,9 +148,13 @@ function invokesRawCodex(command: string): boolean {
     }
 
     const binary = (words[index] ?? "").split("/").at(-1);
-    if (binary === "codex" && codexWorkVerb(words, index)) return true;
+    if (binary === "codex" && codexWorkVerb(words, index)) return "gpt";
+    if (binary === "agy") {
+      const headless = words.slice(index + 1).some((word) => AGY_HEADLESS_OPTIONS.has(word.split("=")[0]!));
+      if (headless) return "gemini";
+    }
   }
-  return false;
+  return undefined;
 }
 
 try {
@@ -156,9 +167,17 @@ try {
   const command = (toolInput as Record<string, unknown>).command;
   if (typeof command !== "string") process.exit(0);
   const unquoted = stripQuotedSegments(command);
-  if (!invokesRawCodex(stripHeredocBodies(unquoted, command))) process.exit(0);
+  // Second pass with quotes and backslash escapes collapsed, so agy "--print=x",
+  // "agy" --print=x, and \agy --print=x still read as a headless call. Only a
+  // segment whose first word is the binary matches, so quoted prose stays free.
+  const collapsed = command.replace(/\\(.)/g, "$1").replace(/["']/g, "");
+  const engine = invokedRawEngine(stripHeredocBodies(unquoted, command))
+    ?? invokedRawEngine(stripHeredocBodies(collapsed, command));
+  if (!engine) process.exit(0);
 
-  console.error("Use cdx for Codex work. Run 'cdx help'.");
+  console.error(engine === "gemini"
+    ? "Use cdx --engine gemini for Antigravity work. Run 'cdx help'."
+    : "Use cdx for Codex work. Run 'cdx help'.");
   process.exit(2);
 } catch {
   process.exit(0);
