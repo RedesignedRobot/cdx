@@ -851,9 +851,57 @@ describe("cdx execution engines", () => {
     expect(geminiLane.reviewState).toBe("done");
   }, 15000);
 
+  test("a review-only lane follows the engine of its latest review and resumes there", () => {
+    const root = tempPath("review-only-switch");
+    const state = tempPath("review-only-switch-state");
+    // The trace lives outside the reviewed repo, or the review round would
+    // rightly fail as "review modified the tree".
+    const trace = `${state}/agy-trace.jsonl`;
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(root);
+    const env = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+      FAKE_AGY_TRACE: trace,
+    };
+    mkdirSync(state, { recursive: true });
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    // The fake codex has no exec mode, so the review-only gpt lane is seeded
+    // from a gemini review and re-labelled to the shape a codex intent review
+    // leaves behind: kind review, engine gpt, a codex session id, no work thread.
+    expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const ledgerPath = `${state}/ledger.json`;
+    const seeded = JSON.parse(readFileSync(ledgerPath, "utf8"));
+    expect(seeded.audit.kind).toBe("review");
+    expect(seeded.audit.workSessionId).toBeUndefined();
+    seeded.audit.engine = "gpt";
+    seeded.audit.reviewEngine = "gpt";
+    seeded.audit.sessionId = "22222222-2222-4222-8222-222222222222";
+    writeFileSync(ledgerPath, JSON.stringify(seeded, null, 2));
+
+    expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const switched = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).audit;
+    expect(switched.engine).toBe("gemini");
+    expect(switched.reviewEngine).toBe("gemini");
+
+    writeFileSync(trace, "");
+    expect(runCli(["resume", "audit", "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const calls = readFileSync(trace, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line) as { args?: string[] })
+      .filter((record): record is { args: string[] } => Array.isArray(record.args));
+    expect(calls.length).toBeGreaterThan(0);
+    const conversations = calls.map((call) => call.args[call.args.indexOf("--conversation") + 1]);
+    expect(conversations).toEqual(calls.map(() => switched.sessionId));
+  }, 20000);
+
   test("refuses agy cancellation template as a report and suppresses gate", () => {
     expect(isAgyCancellationTemplate("User initiated cancellation")).toBe(true);
-    expect(isAgyCancellationTemplate("Task interrupted: Execution stopped per your cancellation request")).toBe(true);
+    expect(isAgyCancellationTemplate("Execution stopped per your cancellation request.")).toBe(true);
+    expect(isAgyCancellationTemplate("An execution step was interrupted by the user.\n\nReason: User initiated cancellation.")).toBe(true);
+    expect(isAgyCancellationTemplate("# Audit: User initiated cancellation handling in cdx\n\nFindings follow.")).toBe(false);
     expect(isAgyCancellationTemplate("An execution step was interrupted by the user while running tool")).toBe(true);
     expect(isAgyCancellationTemplate("Finished inspecting the files; report complete.")).toBe(false);
     expect(isAgyCancellationTemplate(`An execution step was interrupted by the user while running tool run_command with ${"x".repeat(400)}`)).toBe(true);
