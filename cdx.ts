@@ -31,6 +31,8 @@
 // cdx policy comes from $CDX_HOME/config.json. Work lanes cannot commit, push,
 // or deploy. Reviews always get a fresh session. Codex uses a read-only
 // sandbox, while Gemini fails the round if its before-and-after tree hash moves.
+// Worktree creation runs config.worktreeSetup if set, followed by an executable
+// .cdx-worktree-setup at the new worktree root if present.
 //
 // CLI facts this harness absorbs (codex-cli 0.149.1, verified):
 // - Work rounds use app-server JSON-RPC over newline-delimited stdio. Reviews
@@ -45,7 +47,7 @@
 //   becomes a queued follow-up turn because agy has no mid-turn steer.
 
 import {
-  closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync,
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync,
   lstatSync, readlinkSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync,
   statSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
@@ -151,6 +153,7 @@ interface Lane {
   // Review rounds overwrite sessionId with the read-only review session; the
   // work thread survives here so resume always reattaches to it.
   workSessionId?: string;
+  reviewEngine?: Engine;
   // cwd and state remain the stable work values for old ledger consumers.
   cwd: string;
   workCwd?: string;
@@ -183,6 +186,7 @@ interface Lane {
   lastEventAt?: string;
   exitCode?: number;
   note?: string;
+  diffEmpty?: true;
   worktreePath?: string;
   worktreeRepo?: string;
   branch?: string;
@@ -606,11 +610,16 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt"): s
     "Your final response is the lane report. Include what changed or what you reviewed, verification evidence, and any risks or follow-ups.",
   ];
   if (!reviewOnly) {
-    builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
-    builtIns.push('When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point; never ask what the brief or the code already answers.');
+    builtIns.push("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.");
     if (engine === "gemini") {
       builtIns.push("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
+      builtIns.push("Never spawn subagents or delegate; do the work yourself in this thread.");
       builtIns.push("Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine.");
+      builtIns.push("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
+      builtIns.push("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
+    } else {
+      builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
+      builtIns.push('When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point; never ask what the brief or the code already answers.');
     }
   }
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
@@ -670,7 +679,8 @@ function effortOf(parsed: Parsed): Effort {
   return configuredEffort(parsed.flags.effort ?? config.defaultEffort);
 }
 
-const ENGINE_PICKER = `gpt:
+const ENGINE_PICKER = `gemini is the default; pass --engine gpt for design-heavy or judgment work
+gpt:
 + strongest code and judgment on hard multi-file work, design-heavy lanes
 - slow (20-30 min lanes), scarce weekly budget, burns fast
 gemini:
@@ -682,6 +692,10 @@ gpt: one big brief for sweeping multi-file work.`;
 
 function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
   const value = parsed.flags.engine;
+  if (value === undefined) {
+    console.log("cdx: engine gemini (default)");
+    return "gemini";
+  }
   if (value === "gpt" || value === "gemini") return value;
   const usage = `usage: cdx ${command} requires --engine gpt|gemini; gemini is the default for fully specified work, gpt for judgment and design-heavy multi-file work`;
   if (command === "spawn") fail(`${usage}\n\n${ENGINE_PICKER}`);
@@ -819,6 +833,22 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
       fail(`worktree setup failed in ${path}${tail ? `: ${tail}` : ""}`);
     }
   }
+  const repoSetup = `${path}/.cdx-worktree-setup`;
+  let isExecutable = false;
+  try {
+    const st = statSync(repoSetup);
+    if (st.isFile() && (st.mode & 0o111) !== 0) {
+      isExecutable = true;
+    }
+  } catch { /* not present */ }
+  if (isExecutable) {
+    console.log("cdx: repo worktree setup: .cdx-worktree-setup");
+    const setup = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", "./.cdx-worktree-setup"], cwd: path, env: uncoloredChildEnv() });
+    if (!setup.success) {
+      const tail = (setup.stderr.toString() || setup.stdout.toString()).trim().split("\n").at(-1) ?? "";
+      fail(`worktree setup failed in ${path}${tail ? `: ${tail}` : ""}`);
+    }
+  }
   return { path, repo: repoRoot, branch };
 }
 
@@ -873,7 +903,11 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
     const workState = kind === "work" ? "running" : existing ? workStateOf(existing) : "adopted";
     ledger[lane] = {
       ...(existing ?? {}),
-      engine: opts?.preserveEngine ? laneEngine(existing) : opts?.engine ?? laneEngine(existing),
+      // The work engine belongs to the work thread. A review round on an
+      // existing lane records its own engine beside it, so a later resume
+      // still reattaches to the right runtime.
+      engine: opts?.preserveEngine || (kind === "review" && existing) ? laneEngine(existing) : opts?.engine ?? laneEngine(existing),
+      reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
       codexHome,
@@ -915,6 +949,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       lastEventAt: undefined,
       note: kind === "work" ? undefined : existing?.note,
       exitCode: kind === "work" ? undefined : existing?.exitCode,
+      diffEmpty: undefined,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
     };
@@ -1017,6 +1052,7 @@ function recursiveFileListing(cwd: string): Omit<ReviewTreeSnapshot, "kind"> {
 function captureReviewTree(cwd: string): ReviewTreeSnapshot {
   const inside = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--is-inside-work-tree"] });
   if (!inside.success) return { kind: "files", ...recursiveFileListing(cwd) };
+  const head = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "HEAD"] });
   const status = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--porcelain=v1", "-z"] });
   const diff = Bun.spawnSync({ cmd: ["git", "-C", cwd, "diff", "HEAD", "--binary", "--no-ext-diff"] });
   const names = Bun.spawnSync({ cmd: ["git", "-C", cwd, "diff", "HEAD", "--name-only", "--no-ext-diff"] });
@@ -1068,7 +1104,7 @@ function captureReviewTree(cwd: string): ReviewTreeSnapshot {
   }
   return {
     kind: "git",
-    fingerprint: hashParts([status.stdout, status.stderr, diff.stdout, diff.stderr, ...untrackedParts]),
+    fingerprint: hashParts([head.stdout, status.stdout, status.stderr, diff.stdout, diff.stderr, ...untrackedParts]),
     paths: [...paths].sort(),
     pathFingerprints,
   };
@@ -1197,6 +1233,17 @@ async function runRound(lane: string, round: number): Promise<number> {
   }
 }
 
+// The template is a short stock message. A real report that quotes the
+// same words runs far longer, so length bounds the match.
+const AGY_CANCELLATION_TEMPLATE_MAX = 300;
+function isAgyCancellationTemplate(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length > AGY_CANCELLATION_TEMPLATE_MAX) return false;
+  return trimmed.includes("User initiated cancellation")
+    || trimmed.includes("Execution stopped per your cancellation request")
+    || trimmed.startsWith("An execution step was interrupted by the user");
+}
+
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
   const startingLane = readLedger()[lane];
@@ -1207,6 +1254,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
   const reviewSnapshot = gemini && startingLane?.kind === "review" ? captureReviewTree(spec.cwd) : undefined;
+  const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(spec.cwd) : undefined;
   withLedger((ledger) => {
     const item = ledger[lane]!;
     item.pid = process.pid;
@@ -1373,10 +1421,13 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       }
       if (typeof result.response === "string" && result.response.trim()) {
         writeFileSync(reportPath, `${result.response.trim()}\n`);
+        if (isAgyCancellationTemplate(result.response)) {
+          turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+        }
       }
       if (result.status !== "SUCCESS") {
         const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
-        turnFailureReason = detail || "gemini result status ERROR";
+        turnFailureReason ??= detail || "gemini result status ERROR";
       }
       geminiTurnsCompleted += 1;
       const wake = geminiTurnWake;
@@ -1834,6 +1885,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   })();
   const beforeFinalize = readLedger()[lane];
   const reviewModifiedPath = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
+  const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(spec.cwd) : undefined;
+  const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
+  const unchangedWithGate = Boolean(workTreeUnchanged && spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
+  const unchangedNoGate = Boolean(workTreeUnchanged && !spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
+
   const capturedSessionId = beforeFinalize?.sessionId;
   const textSessionId = !jsonMode
     ? /session id: ([0-9a-f-]{36})/i.exec(`${readFileSync(logPath, "utf8")}\n${stderrText}`)?.[1]
@@ -1845,14 +1901,20 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   // rounds only (ledger kind, since intent reviews launch with mode "spawn").
   let gateExit: number | undefined;
   let gateTimedOut = false;
-  if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk) {
+  if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason && !unchangedWithGate) {
     const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
     writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
   }
+  if (unchangedWithGate) {
+    exitCode = 1;
+  }
+  if (unchangedNoGate && existsSync(reportPath)) {
+    appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
+  }
   const gateFailed = gateExit !== undefined && gateExit !== 0;
-  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath ? "done" : "failed";
+  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && !unchangedWithGate ? "done" : "failed";
   expireRoundQuestions(lane, round);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
@@ -1862,6 +1924,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     let roundNote: string | undefined;
     if (reviewModifiedPath) roundNote = `review modified the tree: ${reviewModifiedPath}`;
+    else if (unchangedWithGate) roundNote = "tree unchanged under a required gate: no work landed, gate not run";
     else if (gateFailed) {
       roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
         ? `gate failed after work; baseline passed (exit ${gateExit}): ${spec.gate}`
@@ -1881,6 +1944,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const errTail = stderrText.trim().split("\n").at(-1);
       if (errTail) roundNote = `stderr: ${errTail.slice(0, 200)}`;
     }
+    if (unchangedNoGate) item.diffEmpty = true;
     if (item.kind === "review") {
       item.reviewState = roundState;
       item.reviewExitCode = exitCode;
@@ -1920,7 +1984,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   }
   const finalRoundState = roundStateOf(entry);
   const finalRoundNote = entry.kind === "review" ? entry.reviewNote : entry.note;
-  feedOwned(`[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
+  const diffToken = entry.diffEmpty ? " diff=empty" : "";
+  feedOwned(`[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
@@ -2176,7 +2241,7 @@ async function spawnCommand(argv: string[]) {
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
-  if (!lane || !brief) fail(`usage: cdx spawn <lane> --engine gpt|gemini [options] "<brief>"\n\n${ENGINE_PICKER}`);
+  if (!lane || !brief) fail(`usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`);
   validLane(lane);
   requireEngineBinary(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
@@ -2366,7 +2431,9 @@ async function reviewCommand(argv: string[]) {
   requireEngineBinary(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
-  if (existing) rejectEngineMismatch(lane, existing, engine);
+  if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
+    console.log(color.yellow("cdx: gemini reviewing a gemini lane; give the intent explicit attack items"));
+  }
   const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = engineEffort(engine, parsed);
@@ -2483,8 +2550,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : fmtTokens(entry.tokens);
   const tokenDetail = `${tokenLabel} · ${engine === "gemini" ? "gemini conversation" : "codex session"} ${(entry.workSessionId ?? entry.sessionId)?.slice(0, 8) ?? "-"}`;
   const report = entry.workReport ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
+  const lastParts = [entry.diffEmpty ? "no tree change" : undefined, entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
   const last = entry.kind === "work" && active ? entry.lastAction ?? "-"
-    : [entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean).join(" · ") || "-";
+    : lastParts.join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
   const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
   if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
@@ -3740,11 +3808,11 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
 Engines:
 ${ENGINE_PICKER}
 
-  spawn  <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
+  spawn  <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
   resume <lane> [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
-  review <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
-  adopt  <lane> <sessionId> --engine gpt|gemini [--account NAME] [--cd D]
+  review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
+  adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd D]
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
   ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
@@ -3770,7 +3838,10 @@ Worktree spawns check the gate before worker startup. Use --gate-baseline-check
 to do the same in a non-worktree spawn. A baseline failure is gate-invalid.
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
-// ---------------------------------------------------------------------------
+const REFUSED_INSIDE_LANE = new Set([
+  "spawn", "resume", "fork", "review", "adopt",
+  "kill", "close", "clean", "gate", "reply",
+]);
 
 const [command, ...argv] = process.argv.slice(2);
 try {
@@ -3782,7 +3853,12 @@ try {
   throw err;
 }
 
+export { isAgyCancellationTemplate, houseRules };
+
 async function dispatch(command: string | undefined, argv: string[]) {
+  if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
+    fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the head`);
+  }
 switch (command) {
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
@@ -3803,7 +3879,7 @@ switch (command) {
     const parsed = parseArgs(argv, ["engine", "cd", "account"]);
     const engine = engineOf(parsed, "adopt");
     const [lane, sessionId] = parsed.rest;
-    if (!lane || !sessionId) fail("usage: cdx adopt <lane> <sessionId> --engine gpt|gemini [--cd <dir>]");
+    if (!lane || !sessionId) fail("usage: cdx adopt <lane> <sessionId> [--engine gpt|gemini] [--cd <dir>]");
     validLane(lane);
     requireEngineBinary(engine);
     if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
