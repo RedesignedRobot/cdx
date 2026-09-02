@@ -79,10 +79,9 @@ resume, fork, and the review intent.
 
 `spawn --worktree <path>` creates a git worktree at that path on branch
 `lane/<lane>` from the repo at `--cd` (or the current directory), runs the
-optional `worktreeSetup` config command inside it, and runs the lane there.
-A repository may ship an executable `.cdx-worktree-setup` at its root;
-`spawn --worktree` runs it after the global `worktreeSetup` command and fails
-the spawn on nonzero exit. Use it whenever parallel lanes touch the same
+optional `worktreeSetup` config command and the repository's
+`.cdx-worktree-setup` hook inside it (see Configuration), and runs the lane
+there. Use it whenever parallel lanes touch the same
 repository, so each worker owns its files exclusively. `status` shows the
 branch; `close` prints the removal commands and never deletes anything itself.
 
@@ -159,6 +158,12 @@ records `mode=follow-up-turn`. cdx never consumes a record without delivery.
 `send` refuses review lanes before it writes a record.
 
 The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines.
+While `CDX_LANE` is set, cdx refuses `spawn`, `resume`, `fork`, `review`,
+`adopt`, `kill`, `close`, `clean`, `gate`, and `reply` with the message
+`lane workers cannot drive the harness`; a worker that wants to test the
+harness does it through `cdx.test.ts` under a temporary `CDX_HOME`.
+Inspection commands (`status`, `tail`, `report`, `log`, `feed`, `usage`,
+`questions`, `inbox`, `msg`, `brief`, `doctor`) and `ask` stay available.
 A worker uses `cdx ask [--timeout MIN] "<question>"` when an open point changes
 the architecture or file set. Gemini workers ask via `cdx ask` when a gap changes
 the outcome, ask one small question per gap, and take the narrowest reading only
