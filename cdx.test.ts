@@ -970,6 +970,13 @@ describe("cdx execution engines", () => {
     expect(native.exitCode).toBe(0);
     const prompt = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((record) => record.input)?.input;
     expect(prompt).toContain("Review the diff shown by `git diff HEAD`");
+    const promptFor = (args: string[]) => {
+      writeFileSync(trace, "");
+      expect(runCli(["review", ...args, "--engine", "gemini", "--cd", root], env).exitCode).toBe(0);
+      return readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((record) => record.input)?.input;
+    };
+    expect(promptFor(["gemini-review-base", "--base", "main"])).toContain("Review the diff shown by `git diff main...HEAD`");
+    expect(promptFor(["gemini-review-commit", "--commit", "abc1234"])).toContain("Review the diff shown by `git show abc1234`");
 
     writeFileSync(`${root}/aaa-existing-dirty.txt`, "unchanged baseline dirt\n");
     writeFileSync(`${root}/fake-review-change.txt`, "original dirty content\n");
@@ -1044,6 +1051,17 @@ describe("cdx execution engines", () => {
     expect(result.stderr).toContain("effort");
   });
 
+  test("doctor --probe round-trips the gemini engine", () => {
+    const root = tempPath("gemini-probe");
+    const state = `${root}/state`;
+    const bin = installFakeCodex(root, { doctorDies: true });
+    installFakeAgy(root);
+    const env = baseEnv(state, bin);
+    env.PATH = `${bin}:${process.execPath.replace(/\/[^/]+$/, "")}:/usr/bin:/bin`;
+    const result = runCli(["doctor", "--probe"], env);
+    expect(result.stdout).toContain("gemini probe: OK");
+  });
+
   test("doctor checks and installs both gemini agent files", () => {
     const root = tempPath("gemini-doctor");
     const state = `${root}/state`;
@@ -1078,6 +1096,17 @@ describe("raw engine guard", () => {
       const result = Bun.spawnSync({ cmd: [process.execPath, guard], stdin: new Blob([guardInput(command)]) });
       expect(result.exitCode).toBe(2);
       expect(result.stderr.toString()).toContain("Use cdx --engine gemini for Antigravity work. Run 'cdx help'.");
+    }
+  });
+
+  test("blocks headless agy hidden behind quotes or escapes", () => {
+    for (const command of ['agy "--print=x"', '"agy" --print=x', "\\agy --print=x", "agy '-p' x"]) {
+      const result = Bun.spawnSync({ cmd: [process.execPath, guard], stdin: new Blob([guardInput(command)]) });
+      expect(result.exitCode).toBe(2);
+    }
+    for (const command of ['echo "agy --print=x"', "git commit -m 'codex exec notes'"]) {
+      const result = Bun.spawnSync({ cmd: [process.execPath, guard], stdin: new Blob([guardInput(command)]) });
+      expect(result.exitCode).toBe(0);
     }
   });
 
