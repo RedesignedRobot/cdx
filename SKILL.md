@@ -1,23 +1,40 @@
 ---
 name: cdx
-description: Run OpenAI Codex CLI work, review, steering, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, monitoring, reporting, closing, or cleaning Codex lanes from Claude Code.
+description: Run OpenAI Codex and Google Antigravity work, review, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, monitoring, reporting, closing, or cleaning lanes from Claude Code.
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
 # cdx
 
-Use `cdx` for Codex work commands instead of raw `codex exec`, `codex review`,
-`codex resume`, or `codex fork`. cdx records each lane, captures its report,
-tracks its state, and applies the policy set in `config.json`. Work lanes
-use one Codex app-server stdio child per round with approval policy `never`,
-thread sandbox `danger-full-access`, and turn sandbox policy
-`dangerFullAccess`. Review lanes stay on `codex exec` and `codex review` in
-fresh, read-only sessions.
+Use `cdx` for headless Codex and Antigravity work. cdx records each lane,
+captures its report, tracks its state, and applies the policy in `config.json`.
+Every new spawn, review, and adopted session must name `--engine gpt|gemini`.
+Resume inherits the lane engine.
+
+## Which engine
+
+```text
+gpt:
++ strongest code and judgment on hard multi-file work, design-heavy lanes
+- slow (20-30 min lanes), scarce weekly budget, burns fast
+gemini:
++ near-unlimited quota, fast, good on bounded briefs (investigate, read, search, audit, review, test, small scoped builds)
+- weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks
+gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
+gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
+gpt: one big brief for sweeping multi-file work.
+```
+
+The Claude head plans, briefs, reviews, and merges. GPT through Codex is level
+one for the hardest implementation and design work. Gemini 3.8 Flash high
+through Antigravity is level two for bounded investigation, review, tests, and
+small builds. Gemini always uses `gemini-3.8-flash-high`. Its effort is not
+configurable.
 
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
+cdx spawn  <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
 cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime <min>] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
@@ -27,8 +44,8 @@ cdx reply  <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
-cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
+cdx review <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> --engine gpt|gemini [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
 cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
@@ -45,7 +62,7 @@ cdx brief
 ```
 
 A brief of `-` reads the brief from stdin. Use it for long prompts with quotes
-or backticks: `cdx spawn big-task --bg - < /tmp/brief.md`. It works for spawn,
+or backticks: `cdx spawn big-task --engine gemini --bg - < /tmp/brief.md`. It works for spawn,
 resume, fork, and the review intent.
 
 `spawn --worktree <path>` creates a git worktree at that path on branch
@@ -55,35 +72,24 @@ Use it whenever parallel lanes touch the same repository, so each worker owns
 its files exclusively. `status` shows the branch; `close` prints the removal
 commands and never deletes anything itself.
 
-Work spawn, resume, and fork rounds each own one `codex app-server` child over
-newline-delimited stdio JSON-RPC. cdx initializes the child, starts, resumes,
-or forks the thread, then starts the turn. It writes every app-server
-notification to the round's JSONL log. A report comes from the last
-`agentMessage` with `phase: "final_answer"`, or from an unphased
-`agentMessage` on an older server. Explicit commentary never counts. Without
-a qualifying message, the round fails with `no final report` and skips its
-gate. Work rounds do not use `--output-last-message`. `--image` maps to
-`localImage` input items, `--schema` maps to the turn's `outputSchema`, and
-`--add-dir` maps to extra writable roots in the thread configuration.
+GPT work rounds own one `codex app-server` child over stdio JSON-RPC. Gemini
+work rounds own one `agy` child with stream JSON input and output. cdx launches
+Gemini with `gemini-3.8-flash-high`, the configured work agent, and every lane
+directory passed through `--add-dir`. It removes `CODEX_HOME` from the Gemini
+environment. Each engine writes raw events to the round JSONL log and stderr
+to a separate log. GPT reports come from the final app-server agent message.
+Gemini reports come from the response in the last `result` event. `--schema`
+reaches both engines. `--image` works only with GPT.
 
-`resume` keeps the lane's working directory and always reattaches to the
-lane's work thread, recorded as `workSessionId` in the ledger, even when the
-latest round was a review. Only a lane that never had a work session resumes
-as a read-only review follow-up. `resume` does not accept `--cd` or `--json`.
-It uses the lane's recorded account and Codex home for the app-server child.
-`resume --effort E` overrides the stored effort for that round onward; without
-it the session keeps its own settings.
+`resume` keeps the lane's working directory and engine. It rejects `--engine`.
+GPT reattaches to the recorded work thread and account. Gemini passes the
+recorded conversation ID to `agy --conversation`. A ledger row without an
+engine means GPT. `resume` does not accept `--cd` or `--json`. GPT accepts an
+effort override. Gemini ignores it with a note and records effort `high`.
 `resume --gate "<cmd>"` replaces the lane's stored gate before the round and
-keeps it for later resumes. `fork`
-branches an existing lane or session and keeps the source session's working
-directory, so it does not accept `--cd`; a raw-session-ID fork reads that
-directory from the session's rollout file. A lane-based fork inherits the
-parent lane's recorded account and Codex home and records both on the new lane.
-A raw-session-ID fork has no ledger row to inherit from, so it accepts
-`--account` and otherwise uses the primary account.
-
-Spawn sends the configured model. Resume and fork omit the model from their
-thread request and `turn/start`, so each stored thread keeps its model.
+keeps it for later resumes. `fork` inherits a source lane's engine. GPT can
+fork a lane or a raw Codex session ID. A raw session ID fork is GPT-only.
+Gemini has no headless fork, so use `cdx resume` for a Gemini lane.
 
 `spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work
 round exits 0 with a report, cdx runs the gate with `/bin/sh -lc` in the lane
@@ -103,39 +109,35 @@ gate failure that had no baseline check suggests `--gate-baseline-check`.
 `cdx gate <lane> --clear` to remove it. Both forms print the old and new gate.
 They refuse to change a lane while it is active.
 
-`--max-runtime <min>` on spawn and resume sends SIGTERM to the Codex child at
+`--max-runtime <min>` on spawn and resume sends SIGTERM to the engine child at
 the cap. It sends SIGKILL after 10 seconds if the child remains alive, then
 fails the round with `max runtime exceeded (Nm)`.
 
-`cdx kill <lane>` stops a running lane: SIGTERM lets the runner reap its
-codex child and finalize with a signal note; a runner still silent after 10s,
-or a dead runner with a live codex orphan, gets SIGKILL and a direct ledger
+`cdx kill <lane>` stops a running lane. SIGTERM lets the runner reap its
+engine child and finalize with a signal note. A runner still silent after 10s,
+or a dead runner with a live engine orphan, gets SIGKILL and a direct ledger
 finalize with note `killed`. Exit codes 130, 137, and 143 always finalize as
 `terminated by signal`, never as auth failures.
 
-Native review uses one of `--uncommitted`, `--base`, or `--commit` and cannot
-take a custom intent. Without a target flag, review needs an intent and may
-take `--scope`. Native and intent-based reviews always start fresh, read-only
-sessions. Intent-based reviews receive an adversarial brief that asks for
-severity-ranked findings, concrete failure cases, CONFIRMED or PLAUSIBLE
-labels, and a closing fenced json findings block; cdx parses that block into
-`reports/<lane>-r<n>.findings.json` (best effort, empty array when clean).
-Review defaults to the lane's recorded worktree or working directory. `--cd`
-overrides it. The launch output prints the resolved review directory.
+A review uses one of `--uncommitted`, `--base`, or `--commit`, or takes a custom
+intent with optional `--scope`. GPT target reviews use Codex's native reviewer.
+Gemini receives an equivalent `git diff` instruction. Both engines receive the
+same findings contract, and cdx extracts its fenced JSON block into
+`reports/<lane>-r<n>.findings.json`. Codex enforces read-only access. For
+Gemini, cdx compares the repository tree before and after the round. A changed
+path fails the review, but cdx keeps the report.
 
 ## Communication
 
 Use `cdx send <lane> "<text>"` to correct a running work lane. The command
 appends the text, send time, and optional sender prefix to
-`$CDX_HOME/control/<lane>-r<round>.jsonl`. The runner uses `turn/steer` when a
-turn is active. If the server rejects the steer because the turn has ended,
-cdx retains the record and starts a follow-up turn after `turn/completed`. It
-never consumes a record without delivery. Feed lines record `mode=steered` or
-`mode=follow-up-turn`. A delivered instruction increments the `steers` count
-shown by `cdx status`. `send` refuses review lanes with exit 1 before it writes
-a control record or feed line.
+`$CDX_HOME/control/<lane>-r<round>.jsonl`. GPT uses `turn/steer` while a turn is
+active and starts a follow-up turn otherwise. Antigravity cannot steer
+mid-turn, so every Gemini control becomes a new stdin user turn. Its feed line
+records `mode=follow-up-turn`. cdx never consumes a record without delivery.
+`send` refuses review lanes before it writes a record.
 
-The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to the Codex child.
+The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines.
 A worker uses `cdx ask [--timeout MIN] "<question>"` when an open point changes
 the architecture or file set. `ask` writes
 `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time,
@@ -179,9 +181,9 @@ message for this session. Treat every other target as information only.
   code, tokens, report path, note, session ID) for machine parsing.
   `--report` also prints each finished lane's report content (a `reportText`
   field under `--json`).
-- Use `cdx usage` to answer capacity questions: per-account plan, rate-limit
-  windows with reset dates, reset credits, and all-time lane and token totals
-  from the ledger. `--json` returns the raw structures.
+- Use `cdx usage` to answer capacity questions. It shows Codex account windows,
+  Gemini weekly and five-hour remaining percentages, reset times, and all-time
+  ledger totals. `--json` returns both snapshots.
 - Use `cdx feed -n 30` to replay recent completion and stall lines after a
   context compaction or an away stretch; the live monitor only delivers lines
   to open sessions. `feed` reads only the requested tail. `cdx clean` truncates
@@ -225,6 +227,9 @@ When a `[cdx] WARNING: OpenAI Codex usage` line arrives in the session feed,
 tell the user plainly that their OpenAI Codex usage is consumed. Include the
 reset time and whether a reset credit is available.
 
+When Gemini usage is requested, report both the weekly and five-hour remaining
+percentages and their reset times.
+
 ## Configuration
 
 cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
@@ -236,7 +241,12 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
   "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
   "rules": [],
-  "worktreeSetup": "bun install"
+  "worktreeSetup": "bun install",
+  "gemini": {
+    "model": "gemini-3.8-flash-high",
+    "agent": "cdx-lane",
+    "reviewAgent": "cdx-review"
+  }
 }
 ```
 
@@ -244,35 +254,26 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
 before the lane starts. A nonzero exit aborts the spawn and leaves the
 worktree in place for inspection.
 
-cdx passes `model` through app-server for work spawn. Resume and fork omit the
-model so the stored thread keeps it. Reviews pass it to the Codex CLI. The
-doctor probe exercises the full app-server lifecycle. It initializes a child,
-starts a temporary read-only thread and
-turn, collects the reply and token usage, unsubscribes, and closes the child.
-A closed child or stream fails the probe with its reason instead of leaving it
-waiting.
-Codex 0.149.1 has no `thread/close` request, so cdx uses `thread/unsubscribe`
-before closing its owned stdio child.
-cdx accepts only effort values listed in `efforts`. Spawn and review use
-`defaultEffort` when `--effort` is absent. Fork keeps the source lane's effort
-when that effort remains allowed. A raw session ID fork and an adopted lane use
-`defaultEffort`. If a stored source effort is no longer allowed, pass an
-allowed `--effort`. Resume keeps the lane's stored effort unless `--effort`
-overrides it. A malformed config fails with a message that names the config
-file.
+Existing top-level model and effort keys configure GPT. The optional `gemini`
+object accepts only `model`, `agent`, and `reviewAgent`; the shown values are
+its defaults. Gemini always runs the configured model at high reasoning and
+records effort `high`. cdx ignores a Gemini `--effort` flag with a note. A
+malformed config fails with a message that names the config file.
 
-When `config.json` defines accounts, cdx gives each login its own `CODEX_HOME`.
-New spawn and review lanes choose the first account with capacity. Their
-`--account NAME` flag forces one. Every command that reopens or inspects an
-existing lane reads the account and Codex home from its ledger row before it
-touches Codex. This includes resume, lane-based fork, review, send, ask, reply,
-tail, report, and wait where those commands need the app-server. A lane never
-changes account after spawn.
-When an existing-lane command accepts `--account` for another mode, it rejects
-the flag and names the pinned account. Lane-based fork records the inherited
-account on the new lane. Adopt and raw-session-ID fork accept `--account` and
-otherwise use the primary. A pre-upgrade lane without account data falls back
-to the default Codex home and writes a feed note about the fallback.
+`cdx doctor` reports both binaries, Antigravity usage, and both shipped agent
+files. `doctor --fix` links those agents into
+`~/.gemini/config/agents/<name>/agent.md`. `doctor --probe` runs a short live
+request through each installed engine. A missing `agy` is a warning unless the
+config has a `gemini` object.
+
+When `config.json` defines accounts, cdx gives each Codex login its own
+`CODEX_HOME`. New GPT spawn and review lanes choose the first account with
+capacity. Their `--account NAME` flag forces one. A lane never changes account
+after spawn. Gemini does not use Codex account selection and rejects
+`--account`.
+GPT lane forks inherit the account. GPT adopt and raw-session-ID fork accept
+`--account` and otherwise use the primary account. A pre-upgrade lane without
+account data falls back to the default Codex home and writes a feed note.
 
 cdx appends each `rules` entry to the built-in brief rules. It then appends the
 contents of `.cdx-rules.md` from the lane's working directory when that file
@@ -281,17 +282,21 @@ long-running servers. They require the final report and ask the worker to use
 subagent threads when independent work can run in parallel. They also tell the
 worker to run `cdx ask` when an open point changes the architecture or file set,
 ask once per open point, and skip questions that the brief or code answers.
-Review rules keep the lane read-only and require a report.
+Gemini work rules add four lines: execute as written, ask one small question per
+gap, take the narrowest reading on timeout, and never use search_web,
+read_url_content, or browser tools. The last one lives in the brief because agy
+ignores the agent file tool allowlist.
+Review rules forbid writes and require a report. The harness also checks a
+Gemini review's tree before and after the round.
 
 State uses plain files under `$CDX_HOME`: `ledger.json`, `logs/`, `reports/`,
-`briefs/`, `specs/`, `control/`, `questions/`, and `feed.log`. All work rounds
-write app-server notifications as JSONL. Review logs contain Codex CLI output.
+`briefs/`, `specs/`, `control/`, `questions/`, and `feed.log`. Both engines
+write raw round events as JSONL and stderr to separate logs.
 After a work turn completes with a qualifying report, cdx writes the report
 before unsubscribe and child shutdown. A later cleanup failure produces a
 warning instead of failing the completed round. A missing qualifying message
 fails with `no final report`, and cdx does not run the acceptance gate.
-`turn.error` messages and `turn/failed` details go to the ledger note and feed
-line.
+Engine errors go to the ledger note and feed line.
 
 ## Claude Code plugin
 
@@ -300,10 +305,8 @@ hooks:
 
 - `monitors/monitors.json` tails `$HOME/.cdx/feed.log` and sends lane
   completion lines to the Claude Code session.
-- `hooks/guard-raw-codex.ts` checks Bash commands. It strips single-quoted and
-  double-quoted segments before matching, then blocks a `codex` command word
-  followed by `e`, `exec`, `review`, `resume`, `fork`, `cloud`, or `apply`.
-  Login, logout, `--version`, features, debug, other Codex commands, quoted
-  mentions, and `cdx` commands pass through.
+- `hooks/guard-raw-codex.ts` blocks raw headless Codex and Antigravity work
+  commands. Codex login and version checks pass through. Antigravity model
+  listing, help, update, and version checks pass through.
 - The SessionStart hook runs the plugin copy of `cdx.ts brief`. It prints only
   running or failed lanes and does not require `cdx` on `PATH`.
