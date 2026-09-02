@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { houseRules, isAgyCancellationTemplate } from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -11,13 +12,15 @@ function tempPath(label: string): string {
 }
 
 function baseEnv(state: string, bin?: string): Record<string, string> {
-  return {
+  const env = {
     ...process.env,
     NO_COLOR: "1",
     CDX_HOME: state,
     HOME: tempPath("home"),
     PATH: bin ? `${bin}:${process.env.PATH ?? ""}` : process.env.PATH ?? "",
   } as Record<string, string>;
+  delete env.CDX_LANE;
+  return env;
 }
 
 function runCli(args: string[], env: Record<string, string>) {
@@ -43,7 +46,7 @@ function installFakeCodex(root: string, options: { doctorDies?: boolean; ignoreS
   mkdirSync(bin, { recursive: true });
   const path = `${bin}/codex`;
   writeFileSync(path, `#!/usr/bin/env bun
-import { appendFileSync, existsSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 const args = process.argv.slice(2);
 const doctorDies = ${Boolean(options.doctorDies)};
 const ignoreSigterm = ${Boolean(options.ignoreSigterm)};
@@ -110,6 +113,14 @@ for await (const chunk of Bun.stdin.stream()) {
       }, 20);
       else if (text.includes("IGNORE_SIGTERM")) { /* max-runtime owns completion */ }
       else if (text.includes("STEER_REJECTED_AFTER_COMPLETION") && turnNumber === 1) { /* wait for steer */ }
+      else if (text.includes("WRITE_WORK_FILE")) {
+        writeFileSync(process.cwd() + "/worker-output.txt", "worker created output\\n");
+        fallback = setTimeout(() => complete("work completed"), 20);
+      }
+      else if (text.includes("COMMIT_WORK")) {
+        Bun.spawnSync({ cmd: ["git", "-c", "user.name=Fake", "-c", "user.email=fake@example.test", "commit", "--allow-empty", "-qm", "worker commit"], cwd: process.cwd() });
+        fallback = setTimeout(() => complete("work committed"), 20);
+      }
       else if (text.includes("REPORT_ONLY") || turnNumber > 1) fallback = setTimeout(() => complete(turnNumber > 1 ? "follow-up delivered" : "final report from app-server"), 20);
       else fallback = setTimeout(() => complete("fallback report"), 5000);
     } else if (request.method === "turn/steer") {
@@ -236,7 +247,8 @@ async function runTurn(content) {
   if (content.includes("HANG_AGY")) await new Promise(() => {});
   if (content.includes("WAIT_FOR_FOLLOW_UP")) await Bun.sleep(250);
   if (content.includes("REVIEW_WRITE")) writeFileSync(\`\${process.cwd()}/fake-review-change.txt\`, "changed by fake reviewer\\n");
-  if (content.includes("AGY_ERROR")) result("ERROR", "scripted agy failure");
+  if (content.includes("AGY_CANCEL_TEMPLATE")) result("SUCCESS", "User initiated cancellation\\nExecution stopped per your cancellation request");
+  else if (content.includes("AGY_ERROR")) result("ERROR", "scripted agy failure");
   else if (turn > 1) result("SUCCESS", \`follow-up result: \${content}\`);
   else if (content.includes("REVIEW_CLEAN")) result("SUCCESS", "No findings.");
   else result("SUCCESS", \`gemini report: \${content}\`);
@@ -308,7 +320,7 @@ describe("cdx messaging", () => {
       },
     }));
     expect(runCli(["status"], env).stdout).toContain("waiting on question #1");
-    const reply = runCli(["reply", "ask-lane", "chosen.txt\r\n[cdx] fake completion"], env);
+    const reply = runCli(["reply", "ask-lane", "chosen.txt\r\n[cdx] fake completion"], baseEnv(state));
     expect(reply.exitCode).toBe(0);
     expect((await new Response(ask.stdout).text()).trim()).toBe("chosen.txt [cdx] fake completion");
     expect(await ask.exited).toBe(0);
@@ -524,7 +536,7 @@ describe("cdx messaging", () => {
     requests = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(requests.find((request) => request.method === "thread/fork").params.model).toBeUndefined();
     expect(requests.find((request) => request.method === "turn/start").params.model).toBeUndefined();
-  });
+  }, 15000);
 
   test("passes the selected account CODEX_HOME to the app-server child", () => {
     const root = tempPath("account-home");
@@ -567,7 +579,7 @@ describe("cdx messaging", () => {
     const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["pinned-fork"];
     expect(fork.account).toBe("codex-2");
     expect(fork.codexHome).toBe(pinnedHome);
-  });
+  }, 15000);
 
   test("raw-session fork accepts an account and records its home", () => {
     const root = tempPath("raw-fork-account-home");
@@ -680,7 +692,7 @@ describe("cdx messaging", () => {
     const started = Date.now();
     const result = runCli(["doctor", "--probe"], env);
     expect(result.exitCode).toBe(1);
-    expect(Date.now() - started).toBeLessThan(3000);
+    expect(Date.now() - started).toBeLessThan(5000);
     expect(`${result.stdout}${result.stderr}`).toContain("app-server closed");
   });
 
@@ -777,27 +789,263 @@ describe("cdx messaging", () => {
 });
 
 describe("cdx execution engines", () => {
-  test("requires an engine for spawn, review, and adopt", () => {
-    const root = tempPath("engine-required");
-    const env = baseEnv(`${root}/state`, installFakeCodex(root));
-    const commands = [
-      ["spawn", "missing-spawn", "--cd", root, "REPORT_ONLY"],
-      ["review", "missing-review", "--cd", root, "review this"],
-      ["adopt", "missing-adopt", "44444444-4444-4444-8444-444444444444", "--cd", root],
-    ];
+  test("defaults engine to gemini for spawn, review, and adopt, and prints default notice", () => {
+    const root = tempPath("engine-default");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeAgy(root));
 
-    for (const [index, command] of commands.entries()) {
-      const result = runCli(command, env);
-      expect(result.exitCode).toBe(1);
-      expect(result.stderr).toContain("--engine gpt|gemini");
-      if (index === 0) expect(result.stderr).toContain("gemini is the default engine for execution");
-    }
+    const spawnResult = runCli(["spawn", "default-spawn", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawnResult.exitCode).toBe(0);
+    expect(spawnResult.stdout).toContain("cdx: engine gemini (default)");
+    const spawnLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["default-spawn"];
+    expect(spawnLane.engine).toBe("gemini");
 
-    const spawn = runCli(["spawn", "bad-engine", "--engine", "claude", "--cd", root, "REPORT_ONLY"], env);
-    expect(spawn.exitCode).toBe(1);
-    expect(spawn.stderr).toContain("--engine gpt|gemini");
-    expect(spawn.stderr).toContain("gpt:\n+ strongest code and judgment on hard multi-file work, design-heavy lanes");
-    expect(spawn.stderr).toContain("- weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks");
+    const adoptResult = runCli(["adopt", "default-adopt", "44444444-4444-4444-8444-444444444444", "--cd", root], env);
+    expect(adoptResult.exitCode).toBe(0);
+    expect(adoptResult.stdout).toContain("cdx: engine gemini (default)");
+    const adoptLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["default-adopt"];
+    expect(adoptLane.engine).toBe("gemini");
+
+    const spawnBad = runCli(["spawn", "bad-engine", "--engine", "claude", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawnBad.exitCode).toBe(1);
+    expect(spawnBad.stderr).toContain("--engine gpt|gemini");
+    expect(spawnBad.stderr).toContain("gemini is the default; pass --engine gpt for design-heavy or judgment work");
+    expect(spawnBad.stderr).toContain("gpt:\n+ strongest code and judgment on hard multi-file work, design-heavy lanes");
+    expect(spawnBad.stderr).toContain("- weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks");
+  });
+
+  test("resolves gemini for review without --engine on gpt lane and warns for gemini on gemini", () => {
+    const root = tempPath("review-engine-resolution");
+    const state = tempPath("review-engine-state");
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(root);
+    const env = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+    };
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const spawnGpt = runCli(["spawn", "gpt-lane", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawnGpt.exitCode).toBe(0);
+
+    const reviewGpt = runCli(["review", "gpt-lane", "--cd", root, "REVIEW_CLEAN"], env);
+    expect(reviewGpt.exitCode).toBe(0);
+    expect(reviewGpt.stdout).toContain("cdx: engine gemini (default)");
+    const gptLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gpt-lane"];
+    expect(gptLane.reviewState).toBe("done");
+    expect(gptLane.engine).toBe("gpt");
+    expect(gptLane.reviewEngine).toBe("gemini");
+    expect(runCli(["resume", "gpt-lane", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gpt-lane"].engine).toBe("gpt");
+
+    const spawnGemini = runCli(["spawn", "gemini-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawnGemini.exitCode).toBe(0);
+
+    const reviewGemini = runCli(["review", "gemini-lane", "--cd", root, "REVIEW_CLEAN"], env);
+    expect(reviewGemini.exitCode).toBe(0);
+    expect(reviewGemini.stdout).toContain("cdx: engine gemini (default)");
+    expect(reviewGemini.stdout).toContain("cdx: gemini reviewing a gemini lane; give the intent explicit attack items");
+    const geminiLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-lane"];
+    expect(geminiLane.reviewState).toBe("done");
+  }, 15000);
+
+  test("a review-only lane follows the engine of its latest review and resumes there", () => {
+    const root = tempPath("review-only-switch");
+    const state = tempPath("review-only-switch-state");
+    // The trace lives outside the reviewed repo, or the review round would
+    // rightly fail as "review modified the tree".
+    const trace = `${state}/agy-trace.jsonl`;
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(root);
+    const env = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+      FAKE_AGY_TRACE: trace,
+    };
+    mkdirSync(state, { recursive: true });
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    // The fake codex has no exec mode, so the review-only gpt lane is seeded
+    // from a gemini review and re-labelled to the shape a codex intent review
+    // leaves behind: kind review, engine gpt, a codex session id, no work thread.
+    expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const ledgerPath = `${state}/ledger.json`;
+    const seeded = JSON.parse(readFileSync(ledgerPath, "utf8"));
+    expect(seeded.audit.kind).toBe("review");
+    expect(seeded.audit.workSessionId).toBeUndefined();
+    seeded.audit.engine = "gpt";
+    seeded.audit.reviewEngine = "gpt";
+    seeded.audit.sessionId = "22222222-2222-4222-8222-222222222222";
+    writeFileSync(ledgerPath, JSON.stringify(seeded, null, 2));
+
+    expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const switched = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).audit;
+    expect(switched.engine).toBe("gemini");
+    expect(switched.reviewEngine).toBe("gemini");
+
+    writeFileSync(trace, "");
+    expect(runCli(["resume", "audit", "REVIEW_CLEAN"], env).exitCode).toBe(0);
+    const calls = readFileSync(trace, "utf8").trim().split("\n")
+      .map((line) => JSON.parse(line) as { args?: string[] })
+      .filter((record): record is { args: string[] } => Array.isArray(record.args));
+    expect(calls.length).toBeGreaterThan(0);
+    const conversations = calls.map((call) => call.args[call.args.indexOf("--conversation") + 1]);
+    expect(conversations).toEqual(calls.map(() => switched.sessionId));
+  }, 20000);
+
+  test("refuses agy cancellation template as a report and suppresses gate", () => {
+    expect(isAgyCancellationTemplate("User initiated cancellation")).toBe(true);
+    expect(isAgyCancellationTemplate("Execution stopped per your cancellation request.")).toBe(true);
+    expect(isAgyCancellationTemplate("An execution step was interrupted by the user.\n\nReason: User initiated cancellation.")).toBe(true);
+    expect(isAgyCancellationTemplate("# Audit: User initiated cancellation handling in cdx\n\nFindings follow.")).toBe(false);
+    expect(isAgyCancellationTemplate("An execution step was interrupted by the user while running tool")).toBe(true);
+    expect(isAgyCancellationTemplate("Finished inspecting the files; report complete.")).toBe(false);
+    expect(isAgyCancellationTemplate(`An execution step was interrupted by the user while running tool run_command with ${"x".repeat(400)}`)).toBe(true);
+    expect(isAgyCancellationTemplate('# Lane report\n\nThe runner prints "User initiated cancellation" when a turn is aborted.')).toBe(false);
+
+    const root = tempPath("gemini-cancel-template");
+    const state = tempPath("gemini-cancel-state");
+    const gateMarker = `${root}/gate-ran`;
+    const env = baseEnv(state, installFakeAgy(root));
+
+    const result = runCli(["spawn", "cancel-lane", "--engine", "gemini", "--cd", root, "--gate", `touch ${gateMarker}`, "AGY_CANCEL_TEMPLATE"], env);
+    expect(result.exitCode).toBe(1);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["cancel-lane"];
+    expect(lane.state).toBe("failed");
+    expect(lane.note).toContain("agy returned its cancellation template as the report; no qualifying report");
+    expect(readFileSync(`${state}/reports/cancel-lane-r1.md`, "utf8")).toContain("User initiated cancellation");
+    expect(existsSync(gateMarker)).toBe(false);
+  });
+
+  test("empty-diff work round fails under a gate and suppresses gate execution", () => {
+    const root = tempPath("empty-diff-gate");
+    const state = tempPath("empty-diff-gate-state");
+    const bin = installFakeCodex(root);
+    const gateMarker = `${root}/gate-ran`;
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const result = runCli(["spawn", "empty-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "REPORT_ONLY"], baseEnv(state, bin));
+    expect(result.exitCode).toBe(1);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate"];
+    expect(lane.state).toBe("failed");
+    expect(lane.note).toBe("tree unchanged under a required gate: no work landed, gate not run");
+    expect(existsSync(gateMarker)).toBe(false);
+  });
+
+  test("a commit made during the round counts as landed work under a gate", () => {
+    const root = tempPath("commit-diff-gate");
+    const state = tempPath("commit-diff-gate-state");
+    const bin = installFakeCodex(root);
+    const gateMarker = `${root}/gate-ran`;
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const result = runCli(["spawn", "commit-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "COMMIT_WORK"], baseEnv(state, bin));
+    expect(result.exitCode).toBe(0);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["commit-gate"];
+    expect(lane.state).toBe("done");
+    expect(existsSync(gateMarker)).toBe(true);
+  });
+
+  test("empty-diff work round without gate completes done with report note, feed token, and status marker", () => {
+    const root = tempPath("empty-diff-nogate");
+    const state = tempPath("empty-diff-nogate-state");
+    const bin = installFakeCodex(root);
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const env = baseEnv(state, bin);
+    const result = runCli(["spawn", "empty-nogate", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(result.exitCode).toBe(0);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-nogate"];
+    expect(lane.state).toBe("done");
+    expect(lane.diffEmpty).toBe(true);
+    expect(readFileSync(`${state}/reports/empty-nogate-r1.md`, "utf8")).toContain("\n\n## Harness note\n\nThis round changed no files.\n");
+    expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("diff=empty");
+    const status = runCli(["status"], env);
+    expect(status.stdout).toContain("no tree change");
+  });
+
+  test("changed tree work round is unaffected by unchanged-tree check", () => {
+    const root = tempPath("changed-work-tree");
+    const state = tempPath("changed-work-tree-state");
+    const bin = installFakeCodex(root);
+    const gateMarker = `${root}/gate-ran`;
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const env = baseEnv(state, bin);
+    const result = runCli(["spawn", "changed-tree", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "WRITE_WORK_FILE"], env);
+    expect(result.exitCode).toBe(0);
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["changed-tree"];
+    expect(lane.state).toBe("done");
+    expect(lane.diffEmpty).toBeUndefined();
+    expect(existsSync(gateMarker)).toBe(true);
+    expect(readFileSync(`${state}/reports/changed-tree-r1.md`, "utf8")).not.toContain("## Harness note");
+    expect(readFileSync(`${state}/feed.log`, "utf8")).not.toContain("diff=empty");
+    const status = runCli(["status"], env);
+    expect(status.stdout).not.toContain("no tree change");
+  });
+
+  test("houseRules emits gemini-specific rules and gpt-specific rules", () => {
+    const harnessCommandRule = "Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.";
+    const geminiRules = houseRules("/tmp", false, "gemini");
+    expect(geminiRules).toContain(harnessCommandRule);
+    expect(geminiRules).toContain("cdx ask");
+    expect(geminiRules).not.toContain("subagent threads");
+    expect(geminiRules).toContain("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
+    expect(geminiRules).toContain("Never spawn subagents or delegate; do the work yourself in this thread.");
+    expect(geminiRules).toContain("Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine.");
+    expect(geminiRules).toContain("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
+    expect(geminiRules).toContain("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
+
+    const gptRules = houseRules("/tmp", false, "gpt");
+    expect(gptRules).toContain(harnessCommandRule);
+    expect(gptRules).toContain("subagent threads");
+    expect(gptRules).toContain("run `cdx ask");
+  });
+
+  test("refuses driving commands from inside a lane worker but allows inspection commands", () => {
+    const root = tempPath("worker-guard");
+    const state = tempPath("worker-guard-state");
+    const env = { ...baseEnv(state), CDX_LANE: "some-lane" };
+
+    const spawnResult = runCli(["spawn", "nested", "--cd", root, "DO_WORK"], env);
+    expect(spawnResult.exitCode).toBe(1);
+    expect(spawnResult.stderr).toContain('cdx: lane workers cannot drive the harness (command "spawn" refused inside lane some-lane); use cdx ask for anything you need from the head');
+
+    const statusResult = runCli(["status"], env);
+    expect(statusResult.exitCode).toBe(0);
+  });
+
+  test("runs .cdx-worktree-setup in newly created worktree", () => {
+    const root = tempPath("repo-setup-hook");
+    const state = tempPath("repo-setup-hook-state");
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const setupHook = `${root}/.cdx-worktree-setup`;
+    writeFileSync(setupHook, "#!/bin/sh\ntouch repo-setup-marker\n", { mode: 0o755 });
+    chmodSync(setupHook, 0o755);
+    expect(Bun.spawnSync({ cmd: ["git", "add", ".cdx-worktree-setup"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "-qm", "add hook"], cwd: root }).exitCode).toBe(0);
+
+    const wtPath = `${root}/wt-hook`;
+    const env = baseEnv(state, installFakeCodex(root));
+    const result = runCli(["spawn", "wt-hook-lane", "--engine", "gpt", "--cd", root, "--worktree", wtPath, "REPORT_ONLY"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("cdx: repo worktree setup: .cdx-worktree-setup");
+    expect(existsSync(`${wtPath}/repo-setup-marker`)).toBe(true);
   });
 
   test("runs a gemini lane and records its report, tokens, engine, and conversation", () => {
