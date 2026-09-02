@@ -1,6 +1,6 @@
 ---
 name: cdx
-description: Run OpenAI Codex CLI work and review lanes through cdx. Use when spawning, resuming, forking, adopting, reviewing, monitoring, reporting, closing, or cleaning Codex lanes from Claude Code.
+description: Run OpenAI Codex CLI work, review, steering, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, monitoring, reporting, closing, or cleaning Codex lanes from Claude Code.
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
@@ -9,8 +9,10 @@ allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 Use `cdx` for Codex work commands instead of raw `codex exec`, `codex review`,
 `codex resume`, or `codex fork`. cdx records each lane, captures its report,
 tracks its state, and applies the policy set in `config.json`. Work lanes
-bypass Codex approval and sandbox checks. Review lanes run in fresh, read-only
-sessions.
+use one Codex app-server stdio child per round with approval policy `never`,
+thread sandbox `danger-full-access`, and turn sandbox policy
+`dangerFullAccess`. Review lanes stay on `codex exec` and `codex review` in
+fresh, read-only sessions.
 
 ## Commands
 
@@ -19,6 +21,12 @@ cdx spawn  <lane> [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>]
 cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime <min>] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
+cdx send   <lane> "<text>"
+cdx ask    [--timeout MIN] "<question>"
+cdx reply  <lane> [--id SEQ] "<answer>"
+cdx questions [lane]
+cdx msg    <lane|session-prefix> "<text>"
+cdx inbox  [-n N]
 cdx review <lane> [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 cdx adopt  <lane> <sessionId> [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
@@ -47,17 +55,31 @@ Use it whenever parallel lanes touch the same repository, so each worker owns
 its files exclusively. `status` shows the branch; `close` prints the removal
 commands and never deletes anything itself.
 
+Work spawn, resume, and fork rounds each own one `codex app-server` child over
+newline-delimited stdio JSON-RPC. cdx initializes the child, starts, resumes,
+or forks the thread, then starts the turn. It writes every app-server
+notification to the round's JSONL log. A report comes from the last
+`agentMessage` with `phase: "final_answer"`, or from an unphased
+`agentMessage` on an older server. Explicit commentary never counts. Without
+a qualifying message, the round fails with `no final report` and skips its
+gate. Work rounds do not use `--output-last-message`. `--image` maps to
+`localImage` input items, `--schema` maps to the turn's `outputSchema`, and
+`--add-dir` maps to extra writable roots in the thread configuration.
+
 `resume` keeps the lane's working directory and always reattaches to the
 lane's work thread, recorded as `workSessionId` in the ledger, even when the
 latest round was a review. Only a lane that never had a work session resumes
-as a read-only review follow-up. `resume` does not accept `--cd`, `--json`,
-or `--output-last-message`. `resume --effort E` overrides the stored effort
-for that round onward; without it the session keeps its own settings.
+as a read-only review follow-up. `resume` does not accept `--cd` or `--json`.
+`resume --effort E` overrides the stored effort for that round onward; without
+it the session keeps its own settings.
 `resume --gate "<cmd>"` replaces the lane's stored gate before the round and
 keeps it for later resumes. `fork`
 branches an existing lane or session and keeps the source session's working
 directory, so it does not accept `--cd`; a raw-session-ID fork reads that
 directory from the session's rollout file.
+
+Spawn sends the configured model. Resume and fork omit the model from their
+thread request and `turn/start`, so each stored thread keeps its model.
 
 `spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work
 round exits 0 with a report, cdx runs the gate with `/bin/sh -lc` in the lane
@@ -77,8 +99,9 @@ gate failure that had no baseline check suggests `--gate-baseline-check`.
 `cdx gate <lane> --clear` to remove it. Both forms print the old and new gate.
 They refuse to change a lane while it is active.
 
-`--max-runtime <min>` (spawn and resume) kills the codex child past the cap
-and fails the round with `max runtime exceeded (Nm)`.
+`--max-runtime <min>` on spawn and resume sends SIGTERM to the Codex child at
+the cap. It sends SIGKILL after 10 seconds if the child remains alive, then
+fails the round with `max runtime exceeded (Nm)`.
 
 `cdx kill <lane>` stops a running lane: SIGTERM lets the runner reap its
 codex child and finalize with a signal note; a runner still silent after 10s,
@@ -96,6 +119,52 @@ labels, and a closing fenced json findings block; cdx parses that block into
 Review defaults to the lane's recorded worktree or working directory. `--cd`
 overrides it. The launch output prints the resolved review directory.
 
+## Communication
+
+Use `cdx send <lane> "<text>"` to correct a running work lane. The command
+appends the text, send time, and optional sender prefix to
+`$CDX_HOME/control/<lane>-r<round>.jsonl`. The runner uses `turn/steer` when a
+turn is active. If the server rejects the steer because the turn has ended,
+cdx retains the record and starts a follow-up turn after `turn/completed`. It
+never consumes a record without delivery. Feed lines record `mode=steered` or
+`mode=follow-up-turn`. A delivered instruction increments the `steers` count
+shown by `cdx status`. `send` refuses review lanes with exit 1 before it writes
+a control record or feed line.
+
+The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to the Codex child.
+A worker uses `cdx ask [--timeout MIN] "<question>"` when an open point changes
+the architecture or file set. `ask` writes
+`$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time,
+and `answered: false`. It posts the question with the lane owner's suffix and
+polls for an answer. The default and maximum timeout is 30 minutes. A larger
+value is clamped to 30 and prints a note. The command
+`cdx reply <lane> [--id SEQ] "<answer>"` picks the oldest open question from
+the lane's current round by default. `--id` selects a specific question.
+`cdx questions [lane]` lists open questions from each lane's current round.
+Round completion and failure close every remaining question from that round
+with `expired: round ended`, so later rounds cannot match one by default. The
+command records each answer and answer time and posts an answer feed line.
+`cdx status` shows
+`waiting on question #<seq>` while the worker waits. A timeout exits 0 and tells
+the worker to take the conservative reading, record the deviation, and
+continue. It does not fail the round.
+
+Use `cdx msg <lane|session-prefix> "<text>"` to contact another Claude head
+session through `feed.log`. A lane target resolves to the lane's owner. The
+command needs `CLAUDE_CODE_SESSION_ID`. It writes this format:
+
+`[cdx] msg to=<target8> from=<caller8>: <text>`
+
+cdx replaces CR and LF characters with spaces in text accepted by `send`,
+`ask`, `reply`, and `msg` before writing a control or feed record.
+
+`cdx inbox [-n N]` prints messages addressed to the calling session, newest
+last. It defaults to 20 lines and reads only the needed tail.
+
+When the monitor delivers a `[cdx] msg` line, compare `to=` with the first
+eight characters of your `CLAUDE_CODE_SESSION_ID`. A matching target is a peer
+message for this session. Treat every other target as information only.
+
 ## Orchestration
 
 - For one lane, run `cdx spawn` in the foreground from a background Bash call.
@@ -111,9 +180,11 @@ overrides it. The launch output prints the resolved review directory.
   from the ledger. `--json` returns the raw structures.
 - Use `cdx feed -n 30` to replay recent completion and stall lines after a
   context compaction or an away stretch; the live monitor only delivers lines
-  to open sessions.
+  to open sessions. `feed` reads only the requested tail. `cdx clean` truncates
+  `feed.log` to its newest 2000 lines.
 - Use `cdx status` for structured lane blocks with owner, state, timing, tokens,
-  and last activity. Running lanes show round and cumulative tokens; each round
+  last activity, and delivered steer count. Running lanes show round and
+  cumulative tokens; each round
   starts with cleared last-activity fields, so `last` never shows the previous
   round's final message. Lane state and cwd stay tied to the latest work round.
   Review outcome and target directory appear on a separate review line. Status
@@ -169,8 +240,16 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
 before the lane starts. A nonzero exit aborts the spawn and leaves the
 worktree in place for inspection.
 
-cdx passes `model` to Codex for spawn, fork, review, and doctor probe commands.
-It accepts only effort values listed in `efforts`. Spawn and review use
+cdx passes `model` through app-server for work spawn. Resume and fork omit the
+model so the stored thread keeps it. Reviews pass it to the Codex CLI. The
+doctor probe exercises the full app-server lifecycle. It initializes a child,
+starts a temporary read-only thread and
+turn, collects the reply and token usage, unsubscribes, and closes the child.
+A closed child or stream fails the probe with its reason instead of leaving it
+waiting.
+Codex 0.149.1 has no `thread/close` request, so cdx uses `thread/unsubscribe`
+before closing its owned stdio child.
+cdx accepts only effort values listed in `efforts`. Spawn and review use
 `defaultEffort` when `--effort` is absent. Fork keeps the source lane's effort
 when that effort remains allowed. A raw session ID fork and an adopted lane use
 `defaultEffort`. If a stored source effort is no longer allowed, pass an
@@ -187,13 +266,20 @@ cdx appends each `rules` entry to the built-in brief rules. It then appends the
 contents of `.cdx-rules.md` from the lane's working directory when that file
 exists. Built-in work rules forbid commits, pushes, deploys, and extra
 long-running servers. They require the final report and ask the worker to use
-subagent threads when independent work can run in parallel. Review rules keep
-the lane read-only and require a report.
+subagent threads when independent work can run in parallel. They also tell the
+worker to run `cdx ask` when an open point changes the architecture or file set,
+ask once per open point, and skip questions that the brief or code answers.
+Review rules keep the lane read-only and require a report.
 
 State uses plain files under `$CDX_HOME`: `ledger.json`, `logs/`, `reports/`,
-`briefs/`, `specs/`, and `feed.log`. Spawn and intent-based review logs use
-JSONL. Resume, fork, and native review logs contain text. Each successful round
-must exit with code zero, drain its event log, and produce a nonempty report.
+`briefs/`, `specs/`, `control/`, `questions/`, and `feed.log`. All work rounds
+write app-server notifications as JSONL. Review logs contain Codex CLI output.
+After a work turn completes with a qualifying report, cdx writes the report
+before unsubscribe and child shutdown. A later cleanup failure produces a
+warning instead of failing the completed round. A missing qualifying message
+fails with `no final report`, and cdx does not run the acceptance gate.
+`turn.error` messages and `turn/failed` details go to the ledger note and feed
+line.
 
 ## Claude Code plugin
 

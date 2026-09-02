@@ -6,6 +6,12 @@
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> [--account <name>] [--cd <dir>]
+//   cdx send   <lane> "<text>"
+//   cdx ask    [--timeout <min>] "<question>"
+//   cdx reply  <lane> [--id <seq>] "<answer>"
+//   cdx questions [lane]
+//   cdx msg    <target> "<text>"
+//   cdx inbox  [-n <lines>]
 //   cdx status [--all] [--json]
 //   cdx usage  [--json]
 //   cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
@@ -25,14 +31,15 @@
 // cdx policy comes from $CDX_HOME/config.json. Work lanes cannot commit, push,
 // or deploy, and reviews always get a fresh read-only session.
 //
-// CLI facts this harness absorbs (codex-cli 0.149.x, verified):
-// - `exec` supports --json (JSONL events), -o last-message, --cd, --output-schema.
-// - `exec resume` and `exec fork` support NONE of --json/-o/--cd: they keep the
-//   session's workdir, print human text, and the report is requested in-prompt.
+// CLI facts this harness absorbs (codex-cli 0.149.1, verified):
+// - Work rounds use app-server JSON-RPC over newline-delimited stdio. Reviews
+//   stay on `codex exec` and `codex review` as read-only one-shot commands.
+// - app-server uses thread/start, thread/resume, thread/fork, turn/start, and
+//   turn/steer. turn/steer requires the active expectedTurnId on 0.149.1.
 // - `codex review` takes exactly one of --uncommitted/--base/--commit OR a
 //   custom prompt, never both; it reviews the process cwd.
-// - JSONL events: thread.started{thread_id}, turn.started,
-//   item.completed{item:{type,...}}, turn.completed{usage{...}}.
+// - app-server emits thread/started, turn/started, item/*,
+//   thread/tokenUsage/updated, and turn/completed notifications.
 
 import {
   closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync,
@@ -69,6 +76,22 @@ function uncoloredChildEnv(codexHome?: string, stateHome?: string) {
   if (codexHome !== undefined) env.CODEX_HOME = codexHome;
   if (stateHome !== undefined) env.CDX_STATE_HOME = stateHome;
   return env;
+}
+
+interface LaneEnvironment {
+  lane: string;
+  round: number;
+  owner?: string;
+}
+
+function laneChildEnv(codexHome: string | undefined, context: LaneEnvironment) {
+  return {
+    ...uncoloredChildEnv(codexHome),
+    CDX_HOME: ROOT,
+    CDX_LANE: context.lane,
+    CDX_ROUND: String(context.round),
+    CDX_OWNER: context.owner ?? "terminal",
+  };
 }
 
 type Effort = string;
@@ -119,6 +142,8 @@ interface Lane {
   reports: string[];
   tokens?: Tokens;
   roundTokens?: Tokens;
+  steers?: number;
+  steerOpen?: boolean;
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
@@ -149,7 +174,12 @@ interface Spec {
   round: number;
   cwd: string;
   prompt: string;
-  codexArgs: string[];
+  model?: string;
+  codexArgs?: string[];
+  sourceThreadId?: string;
+  additionalDirectories?: string[];
+  images?: string[];
+  outputSchema?: unknown;
   account?: string;
   codexHome?: string;
   multiAccountUsage?: true;
@@ -266,17 +296,47 @@ function readConfig(skipFile = false): Config {
 
 const config = readConfig(process.argv[2] === "_run");
 
-for (const dir of ["logs", "reports", "briefs", "specs"]) mkdirSync(`${ROOT}/${dir}`, { recursive: true });
+for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) mkdirSync(`${ROOT}/${dir}`, { recursive: true });
 
 // Thrown instead of fail() inside withLedger callbacks: process.exit skips
 // finally blocks and would strand the ledger lock. The dispatcher converts it.
 class CmdError extends Error {}
 
+function singleLine(text: string): string {
+  return text.replace(/[\r\n]+/g, " ").trim();
+}
+
+function readTailLines(path: string, limit: number, accept: (line: string) => boolean = () => true): string[] {
+  if (!existsSync(path) || limit < 1) return [];
+  const fd = openSync(path, "r");
+  try {
+    let position = statSync(path).size;
+    let carry = "";
+    const newestFirst: string[] = [];
+    while (position > 0 && newestFirst.length < limit) {
+      const length = Math.min(65_536, position);
+      position -= length;
+      const chunk = Buffer.alloc(length);
+      readSync(fd, chunk, 0, length, position);
+      const parts = `${chunk.toString("utf8")}${carry}`.split("\n");
+      carry = parts.shift() ?? "";
+      for (let index = parts.length - 1; index >= 0 && newestFirst.length < limit; index -= 1) {
+        const line = parts[index]!;
+        if (line && accept(line)) newestFirst.push(line);
+      }
+    }
+    if (position === 0 && carry && newestFirst.length < limit && accept(carry)) newestFirst.push(carry);
+    return newestFirst.reverse();
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // One line per lane completion; the plugin monitor tails this file and
 // delivers each line to the Claude session as a notification.
 function feed(line: string): boolean {
   try {
-    writeFileSync(`${ROOT}/feed.log`, `${line}\n`, { flag: "a" });
+    writeFileSync(`${ROOT}/feed.log`, `${singleLine(line)}\n`, { flag: "a" });
     return true;
   } catch {
     return false;
@@ -375,6 +435,7 @@ function validLane(lane: string): string {
 const reportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.md`;
 const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;
 const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
+const controlPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.jsonl`;
 
 function pidAlive(pid?: number): boolean {
   if (!pid) return false;
@@ -487,6 +548,7 @@ function houseRules(cwd: string, reviewOnly: boolean): string {
   ];
   if (!reviewOnly) {
     builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
+    builtIns.push('When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point; never ask what the brief or the code already answers.');
   }
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
@@ -504,7 +566,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime"]);
+const VALUE_FLAGS = new Set(["effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check"]);
 
@@ -721,6 +783,8 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       reports: existing?.reports ?? [],
       tokens: existing?.tokens ?? { input: 0, cached: 0, output: 0 },
       roundTokens: { input: 0, cached: 0, output: 0 },
+      steers: 0,
+      steerOpen: kind === "work",
       // A fresh round must never display the previous round's final message
       // or note as its own.
       lastAction: undefined,
@@ -737,7 +801,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
   writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
-  const jsonMode = spec.mode === "spawn";
+  const jsonMode = spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
   console.log(`cdx: log=${logPathOf(spec.lane, spec.round, jsonMode)} report=${reportPathOf(spec.lane, spec.round)}`);
@@ -745,7 +809,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     const crashLog = openSync(`${ROOT}/logs/${spec.lane}-r${spec.round}.runner.log`, "a");
     const child = nodeSpawn(process.execPath, [SELF, "_run", spec.lane, String(spec.round)], {
       detached: true,
-      env: uncoloredChildEnv(spec.codexHome, spec.codexHome ? ROOT : undefined),
+      env: uncoloredChildEnv(spec.codexHome, ROOT),
       stdio: ["ignore", crashLog, crashLog],
     });
     child.unref();
@@ -809,7 +873,7 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
   console.error(`cdx: gate log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log`);
 }
 
-function failActiveRound(item: Lane, note: string): void {
+function failActiveRound(lane: string, item: Lane, note: string): void {
   const now = new Date().toISOString();
   if (item.kind === "review") {
     item.reviewState = "failed";
@@ -826,6 +890,48 @@ function failActiveRound(item: Lane, note: string): void {
   item.pid = undefined;
   item.codexPid = undefined;
   item.updatedAt = now;
+  expireRoundQuestions(lane, item.rounds);
+}
+
+interface AppInput {
+  type: "text" | "localImage";
+  text?: string;
+  path?: string;
+}
+
+interface AppTurn {
+  id: string;
+  status: "completed" | "interrupted" | "failed" | "inProgress";
+  items?: Array<Record<string, unknown>>;
+  error?: { message?: string } | null;
+}
+
+interface ControlRecord {
+  text: string;
+  sentAt: string;
+  from?: string;
+}
+
+function appServerWorkRound(spec: Spec, lane: Lane | undefined): boolean {
+  return lane?.kind === "work" && (spec.mode === "spawn" || spec.mode === "resume" || spec.mode === "fork");
+}
+
+function inputText(text: string): AppInput {
+  return { type: "text", text };
+}
+
+function appThreadParams(spec: Spec): Record<string, unknown> {
+  const configOverrides: Record<string, unknown> = {};
+  if (spec.additionalDirectories?.length) {
+    configOverrides.sandbox_workspace_write = { writable_roots: spec.additionalDirectories };
+  }
+  return {
+    ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
+    cwd: spec.cwd,
+    approvalPolicy: "never",
+    sandbox: "danger-full-access",
+    ...(Object.keys(configOverrides).length ? { config: configOverrides } : {}),
+  };
 }
 
 async function runRound(lane: string, round: number): Promise<number> {
@@ -837,7 +943,7 @@ async function runRound(lane: string, round: number): Promise<number> {
     withLedger((ledger) => {
       const item = ledger[lane];
       if (item) {
-        failActiveRound(item, `runner error: ${String(error).slice(0, 200)}`);
+        failActiveRound(lane, item, `runner error: ${String(error).slice(0, 200)}`);
       }
     });
     console.error(`cdx: lane=${color.magenta(lane)} round-state=${color.red("failed")} runner error: ${error}`);
@@ -858,7 +964,9 @@ async function runRound(lane: string, round: number): Promise<number> {
 
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
-  const jsonMode = spec.mode === "spawn";
+  const startingLane = readLedger()[lane];
+  const appServer = appServerWorkRound(spec, startingLane);
+  const jsonMode = appServer || spec.mode === "spawn";
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
   withLedger((ledger) => {
@@ -869,10 +977,10 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   });
 
   const proc = Bun.spawn({
-    cmd: ["codex", ...spec.codexArgs],
+    cmd: appServer ? ["codex", "app-server", "--listen", "stdio://"] : ["codex", ...(spec.codexArgs ?? [])],
     cwd: spec.cwd,
-    env: uncoloredChildEnv(spec.codexHome),
-    stdin: "ignore",
+    env: laneChildEnv(spec.codexHome, { lane, round, owner: spec.ownerSession }),
+    stdin: appServer ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -908,11 +1016,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   // round. The exitCode guard closes the race where the timer fires after a
   // clean exit but before it is cleared.
   let maxRuntimeHit = false;
+  let maxRuntimeForceTimer: ReturnType<typeof setTimeout> | undefined;
   const maxRuntimeTimer = spec.maxRuntimeMins
     ? setTimeout(() => {
         if (proc.exitCode !== null) return;
         maxRuntimeHit = true;
-        try { proc.kill(); } catch { /* already gone */ }
+        try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+        maxRuntimeForceTimer = setTimeout(() => {
+          if (proc.exitCode === null) {
+            try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+          }
+        }, 10_000);
       }, spec.maxRuntimeMins * 60_000)
     : undefined;
   const watchdog = setInterval(() => {
@@ -923,12 +1037,85 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
   }, 60_000);
 
+  const turnUsage = new Map<string, Tokens>();
+  const completedTurns = new Map<string, AppTurn>();
+  const turnWaiters = new Map<string, Array<(turn: AppTurn) => void>>();
+  let reportOrder = 0;
+  let writtenReportOrder = 0;
+  let latestReportCandidate: { text: string; turnId: string; order: number } | undefined;
+  let turnFailureReason: string | undefined;
+  let lastProtocolError: string | undefined;
+  let activeTurnId: string | undefined;
+
+  const persistCapturedReport = () => {
+    const candidate = latestReportCandidate;
+    if (!candidate || candidate.order <= writtenReportOrder || !completedTurns.has(candidate.turnId)) return;
+    writeFileSync(reportPath, `${candidate.text.trim()}\n`);
+    writtenReportOrder = candidate.order;
+  };
+  const rememberAgentMessage = (item: Record<string, unknown>, turnId: string | undefined) => {
+    if (!turnId || item.type !== "agentMessage" || typeof item.text !== "string") return;
+    const qualifying = item.phase === "final_answer" || item.phase == null;
+    if (!qualifying) return;
+    latestReportCandidate = { text: item.text, turnId, order: ++reportOrder };
+    persistCapturedReport();
+  };
+  const turnErrorText = (turn: AppTurn): string | undefined => {
+    const error = turn.error as { message?: string; additionalDetails?: string | null } | null | undefined;
+    const details = [error?.message, error?.additionalDetails].filter((value): value is string => Boolean(value));
+    return details.length ? details.join(": ") : lastProtocolError;
+  };
+
   const handleEvent = (line: string) => {
     let event: any;
     try { event = JSON.parse(line); } catch { return; }
     noteActivity();
     const now = new Date().toISOString();
-    if (event.type === "thread.started" && event.thread_id) {
+    if (event.method === "thread/started" && event.params?.thread?.id) {
+      touchLedger((item) => { item.sessionId = event.params.thread.id; item.lastEventAt = now; }, true);
+    } else if (event.method === "error" && event.params?.error) {
+      const error = event.params.error;
+      lastProtocolError = [error.message, error.additionalDetails].filter(Boolean).join(": ") || "app-server turn error";
+      touchLedger((item) => { item.lastAction = `error: ${lastProtocolError}`; item.lastEventAt = now; }, true);
+    } else if (event.method === "thread/tokenUsage/updated" && event.params?.turnId && event.params?.tokenUsage?.last) {
+      const usage = event.params.tokenUsage.last;
+      turnUsage.set(event.params.turnId, {
+        input: usage.inputTokens ?? 0,
+        cached: usage.cachedInputTokens ?? 0,
+        output: usage.outputTokens ?? 0,
+      });
+      touchLedger((item) => { item.lastEventAt = now; });
+    } else if (event.method === "turn/completed" && event.params?.turn?.id) {
+      const turn = event.params.turn as AppTurn;
+      for (const item of turn.items ?? []) {
+        rememberAgentMessage(item, turn.id);
+      }
+      const usage = turnUsage.get(turn.id);
+      if (usage) {
+        touchLedger((item) => {
+          const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+          const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+          for (const tokens of [cumulative, roundTokens]) {
+            tokens.input += usage.input;
+            tokens.cached += usage.cached;
+            tokens.output += usage.output;
+          }
+          item.lastEventAt = now;
+        }, true);
+      }
+      completedTurns.set(turn.id, turn);
+      if (turn.status !== "completed") {
+        turnFailureReason = turnErrorText(turn) ?? `turn ended with status ${turn.status}`;
+      }
+      persistCapturedReport();
+      for (const resolve of turnWaiters.get(turn.id) ?? []) resolve(turn);
+      turnWaiters.delete(turn.id);
+      if (activeTurnId === turn.id) activeTurnId = undefined;
+    } else if (event.method === "item/completed" && event.params?.item) {
+      const item = event.params.item as Record<string, unknown>;
+      rememberAgentMessage(item, event.params.turnId ?? activeTurnId);
+      touchLedger((entry) => { entry.lastAction = excerpt(item); entry.lastEventAt = now; });
+    } else if (event.type === "thread.started" && event.thread_id) {
       touchLedger((item) => { item.sessionId = event.thread_id; item.lastEventAt = now; }, true);
     } else if (event.type === "turn.completed" && event.usage) {
       touchLedger((item) => {
@@ -968,10 +1155,248 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
   };
 
-  await Promise.all([jsonMode ? pumpJson(proc.stdout) : pumpRaw(proc.stdout, log), pumpRaw(proc.stderr, errLog)]);
+  let exitCode: number;
+  let roundCleanupWarning: string | undefined;
+  if (appServer) {
+    let requestId = 0;
+    let rpcClosed = false;
+    const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+    const writeRpc = (message: Record<string, unknown>) => {
+      proc.stdin.write(`${JSON.stringify(message)}\n`);
+      proc.stdin.flush();
+    };
+    const request = (method: string, params: Record<string, unknown>): Promise<any> => {
+      if (rpcClosed) return Promise.reject(new Error(`app-server closed before ${method}`));
+      const id = ++requestId;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        writeRpc({ id, method, params });
+      });
+    };
+    const notify = (method: string) => writeRpc({ method });
+    const pumpRpc = async (stream: ReadableStream<Uint8Array>) => {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of stream) {
+        log.write(chunk);
+        log.flush();
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          handleEvent(line);
+          let message: any;
+          try { message = JSON.parse(line); } catch { continue; }
+          if (typeof message.id === "number" && pending.has(message.id)) {
+            const waiter = pending.get(message.id)!;
+            pending.delete(message.id);
+            if (message.error) waiter.reject(new Error(`${message.error.message ?? "app-server request failed"}${message.error.data ? `: ${JSON.stringify(message.error.data)}` : ""}`));
+            else waiter.resolve(message.result);
+          } else if (message.id !== undefined && message.method) {
+            writeRpc({ id: message.id, error: { code: -32601, message: `cdx does not handle server request ${message.method}` } });
+          }
+        }
+      }
+      if (buffer.trim()) handleEvent(buffer);
+      rpcClosed = true;
+      const error = new Error("app-server closed before replying");
+      for (const waiter of pending.values()) waiter.reject(error);
+      pending.clear();
+      if (activeTurnId && !completedTurns.has(activeTurnId)) {
+        const failedTurn: AppTurn = { id: activeTurnId, status: "failed", error: { message: error.message } };
+        completedTurns.set(activeTurnId, failedTurn);
+        for (const resolve of turnWaiters.get(activeTurnId) ?? []) resolve(failedTurn);
+        turnWaiters.delete(activeTurnId);
+        activeTurnId = undefined;
+      }
+    };
+    const stdoutPump = pumpRpc(proc.stdout);
+    const stderrPump = pumpRaw(proc.stderr, errLog);
+    const waitForTurn = (turnId: string): Promise<AppTurn> => {
+      const completed = completedTurns.get(turnId);
+      if (completed) return Promise.resolve(completed);
+      return new Promise((resolve) => {
+        const waiters = turnWaiters.get(turnId) ?? [];
+        waiters.push(resolve);
+        turnWaiters.set(turnId, waiters);
+      });
+    };
+    const startTurn = async (threadId: string, text: string, includeRoundOptions: boolean) => {
+      const input: AppInput[] = [inputText(text)];
+      if (includeRoundOptions) {
+        for (const path of spec.images ?? []) input.push({ type: "localImage", path });
+      }
+      const result = await request("turn/start", {
+        threadId,
+        input,
+        cwd: spec.cwd,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "dangerFullAccess" },
+        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
+        effort: readLedger()[lane]?.effort ?? config.defaultEffort,
+        ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
+      });
+      const turnId = result?.turn?.id;
+      if (typeof turnId !== "string") throw new Error("turn/start returned no turn id");
+      activeTurnId = turnId;
+      return turnId;
+    };
+    let controlIndex = 0;
+    let controlChain = Promise.resolve();
+    let threadId = "";
+    const reportedControlFailures = new Set<number>();
+    const delivered = (record: ControlRecord, mode: "steered" | "follow-up-turn") => {
+      const flat = record.text.replace(/\s+/g, " ").trim();
+      const short = flat.length > 120 ? `${flat.slice(0, 117)}...` : flat;
+      withLedger((ledger) => {
+        const item = ledger[lane];
+        if (item) { item.steers = (item.steers ?? 0) + 1; item.updatedAt = new Date().toISOString(); }
+      });
+      feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=${mode}: ${short}`, spec.ownerSession);
+    };
+    const deliverControl = async (record: ControlRecord): Promise<"steered" | "follow-up-turn" | undefined> => {
+      const expectedTurnId = activeTurnId;
+      try {
+        if (expectedTurnId) {
+          await request("turn/steer", { threadId, expectedTurnId, input: [inputText(record.text)] });
+          return "steered";
+        } else {
+          await startTurn(threadId, record.text, false);
+          return "follow-up-turn";
+        }
+      } catch (steerError) {
+        if (expectedTurnId) {
+          try {
+            await waitForTurn(expectedTurnId);
+            await startTurn(threadId, record.text, false);
+            return "follow-up-turn";
+          } catch (followUpError) {
+            steerError = followUpError;
+          }
+        }
+        const reason = steerError instanceof Error ? steerError.message : String(steerError);
+        if (!reportedControlFailures.has(controlIndex)) {
+          reportedControlFailures.add(controlIndex);
+          feedOwned(`[cdx] lane=${lane} round=${round} steer rejected and retained: ${reason.slice(0, 160)}`, spec.ownerSession);
+        }
+        return undefined;
+      }
+    };
+    const drainControls = async () => {
+      const path = controlPathOf(lane, round);
+      if (!existsSync(path)) return;
+      const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
+      while (controlIndex < lines.length) {
+        const line = lines[controlIndex]!;
+        let record: ControlRecord;
+        try { record = JSON.parse(line) as ControlRecord; } catch { controlIndex += 1; continue; }
+        if (typeof record.text !== "string" || !record.text.trim()) { controlIndex += 1; continue; }
+        const mode = await deliverControl(record);
+        if (!mode) break;
+        delivered(record, mode);
+        controlIndex += 1;
+      }
+    };
+    const queueControlDrain = () => {
+      controlChain = controlChain.then(drainControls, drainControls);
+      return controlChain;
+    };
+    let controlWatcher: ReturnType<typeof setInterval> | undefined;
+    let protocolFailed = false;
+    try {
+      await request("initialize", {
+        clientInfo: { name: "cdx", title: "cdx", version: "2.2.0" },
+        capabilities: { experimentalApi: true },
+      });
+      notify("initialized");
+      const threadParams = appThreadParams(spec);
+      const method = spec.mode === "spawn" ? "thread/start" : spec.mode === "resume" ? "thread/resume" : "thread/fork";
+      const sourceThreadId = spec.sourceThreadId;
+      if (method !== "thread/start" && !sourceThreadId) throw new Error(`${method} needs a source thread id`);
+      const threadResult = await request(method, {
+        ...(method === "thread/start" ? {} : { threadId: sourceThreadId }),
+        ...threadParams,
+      });
+      threadId = threadResult?.thread?.id;
+      if (typeof threadId !== "string") throw new Error(`${method} returned no thread id`);
+      touchLedger((item) => { item.sessionId = threadId; item.lastEventAt = new Date().toISOString(); }, true);
+      const firstTurnId = await startTurn(threadId, spec.prompt, true);
+      await queueControlDrain();
+      controlWatcher = setInterval(() => { void queueControlDrain(); }, 250);
+      let nextTurnId: string | undefined = firstTurnId;
+      while (nextTurnId) {
+        const turn = await waitForTurn(nextTurnId);
+        if (turn.status !== "completed") protocolFailed = true;
+        if (activeTurnId === nextTurnId) activeTurnId = undefined;
+        await queueControlDrain();
+        await Bun.sleep(1100);
+        await queueControlDrain();
+        nextTurnId = activeTurnId;
+      }
+      clearInterval(controlWatcher);
+      controlWatcher = undefined;
+      await controlChain;
+      withLedger((ledger) => {
+        const item = ledger[lane];
+        if (item) item.steerOpen = false;
+      });
+      await queueControlDrain();
+      while (activeTurnId) {
+        const finalQueuedTurn = activeTurnId;
+        const turn = await waitForTurn(finalQueuedTurn);
+        if (turn.status !== "completed") protocolFailed = true;
+        if (activeTurnId === finalQueuedTurn) activeTurnId = undefined;
+        await queueControlDrain();
+      }
+      exitCode = protocolFailed ? 1 : 0;
+      if (proc.exitCode === null && !rpcClosed) {
+        try {
+          await request("thread/unsubscribe", { threadId });
+        } catch (error) {
+          roundCleanupWarning = `thread unsubscribe failed after completed turn: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      } else if (proc.exitCode !== null && proc.exitCode !== 0) {
+        roundCleanupWarning = `app-server exited ${proc.exitCode} after completed turn`;
+      }
+      try { proc.stdin.end(); } catch { /* child already closed */ }
+      if (proc.exitCode === null) await Promise.race([proc.exited, Bun.sleep(3000)]);
+      if (proc.exitCode !== null && proc.exitCode !== 0 && existsSync(reportPath) && !maxRuntimeHit) {
+        roundCleanupWarning ??= `app-server exited ${proc.exitCode} after completed turn`;
+      }
+      if (proc.exitCode === null) {
+        roundCleanupWarning ??= "app-server did not exit after stdin closed";
+        try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+        await Promise.race([proc.exited, Bun.sleep(10_000)]);
+      }
+      if (proc.exitCode === null) {
+        try { proc.kill("SIGKILL"); } catch { /* already gone */ }
+        await proc.exited;
+      }
+      await Promise.allSettled([stdoutPump, stderrPump]);
+      if (roundCleanupWarning) {
+        feedOwned(`[cdx] lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`, spec.ownerSession);
+        console.error(`cdx: lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`);
+      }
+    } catch (error) {
+      if (controlWatcher) clearInterval(controlWatcher);
+      try { proc.stdin.end(); } catch { /* child already closed */ }
+      try { proc.kill(); } catch { /* child already closed */ }
+      await Promise.allSettled([stdoutPump, stderrPump, proc.exited]);
+      clearInterval(watchdog);
+      if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
+      if (maxRuntimeForceTimer) clearTimeout(maxRuntimeForceTimer);
+      log.end();
+      errLog.end();
+      throw error;
+    }
+  } else {
+    await Promise.all([jsonMode ? pumpJson(proc.stdout) : pumpRaw(proc.stdout, log), pumpRaw(proc.stderr, errLog)]);
+    exitCode = await proc.exited;
+  }
   clearInterval(watchdog);
-  const exitCode = await proc.exited;
   if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
+  if (maxRuntimeForceTimer) clearTimeout(maxRuntimeForceTimer);
   log.end();
   errLog.end();
 
@@ -1017,6 +1442,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   }
   const gateFailed = gateExit !== undefined && gateExit !== 0;
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit ? "done" : "failed";
+  expireRoundQuestions(lane, round);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
     if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
@@ -1029,7 +1455,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         ? `gate failed after work; baseline passed (exit ${gateExit}): ${spec.gate}`
         : `gate failed (exit ${gateExit}): ${spec.gate}; baseline was not checked, use --gate-baseline-check on spawn`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
-    else if (exitCode === 0 && !reportOk) roundNote = "exit 0 but no report produced; inspect the log";
+    else if (turnFailureReason) roundNote = `turn failed: ${turnFailureReason.slice(0, 200)}`;
+    else if (exitCode === 0 && !reportOk) roundNote = "no final report";
+    else if (roundCleanupWarning) roundNote = `cleanup warning: ${roundCleanupWarning.slice(0, 200)}`;
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.
     else if (exitCode === 130 || exitCode === 137 || exitCode === 143) {
@@ -1096,6 +1524,213 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 // Commands
 // ---------------------------------------------------------------------------
 
+interface QuestionRecord {
+  lane: string;
+  round: number;
+  seq: number;
+  question: string;
+  askedAt: string;
+  answered: boolean;
+  owner?: string;
+  answer?: string;
+  answeredAt?: string;
+  timedOutAt?: string;
+  expiredAt?: string;
+  status?: "expired: round ended";
+}
+
+function readQuestion(path: string): QuestionRecord | undefined {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8")) as QuestionRecord;
+    return typeof value.question === "string" && typeof value.seq === "number" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function questionFiles(lane?: string): Array<{ path: string; record: QuestionRecord }> {
+  const results: Array<{ path: string; record: QuestionRecord }> = [];
+  for (const file of readdirSync(`${ROOT}/questions`)) {
+    if (!file.endsWith(".json")) continue;
+    const path = `${ROOT}/questions/${file}`;
+    const record = readQuestion(path);
+    if (!record || (lane && record.lane !== lane)) continue;
+    results.push({ path, record });
+  }
+  return results.sort((left, right) => Date.parse(left.record.askedAt) - Date.parse(right.record.askedAt));
+}
+
+function writeQuestion(path: string, record: QuestionRecord): void {
+  const tmp = `${path}.tmp.${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
+  renameSync(tmp, path);
+}
+
+function questionOpen(record: QuestionRecord): boolean {
+  return !record.answered && !record.timedOutAt && !record.expiredAt;
+}
+
+function expireRoundQuestions(lane: string, round: number): void {
+  const expiredAt = new Date().toISOString();
+  for (const { path, record } of questionFiles(lane)) {
+    if (record.round !== round || !questionOpen(record)) continue;
+    record.expiredAt = expiredAt;
+    record.status = "expired: round ended";
+    writeQuestion(path, record);
+  }
+}
+
+function sendCommand(argv: string[]): void {
+  const [lane, ...parts] = argv;
+  const text = singleLine(parts.join(" "));
+  if (!lane || !text) fail('usage: cdx send <lane> "<text>"');
+  const record: ControlRecord = {
+    text,
+    sentAt: new Date().toISOString(),
+    ...(process.env.CLAUDE_CODE_SESSION_ID ? { from: process.env.CLAUDE_CODE_SESSION_ID.slice(0, 8) } : {}),
+  };
+  const entry = withLedger((ledger) => {
+    const current = ledger[lane];
+    if (!current) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
+    if (!laneRunning(current) || !pidAlive(current.pid)) throw new CmdError(`lane "${lane}" is not running`);
+    if (current.kind === "review") throw new CmdError(`lane "${lane}" is a review lane; review turns do not accept steering`);
+    if (current.steerOpen === false) throw new CmdError(`lane "${lane}" is finishing and no longer accepts steering`);
+    writeFileSync(controlPathOf(lane, current.rounds), `${JSON.stringify(record)}\n`, { flag: "a" });
+    return current;
+  });
+  console.log(`cdx: lane=${lane} round=${entry.rounds} steer queued`);
+}
+
+async function askCommand(argv: string[]): Promise<void> {
+  const parsed = parseArgs(argv, ["timeout"]);
+  const question = singleLine(parsed.rest.join(" "));
+  if (!question) fail('usage: cdx ask [--timeout <min>] "<question>"');
+  const lane = process.env.CDX_LANE?.trim();
+  const round = Number(process.env.CDX_ROUND);
+  const owner = process.env.CDX_OWNER?.trim();
+  if (!lane || !Number.isInteger(round) || round < 1) {
+    fail("cdx ask must run inside a cdx work lane with CDX_LANE and CDX_ROUND set");
+  }
+  const requestedTimeout = Number(parsed.flags.timeout ?? 30);
+  if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) fail("--timeout must be a positive number of minutes");
+  const timeoutMinutes = Math.min(requestedTimeout, 30);
+  if (requestedTimeout > 30) console.error(`cdx: --timeout ${requestedTimeout}m exceeds the 30m limit; using 30m`);
+  const created = withLedger(() => {
+    const seq = questionFiles(lane).reduce((highest, item) => Math.max(highest, item.record.seq), 0) + 1;
+    const record: QuestionRecord = {
+      lane,
+      round,
+      seq,
+      question,
+      askedAt: new Date().toISOString(),
+      answered: false,
+      ...(owner ? { owner } : {}),
+    };
+    const path = `${ROOT}/questions/${lane}-r${round}-${seq}.json`;
+    writeQuestion(path, record);
+    return { path, record };
+  });
+  feedOwned(`[cdx] lane=${lane} round=${round} QUESTION #${created.record.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner);
+  const deadline = Date.now() + timeoutMinutes * 60_000;
+  while (Date.now() < deadline) {
+    const current = readQuestion(created.path);
+    if (current?.answered) {
+      console.log(current.answer ?? "");
+      return;
+    }
+    if (current?.expiredAt) {
+      console.log("cdx ask expired because the round ended. Take the conservative reading, record the deviation in the lane report, and continue.");
+      return;
+    }
+    await Bun.sleep(Math.min(1000, Math.max(10, deadline - Date.now())));
+  }
+  const outcome = withLedger(() => {
+    const current = readQuestion(created.path) ?? created.record;
+    if (current.answered) return current;
+    current.timedOutAt = new Date().toISOString();
+    writeQuestion(created.path, current);
+    return current;
+  });
+  if (outcome.answered) {
+    console.log(outcome.answer ?? "");
+    return;
+  }
+  console.log("cdx ask timed out. Take the conservative reading, record the deviation in the lane report, and continue.");
+}
+
+function replyCommand(argv: string[]): void {
+  const parsed = parseArgs(argv, ["id"]);
+  const [lane, ...parts] = parsed.rest;
+  const answer = singleLine(parts.join(" "));
+  if (!lane || !answer) fail('usage: cdx reply <lane> [--id <seq>] "<answer>"');
+  const requestedId = parsed.flags.id === undefined ? undefined : Number(parsed.flags.id);
+  if (requestedId !== undefined && (!Number.isInteger(requestedId) || requestedId < 1)) fail("--id must be a positive integer");
+  const answered = withLedger((ledger) => {
+    const currentRound = ledger[lane]?.rounds;
+    if (!currentRound) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
+    const open = questionFiles(lane).filter(({ record }) => record.round === currentRound && questionOpen(record));
+    const target = requestedId === undefined ? open[0] : open.find(({ record }) => record.seq === requestedId);
+    if (!target) throw new CmdError(requestedId === undefined
+      ? `lane "${lane}" has no open questions`
+      : `lane "${lane}" has no open question #${requestedId}`);
+    const current = readQuestion(target.path) ?? target.record;
+    if (!questionOpen(current)) throw new CmdError(`question #${current.seq} is no longer open`);
+    current.answered = true;
+    current.answer = answer;
+    current.answeredAt = new Date().toISOString();
+    writeQuestion(target.path, current);
+    return current;
+  });
+  const laneOwner = readLedger()[lane]?.ownerSession;
+  feedOwned(`[cdx] lane=${lane} round=${answered.round} ANSWER #${answered.seq}: ${answer}`, answered.owner || laneOwner);
+  console.log(`cdx: answered lane=${lane} question #${answered.seq}`);
+}
+
+function questionsCommand(argv: string[]): void {
+  const [lane, extra] = argv;
+  if (extra) fail("usage: cdx questions [lane]");
+  const ledger = readLedger();
+  if (lane && !ledger[lane]) fail(`unknown lane "${lane}" (cdx status lists lanes)`);
+  const open = questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[record.lane]?.rounds === record.round);
+  if (open.length === 0) {
+    console.log(lane ? `cdx: lane=${lane} has no open questions` : "cdx: no open questions");
+    return;
+  }
+  for (const { record } of open) {
+    console.log(`${record.lane} r${record.round} QUESTION #${record.seq} asked ${fmtAge(record.askedAt)} ago: ${record.question}`);
+  }
+}
+
+function msgCommand(argv: string[]): void {
+  const [target, ...parts] = argv;
+  const message = singleLine(parts.join(" "));
+  if (!target || !message) fail('usage: cdx msg <target> "<text>"');
+  const caller = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  if (!caller) fail("cdx msg needs CLAUDE_CODE_SESSION_ID from the calling Claude Code session");
+  const lane = readLedger()[target];
+  const resolved = lane ? lane.ownerSession : target;
+  if (!resolved) fail(`lane "${target}" has no Claude session owner`);
+  if (resolved.length < 8) fail("message target must be a lane name or an 8-character session prefix");
+  const target8 = resolved.slice(0, 8);
+  const from8 = caller.slice(0, 8);
+  feed(`[cdx] msg to=${target8} from=${from8}: ${message}`);
+  console.log(`cdx: message sent to=${target8} from=${from8}`);
+}
+
+function inboxCommand(argv: string[]): void {
+  const parsed = parseArgs(argv, ["n"]);
+  if (parsed.rest.length) fail("usage: cdx inbox [-n <lines>]");
+  const caller = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  if (!caller) fail("cdx inbox needs CLAUDE_CODE_SESSION_ID from the calling Claude Code session");
+  const limit = Number(parsed.flags.n ?? 20);
+  if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
+  const path = `${ROOT}/feed.log`;
+  if (!existsSync(path)) { console.log("cdx: inbox empty"); return; }
+  const prefix = `[cdx] msg to=${caller.slice(0, 8)} `;
+  const messages = readTailLines(path, limit, (line) => line.startsWith(prefix));
+  console.log(messages.length ? messages.join("\n") : "cdx: inbox empty");
+}
+
 function gateLabel(command?: string): string {
   return command ?? "<none>";
 }
@@ -1150,6 +1785,19 @@ async function spawnCommand(argv: string[]) {
   if (!config.accounts || parsed.flags.account) warnCachedUsageBeforeLaunch(selection.choice);
   const account = selection.choice;
   const owner = callerOwnership();
+  const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
+    if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
+    return realpathSync(dir);
+  });
+  const images = (parsed.lists.image ?? []).map((image) => {
+    if (!existsSync(image)) fail(`--image does not exist: ${image}`);
+    return realpathSync(image);
+  });
+  let outputSchema: unknown;
+  if (parsed.flags.schema) {
+    try { outputSchema = JSON.parse(readFileSync(parsed.flags.schema, "utf8")); }
+    catch (error) { fail(`--schema must name valid JSON: ${error instanceof Error ? error.message : String(error)}`); }
+  }
   const { round } = openRound(lane, "work", cwd, effort, { account, owner, worktree, gate: parsed.flags.gate });
   announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
@@ -1170,16 +1818,16 @@ async function spawnCommand(argv: string[]) {
     }
     console.log(`cdx: gate baseline passed cwd=${cwd}`);
   }
-  const codexArgs = [
-    "exec", "--json", "-m", config.model, "-c", `model_reasoning_effort=${effort}`,
-    "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "--cd", cwd,
-    "--output-last-message", reportPathOf(lane, round),
-  ];
-  for (const dir of parsed.lists["add-dir"] ?? []) codexArgs.push("--add-dir", dir);
-  for (const image of parsed.lists.image ?? []) codexArgs.push("--image", image);
-  if (parsed.flags.schema) codexArgs.push("--output-schema", parsed.flags.schema);
-  codexArgs.push(fullBrief);
-  return launch({ mode: "spawn", lane, round, cwd, prompt: fullBrief, codexArgs, ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}), ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({
+    mode: "spawn", lane, round, cwd, prompt: fullBrief, model: config.model,
+    ...(additionalDirectories.length ? { additionalDirectories } : {}),
+    ...(images.length ? { images } : {}),
+    ...(outputSchema !== undefined ? { outputSchema } : {}),
+    ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}),
+    ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
+    ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
+    ...accountSpec(account), ...ownershipSpec(owner),
+  }, fullBrief, parsed.bools.has("bg"));
 }
 
 async function resumeCommand(argv: string[]) {
@@ -1208,15 +1856,21 @@ async function resumeCommand(argv: string[]) {
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const reportInstruction = reviewResume
     ? "Print your final report. cdx captures it from the transcript."
-    : `Write your final report to ${reportPathOf(lane, round)} as well as printing it.`;
+    : "Print your final report. cdx captures the last final agent message.";
   const prompt = `Ground rules:\n${houseRules(cwd, reviewResume)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
   // The session keeps its own settings; only an explicit --effort overrides.
   const effortArgs = parsed.flags.effort ? ["-c", `model_reasoning_effort=${effort}`] : [];
   const codexArgs = reviewResume
     ? ["exec", "resume", ...effortArgs, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
-    : ["exec", "resume", ...effortArgs, "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId!, prompt];
+    : undefined;
   const gate = parsed.flags.gate ?? before.gate;
-  return launch({ mode: "resume", lane, round, cwd, prompt, codexArgs, ...(!reviewResume && gate ? { gate } : {}), ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({
+    mode: "resume", lane, round, cwd, prompt,
+    ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
+    ...(!reviewResume && gate ? { gate } : {}),
+    ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
+    ...accountSpec(account), ...ownershipSpec(owner),
+  }, prompt, parsed.bools.has("bg"));
 }
 
 async function forkCommand(argv: string[]) {
@@ -1227,7 +1881,9 @@ async function forkCommand(argv: string[]) {
   validLane(newLane);
   const ledger = readLedger();
   const sourceLane = ledger[source];
-  const sessionId = sourceLane?.sessionId ?? source;
+  const sessionId = sourceLane
+    ? sourceLane.workSessionId ?? sourceLane.sessionId ?? source
+    : source;
   if (!/^[0-9a-f-]{36}$/.test(sessionId)) fail(`"${source}" is neither a lane with a session nor a session UUID`);
   const effort = parsed.flags.effort
     ? effortOf(parsed)
@@ -1263,12 +1919,8 @@ async function forkCommand(argv: string[]) {
   }
   const owner = callerOwnership();
   const { round } = openRound(newLane, "work", cwd, effort, { account, owner });
-  const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nWrite your final report to ${reportPathOf(newLane, round)} as well as printing it.`;
-  const codexArgs = [
-    "exec", "fork", "-m", config.model, "-c", `model_reasoning_effort=${effort}`,
-    "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", sessionId, prompt,
-  ];
-  return launch({ mode: "fork", lane: newLane, round, cwd, prompt, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nPrint your final report. cdx captures the last final agent message.`;
+  return launch({ mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function reviewCommand(argv: string[]) {
@@ -1360,7 +2012,8 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const workState = workStateOf(entry);
   const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
   const workRound = entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined);
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""} ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}`;
+  const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""} ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd) {
@@ -1382,6 +2035,8 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const last = entry.kind === "work" && active ? entry.lastAction ?? "-"
     : [entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean).join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
+  const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
+  if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
   if (entry.reviewState) {
     const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.reviewState;
     const reviewTiming = entry.reviewState === "running"
@@ -1478,6 +2133,11 @@ async function waitCommand(argv: string[]) {
 function renderEventLine(line: string): string | undefined {
   try {
     const event = JSON.parse(line);
+    if (event.method === "thread/started") return `[session ${event.params?.thread?.id ?? "?"}]`;
+    if (event.method === "turn/completed") return `[turn ${event.params?.turn?.status ?? "done"}]`;
+    if (event.method === "item/completed" && event.params?.item) {
+      return event.params.item.type === "agentMessage" ? `codex: ${event.params.item.text}` : excerpt(event.params.item);
+    }
     if (event.type === "thread.started") return `[session ${event.thread_id}]`;
     if (event.type === "turn.completed") return `[turn done: ${event.usage?.input_tokens ?? "?"} in / ${event.usage?.output_tokens ?? "?"} out]`;
     if (event.type === "item.completed" && event.item) {
@@ -2066,6 +2726,117 @@ async function usageCommand(argv: string[]) {
   }
 }
 
+async function probeAppServer(account?: AccountChoice): Promise<{ reply: string; usage: string }> {
+  const proc = Bun.spawn({
+    cmd: ["codex", "app-server", "--listen", "stdio://"],
+    cwd: "/tmp",
+    ...(account ? { env: uncoloredChildEnv(account.home) } : {}),
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  let nextId = 0;
+  const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
+  let reply = "";
+  let usage = "? in / ? out";
+  let turnResolve: ((turn: AppTurn) => void) | undefined;
+  let turnReject: ((error: Error) => void) | undefined;
+  const write = (message: Record<string, unknown>) => {
+    proc.stdin.write(`${JSON.stringify(message)}\n`);
+    proc.stdin.flush();
+  };
+  const request = (method: string, params: Record<string, unknown>) => {
+    const id = ++nextId;
+    return new Promise<any>((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      write({ id, method, params });
+    });
+  };
+  const reader = (async () => {
+    try {
+      const decoder = new TextDecoder();
+      let buffer = "";
+      for await (const chunk of proc.stdout) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const event = JSON.parse(line);
+          if (typeof event.id === "number" && pending.has(event.id)) {
+            const waiter = pending.get(event.id)!;
+            pending.delete(event.id);
+            if (event.error) waiter.reject(new Error(event.error.message ?? "app-server probe request failed"));
+            else waiter.resolve(event.result);
+          } else if (event.method === "item/completed" && event.params?.item?.type === "agentMessage") {
+            reply = event.params.item.text ?? reply;
+          } else if (event.method === "thread/tokenUsage/updated" && event.params?.tokenUsage?.last) {
+            const last = event.params.tokenUsage.last;
+            usage = `${last.inputTokens ?? "?"} in / ${last.outputTokens ?? "?"} out`;
+          } else if (event.method === "turn/completed") {
+            const resolve = turnResolve;
+            turnResolve = undefined;
+            turnReject = undefined;
+            resolve?.(event.params.turn as AppTurn);
+          }
+        }
+      }
+    } finally {
+      const suffix = proc.exitCode === null ? "stdout stream ended" : `child exited ${proc.exitCode}`;
+      const closed = new Error(`app-server closed before turn/completed: ${suffix}`);
+      for (const waiter of pending.values()) waiter.reject(closed);
+      pending.clear();
+      const reject = turnReject;
+      turnResolve = undefined;
+      turnReject = undefined;
+      reject?.(closed);
+    }
+  })();
+  const stderr = new Response(proc.stderr).text();
+  const killer = setTimeout(() => { try { proc.kill(); } catch { /* already gone */ } }, 180_000);
+  try {
+    await request("initialize", {
+      clientInfo: { name: "cdx", title: "cdx doctor", version: "2.2.0" },
+      capabilities: { experimentalApi: true },
+    });
+    write({ method: "initialized" });
+    const started = await request("thread/start", {
+      model: config.model,
+      cwd: "/tmp",
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      ephemeral: true,
+    });
+    const threadId = started?.thread?.id;
+    if (typeof threadId !== "string") throw new Error("thread/start returned no thread id");
+    const completion = new Promise<AppTurn>((resolve, reject) => { turnResolve = resolve; turnReject = reject; });
+    await request("turn/start", {
+      threadId,
+      input: [inputText("Reply with the single word OK and nothing else.")],
+      cwd: "/tmp",
+      approvalPolicy: "never",
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      model: config.model,
+      effort: config.defaultEffort,
+    });
+    const turn = await completion;
+    if (turn.status !== "completed") throw new Error(`turn ended with status ${turn.status}${turn.error?.message ? `: ${turn.error.message}` : ""}`);
+    await request("thread/unsubscribe", { threadId });
+    proc.stdin.end();
+    await Promise.race([proc.exited, Bun.sleep(3000).then(() => { try { proc.kill(); } catch { /* already gone */ } })]);
+    await Promise.all([reader, stderr]);
+    if (!reply.trim()) throw new Error("turn completed without an agent message");
+    return { reply, usage };
+  } catch (error) {
+    try { proc.stdin.end(); } catch { /* already closed */ }
+    try { proc.kill(); } catch { /* already closed */ }
+    await Promise.allSettled([reader, stderr, proc.exited]);
+    throw error;
+  } finally {
+    clearTimeout(killer);
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -2183,7 +2954,7 @@ async function doctorCommand(argv: string[]) {
     }
     withLedger((ledger) => {
       for (const [lane] of stale) {
-        failActiveRound(ledger[lane]!, "runner died without finalizing; repaired by cdx doctor --fix");
+        failActiveRound(lane, ledger[lane]!, "runner died without finalizing; repaired by cdx doctor --fix");
       }
     });
     good(`fixed: marked ${stale.length} stale round(s) failed`);
@@ -2195,36 +2966,18 @@ async function doctorCommand(argv: string[]) {
     if (!version?.success || !loggedIn) {
       warn("probe: skipped, fix the failures above first");
     } else {
-      console.log(color.cyan("probe: live exec round-trip, may take about 30s..."));
+      console.log(color.cyan("probe: live app-server round-trip, may take about 30s..."));
       const started = Date.now();
-      const proc = Bun.spawn({
-        cmd: ["codex", "exec", "--json", "-m", config.model, "-c", `model_reasoning_effort=${config.defaultEffort}`, "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", "/tmp", "Reply with the single word OK and nothing else."],
-        ...(doctorAccount ? { env: uncoloredChildEnv(doctorAccount.home) } : {}),
-        stdout: "pipe", stderr: "pipe",
-      });
-      const killer = setTimeout(() => proc.kill(), 180_000);
-      const [out, errText, exitCode] = await Promise.all([
-        new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited,
-      ]);
-      clearTimeout(killer);
-      let reply = "";
-      let usage = "";
-      for (const line of out.split("\n")) {
-        try {
-          const event = JSON.parse(line);
-          if (event.type === "item.completed" && event.item?.type === "agent_message") reply = event.item.text;
-          if (event.type === "turn.completed") usage = `${event.usage?.input_tokens ?? "?"} in / ${event.usage?.output_tokens ?? "?"} out`;
-        } catch { /* interleaved non-JSON noise */ }
-      }
-      const secs = ((Date.now() - started) / 1000).toFixed(1);
-      if (exitCode === 0 && reply) {
-        good(`probe: OK in ${secs}s (reply "${reply.trim()}", ${usage})`);
-      } else {
-        const errTail = errText.trim().split("\n").at(-1) ?? "";
-        const remedy = /auth|login|401|unauthorized/i.test(errText) ? "run `codex login`"
-          : /model/i.test(errText) ? `model ${config.model} rejected; check \`codex features\` and account access`
-          : "check network, then `codex login status`; full stderr is above";
-        bad("probe", `exec exited ${exitCode} after ${secs}s${errTail ? ` (${errTail})` : ""}`, remedy);
+      try {
+        const result = await probeAppServer(doctorAccount);
+        const secs = ((Date.now() - started) / 1000).toFixed(1);
+        good(`probe: OK in ${secs}s (reply "${result.reply.trim()}", ${result.usage}, thread unsubscribed)`);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        const remedy = /auth|login|401|unauthorized/i.test(detail) ? "run `codex login`"
+          : /model/i.test(detail) ? `model ${config.model} rejected; check \`codex features\` and account access`
+          : "check the 0.149.1 app-server schema, network, and `codex login status`";
+        bad("probe", detail.slice(0, 240), remedy);
       }
     }
   }
@@ -2250,8 +3003,9 @@ function feedCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["n"]);
   const path = `${ROOT}/feed.log`;
   if (!existsSync(path)) { console.log("cdx: no feed yet"); return; }
-  const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
-  console.log(lines.slice(-Number(parsed.flags.n ?? 20)).join("\n"));
+  const limit = Number(parsed.flags.n ?? 20);
+  if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
+  console.log(readTailLines(path, limit, (line) => line.trim().length > 0).join("\n"));
 }
 
 function cleanCommand(argv: string[]) {
@@ -2262,10 +3016,11 @@ function cleanCommand(argv: string[]) {
   withLedger((ledger) => {
     for (const [lane, entry] of Object.entries(ledger)) {
       if (entry.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
-      // Anchor on "-r<digits>." so lane "foo" never matches "foo-review-r1".
+      // Anchor on "-r<digits>" plus a separator so lane "foo" never matches
+      // "foo-review-r1".
       const escaped = lane.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`^${escaped}-r\\d+\\.`);
-      for (const dir of ["logs", "reports", "briefs", "specs"]) {
+      const pattern = new RegExp(`^${escaped}-r\\d+(?:\\.|-)`);
+      for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
         for (const file of readdirSync(`${ROOT}/${dir}`)) {
           if (pattern.test(file)) rmSync(`${ROOT}/${dir}/${file}`, { force: true });
         }
@@ -2274,6 +3029,11 @@ function cleanCommand(argv: string[]) {
       removed.push(lane);
     }
   });
+  const feedPath = `${ROOT}/feed.log`;
+  if (existsSync(feedPath)) {
+    const tail = readTailLines(feedPath, 2000, (line) => line.trim().length > 0);
+    writeFileSync(feedPath, tail.length ? `${tail.join("\n")}\n` : "");
+  }
   console.log(removed.length > 0 ? `cdx: pruned closed lanes older than ${days}d: ${removed.join(", ")}` : `cdx: nothing to prune (closed lanes older than ${days}d)`);
 }
 
@@ -2318,7 +3078,7 @@ async function killCommand(argv: string[]) {
   }
   const finalized = withLedger((ledger) => {
     const item = ledger[lane]!;
-    failActiveRound(item, note ? `killed: ${note}` : "killed");
+    failActiveRound(lane, item, note ? `killed: ${note}` : "killed");
     if (item.kind === "review") item.reviewExitCode = undefined;
     else item.exitCode = undefined;
     return item;
@@ -2335,6 +3095,10 @@ cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default
   fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   adopt  <lane> <sessionId> [--account NAME] [--cd D]
+  send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
+  ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
+  reply  <lane> [--id SEQ] "<answer>"  questions [lane]
+  msg    <lane|session-prefix> "<text>"  inbox [-n N]
   status [--json]         wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
@@ -2374,6 +3138,12 @@ switch (command) {
   case "review": await reviewCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "fork": await forkCommand(argv); break;
+  case "send": sendCommand(argv); break;
+  case "ask": await askCommand(argv); break;
+  case "reply": replyCommand(argv); break;
+  case "questions": questionsCommand(argv); break;
+  case "msg": msgCommand(argv); break;
+  case "inbox": inboxCommand(argv); break;
   case "_run": {
     const [lane, round] = argv;
     if (!lane || !round) fail("internal: _run <lane> <round>");
