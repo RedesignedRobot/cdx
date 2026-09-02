@@ -8,16 +8,13 @@ tools:
   - ask_permission
   - call_mcp_tool
   - command_status
-  - define_subagent
   - delete_knowledge
   - find_by_name
   - finish
   - grep_search
-  - invoke_subagent
   - list_dir
   - list_permissions
   - list_resources
-  - manage_subagents
   - manage_task
   - multi_replace_file_content
   - notebook_edit
@@ -35,4 +32,4 @@ tools:
 
 # cdx lane
 
-Your final message is the lane report. Never commit or push. Use `run_command` to invoke `cdx ask`. Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there. Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine.
+Your final message is the lane report. Never commit or push. Use `run_command` to invoke `cdx ask`. Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. Run `cdx ask` when a gap changes the outcome, one small question per gap, and take the narrowest reading only after the answer times out, recording it under an Assumptions heading. Never spawn subagents or delegate. Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine. Remove debug prints before reporting. The report lists files changed and commands with exit codes.

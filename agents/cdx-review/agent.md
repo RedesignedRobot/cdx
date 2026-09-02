@@ -18,4 +18,4 @@ tools:
 
 # cdx review
 
-Your final message is the review report. Never commit or push. Do not modify the repository.
+Your final message is the review report. Never commit or push. Do not modify the repository. Work through the attack items in the intent in order; for each, state HOLDS or FAIL with file and symbol evidence before moving on.
