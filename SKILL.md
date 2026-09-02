@@ -8,18 +8,19 @@ allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 
 Use `cdx` for headless Codex and Antigravity work. cdx records each lane,
 captures its report, tracks its state, and applies the policy in `config.json`.
-Every new spawn, review, and adopted session must name `--engine gpt|gemini`.
-Resume inherits the lane engine.
+`--engine` is optional on spawn, review, and adopt and defaults to `gemini`.
+`--engine gpt` is explicit. Resume inherits the lane engine.
 
 ## Which engine
 
 ```text
-gpt:
-+ strongest code and judgment on hard multi-file work, design-heavy lanes
-- slow (20-30 min lanes), scarce weekly budget, burns fast
+gemini is the default; gpt is explicit.
 gemini:
 + near-unlimited quota, fast, good on bounded briefs (investigate, read, search, audit, review, test, small scoped builds)
 - weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks
+gpt:
++ strongest code and judgment on hard multi-file work, design-heavy lanes
+- slow (20-30 min lanes), scarce weekly budget, burns fast
 gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
 gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
 gpt: one big brief for sweeping multi-file work.
@@ -31,10 +32,21 @@ through Antigravity is level two for bounded investigation, review, tests, and
 small builds. Gemini always uses `gemini-3.8-flash-high`. Its effort is not
 configurable.
 
+### Gemini operating rules
+
+- Asks via cdx ask when a gap changes the outcome, one small question per gap, and takes the narrowest reading only after the answer times out, recording it under an Assumptions heading.
+- Never delegates.
+- Brief under a page with named files and acceptance checks.
+- One outcome per lane.
+- Fan out many lanes with `--bg` and one `cdx wait`.
+- Gate every build lane.
+- Reviews of gemini work carry explicit attack items.
+- A gemini review of a gemini lane is allowed but weaker than a different reviewer.
+
 ## Commands
 
 ```bash
-cdx spawn  <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
+cdx spawn  <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
 cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime <min>] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
@@ -44,8 +56,8 @@ cdx reply  <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
-cdx review <lane> --engine gpt|gemini [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> --engine gpt|gemini [--account NAME] [--cd <dir>]
+cdx review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
 cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
@@ -67,10 +79,11 @@ resume, fork, and the review intent.
 
 `spawn --worktree <path>` creates a git worktree at that path on branch
 `lane/<lane>` from the repo at `--cd` (or the current directory), runs the
-optional `worktreeSetup` config command inside it, and runs the lane there.
-Use it whenever parallel lanes touch the same repository, so each worker owns
-its files exclusively. `status` shows the branch; `close` prints the removal
-commands and never deletes anything itself.
+optional `worktreeSetup` config command and the repository's
+`.cdx-worktree-setup` hook inside it (see Configuration), and runs the lane
+there. Use it whenever parallel lanes touch the same
+repository, so each worker owns its files exclusively. `status` shows the
+branch; `close` prints the removal commands and never deletes anything itself.
 
 GPT work rounds own one `codex app-server` child over stdio JSON-RPC. Gemini
 work rounds own one `agy` child with stream JSON input and output. cdx launches
@@ -99,6 +112,12 @@ rerun the stored gate; reviews never run one. Full gate output lands in
 `logs/<lane>-r<n>.gate.log`. The gate is the harness's own verification, so
 a worker's optimistic done claim cannot finalize green.
 
+When a work round changes no files, cdx checks whether the lane has a gate.
+With a gate, the round fails with "gate passed on an unchanged tree: no work landed"
+and the gate is skipped. Without a gate, the round finalizes done, the report
+gets a "## Harness note" saying no files changed, the feed line carries
+`diff=empty`, and status shows "no tree change".
+
 A worktree spawn with `--gate` runs the gate once in the untouched baseline
 tree before the worker starts. For a non-worktree spawn, add
 `--gate-baseline-check` to run the same check. A baseline failure stops the
@@ -121,7 +140,8 @@ finalize with note `killed`. Exit codes 130, 137, and 143 always finalize as
 
 A review uses one of `--uncommitted`, `--base`, or `--commit`, or takes a custom
 intent with optional `--scope`. GPT target reviews use Codex's native reviewer.
-Gemini receives an equivalent `git diff` instruction. Both engines receive the
+Gemini receives an equivalent `git diff` instruction. A gemini review of a
+gemini lane prints a note asking for explicit attack items. Both engines receive the
 same findings contract, and cdx extracts its fenced JSON block into
 `reports/<lane>-r<n>.findings.json`. Codex enforces read-only access. For
 Gemini, cdx compares the repository tree before and after the round. A changed
@@ -138,8 +158,16 @@ records `mode=follow-up-turn`. cdx never consumes a record without delivery.
 `send` refuses review lanes before it writes a record.
 
 The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines.
+While `CDX_LANE` is set, cdx refuses `spawn`, `resume`, `fork`, `review`,
+`adopt`, `kill`, `close`, `clean`, `gate`, and `reply` with the message
+`lane workers cannot drive the harness`; a worker that wants to test the
+harness does it through `cdx.test.ts` under a temporary `CDX_HOME`.
+Inspection commands (`status`, `tail`, `report`, `log`, `feed`, `usage`,
+`questions`, `inbox`, `msg`, `brief`, `doctor`) and `ask` stay available.
 A worker uses `cdx ask [--timeout MIN] "<question>"` when an open point changes
-the architecture or file set. `ask` writes
+the architecture or file set. Gemini workers ask via `cdx ask` when a gap changes
+the outcome, ask one small question per gap, and take the narrowest reading only
+after the answer times out, recording it under an Assumptions heading. `ask` writes
 `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time,
 and `answered: false`. It posts the question with the lane owner's suffix and
 polls for an answer. The default and maximum timeout is 30 minutes. A larger
@@ -252,7 +280,9 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
 
 `worktreeSetup` is optional: a shell command run inside every new `--worktree`
 before the lane starts. A nonzero exit aborts the spawn and leaves the
-worktree in place for inspection.
+worktree in place for inspection. A repository may ship an executable
+`.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global
+`worktreeSetup` command and fails the spawn on nonzero exit.
 
 Existing top-level model and effort keys configure GPT. The optional `gemini`
 object accepts only `model`, `agent`, and `reviewAgent`; the shown values are
@@ -278,14 +308,15 @@ account data falls back to the default Codex home and writes a feed note.
 cdx appends each `rules` entry to the built-in brief rules. It then appends the
 contents of `.cdx-rules.md` from the lane's working directory when that file
 exists. Built-in work rules forbid commits, pushes, deploys, and extra
-long-running servers. They require the final report and ask the worker to use
-subagent threads when independent work can run in parallel. They also tell the
-worker to run `cdx ask` when an open point changes the architecture or file set,
-ask once per open point, and skip questions that the brief or code answers.
-Gemini work rules add four lines: execute as written, ask one small question per
-gap, take the narrowest reading on timeout, and never use search_web,
-read_url_content, or browser tools. The last one lives in the brief because agy
-ignores the agent file tool allowlist.
+long-running servers. They require the final report. GPT workers receive rules
+to use subagents for parallel work and run `cdx ask` when open points change
+architecture or files. Gemini house rules require the worker to execute as
+written, ask via `cdx ask` when a gap changes the outcome (one small question
+per gap), and take the narrowest reading only after the answer times out,
+recording it under an Assumptions heading. Gemini workers never spawn subagents,
+avoid web tools, remove debug prints before reporting, and list files changed
+and commands with exit codes in the report. The web tool ban lives in the brief
+because agy ignores the agent file tool allowlist.
 Review rules forbid writes and require a report. The harness also checks a
 Gemini review's tree before and after the round.
 
@@ -296,6 +327,10 @@ After a work turn completes with a qualifying report, cdx writes the report
 before unsubscribe and child shutdown. A later cleanup failure produces a
 warning instead of failing the completed round. A missing qualifying message
 fails with `no final report`, and cdx does not run the acceptance gate.
+A Gemini round whose final response is the agy cancellation template ("User
+initiated cancellation", "Execution stopped per your cancellation request")
+finalizes failed with note "agy returned its cancellation template as the
+report; no qualifying report", and the gate does not run.
 Engine errors go to the ledger note and feed line.
 
 ## Claude Code plugin
