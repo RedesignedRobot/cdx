@@ -7,5 +7,8 @@
     "cdx": "./cdx.ts"
   },
   "repository": "github:RedesignedRobot/cdx",
-  "description": "Codex execution lanes for Claude Code."
+  "description": "Codex execution lanes for Claude Code.",
+  "scripts": {
+    "check": "bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts"
+  }
 }
