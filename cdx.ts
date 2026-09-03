@@ -63,6 +63,7 @@ const LEDGER = `${ROOT}/ledger.json`;
 const CONFIG_PATH = `${ROOT}/config.json`;
 const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
+const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
 const VERSION = "3.1.0";
@@ -170,6 +171,7 @@ interface Lane {
   roundTokens?: Tokens;
   steers?: number;
   steerOpen?: boolean;
+  continuations?: number;
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
@@ -496,6 +498,7 @@ function validLane(lane: string): string {
 }
 
 const reportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.md`;
+const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.partial.md`;
 const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;
 const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
 const controlPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.jsonl`;
@@ -613,8 +616,7 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt"): s
     builtIns.push("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.");
     if (engine === "gemini") {
       builtIns.push("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
-      builtIns.push("Never spawn subagents or delegate; do the work yourself in this thread.");
-      builtIns.push("Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine.");
+      builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
       builtIns.push("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
       builtIns.push("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
     } else {
@@ -955,6 +957,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       roundTokens: { input: 0, cached: 0, output: 0 },
       steers: 0,
       steerOpen: kind === "work",
+      continuations: 0,
       // A fresh round must never display the previous round's final message
       // or note as its own.
       lastAction: undefined,
@@ -1366,6 +1369,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   let geminiTurnsSent = 0;
   let geminiTurnsCompleted = 0;
   let geminiTurnWake: (() => void) | undefined;
+  let geminiContinuations = 0;
+  const writeUserTurn = (text: string) => {
+    proc.stdin.write(`${JSON.stringify({ event: "user", message: { content: text } })}\n`);
+    proc.stdin.flush();
+    geminiTurnsSent += 1;
+  };
 
   const persistCapturedReport = () => {
     const candidate = latestReportCandidate;
@@ -1431,14 +1440,38 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         touchLedger((item) => { item.sessionId = result.conversation_id; item.lastEventAt = now; }, true);
       }
       if (typeof result.response === "string" && result.response.trim()) {
-        writeFileSync(reportPath, `${result.response.trim()}\n`);
-        if (isAgyCancellationTemplate(result.response)) {
-          turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+        if (result.status === "SUCCESS") {
+          writeFileSync(reportPath, `${result.response.trim()}\n`);
+          if (isAgyCancellationTemplate(result.response)) {
+            turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+          }
+        } else {
+          writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
         }
       }
       if (result.status !== "SUCCESS") {
-        const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
-        turnFailureReason ??= detail || "gemini result status ERROR";
+        const rawError = result.error?.message ?? result.error;
+        const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
+        const errorCandidates = [
+          errorText,
+          typeof result.response === "string" ? result.response : "",
+        ].filter((s) => s.trim().length > 0);
+        const errString = errorCandidates[0] ?? "";
+        const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
+
+        if (isTransportError && proc.exitCode === null && geminiContinuations < 2) {
+          geminiContinuations += 1;
+          touchLedger((item) => {
+            item.continuations = geminiContinuations;
+            item.lastEventAt = now;
+          }, true);
+          const reason = singleLine(errString).slice(0, 80);
+          feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, spec.ownerSession);
+          writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+        } else {
+          const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
+          turnFailureReason ??= detail || "gemini result status ERROR";
+        }
       }
       geminiTurnsCompleted += 1;
       const wake = geminiTurnWake;
@@ -1548,11 +1581,6 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const stderrPump = pumpRaw(proc.stderr, errLog);
     let controlIndex = 0;
     let controlChain = Promise.resolve();
-    const writeUserTurn = (text: string) => {
-      proc.stdin.write(`${JSON.stringify({ event: "user", message: { content: text } })}\n`);
-      proc.stdin.flush();
-      geminiTurnsSent += 1;
-    };
     const drainControls = async () => {
       const path = controlPathOf(lane, round);
       if (!existsSync(path)) return;
@@ -1942,7 +1970,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         : `gate failed (exit ${gateExit}): ${spec.gate}; baseline was not checked, use --gate-baseline-check on spawn`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (receivedSignal) roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
-    else if (turnFailureReason) roundNote = `turn failed: ${turnFailureReason.slice(0, 200)}`;
+    else if (turnFailureReason) {
+      const continuePrefix = geminiContinuations > 0
+        ? `turn failed after ${geminiContinuations} auto-continue${geminiContinuations === 1 ? "" : "s"}`
+        : "turn failed";
+      roundNote = `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
+    }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
     else if (roundCleanupWarning) roundNote = `cleanup warning: ${roundCleanupWarning.slice(0, 200)}`;
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
@@ -1975,6 +2008,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     item.pid = undefined;
     item.codexPid = undefined;
     if (existsSync(reportPath)) item.reports.push(reportPath);
+    if (geminiContinuations > 0) item.continuations = geminiContinuations;
     item.updatedAt = new Date().toISOString();
     return item;
   });
@@ -2541,8 +2575,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
   const workRound = entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined);
   const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
+  const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
   const engine = laneEngine(entry);
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerDetail}`;
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd) {
