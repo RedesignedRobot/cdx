@@ -197,12 +197,14 @@ let turn = 0;
 let processing = false;
 let inputClosed = false;
 const queue = [];
-const result = (status, response) => send({
+let fail3x = false;
+const result = (status, response, error) => send({
   event: "result",
   result: {
     conversation_id: conversationId,
     status,
     response,
+    ...(error !== undefined ? { error } : {}),
     // Cumulative over the conversation, like the real agy; cdx must not add it.
     usage: {
       input_tokens: 999 * turn,
@@ -247,9 +249,24 @@ async function runTurn(content) {
   if (content.includes("HANG_AGY")) await new Promise(() => {});
   if (content.includes("WAIT_FOR_FOLLOW_UP")) await Bun.sleep(250);
   if (content.includes("REVIEW_WRITE")) writeFileSync(\`\${process.cwd()}/fake-review-change.txt\`, "changed by fake reviewer\\n");
-  if (content.includes("AGY_CANCEL_TEMPLATE")) result("SUCCESS", "User initiated cancellation\\nExecution stopped per your cancellation request");
+  if (content.includes("FAIL_3X")) fail3x = true;
+  if (fail3x) {
+    result("ERROR", "interrupted progress", "The stream was interrupted. Please continue the task you were working on.");
+  } else if (content.includes("STREAM_INTERRUPT") && turn === 1) {
+    result("ERROR", "turn 1 interrupted progress", "The stream was interrupted. Please continue the task you were working on.");
+  } else if (content.includes("NON_TRANSPORT_ERROR")) {
+    result("ERROR", "syntax failure", "non-transport fatal error");
+  } else if (content.includes("WRITE_WORKER_REPORT_PARTIAL")) {
+    const cdxHome = process.env.CDX_HOME;
+    const lane = process.env.CDX_LANE;
+    const round = process.env.CDX_ROUND;
+    if (cdxHome && lane && round) {
+      writeFileSync(\`\${cdxHome}/reports/\${lane}-r\${round}.md\`, "worker report\\n");
+    }
+    result("ERROR", "progress text", "scripted non-transport error");
+  } else if (content.includes("AGY_CANCEL_TEMPLATE")) result("SUCCESS", "User initiated cancellation\\nExecution stopped per your cancellation request");
   else if (content.includes("AGY_ERROR")) result("ERROR", "scripted agy failure");
-  else if (turn > 1) result("SUCCESS", \`follow-up result: \${content}\`);
+  else if (turn > 1) result("SUCCESS", content.includes("cut off by a transport error") ? "second response report" : \`follow-up result: \${content}\`);
   else if (content.includes("REVIEW_CLEAN")) result("SUCCESS", "No findings.");
   else result("SUCCESS", \`gemini report: \${content}\`);
   processing = false;
@@ -1001,10 +1018,10 @@ describe("cdx execution engines", () => {
     const geminiRules = houseRules("/tmp", false, "gemini");
     expect(geminiRules).toContain(harnessCommandRule);
     expect(geminiRules).toContain("cdx ask");
-    expect(geminiRules).not.toContain("subagent threads");
+    expect(geminiRules).toContain("subagent threads");
     expect(geminiRules).toContain("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
-    expect(geminiRules).toContain("Never spawn subagents or delegate; do the work yourself in this thread.");
-    expect(geminiRules).toContain("Never use search_web, read_url_content, or browser tools. The brief and the code stay on this machine.");
+    expect(geminiRules).not.toContain("Never spawn subagents");
+    expect(geminiRules).not.toContain("search_web");
     expect(geminiRules).toContain("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
     expect(geminiRules).toContain("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
 
@@ -1214,7 +1231,102 @@ describe("cdx execution engines", () => {
     expect(result.exitCode).toBe(1);
     expect(lane.state).toBe("failed");
     expect(lane.note).toContain("scripted agy failure");
-    expect(readFileSync(`${state}/reports/gemini-error-r1.md`, "utf8")).toContain("scripted agy failure");
+    expect(readFileSync(`${state}/reports/gemini-error-r1.partial.md`, "utf8")).toContain("scripted agy failure");
+  });
+
+  test("auto-continues on gemini stream-interrupted transport error and succeeds on second turn", () => {
+    const root = tempPath("gemini-auto-continue");
+    const state = `${root}/state`;
+    const trace = `${root}/agy.trace`;
+    const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
+    const result = runCli(["spawn", "gemini-continue", "--engine", "gemini", "--cd", root, "STREAM_INTERRUPT"], env);
+    expect(result.exitCode).toBe(0);
+
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-continue"];
+    expect(lane.state).toBe("done");
+    expect(lane.continuations).toBe(1);
+
+    const report = readFileSync(`${state}/reports/gemini-continue-r1.md`, "utf8").trim();
+    expect(report).toBe("second response report");
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain("auto-continue 1/2");
+
+    const traceLines = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const inputs = traceLines.filter((record) => record.input).map((record) => record.input);
+    expect(inputs.length).toBe(2);
+    expect(inputs[1]).toBe("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+
+    const status = runCli(["status"], env);
+    expect(status.stdout).toContain("auto-continued 1x");
+  });
+
+  test("fails after 2 auto-continues when gemini errors 3 times in a row", () => {
+    const root = tempPath("gemini-fail-3x");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeAgy(root));
+    const result = runCli(["spawn", "gemini-fail-3x", "--engine", "gemini", "--cd", root, "FAIL_3X"], env);
+    expect(result.exitCode).toBe(1);
+
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-fail-3x"];
+    expect(lane.state).toBe("failed");
+    expect(lane.continuations).toBe(2);
+    expect(lane.note).toMatch(/^turn failed after 2 auto-continues/);
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain("auto-continue 1/2");
+    expect(feed).toContain("auto-continue 2/2");
+  });
+
+  test("fails without continuation on non-transport gemini error", () => {
+    const root = tempPath("gemini-non-transport");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeAgy(root));
+    const result = runCli(["spawn", "gemini-non-transport", "--engine", "gemini", "--cd", root, "NON_TRANSPORT_ERROR"], env);
+    expect(result.exitCode).toBe(1);
+
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-non-transport"];
+    expect(lane.state).toBe("failed");
+    expect(lane.continuations ?? 0).toBe(0);
+    expect(lane.note).not.toContain("auto-continue");
+    expect(lane.note).toContain("non-transport fatal error");
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).not.toContain("auto-continue");
+  });
+
+  test("never overwrites worker-written report with partial turn text on failure", () => {
+    const root = tempPath("gemini-partial-report");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeAgy(root));
+    const result = runCli(["spawn", "gemini-partial", "--engine", "gemini", "--cd", root, "WRITE_WORKER_REPORT_PARTIAL"], env);
+    expect(result.exitCode).toBe(1);
+
+    const workerReport = readFileSync(`${state}/reports/gemini-partial-r1.md`, "utf8").trim();
+    expect(workerReport).toBe("worker report");
+
+    const partialReport = readFileSync(`${state}/reports/gemini-partial-r1.partial.md`, "utf8").trim();
+    expect(partialReport).toBe("progress text");
+
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-partial"];
+    expect(lane.state).toBe("failed");
+    expect(lane.workReport).toBe(`${state}/reports/gemini-partial-r1.md`);
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain(`report=${state}/reports/gemini-partial-r1.md`);
+  });
+
+  test("gemini brief in briefs/ reflects updated house rules", () => {
+    const root = tempPath("gemini-brief-rules");
+    const state = `${root}/state`;
+    const env = baseEnv(state, installFakeAgy(root));
+    const result = runCli(["spawn", "brief-rules", "--engine", "gemini", "--cd", root, "inspect"], env);
+    expect(result.exitCode).toBe(0);
+
+    const brief = readFileSync(`${state}/briefs/brief-rules-r1.md`, "utf8");
+    expect(brief).not.toContain("search_web");
+    expect(brief).not.toContain("Never spawn subagents");
+    expect(brief).toContain("subagent threads");
   });
 
   test("guards gemini reviews against writes and converts native targets to prompt text", () => {
