@@ -154,6 +154,7 @@ interface Lane {
   // Review rounds overwrite sessionId with the read-only review session; the
   // work thread survives here so resume always reattaches to it.
   workSessionId?: string;
+  transcriptPath?: string;
   reviewEngine?: Engine;
   // cwd and state remain the stable work values for old ledger consumers.
   cwd: string;
@@ -503,6 +504,11 @@ const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/
 const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
 const controlPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.jsonl`;
 
+function geminiTranscriptPath(conversationId: string): string {
+  const base = process.env.CDX_AGY_STATE_HOME ?? `${HOME}/.gemini/antigravity-cli`;
+  return `${base}/brain/${conversationId}/.system_generated/logs/transcript_full.jsonl`;
+}
+
 function pidAlive(pid?: number): boolean {
   if (!pid) return false;
   try { process.kill(pid, 0); return true; } catch { return false; }
@@ -634,7 +640,35 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt"): s
   return sections.join("\n");
 }
 
-const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, test gaps. Severity-rank findings, each with a concrete failure scenario, and mark each CONFIRMED (you traced the code path) or PLAUSIBLE (you could not fully trace it). If clean, say clean and list exactly what you checked. End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
+const REVIEW_FINDINGS_SCHEMA = {
+  type: "object",
+  required: ["report", "findings"],
+  properties: {
+    report: { type: "string", description: "the full markdown review report" },
+    findings: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["severity", "confidence", "file", "line", "summary"],
+        properties: {
+          severity: { type: "string", enum: ["P1", "P2", "P3"] },
+          confidence: { type: "string", enum: ["CONFIRMED", "PLAUSIBLE"] },
+          file: { type: "string" },
+          line: { type: "integer" },
+          summary: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, test gaps. Severity-rank findings, each with a concrete failure scenario, and mark each CONFIRMED (you traced the code path) or PLAUSIBLE (you could not fully trace it). If clean, say clean and list exactly what you checked.";
+const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
+const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
+
+function reviewFrame(engine: Engine): string {
+  return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
+}
 
 // ---------------------------------------------------------------------------
 // Flag parsing
@@ -642,7 +676,7 @@ const REVIEW_FRAME = `ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, r
 
 const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -928,6 +962,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       ownerSession,
       ownerCwd,
       sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
+      transcriptPath: undefined,
       workSessionId: kind === "review"
         ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
         : existing?.workSessionId,
@@ -1267,6 +1302,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const jsonMode = gemini || appServer || spec.mode === "spawn";
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
+  try { unlinkSync(`${ROOT}/reports/${lane}-r${round}.findings.json`); } catch { /* ignore if missing */ }
   const reviewSnapshot = gemini && startingLane?.kind === "review" ? captureReviewTree(spec.cwd) : undefined;
   const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(spec.cwd) : undefined;
   withLedger((ledger) => {
@@ -1370,7 +1406,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   let geminiTurnsCompleted = 0;
   let geminiTurnWake: (() => void) | undefined;
   let geminiContinuations = 0;
+  const turnAgentResponses = new Map<string, { stepIndex: string; num: number; text: string }>();
   const writeUserTurn = (text: string) => {
+    turnAgentResponses.clear();
     proc.stdin.write(`${JSON.stringify({ event: "user", message: { content: text } })}\n`);
     proc.stdin.flush();
     geminiTurnsSent += 1;
@@ -1401,7 +1439,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     noteActivity();
     const now = new Date().toISOString();
     if (event.event === "init" && event.conversation_id) {
-      touchLedger((item) => { item.sessionId = event.conversation_id; item.lastEventAt = now; }, true);
+      touchLedger((item) => {
+        item.sessionId = event.conversation_id;
+        item.transcriptPath = geminiTranscriptPath(event.conversation_id);
+        item.lastEventAt = now;
+      }, true);
     } else if (event.event === "step_update" && event.step_update) {
       const update = event.step_update;
       const stepUsage = update.usage;
@@ -1429,23 +1471,90 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         const params = update.tool_info?.parameters;
         const detail = params === undefined ? "" : ` ${singleLine(typeof params === "string" ? params : JSON.stringify(params)).slice(0, 120)}`;
         touchLedger((item) => { item.lastAction = `${tool}${detail}`; item.lastEventAt = now; });
-      } else if (update.step_type === "agent_response" && typeof update.text_delta === "string") {
-        touchLedger((item) => { item.lastAction = singleLine(update.text_delta).slice(0, 160); item.lastEventAt = now; });
+      } else if (update.step_type === "agent_response") {
+        const stepIdx = String(update.step_index ?? "");
+        if (stepIdx) {
+          const existing = turnAgentResponses.get(stepIdx) ?? {
+            stepIndex: stepIdx,
+            num: Number(stepIdx),
+            text: "",
+          };
+          if (typeof update.text_delta === "string") {
+            existing.text += update.text_delta;
+          }
+          turnAgentResponses.set(stepIdx, existing);
+        }
+        if (typeof update.text_delta === "string") {
+          touchLedger((item) => { item.lastAction = singleLine(update.text_delta).slice(0, 160); item.lastEventAt = now; });
+        }
       }
     } else if (event.event === "result" && event.result) {
       const result = event.result;
       // result.usage is cumulative over the whole conversation (verified live:
       // turn 2 reported turn 1 plus its own steps), so tokens come from step_update.
       if (typeof result.conversation_id === "string") {
-        touchLedger((item) => { item.sessionId = result.conversation_id; item.lastEventAt = now; }, true);
+        touchLedger((item) => {
+          item.sessionId = result.conversation_id;
+          item.transcriptPath = geminiTranscriptPath(result.conversation_id);
+          item.lastEventAt = now;
+        }, true);
       }
-      if (typeof result.response === "string" && result.response.trim()) {
-        if (result.status === "SUCCESS") {
-          writeFileSync(reportPath, `${result.response.trim()}\n`);
-          if (isAgyCancellationTemplate(result.response)) {
-            turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+      const isReview = startingLane?.kind === "review";
+      if (result.status === "SUCCESS") {
+        if (isReview) {
+          const structured = result.structured_output;
+          const hasStructuredReport = Boolean(
+            structured && typeof structured === "object" && !Array.isArray(structured) && typeof structured.report === "string"
+          );
+          if (hasStructuredReport) {
+            writeFileSync(reportPath, `${structured.report.trim()}\n`);
+            if (Array.isArray(structured.findings)) {
+              writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify({ findings: structured.findings }, null, 2)}\n`);
+            }
+            if (isAgyCancellationTemplate(structured.report)) {
+              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+            }
+          } else {
+            const rawResponse = typeof result.response === "string" ? result.response.trim() : "";
+            const fallbackReport = `${rawResponse}\n\n## Harness note\n\nStructured output was missing.\n`;
+            writeFileSync(reportPath, fallbackReport);
+            if (isAgyCancellationTemplate(rawResponse)) {
+              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+            }
+          }
+        } else if (spec.outputSchema !== undefined) {
+          if (typeof result.response === "string" && result.response.trim()) {
+            writeFileSync(reportPath, `${result.response.trim()}\n`);
+            if (isAgyCancellationTemplate(result.response)) {
+              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+            }
           }
         } else {
+          let chosenReport: string | undefined;
+          if (turnAgentResponses.size > 0) {
+            const sorted = [...turnAgentResponses.values()].sort((a, b) => {
+              return Number.isFinite(a.num) && Number.isFinite(b.num) ? a.num - b.num : 0;
+            });
+            for (let i = sorted.length - 1; i >= 0; i--) {
+              const text = sorted[i].text.trim();
+              if (text) {
+                chosenReport = text;
+                break;
+              }
+            }
+          }
+          if (!chosenReport && typeof result.response === "string" && result.response.trim()) {
+            chosenReport = result.response.trim();
+          }
+          if (chosenReport) {
+            writeFileSync(reportPath, `${chosenReport}\n`);
+            if (isAgyCancellationTemplate(chosenReport)) {
+              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
+            }
+          }
+        }
+      } else {
+        if (typeof result.response === "string" && result.response.trim()) {
           writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
         }
       }
@@ -2015,7 +2124,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   // Structured verdict: reviewers end reports with a fenced json findings
   // block. Persist the last parsable one for machine consumers; a malformed
   // block leaves the markdown report as the only artifact, never a failure.
-  if (beforeFinalize?.kind === "review" && reportOk) {
+  if (beforeFinalize?.kind === "review" && reportOk && !existsSync(`${ROOT}/reports/${lane}-r${round}.findings.json`)) {
     const blocks = [...readFileSync(reportPath, "utf8").matchAll(/```(?:json)?[^\n]*\n([\s\S]*?)```/g)];
     for (let index = blocks.length - 1; index >= 0; index -= 1) {
       try {
@@ -2402,7 +2511,9 @@ async function resumeCommand(argv: string[]) {
   });
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const reportInstruction = reviewResume
-    ? "Print your final report. cdx captures it from the transcript."
+    ? (engine === "gemini"
+        ? "Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
+        : "Print your final report. cdx captures it from the transcript.")
     : "Print your final report. cdx captures the last final agent message.";
   const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
   // The session keeps its own settings; only an explicit --effort overrides.
@@ -2414,7 +2525,7 @@ async function resumeCommand(argv: string[]) {
   return launch({
     engine, mode: "resume", lane, round, cwd, prompt,
     ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
-    ...(reviewResume && engine === "gemini" ? { reviewDir: cwd } : {}),
+    ...(reviewResume && engine === "gemini" ? { reviewDir: cwd, outputSchema: REVIEW_FINDINGS_SCHEMA } : {}),
     ...(!reviewResume && gate ? { gate } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account, fallbackHome), ...ownershipSpec(owner),
@@ -2505,9 +2616,9 @@ async function reviewCommand(argv: string[]) {
       const task = target
         ? `Review the diff shown by \`git diff ${target}\` in this repository.`
         : `Review the diff shown by \`git show ${parsed.flags.commit}\` in this repository.`;
-      const fullBrief = [REVIEW_FRAME, `Ground rules:\n${houseRules(cwd, true)}`, `Task:\n${task}`].join("\n\n");
+      const fullBrief = [reviewFrame(engine), `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${task}`].join("\n\n");
       const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true });
-      return launch({ engine, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+      return launch({ engine, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, outputSchema: REVIEW_FINDINGS_SCHEMA, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
     }
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
@@ -2530,14 +2641,14 @@ async function reviewCommand(argv: string[]) {
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
     : "";
-  const fullBrief = [REVIEW_FRAME + scope, `Ground rules:\n${houseRules(cwd, true)}`, `Task:\n${intent}`].join("\n\n");
+  const fullBrief = [reviewFrame(engine) + scope, `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${intent}`].join("\n\n");
   // Reviews are read-only: enforce it with the sandbox, not just the prompt.
   const codexArgs = engine === "gpt" ? [
     "exec", "--json", "-m", config.model, "-c", `model_reasoning_effort=${effort}`,
     "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ] : undefined;
-  return launch({ engine, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account, fallbackHome) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ engine, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(engine === "gemini" ? { outputSchema: REVIEW_FINDINGS_SCHEMA } : {}), ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account, fallbackHome) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 function fmtTokens(tokens?: Tokens): string {
@@ -3551,6 +3662,69 @@ function installAgentLink(name: string, sourceName: "cdx-lane" | "cdx-review"): 
   symlinkSync(state.source, state.target);
 }
 
+function parseAgyModels(stdout: string): string[] | undefined {
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart === -1) return undefined;
+  try {
+    const parsed = JSON.parse(stdout.slice(jsonStart));
+    const models = parsed?.command?.data?.models;
+    if (Array.isArray(models)) {
+      return models.map((m: any) => typeof m?.id === "string" ? m.id : "").filter(Boolean);
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+async function checkDoctorGeminiModel(
+  good: (message: string) => void,
+  warn: (message: string) => void,
+  bad: (label: string, detail: string, remedy: string) => void,
+): Promise<void> {
+  const agy = Bun.which("agy");
+  if (!agy) return;
+  const configuredModel = (config.gemini ?? geminiConfig()).model;
+  const proc = Bun.spawn([agy, "--output-format", "json", "models"], {
+    env: uncoloredChildEnv(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdout = new Response(proc.stdout).text();
+  const stderr = new Response(proc.stderr).text();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill("SIGKILL"); } catch { /* exited */ }
+  }, 10_000);
+  try {
+    const [exitCode, text] = await Promise.all([proc.exited, stdout]);
+    await stderr;
+    if (timedOut || proc.signalCode === "SIGKILL") {
+      warn("agy models: probe timed out after 10s");
+      return;
+    }
+    if (exitCode !== 0) {
+      warn(`agy models: probe exited ${exitCode}`);
+      return;
+    }
+    const slugs = parseAgyModels(text);
+    if (!slugs) {
+      warn("agy models: probe returned invalid JSON");
+      return;
+    }
+    if (slugs.includes(configuredModel)) {
+      good(`agy model: ${configuredModel} available`);
+    } else {
+      bad("agy model", `configured model "${configuredModel}" not found in agy models`, `check \`agy models\` or update gemini.model in ${CONFIG_PATH}`);
+    }
+  } catch (error) {
+    warn(`agy models: probe failed (${error instanceof Error ? error.message : String(error)})`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -3582,6 +3756,7 @@ async function doctorCommand(argv: string[]) {
     if (geminiUsage) {
       good(`agy usage: weekly ${geminiUsage.weekly.remainingPercent}% remaining, five-hour ${geminiUsage.fiveHour.remainingPercent}% remaining`);
     } else warn("agy usage: unavailable");
+    await checkDoctorGeminiModel(good, warn, bad);
   } else {
     warn("agy usage: unavailable");
   }
@@ -3899,7 +4074,7 @@ try {
   throw err;
 }
 
-export { isAgyCancellationTemplate, houseRules };
+export { isAgyCancellationTemplate, houseRules, REVIEW_FINDINGS_SCHEMA };
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
@@ -3971,9 +4146,48 @@ switch (command) {
     break;
   }
   case "log": {
-    const [lane, roundArg] = argv;
-    if (!lane) fail("usage: cdx log <lane> [round]");
+    const parsed = parseArgs(argv, ["transcript"]);
+    const [lane, roundArg] = parsed.rest;
+    if (!lane) fail("usage: cdx log <lane> [round] [--transcript]");
     const entry = readLane(lane);
+    if (parsed.bools.has("transcript")) {
+      let transcriptPath = entry.transcriptPath;
+      if (roundArg) {
+        const roundNum = Number(roundArg);
+        const roundLog = logPathOf(lane, roundNum, true);
+        if (existsSync(roundLog)) {
+          const rawLog = readFileSync(roundLog, "utf8");
+          for (const line of rawLog.split("\n")) {
+            if (!line.trim()) continue;
+            try {
+              const event = JSON.parse(line);
+              if (typeof event.conversation_id === "string" && event.conversation_id) {
+                transcriptPath = geminiTranscriptPath(event.conversation_id);
+                break;
+              }
+            } catch { /* continue scanning */ }
+          }
+        }
+      }
+      if (!transcriptPath || !existsSync(transcriptPath)) {
+        fail(`no transcript for lane "${lane}"`);
+      }
+      const raw = readFileSync(transcriptPath, "utf8");
+      for (const line of raw.split("\n")) {
+        if (!line.trim()) continue;
+        try {
+          const record = JSON.parse(line) as Record<string, unknown>;
+          const content = typeof record.content === "string"
+            ? record.content
+            : record.content != null
+            ? JSON.stringify(record.content)
+            : "";
+          const preview = singleLine(content).slice(0, 200);
+          console.log(`#${record.step_index} ${record.type} ${record.status}${preview ? ` ${preview}` : ""}`);
+        } catch { /* skip invalid lines */ }
+      }
+      break;
+    }
     if (roundArg) {
       for (const json of [true, false]) {
         const path = logPathOf(lane, Number(roundArg), json);
