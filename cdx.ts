@@ -172,6 +172,7 @@ interface Lane {
   steers?: number;
   steerOpen?: boolean;
   continuations?: number;
+  hooksActive?: boolean;
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
@@ -356,9 +357,16 @@ function geminiConfig(): GeminiConfig {
   };
 }
 
-const config = readConfig(process.argv[2] === "_run");
+const isHookInvocation = process.argv[2] === "hook";
+const config = readConfig(process.argv[2] === "_run" || isHookInvocation);
 
-for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) mkdirSync(`${ROOT}/${dir}`, { recursive: true });
+if (!isHookInvocation) {
+  for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
+    try {
+      mkdirSync(`${ROOT}/${dir}`, { recursive: true });
+    } catch { /* ignore if read-only or raced */ }
+  }
+}
 
 // Thrown instead of fail() inside withLedger callbacks: process.exit skips
 // finally blocks and would strand the ledger lock. The dispatcher converts it.
@@ -430,7 +438,7 @@ function withLedger<T>(mutate: (ledger: Ledger) => T): T {
       try {
         if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
       } catch { /* raced */ }
-      if (Date.now() > deadline) fail("ledger lock timeout");
+      if (Date.now() > deadline) throw new CmdError("ledger lock timeout");
       Bun.sleepSync(50);
     }
   }
@@ -502,6 +510,25 @@ const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${
 const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;
 const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
 const controlPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.jsonl`;
+const deliveredPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.delivered`;
+
+function readDeliveredCount(lane: string, round: number): number {
+  const path = deliveredPathOf(lane, round);
+  try {
+    const text = readFileSync(path, "utf8").trim();
+    const count = Number(text);
+    return Number.isFinite(count) && count >= 0 ? count : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function writeDeliveredCount(lane: string, round: number, count: number): void {
+  const path = deliveredPathOf(lane, round);
+  const dir = join(path, "..");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(path, `${count}\n`);
+}
 
 function pidAlive(pid?: number): boolean {
   if (!pid) return false;
@@ -915,12 +942,17 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
     const ownerCwd = opts?.preserveOwner ? existing?.ownerCwd : opts?.owner?.ownerCwd;
     const workCwd = kind === "work" ? cwd : existing ? workCwdOf(existing) : cwd;
     const workState = kind === "work" ? "running" : existing ? workStateOf(existing) : "adopted";
+    const roundEngineType = opts?.preserveEngine || (kind === "review" && existing && hasWorkThread(existing)) ? laneEngine(existing) : opts?.engine ?? laneEngine(existing);
+    const hooksActive = roundEngineType === "gemini" && hookInstallState().state === "current";
+    if (kind === "work" && roundEngineType === "gemini" && !hooksActive) {
+      console.error("cdx: agy hooks not installed; steering falls back to follow-up turns (cdx doctor --fix)");
+    }
     ledger[lane] = {
       ...(existing ?? {}),
       // The work engine belongs to the work thread. A review round on an
       // existing lane records its own engine beside it, so a later resume
       // still reattaches to the right runtime.
-      engine: opts?.preserveEngine || (kind === "review" && existing && hasWorkThread(existing)) ? laneEngine(existing) : opts?.engine ?? laneEngine(existing),
+      engine: roundEngineType,
       reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
@@ -958,6 +990,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       steers: 0,
       steerOpen: kind === "work",
       continuations: 0,
+      ...(hooksActive ? { hooksActive: true } : {}),
       // A fresh round must never display the previous round's final message
       // or note as its own.
       lastAction: undefined,
@@ -1269,11 +1302,14 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const reportPath = reportPathOf(lane, round);
   const reviewSnapshot = gemini && startingLane?.kind === "review" ? captureReviewTree(spec.cwd) : undefined;
   const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(spec.cwd) : undefined;
+  const hooksInstalled = gemini ? hookInstallState().state === "current" : false;
   withLedger((ledger) => {
     const item = ledger[lane]!;
     item.pid = process.pid;
     if (item.kind === "review") item.reviewState = "running";
     else { item.state = "running"; item.workState = "running"; }
+    if (gemini && hooksInstalled) item.hooksActive = true;
+    else delete item.hooksActive;
   });
 
   let geminiSchemaPath: string | undefined;
@@ -1579,24 +1615,39 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   if (gemini) {
     const stdoutPump = pumpJson(proc.stdout);
     const stderrPump = pumpRaw(proc.stderr, errLog);
-    let controlIndex = 0;
     let controlChain = Promise.resolve();
     const drainControls = async () => {
-      const path = controlPathOf(lane, round);
-      if (!existsSync(path)) return;
-      const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
-      while (controlIndex < lines.length) {
-        const line = lines[controlIndex]!;
-        let record: ControlRecord;
-        try { record = JSON.parse(line) as ControlRecord; } catch { controlIndex += 1; continue; }
-        if (typeof record.text !== "string" || !record.text.trim()) { controlIndex += 1; continue; }
-        writeUserTurn(record.text);
-        controlIndex += 1;
-        const flat = singleLine(record.text);
-        withLedger((ledger) => {
+      const turnActive = geminiTurnsCompleted < geminiTurnsSent;
+      const toDeliver: ControlRecord[] = [];
+      withLedger((ledger) => {
+        if (turnActive && hooksInstalled) return;
+        const path = controlPathOf(lane, round);
+        if (!existsSync(path)) return;
+        const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
+        const delivered = readDeliveredCount(lane, round);
+        if (delivered >= lines.length) return;
+
+        let newlyDelivered = 0;
+        for (let i = delivered; i < lines.length; i++) {
+          const line = lines[i]!;
+          let record: ControlRecord;
+          try { record = JSON.parse(line) as ControlRecord; } catch { continue; }
+          if (typeof record.text !== "string" || !record.text.trim()) continue;
+          toDeliver.push(record);
+          newlyDelivered += 1;
+        }
+        writeDeliveredCount(lane, round, lines.length);
+        if (newlyDelivered > 0) {
           const item = ledger[lane];
-          if (item) { item.steers = (item.steers ?? 0) + 1; item.updatedAt = new Date().toISOString(); }
-        });
+          if (item) {
+            item.steers = (item.steers ?? 0) + newlyDelivered;
+            item.updatedAt = new Date().toISOString();
+          }
+        }
+      });
+      for (const record of toDeliver) {
+        writeUserTurn(record.text);
+        const flat = singleLine(record.text);
         feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession);
       }
     };
@@ -2574,10 +2625,13 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const workState = workStateOf(entry);
   const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
   const workRound = entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined);
+  const engine = laneEngine(entry);
+  const steerMode = entry.kind === "work" && active && engine === "gemini"
+    ? `  steer=${entry.hooksActive ? "in-turn" : "follow-up"}`
+    : "";
   const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
   const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
-  const engine = laneEngine(entry);
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerDetail}${continueDetail}`;
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd) {
@@ -3551,6 +3605,217 @@ function installAgentLink(name: string, sourceName: "cdx-lane" | "cdx-review"): 
   symlinkSync(state.source, state.target);
 }
 
+function agyConfigHome(): string {
+  return process.env.CDX_AGY_CONFIG_HOME || `${HOME}/.gemini/config`;
+}
+
+function hooksJsonPath(): string {
+  return join(agyConfigHome(), "hooks.json");
+}
+
+function desiredHookEntry(): Record<string, unknown> {
+  const cmd = `${process.execPath} ${realpathSync(SELF)}`;
+  return {
+    enabled: true,
+    PreToolUse: [
+      {
+        matcher: "*",
+        hooks: [
+          {
+            type: "command",
+            command: `${cmd} hook pre-tool`,
+            timeout: 10,
+          },
+        ],
+      },
+    ],
+    PreInvocation: [
+      {
+        type: "command",
+        command: `${cmd} hook pre-invocation`,
+        timeout: 10,
+      },
+    ],
+  };
+}
+
+function hookInstallState(): { path: string; state: "missing" | "stale" | "corrupt" | "current"; detail: string } {
+  const path = hooksJsonPath();
+  if (!existsSync(path)) return { path, state: "missing", detail: `missing: ${path}` };
+  let parsed: any;
+  try {
+    parsed = JSON.parse(readFileSync(path, "utf8"));
+  } catch {
+    return { path, state: "corrupt", detail: `corrupt JSON at ${path}` };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { path, state: "corrupt", detail: `corrupt config at ${path}` };
+  }
+  const cdxEntry = parsed.cdx;
+  if (!cdxEntry || typeof cdxEntry !== "object") {
+    return { path, state: "missing", detail: `entry "cdx" missing in ${path}` };
+  }
+  const cmd = `${process.execPath} ${realpathSync(SELF)}`;
+  const desiredPreToolCmd = `${cmd} hook pre-tool`;
+  const desiredPreInvocationCmd = `${cmd} hook pre-invocation`;
+
+  const preToolHook = cdxEntry.PreToolUse?.[0]?.hooks?.[0];
+  const preInvocationHook = cdxEntry.PreInvocation?.[0];
+
+  const current =
+    cdxEntry.enabled === true &&
+    Array.isArray(cdxEntry.PreToolUse) &&
+    cdxEntry.PreToolUse.length === 1 &&
+    cdxEntry.PreToolUse[0]?.matcher === "*" &&
+    Array.isArray(cdxEntry.PreToolUse[0]?.hooks) &&
+    cdxEntry.PreToolUse[0]?.hooks.length === 1 &&
+    preToolHook?.type === "command" &&
+    preToolHook?.command === desiredPreToolCmd &&
+    preToolHook?.timeout === 10 &&
+    Array.isArray(cdxEntry.PreInvocation) &&
+    cdxEntry.PreInvocation.length === 1 &&
+    preInvocationHook?.type === "command" &&
+    preInvocationHook?.command === desiredPreInvocationCmd &&
+    preInvocationHook?.timeout === 10;
+
+  return current
+    ? { path, state: "current", detail: path }
+    : { path, state: "stale", detail: `stale hook commands in ${path}` };
+}
+
+function installHooks(): boolean {
+  const path = hooksJsonPath();
+  mkdirSync(join(path, ".."), { recursive: true });
+  let existing: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    let parsed: any;
+    try {
+      parsed = JSON.parse(readFileSync(path, "utf8"));
+    } catch {
+      return false;
+    }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return false;
+    }
+    existing = parsed as Record<string, unknown>;
+  }
+  existing.cdx = desiredHookEntry();
+  writeFileSync(path, `${JSON.stringify(existing, null, 2)}\n`);
+  return true;
+}
+
+const REVIEW_DENIED_TOOLS = new Set([
+  "write_to_file",
+  "replace_file_content",
+  "multi_replace_file_content",
+  "sed_file",
+  "notebook_edit",
+  "notebook_execution",
+  "delete_knowledge",
+]);
+
+async function hookCommand(argv: string[]): Promise<void> {
+  const [subcommand] = argv;
+  const isPreTool = subcommand === "pre-tool";
+  const passThrough = (): never => {
+    console.log(isPreTool ? JSON.stringify({ decision: "allow" }) : "{}");
+    process.exit(0);
+  };
+  try {
+    const rawStdin = await Bun.stdin.text();
+    let input: any;
+    try {
+      input = JSON.parse(rawStdin);
+    } catch {
+      passThrough();
+    }
+    const lane = process.env.CDX_LANE;
+    if (!lane || typeof input !== "object" || input === null) {
+      passThrough();
+    }
+
+    if (subcommand === "pre-tool") {
+      const ledger = readLedger();
+      const entry = ledger[lane];
+      if (!entry) passThrough();
+      const currentRound = process.env.CDX_ROUND;
+      const isReview = entry.kind === "review" || (entry.reviewState === "running" && currentRound !== undefined && String(entry.reviewRound) === String(currentRound));
+      const toolName = input.toolCall?.name;
+      if (isReview && toolName && REVIEW_DENIED_TOOLS.has(toolName)) {
+        console.log(JSON.stringify({
+          decision: "deny",
+          reason: "cdx: review lanes are read-only; put findings in the report instead",
+        }));
+        return;
+      }
+      console.log(JSON.stringify({ decision: "allow" }));
+      return;
+    }
+
+    if (subcommand === "pre-invocation") {
+      const ledger = readLedger();
+      const entry = ledger[lane];
+      if (!entry) passThrough();
+      const currentRound = process.env.CDX_ROUND;
+      const isReview = entry.kind === "review" || (entry.reviewState === "running" && currentRound !== undefined && String(entry.reviewRound) === String(currentRound));
+      if (isReview || entry.kind !== "work") {
+        console.log("{}");
+        return;
+      }
+      const round = Number(currentRound ?? entry.rounds);
+      if (!Number.isFinite(round) || round < 1) {
+        console.log("{}");
+        return;
+      }
+
+      const injectSteps: Array<{ userMessage: string }> = [];
+      withLedger((led) => {
+        const item = led[lane];
+        if (!item) return;
+        const path = controlPathOf(lane, round);
+        if (!existsSync(path)) return;
+        const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
+        const delivered = readDeliveredCount(lane, round);
+        if (delivered >= lines.length) return;
+
+        let newlyDelivered = 0;
+        for (let i = delivered; i < lines.length; i++) {
+          const line = lines[i]!;
+          let record: ControlRecord;
+          try {
+            record = JSON.parse(line) as ControlRecord;
+          } catch {
+            continue;
+          }
+          if (typeof record.text !== "string" || !record.text.trim()) continue;
+          injectSteps.push({
+            userMessage: `HEAD STEER (sent ${record.sentAt}): ${record.text}`,
+          });
+          newlyDelivered += 1;
+          const flat = singleLine(record.text);
+          feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=in-turn: ${flat.slice(0, 120)}`, item.ownerSession);
+        }
+        writeDeliveredCount(lane, round, lines.length);
+        if (newlyDelivered > 0) {
+          item.steers = (item.steers ?? 0) + newlyDelivered;
+          item.updatedAt = new Date().toISOString();
+        }
+      });
+
+      if (injectSteps.length === 0) {
+        console.log("{}");
+      } else {
+        console.log(JSON.stringify({ injectSteps }));
+      }
+      return;
+    }
+
+    passThrough();
+  } catch {
+    passThrough();
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -3601,6 +3866,25 @@ async function doctorCommand(argv: string[]) {
       bad(`agy agent ${name}`, state.detail, `run \`cdx doctor --fix\` to install ${sourceName}`);
     } else {
       warn(`agy agent ${name}: ${state.detail}; run cdx doctor --fix to install`);
+    }
+  }
+
+  let hookState = hookInstallState();
+  let hookInstalled = false;
+  if (hookState.state === "corrupt") {
+    bad("agy hooks", hookState.detail, `fix or move ${hookState.path} by hand`);
+  } else {
+    if (hookState.state !== "current" && parsed.bools.has("fix")) {
+      installHooks();
+      hookState = hookInstallState();
+      if (hookState.state === "current") { good(`agy hooks: installed ${hookState.path}`); hookInstalled = true; }
+    }
+    if (hookState.state === "current") {
+      if (!hookInstalled) good(`agy hooks: current (${hookState.path})`);
+    } else if (config.gemini) {
+      bad("agy hooks", hookState.detail, "run `cdx doctor --fix` to install hooks");
+    } else {
+      warn(`agy hooks: ${hookState.detail}; run cdx doctor --fix to install`);
     }
   }
 
@@ -3893,13 +4177,18 @@ const [command, ...argv] = process.argv.slice(2);
 try {
   await dispatch(command, argv);
 } catch (err) {
+  if (command === "hook") {
+    const isPreTool = argv[0] === "pre-tool";
+    console.log(isPreTool ? JSON.stringify({ decision: "allow" }) : "{}");
+    process.exit(0);
+  }
   // CmdError is a user-facing refusal thrown from inside withLedger callbacks,
   // where process.exit would strand the lock. Convert it here, after unlock.
   if (err instanceof CmdError) fail(err.message);
   throw err;
 }
 
-export { isAgyCancellationTemplate, houseRules };
+export { isAgyCancellationTemplate, houseRules, hookInstallState, installHooks };
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
@@ -3916,6 +4205,7 @@ switch (command) {
   case "questions": questionsCommand(argv); break;
   case "msg": msgCommand(argv); break;
   case "inbox": inboxCommand(argv); break;
+  case "hook": await hookCommand(argv); break;
   case "_run": {
     const [lane, round] = argv;
     if (!lane || !round) fail("internal: _run <lane> <round>");
