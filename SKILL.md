@@ -35,7 +35,8 @@ configurable.
 ### Gemini operating rules
 
 - Asks via cdx ask when a gap changes the outcome, one small question per gap, and takes the narrowest reading only after the answer times out, recording it under an Assumptions heading.
-- Never delegates.
+- Parallelizes independent work with subagent threads rather than working them serially.
+- Every tool is available: web, browser, subagents, MCP. The shipped agent file sets no tools allowlist and cdx passes --dangerously-skip-permissions.
 - Brief under a page with named files and acceptance checks.
 - One outcome per lane.
 - Fan out many lanes with `--bg` and one `cdx wait`.
@@ -65,7 +66,7 @@ cdx tail   <lane> [-n N]
 cdx tail -f [lane]
 cdx feed   [-n N]
 cdx report <lane> [round]
-cdx log    <lane> [round]
+cdx log    <lane> [round] [--transcript]
 cdx kill   <lane> ["note"]
 cdx close  <lane> [--remove-worktree] ["note"]
 cdx clean  [--days N]
@@ -75,7 +76,9 @@ cdx brief
 
 A brief of `-` reads the brief from stdin. Use it for long prompts with quotes
 or backticks: `cdx spawn big-task --engine gemini --bg - < /tmp/brief.md`. It works for spawn,
-resume, fork, and the review intent.
+resume, fork, and the review intent. Headless agy expands `/skill-name ...` at the start of
+a prompt, so a brief may open with a project skill invocation such as `/hyperscale-change ...`
+when the workspace ships that skill under `.agents/skills`.
 
 `spawn --worktree <path>` creates a git worktree at that path on branch
 `lane/<lane>` from the repo at `--cd` (or the current directory), runs the
@@ -90,9 +93,17 @@ work rounds own one `agy` child with stream JSON input and output. cdx launches
 Gemini with `gemini-3.8-flash-high`, the configured work agent, and every lane
 directory passed through `--add-dir`. It removes `CODEX_HOME` from the Gemini
 environment. Each engine writes raw events to the round JSONL log and stderr
-to a separate log. GPT reports come from the final app-server agent message.
-Gemini reports come from the response in the last `result` event. `--schema`
-reaches both engines. `--image` works only with GPT.
+to a separate log. For both engines, work reports capture the final agent message
+of the turn, not concatenated turn text. Non-success Gemini results write to
+`reports/<lane>-r<n>.partial.md` and never overwrites `reports/<lane>-r<n>.md`.
+A Gemini round whose result reports a transport error (`The stream was interrupted`
+or `timeout waiting for response`) while agy is alive gets up to two
+continuation turns in the same conversation. The feed line reports `auto-continue <n>/2`.
+Status reports `auto-continued <n>x`. A third failure fails the round with note
+`turn failed after 2 auto-continues: <reason>`. Every tool is available because the
+shipped agent file sets no tools allowlist and cdx passes `--dangerously-skip-permissions`.
+Gemini always runs `gemini-3.8-flash-high` and `--effort` is ignored with a note.
+`--schema` reaches both engines. `--image` works only with GPT.
 
 `resume` keeps the lane's working directory and engine. It rejects `--engine`.
 GPT reattaches to the recorded work thread and account. Gemini passes the
@@ -141,21 +152,28 @@ finalize with note `killed`. Exit codes 130, 137, and 143 always finalize as
 A review uses one of `--uncommitted`, `--base`, or `--commit`, or takes a custom
 intent with optional `--scope`. GPT target reviews use Codex's native reviewer.
 Gemini receives an equivalent `git diff` instruction. A gemini review of a
-gemini lane prints a note asking for explicit attack items. Both engines receive the
-same findings contract, and cdx extracts its fenced JSON block into
+gemini lane prints a note asking for explicit attack items. Gemini reviews return
+structured output through a JSON schema; the report field becomes
+`reports/<lane>-r<n>.md` and findings land in `reports/<lane>-r<n>.findings.json`.
+GPT reviews keep the fenced JSON block, which cdx extracts into
 `reports/<lane>-r<n>.findings.json`. Codex enforces read-only access. For
-Gemini, cdx compares the repository tree before and after the round. A changed
-path fails the review, but cdx keeps the report.
+Gemini, `cdx hook pre-tool` denies file-writing tools inside review lanes, and cdx
+compares the repository tree before and after the round. A changed path fails
+the review, but cdx keeps the report.
 
 ## Communication
 
 Use `cdx send <lane> "<text>"` to correct a running work lane. The command
 appends the text, send time, and optional sender prefix to
 `$CDX_HOME/control/<lane>-r<round>.jsonl`. GPT uses `turn/steer` while a turn is
-active and starts a follow-up turn otherwise. Antigravity cannot steer
-mid-turn, so every Gemini control becomes a new stdin user turn. Its feed line
-records `mode=follow-up-turn`. cdx never consumes a record without delivery.
-`send` refuses review lanes before it writes a record.
+active and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx`
+entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands.
+`cdx hook pre-invocation` delivers pending `cdx send` records into the running
+turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends
+fall back to follow-up turns (`mode=follow-up-turn`). Set `CDX_AGY_CONFIG_HOME` and
+`CDX_AGY_STATE_HOME` as test overrides for Antigravity configuration and state paths.
+cdx never consumes a record without delivery. `send` refuses review lanes before it writes
+a record.
 
 The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines.
 While `CDX_LANE` is set, cdx refuses `spawn`, `resume`, `fork`, `review`,
@@ -223,7 +241,9 @@ message for this session. Treat every other target as information only.
   round's final message. Lane state and cwd stay tied to the latest work round.
   Review outcome and target directory appear on a separate review line. Status
   shows running lanes first, then the 10 newest finished ones (`--all` for the
-  rest). Use `cdx tail <lane>` for the rendered event log.
+  rest). Use `cdx tail <lane>` for the rendered event log. Use
+  `cdx log <lane> [round] --transcript` to render Antigravity's own transcript
+  for the round's conversation; the path is on the ledger row as `transcriptPath`.
 - Use `cdx tail -f <lane>` for one worker's live transcript. It exits with the
   lane's outcome. Use `cdx tail -f` for all running lanes with `[lane]`
   prefixes. It follows new rounds and attaches new lanes. Any terminal or agent
@@ -290,11 +310,14 @@ its defaults. Gemini always runs the configured model at high reasoning and
 records effort `high`. cdx ignores a Gemini `--effort` flag with a note. A
 malformed config fails with a message that names the config file.
 
-`cdx doctor` reports both binaries, Antigravity usage, and both shipped agent
-files. `doctor --fix` links those agents into
-`~/.gemini/config/agents/<name>/agent.md`. `doctor --probe` runs a short live
-request through each installed engine. A missing `agy` is a warning unless the
-config has a `gemini` object.
+`cdx doctor` reports both binaries, Antigravity usage, both shipped agent
+files, the hooks entry state in `hooks.json`, confirmed loaded hooks in agy
+via `/hooks`, and whether the configured Gemini model is present in `agy models`.
+`doctor --fix` links those agents into `~/.gemini/config/agents/<name>/agent.md`
+and installs the `cdx` entry into `~/.gemini/config/hooks.json`. `doctor --probe`
+runs a short live request through each installed engine. A missing `agy` is a
+warning unless the config has a `gemini` object. Set `CDX_AGY_CONFIG_HOME` and
+`CDX_AGY_STATE_HOME` as test overrides for Antigravity configuration and state.
 
 When `config.json` defines accounts, cdx gives each Codex login its own
 `CODEX_HOME`. New GPT spawn and review lanes choose the first account with
@@ -312,20 +335,23 @@ long-running servers. They require the final report. GPT workers receive rules
 to use subagents for parallel work and run `cdx ask` when open points change
 architecture or files. Gemini house rules require the worker to execute as
 written, ask via `cdx ask` when a gap changes the outcome (one small question
-per gap), and take the narrowest reading only after the answer times out,
-recording it under an Assumptions heading. Gemini workers never spawn subagents,
-avoid web tools, remove debug prints before reporting, and list files changed
-and commands with exit codes in the report. The web tool ban lives in the brief
-because agy ignores the agent file tool allowlist.
+per gap), take the narrowest reading only after the answer times out,
+recording it under an Assumptions heading, parallelize independent work with
+subagent threads rather than working them serially, remove debug prints before
+reporting, and list files changed and commands with exit codes in the report.
+Any subagent depth cap comes from `config.json` rules appended after built-ins.
+Tool access is not an injected rule; the shipped `cdx-lane` agent file sets no
+tools allowlist and cdx passes `--dangerously-skip-permissions`.
 Review rules forbid writes and require a report. The harness also checks a
 Gemini review's tree before and after the round.
 
 State uses plain files under `$CDX_HOME`: `ledger.json`, `logs/`, `reports/`,
 `briefs/`, `specs/`, `control/`, `questions/`, and `feed.log`. Both engines
 write raw round events as JSONL and stderr to separate logs.
-After a work turn completes with a qualifying report, cdx writes the report
-before unsubscribe and child shutdown. A later cleanup failure produces a
-warning instead of failing the completed round. A missing qualifying message
+The report is the last agent message of the turn, not the concatenated turn
+text. After a work turn completes with a qualifying report, cdx writes the report
+before unsubscribe and child shutdown. A later cleanup failure produces
+a warning instead of failing the completed round. A missing qualifying message
 fails with `no final report`, and cdx does not run the acceptance gate.
 A Gemini round whose final response is the agy cancellation template ("User
 initiated cancellation", "Execution stopped per your cancellation request")
