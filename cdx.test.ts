@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA } from "./cdx.ts";
+import { houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -156,7 +156,7 @@ function installFakeAgy(root: string): string {
   mkdirSync(bin, { recursive: true });
   const path = `${bin}/agy`;
   writeFileSync(path, `#!/usr/bin/env bun
-import { appendFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const args = process.argv.slice(2);
@@ -165,7 +165,9 @@ const conversationId = conversationFlag >= 0 ? args[conversationFlag + 1] : "333
 const trace = (record) => {
   if (process.env.FAKE_AGY_TRACE) appendFileSync(process.env.FAKE_AGY_TRACE, JSON.stringify(record) + "\\n");
 };
-trace({ args, cwd: process.cwd(), codexHome: process.env.CODEX_HOME });
+if (!args.some((arg) => arg === "--version" || arg.startsWith("--print="))) {
+  trace({ args, cwd: process.cwd(), codexHome: process.env.CODEX_HOME });
+}
 
 if (args.includes("--version")) { console.log("agy version 1.1.24"); process.exit(0); }
 const modelsIdx = args.indexOf("models");
@@ -194,8 +196,17 @@ if (modelsIdx >= 0) {
   process.exit(0);
 }
 if (args.includes("--print=/usage")) {
+  if (process.env.FAKE_AGY_USAGE === "fail") {
+    process.exit(1);
+  }
+  if (process.env.FAKE_AGY_USAGE) {
+    console.log(process.env.FAKE_AGY_USAGE);
+    process.exit(0);
+  }
+  const exhausted = Boolean(process.env.CDX_HOME && existsSync(process.env.CDX_HOME + "/.fake-quota-exhausted"));
+  const fiveHour = exhausted ? "1%" : "91%";
   console.log("Gemini Models\\tWeekly Limit Remaining\\t99%\\t2026-09-09T18:16:57Z");
-  console.log("Gemini Models\\tFive Hour Limit Remaining\\t91%\\t2026-09-02T23:16:57Z");
+  console.log("Gemini Models\\tFive Hour Limit Remaining\\t" + fiveHour + "\\t2026-09-02T23:16:57Z");
   console.log("Claude and GPT models\\tWeekly Limit Remaining\\t100%\\t2026-09-09T19:10:44Z");
   console.log("Claude and GPT models\\tFive Hour Limit Remaining\\t100%\\t2026-09-03T00:10:44Z");
   process.exit(0);
@@ -332,6 +343,69 @@ async function runTurn(content) {
     }
     result("ERROR", "progress text", "scripted non-transport error");
   } else if (content.includes("AGY_CANCEL_TEMPLATE")) result("SUCCESS", "User initiated cancellation\\nExecution stopped per your cancellation request");
+  else if (content.includes("QUOTA_ERROR")) {
+    if (process.env.CDX_HOME && !process.env.FAKE_AGY_HEALTHY_USAGE) {
+      try { writeFileSync(process.env.CDX_HOME + "/.fake-quota-exhausted", "1"); } catch {}
+    }
+    const quotaMsg = process.env.FAKE_AGY_QUOTA_ERROR || "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    result("ERROR", "trailing chatter from worker turn", quotaMsg);
+  }
+  else if (content.includes("QUOTA_UNPARSEABLE")) {
+    if (process.env.CDX_HOME && !process.env.FAKE_AGY_HEALTHY_USAGE) {
+      try { writeFileSync(process.env.CDX_HOME + "/.fake-quota-exhausted", "1"); } catch {}
+    }
+    result("ERROR", "trailing chatter from worker turn", "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits.");
+  }
+  else if (content.includes("REPLAYED_ERROR_WITH_REPORT")) {
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "3",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "Working on tasks.",
+    } });
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "7",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "# Lane Report: Resumed Work\\n\\nAll tasks complete.",
+    } });
+    const quotaMsg = process.env.FAKE_AGY_QUOTA_ERROR || "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    result("ERROR", "trailing chatter from worker turn", quotaMsg);
+  }
+  else if (content.includes("REPLAYED_ERROR_NO_REPORT")) {
+    const quotaMsg = process.env.FAKE_AGY_QUOTA_ERROR || "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    result("ERROR", "", quotaMsg);
+  }
+  else if (content.includes("DIFF_ERROR_NO_REPORT")) {
+    result("ERROR", "", "ERROR: A completely different error occurred.");
+  }
+  else if (content.includes("STREAM_INTERRUPT_WITH_REPORT")) {
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "1",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "Partial progress before interruption.",
+    } });
+    result("ERROR", "interrupted progress", "The stream was interrupted. Please continue the task you were working on.");
+  }
+  else if (content.includes("REVIEW_REPLAYED_STRUCTURED")) {
+    const structured = {
+      report: "# Review Replayed\\n\\nFound issues.",
+      findings: [{ severity: "P1", confidence: "CONFIRMED", file: "src/index.ts", line: 42, summary: "critical defect" }],
+    };
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "1",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "# Review Replayed\\n\\nFound issues.",
+    } });
+    const quotaMsg = process.env.FAKE_AGY_QUOTA_ERROR || "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    result("ERROR", JSON.stringify(structured), quotaMsg, { structured_output: structured });
+  }
   else if (content.includes("AGY_ERROR")) result("ERROR", "scripted agy failure");
   else if (content.includes("REVIEW_STRUCTURED")) {
     const structured = {
@@ -2265,5 +2339,522 @@ describe("raw engine guard", () => {
     const result = Bun.spawnSync({ cmd: [process.execPath, guard], stdin: new Blob([guardInput("agy models")]) });
     expect(result.exitCode).toBe(0);
     expect(result.stderr.toString()).toBe("");
+  });
+});
+
+describe("gemini quota handling", () => {
+  test("quota error is not in GEMINI_TRANSPORT_ERRORS", () => {
+    const rawQuotaError = "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    expect(GEMINI_TRANSPORT_ERRORS.some((pattern) => pattern.test(rawQuotaError))).toBe(false);
+  });
+
+  test("parseQuotaResetDelayMs parses m/s, h/m/s, and bare s formats", () => {
+    expect(parseQuotaResetDelayMs("Individual quota reached. Resets in 27m19s.")).toBe((27 * 60 + 19) * 1000);
+    expect(parseQuotaResetDelayMs("Resets in 1h2m3s")).toBe((3600 + 2 * 60 + 3) * 1000);
+    expect(parseQuotaResetDelayMs("Limits exhausted. Resets in 45s.")).toBe(45 * 1000);
+    expect(parseQuotaResetDelayMs("Resets in 2h")).toBe(2 * 3600 * 1000);
+    expect(parseQuotaResetDelayMs("Resets in 10m")).toBe(10 * 60 * 1000);
+    expect(parseQuotaResetDelayMs("no reset info")).toBeUndefined();
+    expect(parseQuotaResetIso("no reset info", 10_000)).toBe(new Date(10_000 + 30 * 60 * 1000).toISOString());
+  });
+
+  test("a gemini round whose result carries the quota error writes gemini-quota.json, sets clean note, emits feed line, and does not auto-continue", () => {
+    const root = tempPath("gemini-quota-error");
+    const state = tempPath("gemini-quota-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    const before = Date.now();
+    const spawnResult = runCli(["spawn", "quota-lane", "--engine", "gemini", "--cd", root, "QUOTA_ERROR"], env);
+    const after = Date.now();
+    expect(spawnResult.exitCode).toBe(1);
+
+    const quotaPath = `${state}/gemini-quota.json`;
+    expect(existsSync(quotaPath)).toBe(true);
+    const quota = JSON.parse(readFileSync(quotaPath, "utf8"));
+    expect(quota.lane).toBe("quota-lane");
+    expect(quota.round).toBe(1);
+    expect(typeof quota.observedAt).toBe("string");
+    expect(typeof quota.blockedUntil).toBe("string");
+    const resetTime = Date.parse(quota.blockedUntil);
+    const expectedDelay = (27 * 60 + 19) * 1000;
+    expect(resetTime).toBeGreaterThanOrEqual(before + expectedDelay);
+    expect(resetTime).toBeLessThanOrEqual(after + expectedDelay + 2000);
+
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const lane = ledger["quota-lane"];
+    expect(lane.state).toBe("failed");
+    expect(lane.note).toBe(`turn failed: gemini five-hour quota exhausted; resets at ${quota.blockedUntil}; resume this lane after the reset`);
+    expect(lane.note).not.toContain("Individual quota reached");
+    expect(lane.note).not.toContain("trailing chatter");
+    expect(lane.continuations ?? 0).toBe(0);
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain(`[cdx] lane=quota-lane round=1 gemini quota exhausted; resets at ${quota.blockedUntil}`);
+    expect(feed).not.toContain("auto-continue");
+  });
+
+  test("spawn, resume, and review fail with block message while blocked and succeed after blockedUntil passes", () => {
+    const root = tempPath("gemini-refuse-quota");
+    const state = tempPath("gemini-refuse-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    const initSpawn = runCli(["spawn", "test-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(initSpawn.exitCode).toBe(0);
+
+    const futureReset = new Date(Date.now() + 25 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: futureReset,
+      observedAt: new Date().toISOString(),
+      lane: "other-lane",
+      round: 1,
+    }, null, 2));
+
+    const spawnBlocked = runCli(["spawn", "blocked-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawnBlocked.exitCode).toBe(1);
+    expect(spawnBlocked.stderr).toContain(`cdx: gemini five-hour quota exhausted; resets at ${futureReset} (in 25m). Wait, or pass --engine gpt.`);
+
+    const resumeBlocked = runCli(["resume", "test-lane", "MORE_WORK"], env);
+    expect(resumeBlocked.exitCode).toBe(1);
+    expect(resumeBlocked.stderr).toContain(`cdx: gemini five-hour quota exhausted; resets at ${futureReset} (in 25m). Wait, or pass --engine gpt.`);
+
+    const reviewBlocked = runCli(["review", "test-lane", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env);
+    expect(reviewBlocked.exitCode).toBe(1);
+    expect(reviewBlocked.stderr).toContain(`cdx: gemini five-hour quota exhausted; resets at ${futureReset} (in 25m). Wait, or pass --engine gpt.`);
+
+    const pastReset = new Date(Date.now() - 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: pastReset,
+      observedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+      lane: "other-lane",
+      round: 1,
+    }, null, 2));
+
+    const spawnAfter = runCli(["spawn", "unblocked-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawnAfter.exitCode).toBe(0);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(false);
+
+    const resumeAfter = runCli(["resume", "test-lane", "MORE_WORK"], env);
+    expect(resumeAfter.exitCode).toBe(0);
+
+    const reviewAfter = runCli(["review", "test-lane", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env);
+    expect(reviewAfter.exitCode).toBe(0);
+  }, 15_000);
+
+  test("usage snapshot: 3% blocks, 10% warns on stderr and proceeds, 50% is silent", () => {
+    const root = tempPath("gemini-snapshot-levels");
+    const state = tempPath("gemini-snapshot-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+    mkdirSync(state, { recursive: true });
+
+    const resetsAt = new Date(Date.now() + 45 * 60 * 1000).toISOString();
+
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      weekly: { remainingPercent: 90, resetsAt },
+      fiveHour: { remainingPercent: 3, resetsAt },
+    }, null, 2));
+    const blockResult = runCli(["spawn", "lane-3pct", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(blockResult.exitCode).toBe(1);
+    expect(blockResult.stderr).toContain(`cdx: gemini five-hour quota exhausted; resets at ${resetsAt} (in 45m). Wait, or pass --engine gpt.`);
+
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      weekly: { remainingPercent: 90, resetsAt },
+      fiveHour: { remainingPercent: 10, resetsAt },
+    }, null, 2));
+    const warnResult = runCli(["spawn", "lane-10pct", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(warnResult.exitCode).toBe(0);
+    expect(warnResult.stderr).toContain(`cdx: gemini five-hour window at 10%, resets at ${resetsAt}; fan out with care`);
+
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      weekly: { remainingPercent: 90, resetsAt },
+      fiveHour: { remainingPercent: 50, resetsAt },
+    }, null, 2));
+    const silentResult = runCli(["spawn", "lane-50pct", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(silentResult.exitCode).toBe(0);
+    expect(silentResult.stderr).not.toContain("five-hour");
+  });
+
+  test("a snapshot older than 15 minutes never blocks", () => {
+    const root = tempPath("gemini-old-snapshot");
+    const state = tempPath("gemini-old-snapshot-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+    mkdirSync(state, { recursive: true });
+
+    const resetsAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date(Date.now() - 16 * 60 * 1000).toISOString(),
+      weekly: { remainingPercent: 90, resetsAt },
+      fiveHour: { remainingPercent: 2, resetsAt },
+    }, null, 2));
+
+    const result = runCli(["spawn", "lane-old-snap", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("cdx: gemini five-hour quota exhausted");
+  });
+
+  test("gpt spawn ignores quota blocks", () => {
+    const root = tempPath("gpt-ignore-quota");
+    const bin = installFakeCodex(root);
+    const state = `${root}/state`;
+    const env = baseEnv(state, bin);
+    mkdirSync(root, { recursive: true });
+
+    const resetsAt = new Date(Date.now() + 30 * 60 * 1000).toISOString();
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: resetsAt,
+      observedAt: new Date().toISOString(),
+      lane: "gemini-lane",
+      round: 1,
+    }, null, 2));
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date().toISOString(),
+      weekly: { remainingPercent: 90, resetsAt },
+      fiveHour: { remainingPercent: 1, resetsAt },
+    }, null, 2));
+
+    const result = runCli(["spawn", "gpt-lane", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("gemini five-hour");
+  });
+
+  test("cdx status and cdx brief show quota line while blocked", () => {
+    const root = tempPath("status-quota");
+    const state = tempPath("status-quota-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(state, { recursive: true });
+
+    const resetsAt = new Date(Date.now() + 20 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: resetsAt,
+      observedAt: new Date().toISOString(),
+      lane: "quota-lane",
+      round: 1,
+    }, null, 2));
+
+    const statusResult = runCli(["status"], env);
+    expect(statusResult.stdout).toContain(`gemini quota: exhausted until ${resetsAt} (in 20m)`);
+
+    const briefResult = runCli(["brief"], env);
+    expect(briefResult.stdout).toContain(`gemini quota: exhausted until ${resetsAt} (in 20m)`);
+  });
+
+  test("cdx doctor warns when blocked and reports clear when snapshot five-hour figure is >= 15%", () => {
+    const root = tempPath("doctor-quota");
+    const state = tempPath("doctor-quota-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(state, { recursive: true });
+
+    const resetsAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: resetsAt,
+      observedAt: new Date().toISOString(),
+      lane: "blocked-lane",
+      round: 1,
+    }, null, 2));
+
+    const blockedDoctor = runCli(["doctor"], env);
+    expect(blockedDoctor.stdout).toContain(`gemini quota: exhausted until ${resetsAt} (in 15m)`);
+
+    unlinkSync(`${state}/gemini-quota.json`);
+    const clearDoctor = runCli(["doctor"], env);
+    expect(clearDoctor.stdout).toContain("gemini quota: clear");
+  });
+
+  test("gemini round refreshes usage-gemini.json on finalize for both success and failure", () => {
+    const root = tempPath("gemini-refresh-usage");
+    const state = tempPath("gemini-refresh-usage-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    expect(existsSync(`${state}/usage-gemini.json`)).toBe(false);
+    const successResult = runCli(["spawn", "success-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(successResult.exitCode).toBe(0);
+    expect(existsSync(`${state}/usage-gemini.json`)).toBe(true);
+
+    const firstUsage = JSON.parse(readFileSync(`${state}/usage-gemini.json`, "utf8"));
+    expect(firstUsage.fiveHour.remainingPercent).toBe(91);
+
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt: new Date(Date.now() - 30000).toISOString(),
+      weekly: { remainingPercent: 50, resetsAt: new Date().toISOString() },
+      fiveHour: { remainingPercent: 50, resetsAt: new Date().toISOString() },
+    }, null, 2));
+
+    const failResult = runCli(["spawn", "fail-lane", "--engine", "gemini", "--cd", root, "AGY_ERROR"], env);
+    expect(failResult.exitCode).toBe(1);
+    expect(existsSync(`${state}/usage-gemini.json`)).toBe(true);
+    const secondUsage = JSON.parse(readFileSync(`${state}/usage-gemini.json`, "utf8"));
+    expect(secondUsage.fiveHour.remainingPercent).toBe(91);
+  });
+
+  test("snapshot with past resetsAt neither blocks nor warns even if fresh", () => {
+    const root = tempPath("gemini-past-reset");
+    const state = tempPath("gemini-past-reset-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+    mkdirSync(state, { recursive: true });
+
+    const checkedAt = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    const resetsAt = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/usage-gemini.json`, JSON.stringify({
+      checkedAt,
+      weekly: { remainingPercent: 90, resetsAt: new Date(Date.now() + 3600 * 1000).toISOString() },
+      fiveHour: { remainingPercent: 1, resetsAt },
+    }, null, 2));
+
+    const result = runCli(["spawn", "lane-past-reset", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stderr).not.toContain("cdx: gemini five-hour");
+  });
+
+  test("cdx adopt succeeds with gemini even when quota is blocked", () => {
+    const root = tempPath("adopt-blocked");
+    const state = tempPath("adopt-blocked-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(state, { recursive: true });
+
+    const futureReset = new Date(Date.now() + 25 * 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: futureReset,
+      observedAt: new Date().toISOString(),
+      lane: "some-lane",
+      round: 1,
+    }, null, 2));
+
+    const result = runCli(["adopt", "adopted-lane", "4a5e2f7b-1111-2222-3333-444455556666", "--engine", "gemini"], env);
+    expect(result.exitCode).toBe(0);
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledger["adopted-lane"]?.engine).toBe("gemini");
+    expect(ledger["adopted-lane"]?.sessionId).toBe("4a5e2f7b-1111-2222-3333-444455556666");
+  });
+
+  test("geminiQuotaState is pure and status/brief/doctor never unlink expired or unparseable block file", () => {
+    const root = tempPath("quota-pure-state");
+    const state = tempPath("quota-pure-state-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(state, { recursive: true });
+
+    const pastReset = new Date(Date.now() - 60 * 1000).toISOString();
+    writeFileSync(`${state}/gemini-quota.json`, JSON.stringify({
+      blockedUntil: pastReset,
+      observedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+      lane: "other-lane",
+      round: 1,
+    }, null, 2));
+
+    runCli(["status"], env);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(true);
+
+    runCli(["brief"], env);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(true);
+
+    runCli(["doctor"], env);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(true);
+
+    mkdirSync(root, { recursive: true });
+    const spawnResult = runCli(["spawn", "clean-spawn", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawnResult.exitCode).toBe(0);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(false);
+  });
+
+  test("when Resets in does not parse, blocks for 30 minutes and feed line says reset time unknown; assuming 30m", () => {
+    const root = tempPath("gemini-unparseable-quota");
+    const state = tempPath("gemini-unparseable-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    const before = Date.now();
+    const spawnResult = runCli(["spawn", "unparse-lane", "--engine", "gemini", "--cd", root, "QUOTA_UNPARSEABLE"], env);
+    const after = Date.now();
+    expect(spawnResult.exitCode).toBe(1);
+
+    const quotaPath = `${state}/gemini-quota.json`;
+    expect(existsSync(quotaPath)).toBe(true);
+    const quota = JSON.parse(readFileSync(quotaPath, "utf8"));
+    const resetTime = Date.parse(quota.blockedUntil);
+    const expectedDelay = 30 * 60 * 1000;
+    expect(resetTime).toBeGreaterThanOrEqual(before + expectedDelay);
+    expect(resetTime).toBeLessThanOrEqual(after + expectedDelay + 2000);
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain("[cdx] lane=unparse-lane round=1 gemini quota exhausted; reset time unknown; assuming 30m");
+  });
+
+  test("replayed error detection: round 1 quota error writes block and lastResultError, round 2 and round 3 replay error and finalize done, genuine success clears it", { timeout: 45_000 }, () => {
+    const root = tempPath("gemini-replay-root");
+    const state = tempPath("gemini-replay-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    // 1. Round 1 quota error writes the block and lastResultError
+    const r1Spawn = runCli(["spawn", "replay-lane", "--engine", "gemini", "--cd", root, "QUOTA_ERROR"], env);
+    expect(r1Spawn.exitCode).toBe(1);
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(true);
+
+    const ledgerR1 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const laneR1 = ledgerR1["replay-lane"];
+    expect(laneR1.state).toBe("failed");
+    const expectedError = "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
+    expect(laneR1.lastResultError).toBe(expectedError);
+
+    // 2. Round 2 resume replays error E with report and finalizes done.
+    unlinkSync(`${state}/gemini-quota.json`);
+
+    const r2Resume = runCli(["resume", "replay-lane", "REPLAYED_ERROR_WITH_REPORT"], env);
+    expect(r2Resume.exitCode).toBe(0);
+
+    const ledgerR2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const laneR2 = ledgerR2["replay-lane"];
+    expect(laneR2.state).toBe("done");
+    // Ruling (1): lastResultError is RETAINED on replayed success
+    expect(laneR2.lastResultError).toBe(expectedError);
+
+    // No new block written
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(false);
+
+    // Report on disk
+    const r2ReportPath = `${state}/reports/replay-lane-r2.md`;
+    expect(existsSync(r2ReportPath)).toBe(true);
+    expect(readFileSync(r2ReportPath, "utf8")).toContain("# Lane Report: Resumed Work");
+
+    // Feed line present
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain(`[cdx] lane=replay-lane round=2 ignored replayed agy error: ${expectedError.slice(0, 80)}`);
+
+    // Round 3 resume replays error E again with report and must ALSO finalize done
+    const r3Resume = runCli(["resume", "replay-lane", "REPLAYED_ERROR_WITH_REPORT"], env);
+    expect(r3Resume.exitCode).toBe(0);
+
+    const ledgerR3 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const laneR3 = ledgerR3["replay-lane"];
+    expect(laneR3.state).toBe("done");
+    expect(laneR3.lastResultError).toBe(expectedError);
+    expect(existsSync(`${state}/reports/replay-lane-r3.md`)).toBe(true);
+
+    // 3. A resume with a different error text still fails
+    const diffRoot = tempPath("gemini-diff-root");
+    mkdirSync(diffRoot, { recursive: true });
+    const r1DiffSpawn = runCli(["spawn", "diff-lane", "--engine", "gemini", "--cd", diffRoot, "QUOTA_ERROR"], env);
+    expect(r1DiffSpawn.exitCode).toBe(1);
+    if (existsSync(`${state}/gemini-quota.json`)) unlinkSync(`${state}/gemini-quota.json`);
+
+    const diffResume = runCli(["resume", "diff-lane", "DIFF_ERROR_NO_REPORT"], env);
+    expect(diffResume.exitCode).toBe(1);
+    const ledgerDiff = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledgerDiff["diff-lane"].state).toBe("failed");
+    expect(ledgerDiff["diff-lane"].lastResultError).toBe("ERROR: A completely different error occurred.");
+
+    // 4. A replayed error with no agent_response text still fails
+    const noReportRoot = tempPath("gemini-no-report-root");
+    mkdirSync(noReportRoot, { recursive: true });
+    const r1NoReportSpawn = runCli(["spawn", "no-report-lane", "--engine", "gemini", "--cd", noReportRoot, "QUOTA_ERROR"], env);
+    expect(r1NoReportSpawn.exitCode).toBe(1);
+    if (existsSync(`${state}/gemini-quota.json`)) unlinkSync(`${state}/gemini-quota.json`);
+
+    const noReportResume = runCli(["resume", "no-report-lane", "REPLAYED_ERROR_NO_REPORT"], env);
+    expect(noReportResume.exitCode).toBe(1);
+    const ledgerNoReport = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledgerNoReport["no-report-lane"].state).toBe("failed");
+  });
+
+  test("transport errors are excluded from replay detection: stream-interrupted error with response text auto-continues, does not finalize done", { timeout: 25_000 }, () => {
+    const root = tempPath("gemini-transport-exclude-root");
+    const state = tempPath("gemini-transport-exclude-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    // Round 1 encounters stream interrupted error with partial response text.
+    // Even if previousResultError on ledger is identical or set, it must auto-continue, not finalize done.
+    const spawnResult = runCli(["spawn", "transport-lane", "--engine", "gemini", "--cd", root, "STREAM_INTERRUPT_WITH_REPORT"], env);
+    expect(spawnResult.exitCode).toBe(0);
+
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const lane = ledger["transport-lane"];
+    expect(lane.state).toBe("done");
+    expect(lane.continuations).toBe(1);
+
+    const feed = readFileSync(`${state}/feed.log`, "utf8");
+    expect(feed).toContain("[cdx] lane=transport-lane round=1 auto-continue 1/2");
+    expect(feed).not.toContain("ignored replayed agy error");
+  });
+
+  test("replayed review shares genuine success code: extracts structured_output with findings array to findings.json", { timeout: 30_000 }, () => {
+    const root = tempPath("gemini-review-replay-root");
+    const state = tempPath("gemini-review-replay-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    // Round 1 review fails with quota error to record lastResultError
+    const r1Review = runCli(["review", "rev-lane", "--engine", "gemini", "--cd", root, "QUOTA_ERROR"], env);
+    expect(r1Review.exitCode).toBe(1);
+    unlinkSync(`${state}/gemini-quota.json`);
+
+    // Round 2 review replays the error but carries structured_output with findings
+    const r2Review = runCli(["review", "rev-lane", "--engine", "gemini", "--cd", root, "REVIEW_REPLAYED_STRUCTURED"], env);
+    expect(r2Review.exitCode).toBe(0);
+
+    const findingsPath = `${state}/reports/rev-lane-r2.findings.json`;
+    expect(existsSync(findingsPath)).toBe(true);
+    const findingsData = JSON.parse(readFileSync(findingsPath, "utf8"));
+    expect(Array.isArray(findingsData.findings)).toBe(true);
+    expect(findingsData.findings[0]?.summary).toBe("critical defect");
+
+    const reportPath = `${state}/reports/rev-lane-r2.md`;
+    expect(existsSync(reportPath)).toBe(true);
+    expect(readFileSync(reportPath, "utf8")).toContain("# Review Replayed");
+
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledger["rev-lane"].reviewState).toBe("done");
+  });
+
+  test("spawn --worktree with bad --add-dir path exits nonzero and leaves no worktree directory and no branch", () => {
+    const root = tempPath("gemini-wt-clean-root");
+    const state = tempPath("gemini-wt-clean-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+
+    Bun.spawnSync({ cmd: ["git", "init", "-b", "main"], cwd: root });
+    Bun.spawnSync({ cmd: ["git", "config", "user.email", "test@example.com"], cwd: root });
+    Bun.spawnSync({ cmd: ["git", "config", "user.name", "Test User"], cwd: root });
+    Bun.spawnSync({ cmd: ["git", "commit", "--allow-empty", "-m", "init"], cwd: root });
+
+    const wtPath = join(root, "wt-dest");
+    const badDir = join(root, "nonexistent-add-dir");
+
+    const spawnResult = runCli(["spawn", "wt-lane", "--worktree", wtPath, "--add-dir", badDir, "--cd", root, "task"], env);
+    expect(spawnResult.exitCode).not.toBe(0);
+
+    // No worktree directory created
+    expect(existsSync(wtPath)).toBe(false);
+
+    // No git branch created
+    const branchCheck = Bun.spawnSync({ cmd: ["git", "branch", "--list", "lane/wt-lane"], cwd: root });
+    expect(branchCheck.stdout.toString().trim()).toBe("");
+  });
+
+  test("quota class refreshGeminiUsage check: if fiveHour >= 5% remaining, does not write block and fails with note", { timeout: 15_000 }, () => {
+    const root = tempPath("gemini-healthy-usage-root");
+    const state = tempPath("gemini-healthy-usage-state");
+    const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_HEALTHY_USAGE: "1" };
+    mkdirSync(root, { recursive: true });
+
+    const spawnResult = runCli(["spawn", "healthy-lane", "--engine", "gemini", "--cd", root, "QUOTA_ERROR"], env);
+    expect(spawnResult.exitCode).toBe(1);
+
+    // Block must NOT be written because usage was 91% (>= 5%)
+    expect(existsSync(`${state}/gemini-quota.json`)).toBe(false);
+
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const lane = ledger["healthy-lane"];
+    expect(lane.state).toBe("failed");
+    expect(lane.note).toContain("agy reported quota exhausted but usage shows 91% five-hour remaining; no block written");
+    expect(lane.lastResultError).toContain("Individual quota reached");
   });
 });
