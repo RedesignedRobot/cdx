@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { houseRules, isAgyCancellationTemplate } from "./cdx.ts";
@@ -247,7 +247,7 @@ async function runTurn(content) {
     return;
   }
   if (content.includes("HANG_AGY")) await new Promise(() => {});
-  if (content.includes("WAIT_FOR_FOLLOW_UP")) await Bun.sleep(250);
+  if (content.includes("WAIT_FOR_FOLLOW_UP")) await Bun.sleep(content.includes("LONG_SLEEP") ? 800 : 250);
   if (content.includes("REVIEW_WRITE")) writeFileSync(\`\${process.cwd()}/fake-review-change.txt\`, "changed by fake reviewer\\n");
   if (content.includes("FAIL_3X")) fail3x = true;
   if (fail3x) {
@@ -279,6 +279,7 @@ lines.on("line", (line) => {
   if (!line.trim()) return;
   const event = JSON.parse(line);
   if (event.event !== "user") return;
+  trace({ stdinUser: event.message?.content });
   const content = event.message?.content ?? "";
   if (processing) queue.push(content);
   else void runTurn(content);
@@ -1119,16 +1120,29 @@ describe("cdx execution engines", () => {
   test("warns when a gemini brief exceeds 1500 words", () => {
     const root = tempPath("gemini-long-brief");
     const state = `${root}/state`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(configHome, { recursive: true });
+    writeFileSync(`${configHome}/hooks.json`, JSON.stringify({
+      cdx: {
+        enabled: true,
+        PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: `${process.execPath} ${realpathSync(CLI)} hook pre-tool`, timeout: 10 }] }],
+        PreInvocation: [{ type: "command", command: `${process.execPath} ${realpathSync(CLI)} hook pre-invocation`, timeout: 10 }],
+      },
+    }, null, 2) + "\n");
+    const env = {
+      ...baseEnv(state, installFakeAgy(root)),
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
     const brief = Array.from({ length: 1501 }, (_, index) => `word${index}`).join(" ");
     const expected = "cdx: gemini brief is 1501 words; gemini works best on one outcome per lane, consider splitting into parallel lanes";
-    const result = runCli(["spawn", "gemini-long", "--engine", "gemini", "--cd", root, brief], baseEnv(state, installFakeAgy(root)));
+    const result = runCli(["spawn", "gemini-long", "--engine", "gemini", "--cd", root, brief], env);
 
     expect(result.exitCode).toBe(0);
     expect(result.stderr.trim()).toBe(expected);
     expect(readFileSync(`${state}/feed.log`, "utf8").split("\n")).toContain(expected);
 
     const boundary = Array.from({ length: 1500 }, (_, index) => `word${index}`).join(" ");
-    const boundaryResult = runCli(["spawn", "gemini-boundary", "--engine", "gemini", "--cd", root, boundary], baseEnv(state, installFakeAgy(root)));
+    const boundaryResult = runCli(["spawn", "gemini-boundary", "--engine", "gemini", "--cd", root, boundary], env);
     expect(boundaryResult.exitCode).toBe(0);
     expect(boundaryResult.stderr).not.toContain("gemini brief is");
   });
@@ -1138,20 +1152,33 @@ describe("cdx execution engines", () => {
     const state = `${root}/state`;
     const trace = `${root}/agy.trace`;
     const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
-    expect(runCli(["spawn", "gemini-follow-up", "--engine", "gemini", "--cd", root, "--bg", "WAIT_FOR_FOLLOW_UP"], env).exitCode).toBe(0);
+    expect(runCli(["spawn", "gemini-follow-up", "--engine", "gemini", "--cd", root, "--bg", "WAIT_FOR_FOLLOW_UP LONG_SLEEP"], env).exitCode).toBe(0);
     await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.codexPid);
     expect(runCli(["send", "gemini-follow-up", "inspect the tests"], env).exitCode).toBe(0);
+
+    // With hooks missing, the send is written immediately to stdin
+    const getStdinUsers = () => {
+      if (!existsSync(trace)) return [];
+      return readFileSync(trace, "utf8").trim().split("\n")
+        .map((l) => { try { return JSON.parse(l); } catch { return {}; } })
+        .filter((r) => r.stdinUser)
+        .map((r) => r.stdinUser);
+    };
+    await waitFor(() => getStdinUsers().some((u: string) => u.includes("inspect the tests")));
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.state).toBe("running");
+
     await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.state === "done");
     expect(readFileSync(`${state}/reports/gemini-follow-up-r1.md`, "utf8").trim()).toContain("follow-up result: inspect the tests");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("mode=follow-up-turn");
     expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"].steers).toBe(1);
+    expect(readFileSync(`${state}/control/gemini-follow-up-r1.delivered`, "utf8").trim()).toBe("1");
 
     writeFileSync(trace, "");
     expect(runCli(["resume", "gemini-follow-up", "check once more"], env).exitCode).toBe(0);
     const invocation = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
     const conversationIndex = invocation.args.indexOf("--conversation");
     expect(invocation.args[conversationIndex + 1]).toBe("33333333-3333-4333-8333-333333333333");
-  }, 12_000);
+  }, 15_000);
 
   test("round-trips cdx ask and reply from a gemini child", async () => {
     const root = tempPath("gemini-ask");
@@ -1460,6 +1487,357 @@ describe("cdx execution engines", () => {
     expect(checked.exitCode).toBe(0);
     expect(checked.stdout).toContain("cdx-lane");
     expect(checked.stdout).toContain("cdx-review");
+  });
+});
+
+describe("agy lifecycle hooks", () => {
+  test("cdx hook pre-tool allows or denies based on lane state and tool name", () => {
+    const state = tempPath("hook-pre-tool");
+    const env = baseEnv(state);
+    mkdirSync(state, { recursive: true });
+
+    // 1. with no CDX_LANE answers allow
+    const noLaneResult = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env,
+      stdin: new Blob([JSON.stringify({ toolCall: { name: "write_to_file" } })]),
+    });
+    expect(noLaneResult.exitCode).toBe(0);
+    expect(JSON.parse(noLaneResult.stdout.toString())).toEqual({ decision: "allow" });
+
+    // Setup review lane and work lane in ledger
+    const now = new Date().toISOString();
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+      "review-lane": {
+        engine: "gemini",
+        cwd: "/tmp",
+        effort: "high",
+        state: "running",
+        reviewState: "running",
+        reviewRound: 1,
+        kind: "review",
+        rounds: 1,
+        reports: [],
+        createdAt: now,
+        updatedAt: now,
+      },
+      "work-lane": {
+        engine: "gemini",
+        cwd: "/tmp",
+        effort: "high",
+        state: "running",
+        workState: "running",
+        kind: "work",
+        rounds: 1,
+        reports: [],
+        createdAt: now,
+        updatedAt: now,
+      },
+    }));
+
+    const reviewEnv = { ...env, CDX_LANE: "review-lane", CDX_ROUND: "1" };
+
+    // 2. with a review row and write_to_file answers deny with the reason
+    const reviewWriteResult = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env: reviewEnv,
+      stdin: new Blob([JSON.stringify({ toolCall: { name: "write_to_file", args: {} } })]),
+    });
+    expect(reviewWriteResult.exitCode).toBe(0);
+    expect(JSON.parse(reviewWriteResult.stdout.toString())).toEqual({
+      decision: "deny",
+      reason: "cdx: review lanes are read-only; put findings in the report instead",
+    });
+
+    // 3. with a review row and view_file answers allow
+    const reviewViewResult = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env: reviewEnv,
+      stdin: new Blob([JSON.stringify({ toolCall: { name: "view_file", args: {} } })]),
+    });
+    expect(reviewViewResult.exitCode).toBe(0);
+    expect(JSON.parse(reviewViewResult.stdout.toString())).toEqual({ decision: "allow" });
+
+    // 4. with a work row and write_to_file answers allow
+    const workEnv = { ...env, CDX_LANE: "work-lane", CDX_ROUND: "1" };
+    const workWriteResult = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env: workEnv,
+      stdin: new Blob([JSON.stringify({ toolCall: { name: "write_to_file", args: {} } })]),
+    });
+    expect(workWriteResult.exitCode).toBe(0);
+    expect(JSON.parse(workWriteResult.stdout.toString())).toEqual({ decision: "allow" });
+
+    // 5. with unparsable stdin answers allow and exits 0
+    const unparseResult = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env: reviewEnv,
+      stdin: new Blob(["not-json"]),
+    });
+    expect(unparseResult.exitCode).toBe(0);
+    expect(JSON.parse(unparseResult.stdout.toString())).toEqual({ decision: "allow" });
+  });
+
+  test("cdx hook pre-invocation delivers pending control records and advances sidecar", () => {
+    const state = tempPath("hook-pre-invocation");
+    const env = baseEnv(state);
+    mkdirSync(state, { recursive: true });
+    mkdirSync(`${state}/control`, { recursive: true });
+
+    const now = new Date().toISOString();
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+      "steer-lane": {
+        engine: "gemini",
+        cwd: "/tmp",
+        effort: "high",
+        state: "running",
+        workState: "running",
+        kind: "work",
+        rounds: 1,
+        reports: [],
+        createdAt: now,
+        updatedAt: now,
+        steers: 0,
+        ownerSession: "12345678-session",
+      },
+    }));
+
+    const sentAt1 = "2026-09-03T10:00:00.000Z";
+    const sentAt2 = "2026-09-03T10:01:00.000Z";
+    writeFileSync(`${state}/control/steer-lane-r1.jsonl`, [
+      JSON.stringify({ text: "first steer", sentAt: sentAt1 }),
+      JSON.stringify({ text: "second steer", sentAt: sentAt2 }),
+    ].join("\n") + "\n");
+
+    const hookEnv = { ...env, CDX_LANE: "steer-lane", CDX_ROUND: "1" };
+
+    // First call: returns two injectSteps in order, advances sidecar to 2, increments steers by 2, writes 2 feed lines
+    const res1 = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-invocation"],
+      env: hookEnv,
+      stdin: new Blob([JSON.stringify({ invocationNum: 0 })]),
+    });
+    expect(res1.exitCode).toBe(0);
+    const parsed1 = JSON.parse(res1.stdout.toString());
+    expect(parsed1).toEqual({
+      injectSteps: [
+        { userMessage: `HEAD STEER (sent ${sentAt1}): first steer` },
+        { userMessage: `HEAD STEER (sent ${sentAt2}): second steer` },
+      ],
+    });
+
+    expect(readFileSync(`${state}/control/steer-lane-r1.delivered`, "utf8").trim()).toBe("2");
+    const ledger1 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"];
+    expect(ledger1.steers).toBe(2);
+
+    const feedLines = readFileSync(`${state}/feed.log`, "utf8").trim().split("\n");
+    expect(feedLines).toHaveLength(2);
+    expect(feedLines[0]).toContain("steer delivered mode=in-turn: first steer");
+    expect(feedLines[1]).toContain("steer delivered mode=in-turn: second steer");
+
+    // Second call: returns {} and changes nothing
+    const res2 = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-invocation"],
+      env: hookEnv,
+      stdin: new Blob([JSON.stringify({ invocationNum: 1 })]),
+    });
+    expect(res2.exitCode).toBe(0);
+    expect(JSON.parse(res2.stdout.toString())).toEqual({});
+
+    expect(readFileSync(`${state}/control/steer-lane-r1.delivered`, "utf8").trim()).toBe("2");
+    const ledger2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"];
+    expect(ledger2.steers).toBe(2);
+    const feedLines2 = readFileSync(`${state}/feed.log`, "utf8").trim().split("\n");
+    expect(feedLines2).toHaveLength(2);
+  });
+
+  test("runner coordinates cdx send with fake agy when hooks are installed", async () => {
+    const root = tempPath("gemini-hooks-steer");
+    const state = `${root}/state`;
+    const trace = `${root}/agy.trace`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(configHome, { recursive: true });
+    writeFileSync(`${configHome}/hooks.json`, JSON.stringify({
+      cdx: {
+        enabled: true,
+        PreToolUse: [{ matcher: "*", hooks: [{ type: "command", command: `${process.execPath} ${realpathSync(join(import.meta.dir, "cdx.ts"))} hook pre-tool`, timeout: 10 }] }],
+        PreInvocation: [{ type: "command", command: `${process.execPath} ${realpathSync(join(import.meta.dir, "cdx.ts"))} hook pre-invocation`, timeout: 10 }],
+      },
+    }, null, 2) + "\n");
+
+    const env = {
+      ...baseEnv(state, installFakeAgy(root)),
+      FAKE_AGY_TRACE: trace,
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+
+    expect(runCli(["spawn", "hooks-lane", "--engine", "gemini", "--cd", root, "--bg", "WAIT_FOR_FOLLOW_UP LONG_SLEEP"], env).exitCode).toBe(0);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.codexPid);
+
+    // Send while first turn is active
+    expect(runCli(["send", "hooks-lane", "steer while active"], env).exitCode).toBe(0);
+
+    // While turn 1 is active, verify the steer has NOT been written to fake agy's stdin
+    const getStdinUsers = () => {
+      if (!existsSync(trace)) return [];
+      return readFileSync(trace, "utf8").trim().split("\n")
+        .map((l) => { try { return JSON.parse(l); } catch { return {}; } })
+        .filter((r) => r.stdinUser)
+        .map((r) => r.stdinUser);
+    };
+
+    await Bun.sleep(300);
+    const immediateUsers = getStdinUsers();
+    expect(immediateUsers.some((u: string) => u.includes("steer while active"))).toBe(false);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.state).toBe("running");
+
+    // Wait for the lane to complete
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.state === "done");
+
+    // After result arrived, it was delivered as follow-up turn once
+    const finalUsers = getStdinUsers();
+    expect(finalUsers.filter((u: string) => u.includes("steer while active"))).toHaveLength(1);
+    expect(readFileSync(`${state}/reports/hooks-lane-r1.md`, "utf8").trim()).toContain("follow-up result: steer while active");
+    expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("mode=follow-up-turn");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"].steers).toBe(1);
+    expect(readFileSync(`${state}/control/hooks-lane-r1.delivered`, "utf8").trim()).toBe("1");
+  }, 15_000);
+
+  test("doctor --fix creates hooks.json, preserves other entries, and is idempotent", () => {
+    const root = tempPath("doctor-hooks");
+    const state = `${root}/state`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(configHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol",
+      efforts: ["medium"],
+      defaultEffort: "medium",
+      rules: [],
+      gemini: {},
+    }));
+
+    const bin = installFakeCodex(root);
+    installFakeAgy(root);
+    const env = {
+      ...baseEnv(state, bin),
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+
+    // On an empty config dir, doctor --fix creates hooks.json with cdx entry
+    const fix1 = runCli(["doctor", "--fix"], env);
+    expect(fix1.exitCode).toBe(0);
+    expect(existsSync(`${configHome}/hooks.json`)).toBe(true);
+    const hooks1 = JSON.parse(readFileSync(`${configHome}/hooks.json`, "utf8"));
+    expect(hooks1.cdx).toBeDefined();
+    expect(hooks1.cdx.enabled).toBe(true);
+    expect(hooks1.cdx.PreToolUse[0].hooks[0].command).toContain("hook pre-tool");
+    expect(hooks1.cdx.PreInvocation[0].command).toContain("hook pre-invocation");
+
+    // Second --fix is a no-op; doctor reports current
+    const contentBefore = readFileSync(`${configHome}/hooks.json`, "utf8");
+    const fix2 = runCli(["doctor", "--fix"], env);
+    expect(fix2.exitCode).toBe(0);
+    const contentAfter = readFileSync(`${configHome}/hooks.json`, "utf8");
+    expect(contentAfter).toBe(contentBefore);
+
+    const docCurrent = runCli(["doctor"], env);
+    expect(docCurrent.exitCode).toBe(0);
+    expect(docCurrent.stdout).toContain("agy hooks: current");
+
+    // On a config that already has another entry "foo", keeps foo unchanged and adds cdx
+    const configHome2 = `${root}/agy-config-foo`;
+    mkdirSync(configHome2, { recursive: true });
+    const fooHook = { enabled: false, custom: "kept-value" };
+    writeFileSync(`${configHome2}/hooks.json`, JSON.stringify({ foo: fooHook }, null, 2) + "\n");
+
+    const env2 = {
+      ...baseEnv(state, bin),
+      CDX_AGY_CONFIG_HOME: configHome2,
+    };
+    const fixFoo = runCli(["doctor", "--fix"], env2);
+    expect(fixFoo.exitCode).toBe(0);
+    const hooksMerged = JSON.parse(readFileSync(`${configHome2}/hooks.json`, "utf8"));
+    expect(hooksMerged.foo).toEqual(fooHook);
+    expect(hooksMerged.cdx).toBeDefined();
+    expect(hooksMerged.cdx.enabled).toBe(true);
+  });
+
+  test("cdx hook pre-tool exits 0 with allow when config.json has invalid JSON", () => {
+    const state = tempPath("hook-invalid-config");
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, "{invalid: json");
+    const env = baseEnv(state);
+
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, CLI, "hook", "pre-tool"],
+      env,
+      stdin: new Blob([JSON.stringify({ toolCall: { name: "write_to_file" } })]),
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.toString().trim()).toBe('{"decision":"allow"}');
+  });
+
+  test("doctor --fix reports bad and does not overwrite corrupt hooks.json", () => {
+    const root = tempPath("doctor-corrupt-hooks");
+    const state = `${root}/state`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(configHome, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol",
+      efforts: ["medium"],
+      defaultEffort: "medium",
+      rules: [],
+      gemini: {},
+    }));
+    const corruptContent = "{\ninvalid json\n";
+    writeFileSync(`${configHome}/hooks.json`, corruptContent);
+
+    const bin = installFakeCodex(root);
+    installFakeAgy(root);
+    const env = {
+      ...baseEnv(state, bin),
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+
+    const fixed = runCli(["doctor", "--fix"], env);
+    expect(fixed.exitCode).toBe(1);
+    expect(fixed.stdout).toContain(`remedy: fix or move ${configHome}/hooks.json by hand`);
+    expect(readFileSync(`${configHome}/hooks.json`, "utf8")).toBe(corruptContent);
+  });
+
+  test("warns once on stderr at spawn and resume when gemini work round opens without hooks", async () => {
+    const root = tempPath("gemini-no-hooks-warning");
+    const state = `${root}/state`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(configHome, { recursive: true });
+    const env = {
+      ...baseEnv(state, installFakeAgy(root)),
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+    const expectedWarn = "cdx: agy hooks not installed; steering falls back to follow-up turns (cdx doctor --fix)";
+
+    const spawnRes = runCli(["spawn", "warn-lane", "--engine", "gemini", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawnRes.exitCode).toBe(0);
+    const spawnWarnCount = spawnRes.stderr.split("\n").filter((l) => l.trim() === expectedWarn).length;
+    expect(spawnWarnCount).toBe(1);
+
+    const resumeRes = runCli(["resume", "warn-lane", "REPORT_ONLY"], env);
+    expect(resumeRes.exitCode).toBe(0);
+    const resumeWarnCount = resumeRes.stderr.split("\n").filter((l) => l.trim() === expectedWarn).length;
+    expect(resumeWarnCount).toBe(1);
+
+    const rootGpt = tempPath("gpt-no-hooks-warning");
+    const stateGpt = `${rootGpt}/state`;
+    const binCodex = installFakeCodex(rootGpt);
+    const envGpt = {
+      ...baseEnv(stateGpt, binCodex),
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+    const gptSpawnRes = runCli(["spawn", "gpt-lane", "--engine", "gpt", "--cd", rootGpt, "REPORT_ONLY"], envGpt);
+    expect(gptSpawnRes.exitCode).toBe(0);
+    expect(gptSpawnRes.stderr).not.toContain(expectedWarn);
   });
 });
 
