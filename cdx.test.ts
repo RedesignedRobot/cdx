@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { houseRules, isAgyCancellationTemplate } from "./cdx.ts";
+import { houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA } from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -168,7 +168,31 @@ const trace = (record) => {
 trace({ args, cwd: process.cwd(), codexHome: process.env.CODEX_HOME });
 
 if (args.includes("--version")) { console.log("agy version 1.1.24"); process.exit(0); }
-if (args[0] === "models") { console.log("gemini-3.8-flash-high"); process.exit(0); }
+const modelsIdx = args.indexOf("models");
+if (modelsIdx >= 0) {
+  const formatIdx = args.indexOf("--output-format");
+  if (formatIdx > modelsIdx) {
+    console.error("Error: flags provided but not defined: -output-format");
+    process.exit(1);
+  }
+  if (formatIdx >= 0 && formatIdx < modelsIdx && args[formatIdx + 1] === "json") {
+    if (process.env.FAKE_AGY_MODELS) {
+      console.log(process.env.FAKE_AGY_MODELS);
+      process.exit(0);
+    }
+    console.log(JSON.stringify({
+      command: {
+        name: "models",
+        data: {
+          models: [{ id: "gemini-3.8-flash-high", label: "Gemini 3.8 Flash (High)" }],
+        },
+      },
+    }));
+    process.exit(0);
+  }
+  console.log("gemini-3.8-flash-high");
+  process.exit(0);
+}
 if (args.includes("--print=/usage")) {
   console.log("Gemini Models\\tWeekly Limit Remaining\\t99%\\t2026-09-09T18:16:57Z");
   console.log("Gemini Models\\tFive Hour Limit Remaining\\t91%\\t2026-09-02T23:16:57Z");
@@ -198,12 +222,13 @@ let processing = false;
 let inputClosed = false;
 const queue = [];
 let fail3x = false;
-const result = (status, response, error) => send({
+const result = (status, response, error, extra) => send({
   event: "result",
   result: {
     conversation_id: conversationId,
     status,
     response,
+    ...(extra || {}),
     ...(error !== undefined ? { error } : {}),
     // Cumulative over the conversation, like the real agy; cdx must not add it.
     usage: {
@@ -266,7 +291,58 @@ async function runTurn(content) {
     result("ERROR", "progress text", "scripted non-transport error");
   } else if (content.includes("AGY_CANCEL_TEMPLATE")) result("SUCCESS", "User initiated cancellation\\nExecution stopped per your cancellation request");
   else if (content.includes("AGY_ERROR")) result("ERROR", "scripted agy failure");
-  else if (turn > 1) result("SUCCESS", content.includes("cut off by a transport error") ? "second response report" : \`follow-up result: \${content}\`);
+  else if (content.includes("REVIEW_STRUCTURED")) {
+    const structured = {
+      report: "# Review\\n\\nclean",
+      findings: [{ severity: "P2", confidence: "CONFIRMED", file: "a.ts", line: 3, summary: "x" }],
+    };
+    result("SUCCESS", JSON.stringify(structured), undefined, { structured_output: structured });
+  } else if (content.includes("REVIEW_NON_ARRAY_FINDINGS")) {
+    const structured = {
+      report: "# Review Non Array\\n\\n\`\`\`json\\n{\\"findings\\":[{\\"severity\\":\\"P1\\",\\"confidence\\":\\"CONFIRMED\\",\\"file\\":\\"f.ts\\",\\"line\\":1,\\"summary\\":\\"extracted from fence\\"}]}\\n\`\`\`",
+      findings: "not-an-array",
+    };
+    result("SUCCESS", JSON.stringify(structured), undefined, { structured_output: structured });
+  } else if (content.includes("REVIEW_UNSTRUCTURED_FINDINGS")) {
+    result("SUCCESS", "# Unstructured Review\\n\\nSome issues.\\n\\n\`\`\`json\\n{\\"findings\\":[{\\"severity\\":\\"P3\\",\\"confidence\\":\\"PLAUSIBLE\\",\\"file\\":\\"b.ts\\",\\"line\\":10,\\"summary\\":\\"fallback finding\\"}]}\\n\`\`\`");
+  } else if (content.includes("SCHEMA_RAW_RESPONSE")) {
+    writeFileSync(\`\${process.cwd()}/schema-work.txt\`, "ok\\n");
+    result("SUCCESS", JSON.stringify({ answer: "raw schema response" }));
+  } else if (content.includes("HIGHEST_EMPTY_AGENT_RESPONSE")) {
+    writeFileSync(\`\${process.cwd()}/highest-empty.txt\`, "ok\\n");
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "3",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "# Actual Final Report\\n\\nDone.",
+    } });
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "7",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "   \\n  ",
+    } });
+    result("SUCCESS", "chatter from result");
+  } else if (content.includes("TWO_AGENT_RESPONSES")) {
+    writeFileSync(\`\${process.cwd()}/final-msg.txt\`, "ok\\n");
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "3",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "I am waiting for bun run check to complete.",
+    } });
+    send({ event: "step_update", step_update: {
+      conversation_id: conversationId,
+      step_index: "7",
+      state: "DONE",
+      step_type: "agent_response",
+      text_delta: "# Final Report\\n\\nAll tasks complete.",
+    } });
+    result("SUCCESS", "I am waiting for bun run check to complete.# Final Report\\n\\nAll tasks complete.");
+  } else if (turn > 1) result("SUCCESS", content.includes("cut off by a transport error") ? "second response report" : \`follow-up result: \${content}\`);
   else if (content.includes("REVIEW_CLEAN")) result("SUCCESS", "No findings.");
   else result("SUCCESS", \`gemini report: \${content}\`);
   processing = false;
@@ -1460,6 +1536,230 @@ describe("cdx execution engines", () => {
     expect(checked.exitCode).toBe(0);
     expect(checked.stdout).toContain("cdx-lane");
     expect(checked.stdout).toContain("cdx-review");
+  });
+
+  test("gemini review captures structured findings and writes clean markdown report", () => {
+    const root = tempPath("gemini-review-structured");
+    const state = tempPath("gemini-review-structured-state");
+    const trace = tempPath("gemini-review-structured-trace");
+    const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const result = runCli(["review", "structured-review", "--engine", "gemini", "--cd", root, "REVIEW_STRUCTURED"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/structured-review-r1.md`, "utf8");
+    expect(report).toContain("# Review");
+    expect(report).not.toContain("{");
+    expect(report).not.toContain("}");
+
+    const findings = JSON.parse(readFileSync(`${state}/reports/structured-review-r1.findings.json`, "utf8"));
+    expect(findings).toEqual({
+      findings: [{ severity: "P2", confidence: "CONFIRMED", file: "a.ts", line: 3, summary: "x" }],
+    });
+
+    const traces = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    const invocation = traces[0];
+    const schemaIdx = invocation.args.indexOf("--json-schema");
+    expect(schemaIdx).toBeGreaterThanOrEqual(0);
+    const schemaFile = invocation.args[schemaIdx + 1];
+    expect(JSON.parse(readFileSync(schemaFile, "utf8"))).toEqual(REVIEW_FINDINGS_SCHEMA);
+  });
+
+  test("gemini review without structured output falls back to response text and harness note", () => {
+    const root = tempPath("gemini-review-fallback");
+    const state = tempPath("gemini-review-fallback-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    const result = runCli(["review", "fallback-review", "--engine", "gemini", "--cd", root, "REVIEW_UNSTRUCTURED_FINDINGS"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/fallback-review-r1.md`, "utf8");
+    expect(report).toContain("# Unstructured Review");
+    expect(report).toContain("## Harness note");
+    expect(report.toLowerCase()).toContain("structured output was missing");
+
+    const findings = JSON.parse(readFileSync(`${state}/reports/fallback-review-r1.findings.json`, "utf8"));
+    expect(findings).toEqual({
+      findings: [{ severity: "P3", confidence: "PLAUSIBLE", file: "b.ts", line: 10, summary: "fallback finding" }],
+    });
+  });
+
+  test("gemini work spawn with --schema keeps raw response text as report", () => {
+    const root = tempPath("gemini-work-schema");
+    const state = tempPath("gemini-work-schema-state");
+    const schemaFile = `${root}/test.schema.json`;
+    mkdirSync(root, { recursive: true });
+    writeFileSync(schemaFile, JSON.stringify({ type: "object", properties: { answer: { type: "string" } } }));
+    const env = baseEnv(state, installFakeAgy(root));
+
+    const result = runCli(["spawn", "schema-work", "--engine", "gemini", "--cd", root, "--schema", schemaFile, "SCHEMA_RAW_RESPONSE"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/schema-work-r1.md`, "utf8").trim();
+    expect(report).toBe(JSON.stringify({ answer: "raw schema response" }));
+    expect(existsSync(`${state}/reports/schema-work-r1.findings.json`)).toBe(false);
+  });
+
+  test("transcriptPath is recorded on ledger and rendered by cdx log --transcript", () => {
+    const root = tempPath("gemini-transcript");
+    const state = tempPath("gemini-transcript-state");
+    const agyStateHome = tempPath("gemini-agy-home");
+    const env = {
+      ...baseEnv(state, installFakeAgy(root)),
+      CDX_AGY_STATE_HOME: agyStateHome,
+    };
+
+    const spawn = runCli(["spawn", "transcript-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
+    expect(spawn.exitCode).toBe(0);
+
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const lane = ledger["transcript-lane"];
+    expect(lane.transcriptPath).toBe(`${agyStateHome}/brain/${lane.sessionId}/.system_generated/logs/transcript_full.jsonl`);
+
+    const missingLog = runCli(["log", "transcript-lane", "--transcript"], env);
+    expect(missingLog.exitCode).toBe(1);
+    expect(missingLog.stderr).toContain('no transcript for lane "transcript-lane"');
+
+    mkdirSync(join(lane.transcriptPath, ".."), { recursive: true });
+    const records = [
+      { step_index: 1, source: "user", type: "USER_INPUT", status: "DONE", created_at: "2026-09-03T00:00:00Z", content: "hello world" },
+      { step_index: 2, source: "agent", type: "AGENT_RESPONSE", status: "DONE", created_at: "2026-09-03T00:00:01Z", content: "response line 1\nresponse line 2" },
+    ];
+    writeFileSync(lane.transcriptPath, records.map((r) => JSON.stringify(r)).join("\n") + "\n");
+
+    const okLog = runCli(["log", "transcript-lane", "--transcript"], env);
+    expect(okLog.exitCode).toBe(0);
+    const lines = okLog.stdout.trim().split("\n");
+    expect(lines).toEqual([
+      "#1 USER_INPUT DONE hello world",
+      "#2 AGENT_RESPONSE DONE response line 1 response line 2",
+    ]);
+
+    // Round arg scans for the first line with conversation_id even if line 0 is preamble
+    const roundLog = `${state}/logs/transcript-lane-r1.jsonl`;
+    writeFileSync(roundLog, `{"preamble":"starting"}\n{"conversation_id":"${lane.sessionId}","event":"init"}\n`);
+    const roundLogResult = runCli(["log", "transcript-lane", "1", "--transcript"], env);
+    expect(roundLogResult.exitCode).toBe(0);
+    expect(roundLogResult.stdout.trim().split("\n")).toEqual([
+      "#1 USER_INPUT DONE hello world",
+      "#2 AGENT_RESPONSE DONE response line 1 response line 2",
+    ]);
+
+    // openRound resets transcriptPath to undefined before init
+    const resume = runCli(["resume", "transcript-lane", "--bg", "WAIT_FOR_FOLLOW_UP"], env);
+    expect(resume.exitCode).toBe(0);
+    const ledgerRound2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledgerRound2["transcript-lane"].transcriptPath).toBeUndefined();
+  });
+
+  test("gemini review with non-array structured findings omits findings.json and unlinks stale findings", () => {
+    const root = tempPath("gemini-review-non-array");
+    const state = tempPath("gemini-review-non-array-state");
+    const env = baseEnv(state, installFakeAgy(root));
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+
+    // Create a stale findings.json before the round starts
+    mkdirSync(`${state}/reports`, { recursive: true });
+    writeFileSync(`${state}/reports/non-array-review-r1.findings.json`, JSON.stringify({ findings: [{ severity: "P3", summary: "stale" }] }));
+
+    const result = runCli(["review", "non-array-review", "--engine", "gemini", "--cd", root, "REVIEW_NON_ARRAY_FINDINGS"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/non-array-review-r1.md`, "utf8");
+    expect(report).toContain("# Review Non Array");
+
+    // Finalize extracted the fenced JSON block because structured.findings was not an array
+    const findings = JSON.parse(readFileSync(`${state}/reports/non-array-review-r1.findings.json`, "utf8"));
+    expect(findings).toEqual({
+      findings: [{ severity: "P1", confidence: "CONFIRMED", file: "f.ts", line: 1, summary: "extracted from fence" }],
+    });
+  });
+
+  test("doctor checks for configured gemini model slug and handles presence and absence", () => {
+    const root = tempPath("doctor-models");
+    const state = tempPath("doctor-models-state");
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol",
+      efforts: ["medium"],
+      defaultEffort: "medium",
+      rules: [],
+      gemini: { model: "gemini-3.8-flash-high", agent: "cdx-lane", reviewAgent: "cdx-review" },
+    }));
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(root);
+    const baseTestEnv = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+    };
+    const fixResult = runCli(["doctor", "--fix"], baseTestEnv);
+    expect(fixResult.exitCode).toBe(0);
+
+    // Fake agy rejects --output-format after models subcommand
+    const proc = Bun.spawnSync({ cmd: [join(binAgy, "agy"), "models", "--output-format", "json"], env: baseTestEnv });
+    expect(proc.exitCode).toBe(1);
+    expect(proc.stderr.toString()).toContain("Error: flags provided but not defined: -output-format");
+
+    // Presence check
+    const presentEnv = {
+      ...baseTestEnv,
+      FAKE_AGY_MODELS: JSON.stringify({ command: { name: "models", data: { models: [{ id: "gemini-3.8-flash-high" }, { id: "gemini-3.7-flash" }] } } }),
+    };
+    const presentResult = runCli(["doctor"], presentEnv);
+    expect(presentResult.exitCode).toBe(0);
+    expect(presentResult.stdout).toContain("gemini-3.8-flash-high available");
+
+    // Absence check
+    const absentEnv = {
+      ...baseTestEnv,
+      FAKE_AGY_MODELS: JSON.stringify({ command: { name: "models", data: { models: [{ id: "gemini-3.7-flash" }] } } }),
+    };
+    const absentResult = runCli(["doctor"], absentEnv);
+    expect(absentResult.exitCode).toBe(1);
+    expect(absentResult.stdout).toContain('FAIL agy model: configured model "gemini-3.8-flash-high" not found in agy models');
+
+    // Failed probe warns, never bad
+    const failedProbeEnv = {
+      ...baseTestEnv,
+      FAKE_AGY_MODELS: "NOT_JSON",
+    };
+    const failedProbeResult = runCli(["doctor"], failedProbeEnv);
+    expect(failedProbeResult.exitCode).toBe(0);
+    expect(failedProbeResult.stdout).toContain("agy models: probe returned invalid JSON");
+  });
+
+  test("gemini report captures only the final agent message from multi-message turn", () => {
+    const root = tempPath("gemini-final-message");
+    const state = tempPath("gemini-final-message-state");
+    const env = baseEnv(state, installFakeAgy(root));
+
+    const result = runCli(["spawn", "final-msg-lane", "--engine", "gemini", "--cd", root, "TWO_AGENT_RESPONSES"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/final-msg-lane-r1.md`, "utf8");
+    expect(report).toBe("# Final Report\n\nAll tasks complete.\n");
+    expect(report).not.toContain("I am waiting for bun run check to complete.");
+  });
+
+  test("gemini report skips empty agent responses to take highest non-empty step", () => {
+    const root = tempPath("gemini-skip-empty");
+    const state = tempPath("gemini-skip-empty-state");
+    const env = baseEnv(state, installFakeAgy(root));
+
+    const result = runCli(["spawn", "skip-empty-lane", "--engine", "gemini", "--cd", root, "HIGHEST_EMPTY_AGENT_RESPONSE"], env);
+    expect(result.exitCode).toBe(0);
+
+    const report = readFileSync(`${state}/reports/skip-empty-lane-r1.md`, "utf8");
+    expect(report).toBe("# Actual Final Report\n\nDone.\n");
+    expect(report).not.toContain("chatter from result");
   });
 });
 
