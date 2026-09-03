@@ -200,6 +200,48 @@ if (args.includes("--print=/usage")) {
   console.log("Claude and GPT models\\tFive Hour Limit Remaining\\t100%\\t2026-09-03T00:10:44Z");
   process.exit(0);
 }
+if (args.includes("--print=/hooks")) {
+  if (process.env.FAKE_AGY_HOOKS) {
+    console.log(process.env.FAKE_AGY_HOOKS);
+    process.exit(0);
+  }
+  console.log(JSON.stringify({
+    conversation_id: "",
+    status: "SUCCESS",
+    response: "cdx\\tenabled\\tPreInvocation\\t-\\tcommand\\t/Users/mas/.bun/bin/bun /Users/mas/code/cdx/cdx.ts hook pre-invocation\\ncdx\\tenabled\\tPreToolUse\\t*\\tcommand\\t/Users/mas/.bun/bin/bun /Users/mas/code/cdx/cdx.ts hook pre-tool\\n",
+    duration_seconds: 0,
+    num_turns: 0,
+    usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+    command: {
+      name: "hooks",
+      data: {
+        hooks: [
+          {
+            name: "cdx",
+            enabled: true,
+            source: "/Users/mas/.gemini/config/hooks.json",
+            actions: [
+              {
+                event: "PreInvocation",
+                type: "command",
+                command: "/Users/mas/.bun/bin/bun /Users/mas/code/cdx/cdx.ts hook pre-invocation",
+                timeout_seconds: 10,
+              },
+              {
+                event: "PreToolUse",
+                matcher: "*",
+                type: "command",
+                command: "/Users/mas/.bun/bin/bun /Users/mas/code/cdx/cdx.ts hook pre-tool",
+                timeout_seconds: 10,
+              },
+            ],
+          },
+        ],
+      },
+    },
+  }));
+  process.exit(0);
+}
 if (args.some((arg) => arg.startsWith("--print="))) {
   console.log(JSON.stringify({ response: "OK", conversation_id: conversationId }));
   process.exit(0);
@@ -2105,6 +2147,61 @@ describe("agy lifecycle hooks", () => {
     expect(fixed.exitCode).toBe(1);
     expect(fixed.stdout).toContain(`remedy: fix or move ${configHome}/hooks.json by hand`);
     expect(readFileSync(`${configHome}/hooks.json`, "utf8")).toBe(corruptContent);
+  });
+
+  test("doctor checks whether cdx hook is loaded in agy via --print=/hooks", () => {
+    const root = tempPath("doctor-hooks-loaded");
+    const state = `${root}/state`;
+    const configHome = `${root}/agy-config`;
+    mkdirSync(state, { recursive: true });
+    mkdirSync(configHome, { recursive: true });
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(root);
+    const baseTestEnv = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+      CDX_AGY_CONFIG_HOME: configHome,
+    };
+
+    // Install hook so hookInstallState() becomes current
+    const fixResult = runCli(["doctor", "--fix"], baseTestEnv);
+    expect(fixResult.exitCode).toBe(0);
+
+    // 1. With cdx hook present in agy --print=/hooks
+    const withHookResult = runCli(["doctor"], baseTestEnv);
+    expect(withHookResult.exitCode).toBe(0);
+    expect(withHookResult.stdout).toContain("agy hooks: current");
+    expect(withHookResult.stdout).toContain("agy hooks: loaded in agy");
+
+    // 2. Without cdx hook in agy --print=/hooks (answers observed shape but without cdx)
+    const withoutHookEnv = {
+      ...baseTestEnv,
+      FAKE_AGY_HOOKS: JSON.stringify({
+        conversation_id: "",
+        status: "SUCCESS",
+        response: "",
+        duration_seconds: 0,
+        num_turns: 0,
+        usage: { input_tokens: 0, output_tokens: 0, thinking_tokens: 0, cache_read_tokens: 0, total_tokens: 0 },
+        command: {
+          name: "hooks",
+          data: {
+            hooks: [
+              {
+                name: "other-tool",
+                enabled: true,
+                source: "/tmp/other.json",
+                actions: [{ event: "PreToolUse", type: "command", command: "echo allow" }],
+              },
+            ],
+          },
+        },
+      }),
+    };
+    const withoutHookResult = runCli(["doctor"], withoutHookEnv);
+    expect(withoutHookResult.exitCode).toBe(0);
+    expect(withoutHookResult.stdout).toContain("agy hooks: current");
+    expect(withoutHookResult.stdout).toContain("agy hooks: cdx hook not loaded in agy");
   });
 
   test("warns once on stderr at spawn and resume when gemini work round opens without hooks", async () => {

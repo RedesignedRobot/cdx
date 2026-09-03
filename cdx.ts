@@ -66,7 +66,7 @@ const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.1.0";
+const VERSION = "3.2.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -3990,6 +3990,74 @@ async function checkDoctorGeminiModel(
   }
 }
 
+function parseAgyHooksLoaded(stdout: string): boolean {
+  const jsonStart = stdout.indexOf("{");
+  if (jsonStart === -1) return false;
+  try {
+    const parsed = JSON.parse(stdout.slice(jsonStart));
+    const hooks = parsed?.command?.data?.hooks;
+    if (Array.isArray(hooks)) {
+      for (const hook of hooks) {
+        if (hook?.name === "cdx") return true;
+        if (Array.isArray(hook?.actions)) {
+          for (const action of hook.actions) {
+            if (typeof action?.command === "string" && action.command.includes("hook pre-invocation")) {
+              return true;
+            }
+          }
+        }
+      }
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+async function checkDoctorAgyHooks(
+  good: (message: string) => void,
+  warn: (message: string) => void,
+): Promise<void> {
+  const agy = Bun.which("agy");
+  if (!agy) {
+    warn("agy hooks: CLI not found");
+    return;
+  }
+  const proc = Bun.spawn([agy, "--print=/hooks", "--output-format", "json", "--add-dir", "/tmp"], {
+    env: uncoloredChildEnv(),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const stdout = new Response(proc.stdout).text();
+  const stderr = new Response(proc.stderr).text();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    try { proc.kill("SIGKILL"); } catch { /* exited */ }
+  }, 15_000);
+  try {
+    const [exitCode, text] = await Promise.all([proc.exited, stdout]);
+    await stderr;
+    if (timedOut || proc.signalCode === "SIGKILL") {
+      warn("agy hooks: probe timed out after 15s");
+      return;
+    }
+    if (exitCode !== 0) {
+      warn(`agy hooks: probe exited ${exitCode}`);
+      return;
+    }
+    if (parseAgyHooksLoaded(text)) {
+      good("agy hooks: loaded in agy");
+    } else {
+      warn("agy hooks: cdx hook not loaded in agy");
+    }
+  } catch (error) {
+    warn(`agy hooks: probe failed (${error instanceof Error ? error.message : String(error)})`);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -4056,6 +4124,7 @@ async function doctorCommand(argv: string[]) {
     }
     if (hookState.state === "current") {
       if (!hookInstalled) good(`agy hooks: current (${hookState.path})`);
+      await checkDoctorAgyHooks(good, warn);
     } else if (config.gemini) {
       bad("agy hooks", hookState.detail, "run `cdx doctor --fix` to install hooks");
     } else {
