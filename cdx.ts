@@ -63,10 +63,11 @@ const LEDGER = `${ROOT}/ledger.json`;
 const CONFIG_PATH = `${ROOT}/config.json`;
 const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
+const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.2.0";
+const VERSION = "3.3.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -190,6 +191,7 @@ interface Lane {
   lastEventAt?: string;
   exitCode?: number;
   note?: string;
+  lastResultError?: string;
   diffEmpty?: true;
   worktreePath?: string;
   worktreeRepo?: string;
@@ -797,6 +799,108 @@ function requireEngineBinary(engine: Engine): void {
   }
 }
 
+interface GeminiQuotaRecord {
+  blockedUntil: string;
+  observedAt: string;
+  lane: string;
+  round: number;
+}
+
+function writeGeminiQuota(record: GeminiQuotaRecord): void {
+  mkdirSync(ROOT, { recursive: true });
+  const tmp = `${GEMINI_QUOTA_PATH}.tmp.${process.pid}`;
+  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
+  renameSync(tmp, GEMINI_QUOTA_PATH);
+}
+
+function readGeminiQuota(): GeminiQuotaRecord | undefined {
+  try {
+    const value = JSON.parse(readFileSync(GEMINI_QUOTA_PATH, "utf8")) as GeminiQuotaRecord;
+    return value && typeof value.blockedUntil === "string" && Number.isFinite(Date.parse(value.blockedUntil))
+      ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function parseQuotaResetDelayMs(text: string): number | undefined {
+  const match = /Resets in (?:(?:(\d+)\s*h\s*)?(?:(\d+)\s*m\s*)?(?:(\d+)\s*s)?)/i.exec(text);
+  if (!match) return undefined;
+  const hours = match[1] ? Number(match[1]) : 0;
+  const minutes = match[2] ? Number(match[2]) : 0;
+  const seconds = match[3] ? Number(match[3]) : 0;
+  if (!match[1] && !match[2] && !match[3]) return undefined;
+  return (hours * 3600 + minutes * 60 + seconds) * 1000;
+}
+
+function parseQuotaResetIso(text: string, baseTime = Date.now()): string {
+  const delayMs = parseQuotaResetDelayMs(text) ?? (30 * 60 * 1000);
+  return new Date(baseTime + delayMs).toISOString();
+}
+
+function resetMinutesRemaining(iso: string, now = Date.now()): number {
+  const diffMs = Date.parse(iso) - now;
+  if (diffMs <= 0) return 0;
+  return Math.max(1, Math.round(diffMs / 60_000));
+}
+
+interface GeminiQuotaState {
+  block?: { resetsAt: string; minutesRemaining: number };
+  warnPercent?: number;
+  resetsAt?: string;
+}
+
+function geminiQuotaState(now = Date.now()): GeminiQuotaState {
+  const quota = readGeminiQuota();
+  if (quota && Date.parse(quota.blockedUntil) > now) {
+    return {
+      block: {
+        resetsAt: quota.blockedUntil,
+        minutesRemaining: resetMinutesRemaining(quota.blockedUntil, now),
+      },
+    };
+  }
+
+  const snapshot = readGeminiUsageSnapshot();
+  if (snapshot) {
+    const ageMs = now - Date.parse(snapshot.checkedAt);
+    const resetTime = Date.parse(snapshot.fiveHour.resetsAt);
+    if (ageMs >= 0 && ageMs < 15 * 60 * 1000 && resetTime > now) {
+      if (snapshot.fiveHour.remainingPercent < 5) {
+        return {
+          block: {
+            resetsAt: snapshot.fiveHour.resetsAt,
+            minutesRemaining: resetMinutesRemaining(snapshot.fiveHour.resetsAt, now),
+          },
+        };
+      }
+      if (snapshot.fiveHour.remainingPercent < 15) {
+        return {
+          warnPercent: snapshot.fiveHour.remainingPercent,
+          resetsAt: snapshot.fiveHour.resetsAt,
+        };
+      }
+    }
+  }
+
+  return {};
+}
+
+function requireGeminiQuota(engine: Engine): void {
+  if (engine !== "gemini") return;
+
+  const state = geminiQuotaState();
+  if (state.block) {
+    fail(`gemini five-hour quota exhausted; resets at ${state.block.resetsAt} (in ${state.block.minutesRemaining}m). Wait, or pass --engine gpt.`);
+  }
+
+  try { unlinkSync(GEMINI_QUOTA_PATH); } catch { /* ignore */ }
+
+  if (state.warnPercent !== undefined && state.resetsAt) {
+    console.error(color.yellow(`cdx: gemini five-hour window at ${state.warnPercent}%, resets at ${state.resetsAt}; fan out with care`));
+  }
+}
+
 function rejectEngineMismatch(laneName: string, lane: Lane, requested: Engine): void {
   const recorded = laneEngine(lane);
   if (recorded !== requested) fail(`lane "${laneName}" uses engine ${recorded}; choose --engine ${recorded}`);
@@ -1305,6 +1409,11 @@ async function runRound(lane: string, round: number): Promise<number> {
     feedOwned(`[cdx] lane=${lane} round=${round} round-state=failed (runner error)`, ownerSession);
     return 1;
   } finally {
+    try {
+      if (spec?.engine === "gemini") {
+        await refreshGeminiUsage();
+      }
+    } catch { /* best-effort */ }
     if (process.argv[2] === "_run" && spec && (spec.engine ?? "gpt") === "gpt") {
       const account = spec.account && spec.codexHome ? { name: spec.account, home: spec.codexHome } : undefined;
       // Without a readable spec the account context is unknown; refreshing
@@ -1324,6 +1433,18 @@ function isAgyCancellationTemplate(text: string): boolean {
   return firstLine === "User initiated cancellation"
     || firstLine === "Execution stopped per your cancellation request"
     || firstLine.startsWith("An execution step was interrupted by the user");
+}
+
+function extractFinalAgentResponse(responses: Map<string, { stepIndex: string; num: number; text: string }>): string | undefined {
+  if (responses.size === 0) return undefined;
+  const sorted = [...responses.values()].sort((a, b) => {
+    return Number.isFinite(a.num) && Number.isFinite(b.num) ? a.num - b.num : 0;
+  });
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const text = sorted[i].text.trim();
+    if (text) return text;
+  }
+  return undefined;
 }
 
 async function runRoundInner(lane: string, round: number): Promise<number> {
@@ -1469,7 +1590,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     return details.length ? details.join(": ") : lastProtocolError;
   };
 
-  const handleEvent = (line: string) => {
+  const handleEvent = async (line: string) => {
     let event: any;
     try { event = JSON.parse(line); } catch { return; }
     noteActivity();
@@ -1536,7 +1657,79 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         }, true);
       }
       const isReview = startingLane?.kind === "review";
-      if (result.status === "SUCCESS") {
+      const finalAgentResponse = extractFinalAgentResponse(turnAgentResponses);
+
+      const rawError = result.error?.message ?? result.error;
+      const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
+      const errorCandidates = [
+        errorText,
+        typeof result.response === "string" ? result.response : "",
+      ].filter((s) => s.trim().length > 0);
+      const effectiveError = (errorText.trim() || (typeof result.response === "string" ? result.response : "")).trim();
+      const recordedError = effectiveError.slice(0, 300);
+
+      const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
+      const previousResultError = readLedger()[lane]?.lastResultError;
+      const isVerbatimReplay = Boolean(!isTransportError && previousResultError && effectiveError === previousResultError);
+
+      let treatedAsReplay = false;
+      let success = result.status === "SUCCESS";
+
+      if (!success) {
+        if (isVerbatimReplay && finalAgentResponse) {
+          treatedAsReplay = true;
+          success = true;
+        } else {
+          const quotaCandidate = errorCandidates.find((c) => /Individual quota reached/i.test(c));
+          if (quotaCandidate) {
+            let usageSnapshot: GeminiUsageSnapshot | undefined;
+            try { usageSnapshot = await refreshGeminiUsage(); } catch {}
+            if (usageSnapshot && usageSnapshot.fiveHour.remainingPercent >= 5) {
+              if (finalAgentResponse) {
+                treatedAsReplay = true;
+                success = true;
+              } else {
+                touchLedger((item) => { item.lastResultError = recordedError; }, true);
+                turnFailureReason = `agy reported quota exhausted but usage shows ${usageSnapshot.fiveHour.remainingPercent}% five-hour remaining; no block written`;
+              }
+            } else {
+              touchLedger((item) => { item.lastResultError = recordedError; }, true);
+              const delayMs = parseQuotaResetDelayMs(quotaCandidate);
+              const observedAt = new Date().toISOString();
+              const blockedUntil = new Date(Date.now() + (delayMs ?? (30 * 60 * 1000))).toISOString();
+              writeGeminiQuota({ blockedUntil, observedAt, lane, round });
+              turnFailureReason = `gemini five-hour quota exhausted; resets at ${blockedUntil}; resume this lane after the reset`;
+              const resetDetail = delayMs !== undefined ? `resets at ${blockedUntil}` : "reset time unknown; assuming 30m";
+              feedOwned(`[cdx] lane=${lane} round=${round} gemini quota exhausted; ${resetDetail}`, spec.ownerSession);
+            }
+          } else {
+            touchLedger((item) => { item.lastResultError = recordedError; }, true);
+            if (isTransportError && proc.exitCode === null && geminiContinuations < 2) {
+              geminiContinuations += 1;
+              touchLedger((item) => {
+                item.continuations = geminiContinuations;
+                item.lastEventAt = now;
+              }, true);
+              const reason = singleLine(effectiveError).slice(0, 80);
+              feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, spec.ownerSession);
+              writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+            } else {
+              const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
+              turnFailureReason ??= detail || "gemini result status ERROR";
+            }
+          }
+        }
+      }
+
+      if (success) {
+        if (result.status === "SUCCESS") {
+          touchLedger((item) => {
+            delete item.lastResultError;
+          }, true);
+        }
+        if (treatedAsReplay) {
+          feedOwned(`[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, spec.ownerSession);
+        }
         if (isReview) {
           const structured = result.structured_output;
           const hasStructuredReport = Boolean(
@@ -1551,7 +1744,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
               turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
             }
           } else {
-            const rawResponse = typeof result.response === "string" ? result.response.trim() : "";
+            const rawResponse = finalAgentResponse || (typeof result.response === "string" ? result.response.trim() : "");
             const fallbackReport = `${rawResponse}\n\n## Harness note\n\nStructured output was missing.\n`;
             writeFileSync(reportPath, fallbackReport);
             if (isAgyCancellationTemplate(rawResponse)) {
@@ -1559,26 +1752,15 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
             }
           }
         } else if (spec.outputSchema !== undefined) {
-          if (typeof result.response === "string" && result.response.trim()) {
-            writeFileSync(reportPath, `${result.response.trim()}\n`);
-            if (isAgyCancellationTemplate(result.response)) {
+          const schemaResponse = finalAgentResponse || (typeof result.response === "string" ? result.response.trim() : "");
+          if (schemaResponse) {
+            writeFileSync(reportPath, `${schemaResponse}\n`);
+            if (isAgyCancellationTemplate(schemaResponse)) {
               turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
             }
           }
         } else {
-          let chosenReport: string | undefined;
-          if (turnAgentResponses.size > 0) {
-            const sorted = [...turnAgentResponses.values()].sort((a, b) => {
-              return Number.isFinite(a.num) && Number.isFinite(b.num) ? a.num - b.num : 0;
-            });
-            for (let i = sorted.length - 1; i >= 0; i--) {
-              const text = sorted[i].text.trim();
-              if (text) {
-                chosenReport = text;
-                break;
-              }
-            }
-          }
+          let chosenReport = finalAgentResponse;
           if (!chosenReport && typeof result.response === "string" && result.response.trim()) {
             chosenReport = result.response.trim();
           }
@@ -1592,30 +1774,6 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       } else {
         if (typeof result.response === "string" && result.response.trim()) {
           writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
-        }
-      }
-      if (result.status !== "SUCCESS") {
-        const rawError = result.error?.message ?? result.error;
-        const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
-        const errorCandidates = [
-          errorText,
-          typeof result.response === "string" ? result.response : "",
-        ].filter((s) => s.trim().length > 0);
-        const errString = errorCandidates[0] ?? "";
-        const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
-
-        if (isTransportError && proc.exitCode === null && geminiContinuations < 2) {
-          geminiContinuations += 1;
-          touchLedger((item) => {
-            item.continuations = geminiContinuations;
-            item.lastEventAt = now;
-          }, true);
-          const reason = singleLine(errString).slice(0, 80);
-          feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, spec.ownerSession);
-          writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
-        } else {
-          const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
-          turnFailureReason ??= detail || "gemini result status ERROR";
         }
       }
       geminiTurnsCompleted += 1;
@@ -1706,9 +1864,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() ?? "";
-      for (const line of lines) if (line.trim()) handleEvent(line);
+      for (const line of lines) if (line.trim()) await handleEvent(line);
     }
-    if (buffer.trim()) handleEvent(buffer);
+    if (buffer.trim()) await handleEvent(buffer);
   };
   const pumpRaw = async (stream: ReadableStream<Uint8Array>, sink: typeof log) => {
     for await (const chunk of stream) {
@@ -1832,7 +1990,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         buffer = lines.pop() ?? "";
         for (const line of lines) {
           if (!line.trim()) continue;
-          handleEvent(line);
+          await handleEvent(line);
           let message: any;
           try { message = JSON.parse(line); } catch { continue; }
           if (typeof message.id === "number" && pending.has(message.id)) {
@@ -1845,7 +2003,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
           }
         }
       }
-      if (buffer.trim()) handleEvent(buffer);
+      if (buffer.trim()) await handleEvent(buffer);
       rpcClosed = true;
       const error = new Error("app-server closed before replying");
       for (const waiter of pending.values()) waiter.reject(error);
@@ -2449,6 +2607,7 @@ async function spawnCommand(argv: string[]) {
   if (!lane || !brief) fail(`usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`);
   validLane(lane);
   requireEngineBinary(engine);
+  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gemini" && (parsed.lists.image?.length ?? 0) > 0) fail("--image is not supported for gemini");
   let cwd = parsed.flags.cd ?? process.cwd();
@@ -2467,6 +2626,19 @@ async function spawnCommand(argv: string[]) {
     rejectEngineMismatch(lane, existingLane, engine);
     if (engine === "gpt") rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   }
+  const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
+    if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
+    return realpathSync(dir);
+  });
+  const images = (parsed.lists.image ?? []).map((image) => {
+    if (!existsSync(image)) fail(`--image does not exist: ${image}`);
+    return realpathSync(image);
+  });
+  let outputSchema: unknown;
+  if (parsed.flags.schema) {
+    try { outputSchema = JSON.parse(readFileSync(parsed.flags.schema, "utf8")); }
+    catch (error) { fail(`--schema must name valid JSON: ${error instanceof Error ? error.message : String(error)}`); }
+  }
   let worktree: WorktreeInfo | undefined;
   if (parsed.flags.worktree) {
     worktree = createWorktree(cwd, parsed.flags.worktree, lane);
@@ -2484,19 +2656,6 @@ async function spawnCommand(argv: string[]) {
       console.error(warning);
       feed(warning);
     }
-  }
-  const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
-    if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
-    return realpathSync(dir);
-  });
-  const images = (parsed.lists.image ?? []).map((image) => {
-    if (!existsSync(image)) fail(`--image does not exist: ${image}`);
-    return realpathSync(image);
-  });
-  let outputSchema: unknown;
-  if (parsed.flags.schema) {
-    try { outputSchema = JSON.parse(readFileSync(parsed.flags.schema, "utf8")); }
-    catch (error) { fail(`--schema must name valid JSON: ${error instanceof Error ? error.message : String(error)}`); }
   }
   const { round } = openRound(lane, "work", cwd, effort, {
     engine, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate: parsed.flags.gate,
@@ -2541,6 +2700,7 @@ async function resumeCommand(argv: string[]) {
   const before = readLane(lane);
   const engine = laneEngine(before);
   requireEngineBinary(engine);
+  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gpt") rejectPinnedAccountFlag(lane, before, parsed.flags.account);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
@@ -2636,6 +2796,7 @@ async function reviewCommand(argv: string[]) {
   if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
   validLane(lane);
   requireEngineBinary(engine);
+  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
@@ -2790,6 +2951,10 @@ function statusCommand(argv: string[]) {
     const enriched = Object.fromEntries(all.map(([lane, entry]) => [lane, { ...entry, engine: laneEngine(entry), alive: laneRunning(entry) ? pidAlive(entry.pid) : undefined }]));
     console.log(JSON.stringify(enriched, null, 2));
     return;
+  }
+  const quotaState = geminiQuotaState();
+  if (quotaState.block) {
+    console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
   }
   if (all.length === 0) { console.log("cdx: no lanes"); return; }
   // Running lanes first (most recent activity on top), then finished ones
@@ -4089,9 +4254,24 @@ async function doctorCommand(argv: string[]) {
     if (geminiUsage) {
       good(`agy usage: weekly ${geminiUsage.weekly.remainingPercent}% remaining, five-hour ${geminiUsage.fiveHour.remainingPercent}% remaining`);
     } else warn("agy usage: unavailable");
+
+    const quotaState = geminiQuotaState();
+    const snapshot = geminiUsage ?? readGeminiUsageSnapshot();
+    if (quotaState.block) {
+      warn(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
+    } else if (quotaState.warnPercent !== undefined && quotaState.resetsAt) {
+      warn(`gemini quota: five-hour window at ${quotaState.warnPercent}%, resets at ${quotaState.resetsAt}; fan out with care`);
+    } else if (snapshot && snapshot.fiveHour.remainingPercent >= 15) {
+      good("gemini quota: clear");
+    }
+
     await checkDoctorGeminiModel(good, warn, bad);
   } else {
     warn("agy usage: unavailable");
+    const quotaState = geminiQuotaState();
+    if (quotaState.block) {
+      warn(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
+    }
   }
 
   const geminiPolicy = config.gemini ?? geminiConfig();
@@ -4277,6 +4457,10 @@ async function doctorCommand(argv: string[]) {
 // Prints nothing when all lanes are settled, so the SessionStart hook costs
 // zero context in the common case.
 function briefCommand() {
+  const quotaState = geminiQuotaState();
+  if (quotaState.block) {
+    console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
+  }
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
   const entries = Object.entries(readLedger());
@@ -4432,7 +4616,10 @@ try {
   throw err;
 }
 
-export { isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA };
+export {
+  isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA,
+  GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, requireGeminiQuota, geminiQuotaState,
+};
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
