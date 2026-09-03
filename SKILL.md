@@ -100,7 +100,18 @@ A Gemini round whose result reports a transport error (`The stream was interrupt
 or `timeout waiting for response`) while agy is alive gets up to two
 continuation turns in the same conversation. The feed line reports `auto-continue <n>/2`.
 Status reports `auto-continued <n>x`. A third failure fails the round with note
-`turn failed after 2 auto-continues: <reason>`. Every tool is available because the
+`turn failed after 2 auto-continues: <reason>`. A round whose result carries
+`Individual quota reached` writes `~/.cdx/gemini-quota.json` with the parsed reset
+time (30 minutes when the text does not parse), and `spawn`, `resume`, and
+`review` refuse Gemini work until then: `cdx: gemini five-hour quota exhausted;
+resets at <iso> (in <n>m). Wait, or pass --engine gpt.` Every Gemini round
+refreshes `usage-gemini.json` on finalize; a snapshot under 15 minutes old with a
+future reset blocks under 5% five-hour remaining and warns on stderr under 15%.
+Antigravity sometimes replays a previous turn's error on a resumed conversation
+while the new turn finished. When the result error equals the lane's last
+recorded error verbatim and the turn produced a final agent message, cdx
+finalizes the round as success and writes the feed line `ignored replayed agy
+error: <text>`. Transport errors never take that path. Every tool is available because the
 shipped agent file sets no tools allowlist and cdx passes `--dangerously-skip-permissions`.
 Gemini always runs `gemini-3.8-flash-high` and `--effort` is ignored with a note.
 `--schema` reaches both engines. `--image` works only with GPT.
