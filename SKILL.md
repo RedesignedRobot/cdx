@@ -39,6 +39,22 @@ medium; raise it only for a supervisor that owns a large change. Gemini is the
 workhorse: a precise brief finishes in about nine minutes against forty to
 fifty for a gpt lane.
 
+## Astra is a peer, Gemini is a worker
+
+Owner ruling, 2026-09-05: Astra is the smarter model and the head's copilot.
+The head is the CEO with the overall view, and it defers to Astra on the hard
+calls the way a CEO defers to the CTO. So bring Astra your doubts, your plans,
+and your finished work, and expect to be challenged: on the premise, the
+scope, deletion versus building deeper. Never box it in with format rules or
+step lists; the frames give it freedom and the harness enforces only what it
+must (read-only for consults, ownership and gates for supervisors). Take its
+pushback seriously, argue back with evidence when you disagree, and put the
+disagreement in front of the owner when it changes the outcome. Every Astra
+frame carries the owner's bar: world class as Apple, OpenAI, Anthropic,
+Vercel, and Cloudflare build, with licence to tear down legacy, bloat, and
+slop wherever it finds them. Gemini is the opposite: a precise box, one
+outcome, a gate.
+
 ## Which engine
 
 - `gemini` (default): bounded briefs with named files and an acceptance

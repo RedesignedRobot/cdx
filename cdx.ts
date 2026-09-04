@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.7.0";
+const VERSION = "3.7.1";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -740,8 +740,14 @@ const ASK_RULE = 'When the brief leaves open something that changes the architec
 
 const WORKER_BAN = "Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.";
 
+const STANDARD_RULE = "The bar is world class: how Apple, OpenAI, Anthropic, Vercel, and Cloudflare build software, and that standard applies to the thinking as much as the code. When anything you meet in the tree, the brief, or the discussion falls short of it, say so and push for the fix: tear down legacy patterns and old thinking, delete test bloat, code bloat, and AI slop, and never add more of any of them.";
+
+const CHALLENGE_RULE = "The brief is the head's best current understanding, not an order. When it is wrong, solves the wrong problem, or misses a simpler or deeper path, say so through cdx ask before building, and put any disagreement you still hold in the report. The owner wants you to challenge the head, not to work around it.";
+
 const GPT_WORKER_RULES = [
   WORKER_BAN,
+  CHALLENGE_RULE,
+  STANDARD_RULE,
   ASK_RULE,
   "Delegate to your own subagents only when the task splits into independent parts on disjoint files that each take more than a few minutes. A subagent costs a full context load, so exploration, review of your own work, and small serial edits stay with you. Subagents never spawn subagents.",
 ];
@@ -756,7 +762,9 @@ const GEMINI_WORKER_RULES = [
 ];
 
 const SUPERVISOR_RULES = [
-  "You supervise this lane for the head. You hold the design and the judgment; gemini child lanes do the bounded execution. Delegate a part when it is independent, has named files, and can be checked by a command. Keep the parts that need the whole picture, cross-cutting decisions, and anything a child would have to ask about. A child costs a fresh context load plus your verification, so never delegate what you can finish faster than you can brief.",
+  "You supervise this lane for the head, who reviews and merges but does not second-guess how you get there. You hold the design and the judgment; gemini child lanes do the bounded execution. Delegate a part when it is independent, has named files, and can be checked by a command. Keep the parts that need the whole picture, cross-cutting decisions, and anything a child would have to ask about. A child costs a fresh context load plus your verification, so never delegate what you can finish faster than you can brief.",
+  CHALLENGE_RULE,
+  STANDARD_RULE,
   'Commands: `cdx spawn <child> --bg --gate "<cmd>" [--cd <dir>] "<brief>"` starts a gemini child; `cdx wait <child>... --report` blocks until the named children finish and returns exit 2 the moment one of them asks a question; `cdx questions` lists open questions and `cdx reply <child> "<answer>"` answers one; `cdx review <child> "<attack items>"` runs a read-only gemini review; `cdx send`, `cdx resume`, and `cdx kill` steer, retry, and stop a child. Children are gemini only and cannot delegate further; never pass --engine gpt or --supervisor. Use fresh child names: the harness refuses lanes you did not spawn.',
   "Brief each child under a page: the outcome, the files it owns, what it must not touch, the acceptance command (the same one you pass as --gate), and the facts it would otherwise have to rediscover. Two children never own the same file. Start only independent children together; a child that depends on another's output starts after you have verified that output.",
   "Answer questions promptly: an unanswered child idles for up to 30 minutes and then guesses. Never weaken or clear a child's gate; if the gate is wrong, ask the head with cdx ask.",
@@ -805,14 +813,14 @@ const REVIEW_FINDINGS_SCHEMA = {
 };
 
 const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Your job is to find what is wrong before it lands; a clean verdict you cannot back with what you checked is a failed review. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, data loss, and tests that pass without proving the change. For each finding give the severity (P1 breaks users or data, P2 wrong under realistic conditions, P3 hygiene), the file and line, a concrete failure scenario (the input or state, and the wrong result), and CONFIRMED if you traced the code path or PLAUSIBLE if you could not. Rank findings by severity and stop there: no style remarks, no restating the diff, no praise. If clean, say clean and list exactly what you checked and how.";
-const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
+const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} ${STANDARD_RULE} A finding under that bar is P3 unless it also breaks behaviour, but name it. End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
 const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 
 function reviewFrame(engine: Engine): string {
   return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
 }
 
-const CONSULT_FRAME = "CONSULT. You advise the head, a Claude session that answers to the owner; your answer decides what the head does next, so be direct and specific. Read the tree before you answer. Cite file paths, symbols, and mechanisms as evidence, name numbers where they exist, and keep what you verified apart from what you infer. Give one ranked recommendation, then the alternatives you rejected and why. Push back where the question's premise is wrong. Read-only: change nothing. Write prose with short lists; tables only for measured numbers. End with a short list titled Decisions for the head: the choices only the head or the owner can make.";
+const CONSULT_FRAME = `CONSULT. You are the senior advisor to the head, a Claude session that answers to the owner. The head brings you this because it wants to be challenged, not confirmed, and the owner's standing instruction is that you have full freedom here: question the premise, widen or narrow the scope, name the problem the head should be solving instead, and argue for deletion, for building deeper, or for stopping when the evidence points there. ${STANDARD_RULE} Read the tree before you answer and ground every claim in file paths, symbols, mechanisms, and numbers where they exist; keep what you verified apart from what you infer. Rank what you recommend and say what you rejected and why. Read-only: change nothing. End with a short list titled Decisions for the head: the choices only the head or the owner can make.`;
 
 // ---------------------------------------------------------------------------
 // Flag parsing

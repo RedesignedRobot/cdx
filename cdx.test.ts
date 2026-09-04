@@ -2985,11 +2985,16 @@ describe("cdx models and supervisors", () => {
 
   test("houseRules gives a gpt supervisor delegation rules instead of the worker ban", () => {
     const supervisor = houseRules("/tmp", false, "gpt", { supervisor: true });
-    expect(supervisor).toContain("You supervise this lane for the head.");
+    expect(supervisor).toContain("You supervise this lane for the head, who reviews and merges");
+    expect(supervisor).toContain("The bar is world class");
+    expect(houseRules("/tmp", false, "gemini")).not.toContain("The bar is world class");
     expect(supervisor).toContain("cdx wait <child>... --report");
     expect(supervisor).toContain("returns exit 2 the moment one of them asks a question");
     expect(supervisor).toContain("Never weaken or clear a child's gate");
     expect(supervisor).toContain("Do not spawn your own native subagents");
+    expect(supervisor).toContain("The brief is the head's best current understanding, not an order.");
+    expect(houseRules("/tmp", false, "gpt")).toContain("The brief is the head's best current understanding, not an order.");
+    expect(houseRules("/tmp", false, "gemini")).not.toContain("not an order");
     expect(supervisor).not.toContain("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane");
     expect(supervisor).toContain("run `cdx ask");
     const worker = houseRules("/tmp", false, "gpt");
@@ -3108,7 +3113,9 @@ describe("cdx models and supervisors", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdout).not.toContain("engine gemini (default)");
     const brief = readFileSync(`${state}/briefs/advisor-r1.md`, "utf8");
-    expect(brief).toContain("CONSULT. You advise the head");
+    expect(brief).toContain("CONSULT. You are the senior advisor to the head");
+    expect(brief).toContain("wants to be challenged, not confirmed");
+    expect(brief).toContain("The bar is world class");
     expect(brief).toContain("READ-ONLY: change nothing in the tree");
     expect(brief).not.toContain("ADVERSARIAL REVIEW");
     const args = readFileSync(trace, "utf8");
