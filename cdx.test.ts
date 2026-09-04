@@ -849,11 +849,15 @@ describe("cdx messaging", () => {
     }));
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
     const source = "22222222-2222-4222-8222-222222222222";
-    expect(runCli(["fork", "raw-fork", source, "--account", "codex-2", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(runCli(["fork", "raw-fork", source, "--account", "codex-2", "--model", "gpt-6-astra", "REPORT_ONLY"], { ...env, FAKE_TRACE: `${root}/requests.trace` }).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
     const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["raw-fork"];
     expect(fork.account).toBe("codex-2");
     expect(fork.codexHome).toBe(pinnedHome);
+    expect(fork.model).toBe("gpt-6-astra");
+    // The requested model reaches the forked thread's turn, not just the ledger.
+    const turn = readFileSync(`${root}/requests.trace`, "utf8").split("\n").map((line) => { try { return JSON.parse(line); } catch { return undefined; } }).find((request) => request?.method === "turn/start");
+    expect(turn.params.model).toBe("gpt-6-astra");
   });
 
   test("existing-lane commands refuse --account and name the pinned account", () => {
@@ -1176,7 +1180,7 @@ describe("cdx execution engines", () => {
     expect(existsSync(gateMarker)).toBe(false);
   });
 
-  test("empty-diff work round fails under a gate and suppresses gate execution", () => {
+  test("empty-diff work round under a gate still runs the gate and reports the unchanged tree", () => {
     const root = tempPath("empty-diff-gate");
     const state = tempPath("empty-diff-gate-state");
     const bin = installFakeCodex(root);
@@ -1185,12 +1189,22 @@ describe("cdx execution engines", () => {
     expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
     expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
 
-    const result = runCli(["spawn", "empty-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "REPORT_ONLY"], baseEnv(state, bin));
-    expect(result.exitCode).toBe(1);
+    const env = baseEnv(state, bin);
+    const result = runCli(["spawn", "empty-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "REPORT_ONLY"], env);
+    expect(result.exitCode).toBe(0);
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate"];
-    expect(lane.state).toBe("failed");
-    expect(lane.note).toBe("tree unchanged under a required gate: no work landed, gate not run");
-    expect(existsSync(gateMarker)).toBe(false);
+    expect(lane.state).toBe("done");
+    expect(lane.diffEmpty).toBe(true);
+    expect(existsSync(gateMarker)).toBe(true);
+    expect(readFileSync(`${state}/reports/empty-gate-r1.md`, "utf8")).toContain("This round changed no files.");
+    expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("diff=empty");
+
+    // A failing gate is still the verdict, changed tree or not.
+    const failing = runCli(["spawn", "empty-gate-red", "--engine", "gpt", "--cd", root, "--gate", "exit 3", "REPORT_ONLY"], env);
+    expect(failing.exitCode).toBe(1);
+    const red = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate-red"];
+    expect(red.state).toBe("failed");
+    expect(red.note).toContain("gate failed (exit 3)");
   });
 
   test("a commit made during the round counts as landed work under a gate", () => {
@@ -1255,18 +1269,24 @@ describe("cdx execution engines", () => {
     const harnessCommandRule = "Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.";
     const geminiRules = houseRules("/tmp", false, "gemini");
     expect(geminiRules).toContain(harnessCommandRule);
-    expect(geminiRules).toContain("cdx ask");
-    expect(geminiRules).toContain("subagent threads");
-    expect(geminiRules).toContain("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
-    expect(geminiRules).not.toContain("Never spawn subagents");
+    expect(geminiRules).toContain("run `cdx ask");
+    expect(geminiRules).toContain("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself; the head owns the design and you own the delivery.");
+    expect(geminiRules).toContain("do not spawn subagents");
     expect(geminiRules).not.toContain("search_web");
-    expect(geminiRules).toContain("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
-    expect(geminiRules).toContain("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
+    expect(geminiRules).toContain("remove the temporary diagnostics you added while debugging");
+    expect(geminiRules).toContain("The report lists exactly which files changed, the commands you ran with their exit codes, and an Assumptions heading (write 'none' if empty).");
+    expect(geminiRules).toContain("You are one lane of cdx");
 
     const gptRules = houseRules("/tmp", false, "gpt");
     expect(gptRules).toContain(harnessCommandRule);
-    expect(gptRules).toContain("subagent threads");
+    expect(gptRules).toContain("Delegate to your own subagents only when");
     expect(gptRules).toContain("run `cdx ask");
+    expect(gptRules).not.toContain("Execute the task as written");
+
+    const review = houseRules("/tmp", true, "gemini");
+    expect(review).toContain("READ-ONLY: change nothing in the tree");
+    expect(review).not.toContain("Never commit, push");
+    expect(review).not.toContain(harnessCommandRule);
   });
 
   test("refuses driving commands from inside a lane worker but allows inspection commands", () => {
@@ -1334,7 +1354,7 @@ describe("cdx execution engines", () => {
     const state = `${root}/state`;
     const agyTrace = `${root}/agy.trace`;
     const codexTrace = `${root}/codex.trace`;
-    const rule = "Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.";
+    const rule = "Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself; the head owns the design and you own the delivery.";
     const bin = installFakeCodex(root);
     installFakeAgy(root);
 
@@ -1589,8 +1609,7 @@ describe("cdx execution engines", () => {
 
     const brief = readFileSync(`${state}/briefs/brief-rules-r1.md`, "utf8");
     expect(brief).not.toContain("search_web");
-    expect(brief).not.toContain("Never spawn subagents");
-    expect(brief).toContain("subagent threads");
+    expect(brief).toContain("do not spawn subagents");
   });
 
   test("guards gemini reviews against writes and converts native targets to prompt text", () => {
@@ -2966,18 +2985,21 @@ describe("cdx models and supervisors", () => {
 
   test("houseRules gives a gpt supervisor delegation rules instead of the worker ban", () => {
     const supervisor = houseRules("/tmp", false, "gpt", { supervisor: true });
-    expect(supervisor).toContain("You supervise this lane.");
+    expect(supervisor).toContain("You supervise this lane for the head.");
     expect(supervisor).toContain("cdx wait <child>... --report");
+    expect(supervisor).toContain("returns exit 2 the moment one of them asks a question");
+    expect(supervisor).toContain("Never weaken or clear a child's gate");
+    expect(supervisor).toContain("Do not spawn your own native subagents");
     expect(supervisor).not.toContain("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane");
     expect(supervisor).toContain("run `cdx ask");
     const worker = houseRules("/tmp", false, "gpt");
     expect(worker).toContain("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane");
-    expect(worker).not.toContain("You supervise this lane.");
-    expect(houseRules("/tmp", false, "gemini", { supervisor: true })).not.toContain("You supervise this lane.");
-    expect(houseRules("/tmp", true, "gpt", { supervisor: true })).not.toContain("You supervise this lane.");
+    expect(worker).not.toContain("You supervise this lane");
+    expect(houseRules("/tmp", false, "gemini", { supervisor: true })).not.toContain("You supervise this lane");
+    expect(houseRules("/tmp", true, "gpt", { supervisor: true })).not.toContain("You supervise this lane");
   });
 
-  test("a supervisor lane exports CDX_SUPERVISOR and drives gemini children only", () => {
+  test("a supervisor lane exports CDX_SUPERVISOR and drives gemini children only", async () => {
     const root = tempPath("supervisor");
     const state = `${root}/state`;
     const supervisorTrace = `${root}/supervisor.trace`;
@@ -2995,11 +3017,11 @@ describe("cdx models and supervisors", () => {
     expect(badEngine.exitCode).toBe(1);
     expect(badEngine.stderr).toContain("--supervisor needs --engine gpt");
 
-    const spawned = runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], env);
+    const spawned = runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env);
     expect(spawned.exitCode).toBe(0);
     expect(spawned.stdout).toContain("engine=gpt model=gpt-5.6-sol supervisor mode=spawn");
-    expect(readFileSync(supervisorTrace, "utf8").trim()).toBe("sup");
-    expect(readFileSync(`${state}/briefs/sup-r1.md`, "utf8")).toContain("You supervise this lane.");
+    await waitFor(() => existsSync(supervisorTrace) && readFileSync(supervisorTrace, "utf8").trim() === "sup");
+    expect(readFileSync(`${state}/briefs/sup-r1.md`, "utf8")).toContain("You supervise this lane");
     expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBe(true);
     expect(runCli(["status"], env).stdout).toContain("engine=gpt  model=gpt-5.6-sol  supervisor");
 
@@ -3014,6 +3036,7 @@ describe("cdx models and supervisors", () => {
     expect(child.exitCode).toBe(0);
     const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
     expect(ledger.child.parent).toBe("sup");
+    expect(ledger.child.parentRound).toBe(1);
     expect(ledger.child.engine).toBe("gemini");
     const invocation = readFileSync(agyTrace, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
     expect(invocation.supervisor).toBeUndefined();
@@ -3034,6 +3057,29 @@ describe("cdx models and supervisors", () => {
     const gptReview = runCli(["review", "child", "--engine", "gpt", "look again"], inside);
     expect(gptReview.exitCode).toBe(1);
     expect(gptReview.stderr).toContain("supervisor sup may only run gemini reviews");
+    // One ownership policy: a supervisor mutates only lanes it spawned.
+    const foreignSend = runCli(["send", "plain", "stop"], inside);
+    expect(foreignSend.exitCode).toBe(1);
+    expect(foreignSend.stderr).toContain('supervisor sup may only drive its own children; lane "plain" is not one');
+    const foreignReply = runCli(["reply", "plain", "an answer"], inside);
+    expect(foreignReply.exitCode).toBe(1);
+    expect(foreignReply.stderr).toContain('lane "plain" is not one');
+    const foreignSpawn = runCli(["spawn", "plain", "--cd", root, "BUILD_SMALL_THING"], inside);
+    expect(foreignSpawn.exitCode).toBe(1);
+    expect(foreignSpawn.stderr).toContain('lane "plain" is not one');
+    const ownGate = runCli(["gate", "child", "--clear"], inside);
+    expect(ownGate.exitCode).toBe(1);
+    expect(ownGate.stderr).toContain("supervisor sup may not change a child's gate");
+    expect(runCli(["job", "headjob", "--cd", root, "true"], env).exitCode).toBe(0);
+    const jobKill = runCli(["kill", "headjob"], inside);
+    expect(jobKill.exitCode).toBe(1);
+    expect(jobKill.stderr).toContain("supervisor sup may not stop jobs");
+
+    // A shell from another round of the supervisor has no authority.
+    const stale = runCli(["spawn", "child-stale", "--cd", root, "BUILD_SMALL_THING"], { ...inside, CDX_ROUND: "2" });
+    expect(stale.exitCode).toBe(1);
+    expect(stale.stderr).toContain('supervisor identity "sup" round 2 does not match a running supervisor round');
+
     expect(runCli(["close", "child"], inside).exitCode).toBe(0);
     expect(runCli(["close", "sup"], inside).exitCode).toBe(1);
 
@@ -3041,7 +3087,17 @@ describe("cdx models and supervisors", () => {
     const grandchild = runCli(["spawn", "grandchild", "--cd", root, "BUILD_SMALL_THING"], { ...env, CDX_LANE: "child", CDX_ROUND: "1" });
     expect(grandchild.exitCode).toBe(1);
     expect(grandchild.stderr).toContain("lane workers cannot drive the harness");
-  }, 30_000);
+
+    // Once the supervisor round is over its identity is dead, and a plain
+    // respawn of the same name is a plain lane again.
+    expect(runCli(["kill", "sup"], env).exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.state === "failed");
+    const finished = runCli(["spawn", "child-late", "--cd", root, "BUILD_SMALL_THING"], inside);
+    expect(finished.exitCode).toBe(1);
+    expect(finished.stderr).toContain("does not match a running supervisor round");
+    expect(runCli(["spawn", "sup", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBeUndefined();
+  }, 40_000);
 
   test("consult runs a read-only gpt lane with the advisor frame and resumes read-only", () => {
     const root = tempPath("consult");
@@ -3072,7 +3128,17 @@ describe("cdx models and supervisors", () => {
     const inside = runCli(["consult", "advisor3", "--cd", root, "why"], { ...env, CDX_LANE: "worker" });
     expect(inside.exitCode).toBe(1);
     expect(inside.stderr).toContain('command "consult" refused inside lane worker');
-  }, 15_000);
+
+    // A consult lane and a work lane never share a name: resume would pick
+    // the writable work thread over the read-only consult session.
+    expect(runCli(["spawn", "worker-lane", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    const reused = runCli(["consult", "worker-lane", "--cd", root, "assess this"], env);
+    expect(reused.exitCode).toBe(1);
+    expect(reused.stderr).toContain('lane "worker-lane" has work history; consult needs a fresh name');
+    const promoted = runCli(["spawn", "advisor", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(promoted.exitCode).toBe(1);
+    expect(promoted.stderr).toContain('lane "advisor" is a consult lane');
+  }, 20_000);
 
   test("killing a supervisor kills its running children", async () => {
     const root = tempPath("supervisor-kill");
@@ -3088,8 +3154,69 @@ describe("cdx models and supervisors", () => {
 
     const killed = runCli(["kill", "sup", "stop everything"], env);
     expect(killed.exitCode).toBe(0);
-    expect(killed.stdout).toContain("lane=child is a child of sup; stopping it too");
     await waitFor(() => read().sup.state === "failed" && read().child.state === "failed");
+    // The supervisor's runner settles its children as part of its own
+    // finalization; the CLI cascade is the fallback for a dead runner.
+    expect(read().sup.note).toContain("stop everything");
     expect(read().child.note).toContain("supervisor sup killed");
   }, 30_000);
+
+  test("a supervisor that finishes with a child still running fails and stops the child", async () => {
+    const root = tempPath("supervisor-orphans");
+    const state = `${root}/state`;
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(`${root}/agy`);
+    const env = { ...baseEnv(state), PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}` };
+    expect(runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
+    const inside = { ...env, CDX_LANE: "sup", CDX_SUPERVISOR: "sup", CDX_ROUND: "1", CDX_OWNER: "terminal" };
+    const read = () => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    await waitFor(() => Boolean(read().sup?.codexPid));
+    expect(runCli(["spawn", "child", "--cd", root, "--bg", "HANG_AGY"], inside).exitCode).toBe(0);
+    await waitFor(() => Boolean(read().child?.codexPid));
+
+    // The steer completes the supervisor's turn while the child still hangs.
+    expect(runCli(["send", "sup", "finish now"], env).exitCode).toBe(0);
+    await waitFor(() => read().sup.state === "failed" && read().child.state === "failed", 15_000);
+    expect(read().sup.note).toBe("supervisor ended with running children: child (stopped)");
+    expect(read().child.note).toContain("supervisor sup round 1 ended");
+  }, 30_000);
+
+  test("wait returns exit 2 as soon as a waited lane asks a question", async () => {
+    const root = tempPath("wait-question");
+    const state = `${root}/state`;
+    const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_CDX_CLI: CLI };
+    expect(runCli(["spawn", "asker", "--engine", "gemini", "--cd", root, "--bg", "ASK_OWNER"], env).exitCode).toBe(0);
+    await waitFor(() => existsSync(`${state}/questions/asker-r1-1.json`));
+    const blocked = runCli(["wait", "asker", "--timeout", "20"], env);
+    expect(blocked.exitCode).toBe(2);
+    expect(blocked.stdout).toContain("QUESTION #1: Which file should I inspect? (answer with: cdx reply asker");
+    const asJson = runCli(["wait", "asker", "--timeout", "20", "--json"], env);
+    expect(asJson.exitCode).toBe(2);
+    expect(JSON.parse(asJson.stdout.trim())).toEqual({ lane: "asker", round: 1, question: 1, text: "Which file should I inspect?" });
+    expect(runCli(["reply", "asker", "src/engine.ts"], env).exitCode).toBe(0);
+    const finished = runCli(["wait", "asker", "--timeout", "20"], env);
+    expect(finished.exitCode).toBe(0);
+    expect(finished.stdout).toContain("state=done");
+  }, 20_000);
+
+  test("a detached gemini round runs the configured model and agent", async () => {
+    const root = tempPath("gemini-pinned");
+    const state = `${root}/state`;
+    const trace = `${root}/agy.trace`;
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({ gemini: { model: "gemini-custom-pro", agent: "house-lane", reviewAgent: "house-review" } }));
+    const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
+    expect(runCli(["spawn", "pinned", "--engine", "gemini", "--cd", root, "--bg", "DONE"], env).exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.state === "done");
+    const spec = JSON.parse(readFileSync(`${state}/specs/pinned-r1.json`, "utf8"));
+    expect(spec.model).toBe("gemini-custom-pro");
+    expect(spec.agent).toBe("house-lane");
+    const work = JSON.parse(readFileSync(trace, "utf8").trim().split("\n")[0]!);
+    expect(work.args).toContain("gemini-custom-pro");
+    expect(work.args).toContain("house-lane");
+    expect(runCli(["review", "pinned", "--bg", "attack the change"], env).exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.reviewState !== "running");
+    const review = JSON.parse(readFileSync(`${state}/specs/pinned-r2.json`, "utf8"));
+    expect(review.agent).toBe("house-review");
+  }, 20_000);
 });

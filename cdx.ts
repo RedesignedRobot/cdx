@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.6.0";
+const VERSION = "3.7.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -129,17 +129,39 @@ function runnerEnv(codexHome: string | undefined) {
 }
 
 // Inside a supervisor lane both variables name the same lane. Anything else
-// (a child, a plain worker, the head's shell) is not a supervisor.
+// (a child, a plain worker, the head's shell) is not a supervisor. The claim
+// is then checked against the ledger: the lane must be a running supervisor
+// on the round the environment names, so a shell left over from an earlier
+// round loses its authority instead of keeping it. This catches mistakes,
+// not attackers: both engines hold shell access and could edit the ledger.
 function supervisorLane(): string | undefined {
   const lane = process.env.CDX_LANE?.trim();
   const supervisor = process.env.CDX_SUPERVISOR?.trim();
-  return lane && supervisor === lane ? supervisor : undefined;
+  if (!lane || supervisor !== lane) return undefined;
+  const entry = readLedger()[lane];
+  const round = Number(process.env.CDX_ROUND);
+  if (!entry?.supervisor || entry.kind !== "work" || !laneRunning(entry) || entry.rounds !== round) {
+    fail(`supervisor identity "${lane}" round ${process.env.CDX_ROUND ?? "?"} does not match a running supervisor round in the ledger; this shell belongs to an earlier or unknown round`);
+  }
+  return supervisor;
 }
 
+// One ownership policy for every mutation a supervisor may issue: it may
+// touch only lanes it spawned. The head (no lane identity) is unrestricted.
 function requireOwnChild(lane: string, entry: Lane | undefined): void {
   const supervisor = supervisorLane();
   if (!supervisor || !entry) return;
   if (entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
+}
+
+interface Lineage { supervisor: boolean; parent?: string; parentRound?: number }
+
+// Lineage of a lane spawned from the current shell: a supervisor's children
+// record the supervisor and its round so cleanup can find them later.
+function callerLineage(supervisor: boolean): Lineage {
+  const parent = supervisorLane();
+  const parentRound = Number(process.env.CDX_ROUND);
+  return { supervisor, ...(parent ? { parent, parentRound } : {}) };
 }
 
 type Effort = string;
@@ -182,8 +204,9 @@ interface Lane {
   model?: string;
   // A supervisor lane drives gemini child lanes through cdx.
   supervisor?: true;
-  // Name of the supervisor lane that spawned this one.
+  // Name and round of the supervisor lane that spawned this one.
   parent?: string;
+  parentRound?: number;
   // A read-only advisory lane; resume continues the conversation read-only.
   consult?: true;
   account?: string;
@@ -263,6 +286,8 @@ interface Spec {
   reviewDir?: string;
   maxRuntimeMins?: number;
   supervisor?: true;
+  // agy agent name, pinned at launch so the detached runner cannot drift.
+  agent?: string;
 }
 
 type Ledger = Record<string, Lane>;
@@ -696,33 +721,56 @@ function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): stri
 
 // ---------------------------------------------------------------------------
 // Briefs: standing rules injected once here so per-lane briefs stay short.
+// Every rule names the mechanism behind it. A model that knows why a rule
+// exists keeps it in the cases the rule did not foresee; a bare prohibition
+// gets rationalized away the first time it is inconvenient.
 // ---------------------------------------------------------------------------
 
+const LANE_ROLE = "You are one lane of cdx, a harness the head (a Claude session answering to the owner) uses to delegate bounded work. The head sees nothing you do until your final message, so that message is the whole handoff.";
+
+const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what the tests start themselves. The head integrates your work; a commit from a lane would land unreviewed.";
+
+const READ_ONLY = "READ-ONLY: change nothing in the tree; write only your report. The sandbox and the harness's before-and-after tree check enforce this; a changed path fails the round.";
+
+const WORK_REPORT = "Your final message is the lane report, and the harness fails the round without one. Open with the outcome in one sentence. Then list the files you changed, the commands you ran with their exit codes, and the risks or follow-ups the head must know before merging. Write plain prose and short lists; tables only for measured numbers.";
+
+const REVIEW_REPORT = "Your final message is the report, and the harness fails the round without one. Write plain prose and short lists; tables only for measured numbers.";
+
+const ASK_RULE = 'When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point, small and specific; never ask what the brief or the code already answers. The head answers through the feed. An unanswered question times out after 30 minutes; then take the narrowest reading, record it under an Assumptions heading in the report, and stop there.';
+
+const WORKER_BAN = "Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.";
+
+const GPT_WORKER_RULES = [
+  WORKER_BAN,
+  ASK_RULE,
+  "Delegate to your own subagents only when the task splits into independent parts on disjoint files that each take more than a few minutes. A subagent costs a full context load, so exploration, review of your own work, and small serial edits stay with you. Subagents never spawn subagents.",
+];
+
+const GEMINI_WORKER_RULES = [
+  WORKER_BAN,
+  "Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself; the head owns the design and you own the delivery.",
+  ASK_RULE,
+  "Do the work in this conversation and do not spawn subagents. The harness tracks one worker per lane; a subagent's edits and mistakes would be invisible to it.",
+  "Before reporting, remove the temporary diagnostics you added while debugging (a print, a log line, a fixture) and re-run every test you cite. Logging the task asked for stays.",
+  "The report lists exactly which files changed, the commands you ran with their exit codes, and an Assumptions heading (write 'none' if empty).",
+];
+
 const SUPERVISOR_RULES = [
-  'You supervise this lane. Delegate bounded work to gemini child lanes through cdx: `cdx spawn <child> --bg [--gate "<cmd>"] [--cd <dir>] "<brief>"` starts one, `cdx wait <child>... --report` collects reports, `cdx review <child> "<attack items>"` reviews, and `cdx send`, `cdx resume`, `cdx kill` steer, retry, and stop. Children are gemini only and cannot delegate further; never pass --engine gpt or --supervisor.',
-  "Brief each child under a page: named files, one outcome, explicit acceptance checks, and a --gate command. Fan out independent children in parallel and wait once. Answer their questions with `cdx questions` and `cdx reply <child> \"<answer>\"`.",
-  "Verify every child's work yourself before reporting: read the report, rerun the gate and the tests it cites, and fix or redo what is wrong. Delegate the bounded parts; keep the judgment.",
+  "You supervise this lane for the head. You hold the design and the judgment; gemini child lanes do the bounded execution. Delegate a part when it is independent, has named files, and can be checked by a command. Keep the parts that need the whole picture, cross-cutting decisions, and anything a child would have to ask about. A child costs a fresh context load plus your verification, so never delegate what you can finish faster than you can brief.",
+  'Commands: `cdx spawn <child> --bg --gate "<cmd>" [--cd <dir>] "<brief>"` starts a gemini child; `cdx wait <child>... --report` blocks until the named children finish and returns exit 2 the moment one of them asks a question; `cdx questions` lists open questions and `cdx reply <child> "<answer>"` answers one; `cdx review <child> "<attack items>"` runs a read-only gemini review; `cdx send`, `cdx resume`, and `cdx kill` steer, retry, and stop a child. Children are gemini only and cannot delegate further; never pass --engine gpt or --supervisor. Use fresh child names: the harness refuses lanes you did not spawn.',
+  "Brief each child under a page: the outcome, the files it owns, what it must not touch, the acceptance command (the same one you pass as --gate), and the facts it would otherwise have to rediscover. Two children never own the same file. Start only independent children together; a child that depends on another's output starts after you have verified that output.",
+  "Answer questions promptly: an unanswered child idles for up to 30 minutes and then guesses. Never weaken or clear a child's gate; if the gate is wrong, ask the head with cdx ask.",
+  "Children spawned with --worktree branch from committed HEAD and cannot commit, so their work exists only in that worktree. When children must build on each other, run them in one tree on disjoint files instead.",
+  "After the children finish, verify the combined change yourself: read each report, rerun each gate and the tests it cites, and fix or redo what is wrong. Your report lists each child with its outcome and report path, what you verified and how, and what you did yourself. Never report while a child is still running; the harness stops the child and fails your round.",
+  ASK_RULE,
+  "Do not spawn your own native subagents. Children are the delegation path; the harness cannot see anything else.",
 ];
 
 function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
-  const builtIns = [
-    reviewOnly
-      ? "READ-ONLY: change nothing in the tree; write only your report."
-      : "Never commit, push, deploy, or start long-running servers beyond what specs start themselves.",
-    "Your final response is the lane report. Include what changed or what you reviewed, verification evidence, and any risks or follow-ups.",
-  ];
+  const builtIns = reviewOnly ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT] : [LANE_ROLE, WORK_LIMITS, WORK_REPORT];
   if (!reviewOnly) {
     if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
-    else builtIns.push("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.");
-    if (engine === "gemini") {
-      builtIns.push("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
-      builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
-      builtIns.push("Before reporting, remove every debug print you added (console.log, print, fmt.Println and the like) and re-run the tests you cite.");
-      builtIns.push("The report lists exactly which files changed, the commands you ran with their exit codes, and the Assumptions heading (write 'none' if empty).");
-    } else {
-      builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
-      builtIns.push('When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point; never ask what the brief or the code already answers.');
-    }
+    else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
@@ -756,7 +804,7 @@ const REVIEW_FINDINGS_SCHEMA = {
   },
 };
 
-const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, test gaps. Severity-rank findings, each with a concrete failure scenario, and mark each CONFIRMED (you traced the code path) or PLAUSIBLE (you could not fully trace it). If clean, say clean and list exactly what you checked.";
+const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Your job is to find what is wrong before it lands; a clean verdict you cannot back with what you checked is a failed review. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, data loss, and tests that pass without proving the change. For each finding give the severity (P1 breaks users or data, P2 wrong under realistic conditions, P3 hygiene), the file and line, a concrete failure scenario (the input or state, and the wrong result), and CONFIRMED if you traced the code path or PLAUSIBLE if you could not. Rank findings by severity and stop there: no style remarks, no restating the diff, no praise. If clean, say clean and list exactly what you checked and how.";
 const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
 const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 
@@ -764,7 +812,7 @@ function reviewFrame(engine: Engine): string {
   return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
 }
 
-const CONSULT_FRAME = "CONSULT. You advise the head, a Claude session that answers to the owner. Read the tree before you answer. Give one ranked recommendation with the alternatives you rejected and why, cite file paths and mechanisms as evidence, name numbers where they exist, and push back where the question's premise is wrong. Read-only: change nothing. End with a short list titled Decisions for the head.";
+const CONSULT_FRAME = "CONSULT. You advise the head, a Claude session that answers to the owner; your answer decides what the head does next, so be direct and specific. Read the tree before you answer. Cite file paths, symbols, and mechanisms as evidence, name numbers where they exist, and keep what you verified apart from what you infer. Give one ranked recommendation, then the alternatives you rejected and why. Push back where the question's premise is wrong. Read-only: change nothing. Write prose with short lists; tables only for measured numbers. End with a short list titled Decisions for the head: the choices only the head or the owner can make.";
 
 // ---------------------------------------------------------------------------
 // Flag parsing
@@ -1161,7 +1209,7 @@ function removeWorktree(entry: Lane) {
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; supervisor?: true; parent?: string; consult?: true }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; lineage?: Lineage; consult?: true }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
@@ -1189,8 +1237,11 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       engine: roundEngineType,
       reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
       model: roundEngineType === "gpt" ? opts?.model ?? existing?.model : existing?.model,
-      supervisor: opts?.supervisor ?? existing?.supervisor,
-      parent: opts?.parent ?? existing?.parent,
+      // A spawn sets lineage explicitly (a respawn without --supervisor is
+      // a plain lane again); every other round keeps what the lane had.
+      supervisor: opts?.lineage ? (opts.lineage.supervisor ? true : undefined) : existing?.supervisor,
+      parent: opts?.lineage ? opts.lineage.parent : existing?.parent,
+      parentRound: opts?.lineage ? opts.lineage.parentRound : existing?.parentRound,
       consult: opts?.consult ?? existing?.consult,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
@@ -1245,6 +1296,12 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
 }
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
+  // The detached runner starts without the config file; pin what it needs.
+  if (spec.engine === "gemini") {
+    const policy = config.gemini ?? geminiConfig();
+    spec.model ??= policy.model;
+    spec.agent ??= readLedger()[spec.lane]?.kind === "review" ? policy.reviewAgent : policy.agent;
+  }
   writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
   const jsonMode = (spec.engine ?? "gpt") === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
@@ -1505,6 +1562,9 @@ async function runRound(lane: string, round: number): Promise<number> {
       }
     });
     console.error(`cdx: lane=${color.magenta(lane)} round-state=${color.red("failed")} runner error: ${error}`);
+    if (spec?.supervisor) {
+      try { await killChildren(lane, `supervisor ${lane} runner error`); } catch { /* best-effort */ }
+    }
     const ownerSession = spec?.ownerSession ?? readLedger()[lane]?.ownerSession;
     feedOwned(`[cdx] lane=${lane} round=${round} round-state=failed (runner error)`, ownerSession);
     return 1;
@@ -1577,9 +1637,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const geminiPolicy = config.gemini ?? geminiConfig();
   const geminiArgs = [
     "agy", "--input-format", "stream-json", "--output-format", "stream-json",
-    "--model", geminiPolicy.model, "--dangerously-skip-permissions", "--add-dir", spec.cwd,
+    "--model", spec.model ?? geminiPolicy.model, "--dangerously-skip-permissions", "--add-dir", spec.cwd,
     ...(spec.additionalDirectories ?? []).flatMap((dir) => ["--add-dir", dir]),
-    "--agent", startingLane?.kind === "review" ? geminiPolicy.reviewAgent : geminiPolicy.agent,
+    "--agent", spec.agent ?? (startingLane?.kind === "review" ? geminiPolicy.reviewAgent : geminiPolicy.agent),
     ...(spec.sourceThreadId ? ["--conversation", spec.sourceThreadId] : []),
     ...(geminiSchemaPath ? ["--json-schema", geminiSchemaPath] : []),
     "--print-timeout", spec.maxRuntimeMins ? `${spec.maxRuntimeMins}m` : "12h",
@@ -2138,7 +2198,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         cwd: spec.cwd,
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" },
-        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
+        // A raw-session fork carries the requested model; a lane fork
+        // inherits its source thread's model and sends none.
+        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : spec.mode === "fork" && spec.model ? { model: spec.model } : {}),
         effort: readLedger()[lane]?.effort ?? config.defaultEffort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
       });
@@ -2344,8 +2406,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const reviewModifiedPath = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(spec.cwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
-  const unchangedWithGate = Boolean(workTreeUnchanged && spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
-  const unchangedNoGate = Boolean(workTreeUnchanged && !spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
+  // An unchanged tree is evidence for the report, never a verdict: a
+  // verification-only round or a supervisor whose children worked in their
+  // own worktrees changes nothing here and can still be correct. The gate
+  // decides; the head reads diff=empty on the feed line.
+  const unchangedWork = Boolean(workTreeUnchanged && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
 
   const capturedSessionId = beforeFinalize?.sessionId;
   const textSessionId = !jsonMode
@@ -2358,20 +2423,23 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   // rounds only (ledger kind, since intent reviews launch with mode "spawn").
   let gateExit: number | undefined;
   let gateTimedOut = false;
-  if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason && !unchangedWithGate) {
+  if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason) {
     const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
     writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
   }
-  if (unchangedWithGate) {
-    exitCode = 1;
-  }
-  if (unchangedNoGate && existsSync(reportPath)) {
+  if (unchangedWork && existsSync(reportPath)) {
     appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
   }
   const gateFailed = gateExit !== undefined && gateExit !== 0;
-  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && !unchangedWithGate ? "done" : "failed";
+  // A supervisor's round ends with its children. Whatever the outcome, any
+  // child still running is stopped so nothing keeps editing after the
+  // report; a round that finished with children running cannot be done.
+  const orphanedChildren = beforeFinalize?.kind === "work" && beforeFinalize.supervisor
+    ? await killChildren(lane, receivedSignal ? `supervisor ${lane} killed` : maxRuntimeHit ? `supervisor ${lane} hit max runtime` : `supervisor ${lane} round ${round} ended`)
+    : [];
+  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
   expireRoundQuestions(lane, round);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
@@ -2381,7 +2449,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     let roundNote: string | undefined;
     if (reviewModifiedPath) roundNote = `review modified the tree: ${reviewModifiedPath}`;
-    else if (unchangedWithGate) roundNote = "tree unchanged under a required gate: no work landed, gate not run";
+    else if (orphanedChildren.length > 0 && !receivedSignal && !maxRuntimeHit) roundNote = `supervisor ended with running children: ${orphanedChildren.join(", ")} (stopped)`;
     else if (gateFailed) {
       roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
         ? `gate failed after work; baseline passed (exit ${gateExit}): ${spec.gate}`
@@ -2406,7 +2474,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const errTail = stderrText.trim().split("\n").at(-1);
       if (errTail) roundNote = `stderr: ${errTail.slice(0, 200)}`;
     }
-    if (unchangedNoGate) item.diffEmpty = true;
+    if (unchangedWork) item.diffEmpty = true;
     if (item.kind === "review") {
       item.reviewState = roundState;
       item.reviewExitCode = exitCode;
@@ -2530,6 +2598,7 @@ function sendCommand(argv: string[]): void {
     sentAt: new Date().toISOString(),
     ...(process.env.CLAUDE_CODE_SESSION_ID ? { from: process.env.CLAUDE_CODE_SESSION_ID.slice(0, 8) } : {}),
   };
+  requireOwnChild(lane, readLedger()[lane]);
   const entry = withLedger((ledger) => {
     const current = ledger[lane];
     if (!current) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
@@ -2606,6 +2675,7 @@ function replyCommand(argv: string[]): void {
   if (!lane || !answer) fail('usage: cdx reply <lane> [--id <seq>] "<answer>"');
   const requestedId = parsed.flags.id === undefined ? undefined : Number(parsed.flags.id);
   if (requestedId !== undefined && (!Number.isInteger(requestedId) || requestedId < 1)) fail("--id must be a positive integer");
+  requireOwnChild(lane, readLedger()[lane]);
   const answered = withLedger((ledger) => {
     const currentRound = ledger[lane]?.rounds;
     if (!currentRound) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
@@ -2689,6 +2759,8 @@ function gateCommand(argv: string[]): void {
   }
   if (!parsed.bools.has("clear") && command!.trim() === "") fail("gate command cannot be empty; use --clear");
   const before = readLane(lane);
+  requireOwnChild(lane, before);
+  if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the head's acceptance check (cdx ask if it is wrong)`);
   if (laneRunning(before) && pidAlive(before.pid)) fail(`lane "${lane}" is running; stop it before changing the gate`);
   const next = parsed.bools.has("clear") ? undefined : command;
   withLedger((ledger) => {
@@ -2729,6 +2801,8 @@ async function spawnCommand(argv: string[]) {
     fail(`lane "${lane}" is already running (pid ${existingLane.pid}); pick a new name or wait`);
   }
   if (existingLane) {
+    requireOwnChild(lane, existingLane);
+    if (existingLane.consult) fail(`lane "${lane}" is a consult lane; spawn work under a new name so its resume stays read-only`);
     rejectEngineMismatch(lane, existingLane, engine);
     if (engine === "gpt") rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   }
@@ -2765,7 +2839,7 @@ async function spawnCommand(argv: string[]) {
   }
   const { round } = openRound(lane, "work", cwd, effort, {
     engine, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate: parsed.flags.gate,
-    ...(model ? { model } : {}), ...(supervisor ? { supervisor: true as const } : {}), ...(parent ? { parent } : {}),
+    ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
   if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
@@ -2896,7 +2970,7 @@ async function forkCommand(argv: string[]) {
   const owner = callerOwnership();
   const { round } = openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model });
   const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nPrint your final report. cdx captures the last final agent message.`;
-  return launch({ engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({ engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, ...(sourceLane ? {} : { model }), sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 // consult: a read-only gpt lane framed as an advisor rather than a hostile
@@ -2925,9 +2999,12 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   if (parent && engine !== "gemini") fail(`supervisor ${parent} may only run gemini reviews; drop --engine gpt`);
   if (parent) requireOwnChild(lane, existing);
   if (existing && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
+  // A consult lane must never acquire a work thread: resume would then pick
+  // the writable session over the read-only one. Fresh names only.
+  if (opts.consult && existing && !existing.consult) fail(`lane "${lane}" has work history; consult needs a fresh name so its resume stays read-only`);
   const model = engine === "gpt" ? existing ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
   const roundModel = model && !existing ? { model } : {};
-  const roundParent = parent && !existing ? { parent } : {};
+  const roundParent = !existing ? { lineage: callerLineage(false) } : {};
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
     console.log(color.yellow("cdx: gemini reviewing a gemini lane; give the intent explicit attack items"));
   }
@@ -3133,6 +3210,16 @@ async function waitCommand(argv: string[]) {
   let failed = false;
   while (pending.size > 0 || pendingJobs.size > 0) {
     const ledger = readLedger();
+    // A waited lane that asks a question is blocked, not busy: return at
+    // once (exit 2) so the caller answers instead of both sides idling.
+    const questions = [...pending].flatMap((lane) => questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[lane]?.rounds === record.round).map(({ record }) => record));
+    if (questions.length > 0) {
+      for (const record of questions) {
+        if (json) console.log(JSON.stringify({ lane: record.lane, round: record.round, question: record.seq, text: record.question }));
+        else console.log(`cdx: lane=${color.magenta(record.lane)} round=${record.round} ${color.yellow(`QUESTION #${record.seq}`)}: ${record.question} (answer with: cdx reply ${record.lane} "<answer>", then cdx wait again)`);
+      }
+      process.exit(2);
+    }
     for (const lane of [...pending]) {
       const entry = ledger[lane]!;
       if (laneRunning(entry) && pidAlive(entry.pid)) continue;
@@ -4669,29 +4756,42 @@ async function killCommand(argv: string[]) {
   if (!lane) fail('usage: cdx kill <lane|job> ["note"]');
   if (!readLedger()[lane]) {
     const job = readJobs()[lane];
-    if (job) { await killJob(lane, job, note); return; }
+    if (job) {
+      if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not stop jobs; jobs belong to the head`);
+      await killJob(lane, job, note);
+      return;
+    }
   }
   const entry = readLane(lane);
   requireOwnChild(lane, entry);
   if (!laneRunning(entry)) fail(`lane "${lane}" is not running (latest ${entry.kind} state ${roundStateOf(entry)})`);
   await killLane(lane, entry, note);
-  if (entry.supervisor) await killChildren(lane, note);
+  if (entry.supervisor) await killChildren(lane, note ? `${note} (supervisor ${lane} killed)` : `supervisor ${lane} killed`);
 }
 
-// Killing a supervisor takes its running children with it; nothing else
-// would ever collect them.
-async function killChildren(supervisor: string, note?: string) {
+// Stopping a supervisor takes its running children with it; nothing else
+// would ever collect them. Every child gets its turn: one whose processes
+// already died is reported and left to cdx doctor, never a reason to skip
+// the rest. Returns the names of the children that were running.
+async function killChildren(supervisor: string, note: string): Promise<string[]> {
   const children = Object.entries(readLedger()).filter(([, item]) => item.parent === supervisor && laneRunning(item));
+  const names: string[] = [];
   for (const [child, item] of children) {
+    names.push(child);
     console.log(`cdx: lane=${color.magenta(child)} is a child of ${supervisor}; stopping it too`);
-    await killLane(child, item, note ? `${note} (supervisor ${supervisor} killed)` : `supervisor ${supervisor} killed`);
+    try { await killLane(child, item, note); }
+    catch (error) {
+      if (!(error instanceof CmdError)) throw error;
+      console.error(color.yellow(`cdx: ${error.message}`));
+    }
   }
+  return names;
 }
 
 async function killLane(lane: string, entry: Lane, note?: string) {
   const runnerAlive = pidAlive(entry.pid);
   if (!runnerAlive && !pidAlive(entry.codexPid)) {
-    fail(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
+    throw new CmdError(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
   }
   if (runnerAlive) {
     try { process.kill(entry.pid!, "SIGTERM"); } catch { /* exited between check and kill */ }
