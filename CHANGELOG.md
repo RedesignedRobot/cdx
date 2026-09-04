@@ -1,3 +1,8 @@
+## 3.6.0
+
+- Adds `cdx consult <lane> [--model M] [--effort E] [--cd D] [--bg] "<question>"`: a read-only gpt lane framed as the head's advisor (ranked recommendation, rejected alternatives, evidence from the tree, pushback on a wrong premise, a closing "Decisions for the head" list) instead of the adversarial review frame. It runs through the read-only exec path, records `consult` on the lane, shows as `consult` in status, and `cdx resume <lane>` continues the conversation read-only. Refused inside lanes.
+- Review rounds on a new gpt lane now record the lane model.
+
 ## 3.5.0
 
 - Adds a Codex model picker. `spawn`, `fork`, `review`, and `adopt` take `--model M` for gpt lanes, where M is an alias from the new `models` config key (`{ "astra": "gpt-6-astra" }`) or a raw model id. The lane records its model; resume, fork, and review of an existing lane keep it; status, the launch line, and `cdx help` show it. The `efforts` allowlist may now include `xhigh` for GPT-6 Astra.

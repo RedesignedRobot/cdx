@@ -161,6 +161,7 @@ cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
 cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
+cdx consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 cdx status [--all] [--json]
 cdx usage  [--json]
@@ -226,6 +227,8 @@ A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini -
 **Watch live.** `cdx tail -f <lane>` streams one worker's transcript and exits with the lane's outcome. `cdx tail -f` shows all running lanes with `[lane]` prefixes and follows new rounds and lanes. Any terminal or agent session can use either form against the shared state, which is how parallel Claude sessions see each other's workers.
 
 **Steer, iterate, or branch.** `send` corrects a running lane via in-turn steering or a follow-up turn. `resume` continues a finished worker with its recorded engine and context. `fork` branches GPT context into a new lane. Gemini has no headless fork.
+
+**Consult first.** `cdx consult design --model astra "<question>"` runs a read-only Codex lane with an advisor frame: one ranked recommendation, rejected alternatives, evidence from the tree, pushback where the premise is wrong, and a closing "Decisions for the head" list. `cdx resume design "<follow-up>"` keeps the conversation going, still read-only. Status shows it as `consult`.
 
 **Supervisor tree.** `cdx spawn plan --engine gpt --model astra --supervisor "<brief>"` hands one Codex lane a multi-part change. It briefs the bounded parts to gemini children with `cdx spawn --bg`, waits with `cdx wait --report`, reviews with `cdx review`, and reports once. The head sees the children under `parent=plan` in `cdx status` and kills the whole tree with `cdx kill plan`.
 
