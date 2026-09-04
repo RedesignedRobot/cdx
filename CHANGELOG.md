@@ -1,3 +1,17 @@
+## 3.7.0
+
+Shipped after GPT-6 Astra audited cdx 3.6.0 through `cdx consult` and reproduced nine defects in supervisor mode.
+
+- One ownership policy. A supervisor may mutate only lanes it spawned: `send`, `reply`, `spawn` on an existing name, `resume`, `review`, `kill`, and `close` all check it, `gate` is refused to supervisors outright, and `kill` refuses jobs from inside a supervisor. A supervisor's identity is verified against the ledger on every call (running supervisor round, matching round number), so a stale shell has no authority. Children record `parentRound`.
+- Supervisor lifecycle. When a supervisor round ends for any reason, the runner stops every child still running (continuing past dead ones) and a round that reported with children running fails with `supervisor ended with running children`. A respawn of a supervisor's name without `--supervisor` is a plain lane again.
+- `cdx wait` exits 2 the moment a waited lane asks a question, printing the question and the reply command (`--json` emits one object per question).
+- Gates decide. An unchanged tree no longer fails a gated round or skips the gate; the gate runs, the report notes that no files changed, and the feed line carries `diff=empty`.
+- Consult lanes need a fresh name and cannot be respawned as work lanes, so their resume stays read-only.
+- The detached Gemini runner runs the configured model and agent: both are pinned into the round spec at launch.
+- A raw-session `fork --model` now reaches the forked thread's turns.
+- Prompts rewritten for GPT-6 Astra and Gemini: every built-in rule names its mechanism; workers, Gemini workers, supervisors, reviewers, and consults each get their own contract; native subagents are off for Gemini workers and supervisors and conditional for GPT workers; review findings carry severity definitions and a failure scenario; the shipped agent files match. SKILL.md is now a short operating guide and README holds the reference.
+- `killLane` throws instead of exiting so cascades continue; ownership checks run before the ledger lock so a refusal never leaves the lock behind. package.json and plugin.json versions track the CLI.
+
 ## 3.6.0
 
 - Adds `cdx consult <lane> [--model M] [--effort E] [--cd D] [--bg] "<question>"`: a read-only gpt lane framed as the head's advisor (ranked recommendation, rejected alternatives, evidence from the tree, pushback on a wrong premise, a closing "Decisions for the head" list) instead of the adversarial review frame. It runs through the read-only exec path, records `consult` on the lane, shows as `consult` in status, and `cdx resume <lane>` continues the conversation read-only. Refused inside lanes.
