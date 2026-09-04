@@ -52,10 +52,15 @@ gpt:
 - slow (20-30 min lanes), scarce weekly budget, burns fast
 gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
 gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
-gpt: one big brief for sweeping multi-file work.
+gpt: one big brief for sweeping multi-file work; --model picks the Codex model (alias or id).
+gpt --supervisor: one lane that plans, spawns gemini children through cdx, verifies, and reports.
 ```
 
 `--engine` is optional on spawn, review, and adopt and defaults to `gemini`. `--engine gpt` is explicit. Resume inherits the lane engine. Gemini always runs `gemini-3.8-flash-high`; cdx ignores `--effort` for Gemini with a note. Gemini has no headless fork, so resume it instead.
+
+`--model M` picks the Codex model for a gpt lane: an alias from the `models` config map (`astra` for `gpt-6-astra`, say) or a raw model id. The lane keeps its model across resume, fork, and review, and status shows it.
+
+`--supervisor` (gpt only) makes the lane a supervisor: it may spawn, resume, review, kill, close, gate, and reply to gemini child lanes through cdx, one level deep. Children show `parent=<supervisor>`, report to the supervisor's owner session, and die with it on `cdx kill`.
 
 ## Quickstart
 
@@ -118,7 +123,7 @@ flowchart LR
 
 | Command | What it does |
 |---|---|
-| `cdx spawn <lane> [--engine gpt\|gemini] "<brief>"` | Start a worker in its own lane |
+| `cdx spawn <lane> [--engine gpt\|gemini] [--model M] [--supervisor] "<brief>"` | Start a worker in its own lane |
 | `cdx resume <lane> "<follow-up>"` | Continue a lane's thread, context intact |
 | `cdx gate <lane> "<cmd>"` | Set or replace an inactive lane's acceptance gate |
 | `cdx fork <new> <lane> "<brief>"` | Branch a thread into a new lane |
@@ -145,18 +150,18 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
+cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
 cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime MIN] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
-cdx fork   <new> <lane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
+cdx fork   <new> <lane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
 cdx send   <lane> "<text>"
 cdx ask    [--timeout MIN] "<question>"
 cdx reply  <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
-cdx review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd D]
+cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 cdx status [--all] [--json]
 cdx usage  [--json]
 cdx wait   <lane>... [--timeout S] [--json] [--report]
@@ -222,6 +227,8 @@ A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini -
 
 **Steer, iterate, or branch.** `send` corrects a running lane via in-turn steering or a follow-up turn. `resume` continues a finished worker with its recorded engine and context. `fork` branches GPT context into a new lane. Gemini has no headless fork.
 
+**Supervisor tree.** `cdx spawn plan --engine gpt --model astra --supervisor "<brief>"` hands one Codex lane a multi-part change. It briefs the bounded parts to gemini children with `cdx spawn --bg`, waits with `cdx wait --report`, reviews with `cdx review`, and reports once. The head sees the children under `parent=plan` in `cdx status` and kills the whole tree with `cdx kill plan`.
+
 ## Claude Code integration
 
 Installed as a plugin (the clone into `~/.claude/skills/` above), cdx wires itself into the session:
@@ -239,8 +246,9 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 
 ```json
 {
-  "model": "gpt-5.6-sol",
-  "efforts": ["low", "medium", "high"],
+  "model": "gpt-6-astra",
+  "models": { "astra": "gpt-6-astra", "sol": "gpt-5.6-sol" },
+  "efforts": ["low", "medium", "high", "xhigh"],
   "defaultEffort": "medium",
   "rules": [],
   "worktreeSetup": "bun install",
@@ -252,7 +260,7 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 }
 ```
 
-- Existing top-level keys configure GPT. `model` is the Codex model. `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
+- Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
 - `gemini` is optional. Its shown values are the defaults. Gemini always records effort `high`; its effort is not configurable.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
