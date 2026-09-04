@@ -491,6 +491,47 @@ afterEach(() => {
   }
 });
 
+describe("cdx jobs", () => {
+  test("job runs detached, records exit code, writes a feed line, and wait/kill/status know it", async () => {
+    const state = tempPath("jobs");
+    mkdirSync(state, { recursive: true });
+    const env = { ...baseEnv(state), CLAUDE_CODE_SESSION_ID: "abcdef1234567890" };
+    const started = runCli(["job", "wall", "--cd", state, "printf hello; sleep 0.2; exit 3"], env);
+    expect(started.exitCode).toBe(0);
+    expect(started.stdout).toContain("job=wall");
+    const jobsPath = join(state, "jobs.json");
+    await waitFor(() => existsSync(jobsPath) && JSON.parse(readFileSync(jobsPath, "utf8")).wall?.state === "failed");
+    const job = JSON.parse(readFileSync(jobsPath, "utf8")).wall;
+    expect(job.exitCode).toBe(3);
+    expect(job.cwd).toBe(state);
+    expect(readFileSync(job.log, "utf8")).toContain("hello");
+    const feed = readFileSync(join(state, "feed.log"), "utf8");
+    expect(feed).toContain("[cdx] job=wall state=failed exit=3 in=");
+    expect(feed).toContain("owner=abcdef12");
+    const waited = runCli(["wait", "wall"], env);
+    expect(waited.exitCode).toBe(1);
+    expect(waited.stdout).toContain("job=wall state=failed exit=3");
+    const listed = runCli(["job"], env);
+    expect(listed.stdout).toContain("job=wall state=failed exit=3");
+    const inLane = runCli(["job", "other", "true"], { ...env, CDX_LANE: "some-lane" });
+    expect(inLane.exitCode).not.toBe(0);
+    expect(inLane.stderr).toContain("lane workers cannot drive the harness");
+
+    const long = runCli(["job", "slow", "--cd", state, "sleep 30"], env);
+    expect(long.exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(jobsPath, "utf8")).slow?.pid !== undefined);
+    const status = runCli(["status"], env);
+    expect(status.stdout).toContain("jobs running:");
+    expect(status.stdout).toContain("job=slow state=running");
+    const killed = runCli(["kill", "slow", "stopped by test"], env);
+    expect(killed.exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(jobsPath, "utf8")).slow?.state === "failed");
+    const slow = JSON.parse(readFileSync(jobsPath, "utf8")).slow;
+    expect(slow.note).toBe("stopped by test");
+    expect(slow.exitCode).toBe(143);
+  });
+});
+
 describe("cdx messaging", () => {
   test("delivers a control-file steer through the app-server", async () => {
     const root = tempPath("steer");

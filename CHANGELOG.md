@@ -1,3 +1,8 @@
+## 3.4.0
+
+- Adds `cdx job <name> [--cd D] "<cmd>"`: a detached background shell command beside the lanes (a test wall, a deploy chain, a long gate). One log at `logs/job-<name>.log`, one record in `jobs.json`, and one feed line `[cdx] job=<name> state=done|failed exit=N in=<duration> log=<path>` the plugin monitor delivers on exit, so a head never polls a summary file from a sleep loop. `cdx job` with no arguments lists jobs; `cdx wait` and `cdx kill` accept job names; `status` and `brief` show running jobs. Workers cannot start jobs.
+- Shares one locked JSON writer between the ledger and the jobs file.
+
 ## 3.3.0
 
 - Guards the Gemini five-hour window: a round that ends with `Individual quota reached` writes `~/.cdx/gemini-quota.json` with the parsed reset time (30 minutes when unparsed), and `spawn`, `resume`, and `review` refuse Gemini work until it passes. Status, brief, and doctor show the block.

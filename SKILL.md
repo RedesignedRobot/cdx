@@ -61,17 +61,18 @@ cdx review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd <dir
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
-cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
+cdx wait   <lane|job>... [--timeout <sec>] [--json] [--report]
 cdx tail   <lane> [-n N]
 cdx tail -f [lane]
 cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round] [--transcript]
-cdx kill   <lane> ["note"]
+cdx kill   <lane|job> ["note"]
 cdx close  <lane> [--remove-worktree] ["note"]
 cdx clean  [--days N]
 cdx doctor [--fix] [--probe]
 cdx brief
+cdx job    <name> [--cd <dir>] "<cmd>"   # detached shell job; cdx job alone lists jobs
 ```
 
 A brief of `-` reads the brief from stdin. Use it for long prompts with quotes
@@ -171,6 +172,21 @@ GPT reviews keep the fenced JSON block, which cdx extracts into
 Gemini, `cdx hook pre-tool` denies file-writing tools inside review lanes, and cdx
 compares the repository tree before and after the round. A changed path fails
 the review, but cdx keeps the report.
+
+## Jobs
+
+`cdx job <name> [--cd <dir>] "<cmd>"` runs one shell command detached from
+the calling shell, in the given directory. It is for the head's own long
+commands: a test wall, a deploy chain, a gate. No engine, no brief, no report.
+The command's output lands in `logs/job-<name>.log`, the record in
+`jobs.json`, and on exit cdx writes one feed line
+`[cdx] job=<name> state=done|failed exit=N in=<duration> log=<path>`, which
+the plugin monitor delivers to the session. So the head starts the job and
+goes on working instead of polling a summary file from a sleep loop.
+`cdx wait <name>` blocks on a job the same way it blocks on a lane and exits
+1 on failure. `cdx kill <name>` signals the job's process group. A job name
+must not collide with a lane name, and a lane worker cannot start a job.
+A `-` command reads stdin.
 
 ## Communication
 
