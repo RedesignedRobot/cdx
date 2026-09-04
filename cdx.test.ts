@@ -84,6 +84,7 @@ for await (const chunk of Bun.stdin.stream()) {
     const request = JSON.parse(line);
     if (process.env.FAKE_TRACE) appendFileSync(process.env.FAKE_TRACE, line + "\\n");
     if (process.env.FAKE_ENV_TRACE && request.method === "initialize") appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
+    if (process.env.FAKE_SUPERVISOR_TRACE && request.method === "initialize") appendFileSync(process.env.FAKE_SUPERVISOR_TRACE, String(process.env.CDX_SUPERVISOR || "none") + "\\n");
     if (request.method === "initialized") continue;
     if (request.method === "initialize") send({ id: request.id, result: { userAgent: "fake", codexHome: "/tmp", platformFamily: "unix", platformOs: "test" } });
     else if (request.method === "account/rateLimits/read") send({ id: request.id, result: { rateLimits: {} } });
@@ -166,7 +167,7 @@ const trace = (record) => {
   if (process.env.FAKE_AGY_TRACE) appendFileSync(process.env.FAKE_AGY_TRACE, JSON.stringify(record) + "\\n");
 };
 if (!args.some((arg) => arg === "--version" || arg.startsWith("--print="))) {
-  trace({ args, cwd: process.cwd(), codexHome: process.env.CODEX_HOME });
+  trace({ args, cwd: process.cwd(), codexHome: process.env.CODEX_HOME, supervisor: process.env.CDX_SUPERVISOR });
 }
 
 if (args.includes("--version")) { console.log("agy version 1.1.24"); process.exit(0); }
@@ -2898,4 +2899,163 @@ describe("gemini quota handling", () => {
     expect(lane.note).toContain("agy reported quota exhausted but usage shows 91% five-hour remaining; no block written");
     expect(lane.lastResultError).toContain("Individual quota reached");
   });
+});
+
+describe("cdx models and supervisors", () => {
+  test("resolves --model aliases and raw ids, records the model, and passes it to the app-server", () => {
+    const root = tempPath("model-picker");
+    const state = `${root}/state`;
+    const trace = `${root}/requests.jsonl`;
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", models: { astra: "gpt-6-astra" }, efforts: ["medium", "high", "xhigh"], defaultEffort: "medium",
+    }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_TRACE: trace };
+
+    const spawned = runCli(["spawn", "m-astra", "--engine", "gpt", "--model", "astra", "--effort", "xhigh", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawned.exitCode).toBe(0);
+    expect(spawned.stdout).toContain("model=gpt-6-astra");
+    let requests = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(requests.find((request) => request.method === "thread/start").params.model).toBe("gpt-6-astra");
+    expect(requests.find((request) => request.method === "turn/start").params.effort).toBe("xhigh");
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledger["m-astra"].model).toBe("gpt-6-astra");
+    expect(ledger["m-astra"].effort).toBe("xhigh");
+    expect(runCli(["status"], env).stdout).toContain("model=gpt-6-astra");
+
+    writeFileSync(trace, "");
+    expect(runCli(["spawn", "m-raw", "--engine", "gpt", "--model", "gpt-5.5", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    requests = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(requests.find((request) => request.method === "thread/start").params.model).toBe("gpt-5.5");
+
+    const bad = runCli(["spawn", "m-bad", "--engine", "gpt", "--model", "Nope!", "--cd", root, "REPORT_ONLY"], env);
+    expect(bad.exitCode).toBe(1);
+    expect(bad.stderr).toContain('--model must be a Codex model id or one of astra=gpt-6-astra');
+
+    const gemini = runCli(["spawn", "m-gem", "--model", "astra", "--cd", root, "REPORT_ONLY"], env);
+    expect(gemini.exitCode).toBe(1);
+    expect(gemini.stderr).toContain("--model applies to gpt lanes only");
+
+    const reviewFlag = runCli(["review", "m-astra", "--engine", "gpt", "--model", "astra", "look"], env);
+    expect(reviewFlag.exitCode).toBe(1);
+    expect(reviewFlag.stderr).toContain("review of an existing lane uses its model (gpt-6-astra)");
+
+    const forkFlag = runCli(["fork", "m-fork", "m-astra", "--model", "astra", "REPORT_ONLY"], env);
+    expect(forkFlag.exitCode).toBe(1);
+    expect(forkFlag.stderr).toContain("fork inherits the source lane's model (gpt-6-astra)");
+    expect(runCli(["fork", "m-fork", "m-astra", "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["m-fork"].model).toBe("gpt-6-astra");
+
+    expect(runCli(["help"], env).stdout).toContain("model gpt-5.6-sol (aliases astra=gpt-6-astra)");
+  }, 30_000);
+
+  test("rejects malformed models config", () => {
+    const state = tempPath("models-config");
+    mkdirSync(state, { recursive: true });
+    const env = baseEnv(state);
+    writeFileSync(`${state}/config.json`, JSON.stringify({ models: ["gpt-6-astra"] }));
+    expect(runCli(["status"], env).stderr).toContain("models must be an object mapping aliases to Codex model ids");
+    writeFileSync(`${state}/config.json`, JSON.stringify({ models: { "Bad Alias": "gpt-6-astra" } }));
+    expect(runCli(["status"], env).stderr).toContain('models: alias "Bad Alias" must be lowercase letters, digits, and dashes');
+    writeFileSync(`${state}/config.json`, JSON.stringify({ models: { astra: 7 } }));
+    expect(runCli(["status"], env).stderr).toContain("models.astra must be a Codex model id");
+  });
+
+  test("houseRules gives a gpt supervisor delegation rules instead of the worker ban", () => {
+    const supervisor = houseRules("/tmp", false, "gpt", { supervisor: true });
+    expect(supervisor).toContain("You supervise this lane.");
+    expect(supervisor).toContain("cdx wait <child>... --report");
+    expect(supervisor).not.toContain("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane");
+    expect(supervisor).toContain("run `cdx ask");
+    const worker = houseRules("/tmp", false, "gpt");
+    expect(worker).toContain("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane");
+    expect(worker).not.toContain("You supervise this lane.");
+    expect(houseRules("/tmp", false, "gemini", { supervisor: true })).not.toContain("You supervise this lane.");
+    expect(houseRules("/tmp", true, "gpt", { supervisor: true })).not.toContain("You supervise this lane.");
+  });
+
+  test("a supervisor lane exports CDX_SUPERVISOR and drives gemini children only", () => {
+    const root = tempPath("supervisor");
+    const state = `${root}/state`;
+    const supervisorTrace = `${root}/supervisor.trace`;
+    const agyTrace = `${root}/agy.trace`;
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(`${root}/agy`);
+    const env = {
+      ...baseEnv(state),
+      PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}`,
+      FAKE_SUPERVISOR_TRACE: supervisorTrace,
+      FAKE_AGY_TRACE: agyTrace,
+    };
+
+    const badEngine = runCli(["spawn", "nosup", "--engine", "gemini", "--supervisor", "--cd", root, "REPORT_ONLY"], env);
+    expect(badEngine.exitCode).toBe(1);
+    expect(badEngine.stderr).toContain("--supervisor needs --engine gpt");
+
+    const spawned = runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawned.exitCode).toBe(0);
+    expect(spawned.stdout).toContain("engine=gpt model=gpt-5.6-sol supervisor mode=spawn");
+    expect(readFileSync(supervisorTrace, "utf8").trim()).toBe("sup");
+    expect(readFileSync(`${state}/briefs/sup-r1.md`, "utf8")).toContain("You supervise this lane.");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBe(true);
+    expect(runCli(["status"], env).stdout).toContain("engine=gpt  model=gpt-5.6-sol  supervisor");
+
+    // A plain gpt worker gets no supervisor variable.
+    writeFileSync(supervisorTrace, "");
+    expect(runCli(["spawn", "plain", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(supervisorTrace, "utf8").trim()).toBe("none");
+
+    // Inside the supervisor's codex process.
+    const inside = { ...env, CDX_LANE: "sup", CDX_SUPERVISOR: "sup", CDX_ROUND: "1", CDX_OWNER: "terminal" };
+    const child = runCli(["spawn", "child", "--cd", root, "BUILD_SMALL_THING"], inside);
+    expect(child.exitCode).toBe(0);
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    expect(ledger.child.parent).toBe("sup");
+    expect(ledger.child.engine).toBe("gemini");
+    const invocation = readFileSync(agyTrace, "utf8").trim().split("\n").map((line) => JSON.parse(line))[0];
+    expect(invocation.supervisor).toBeUndefined();
+    expect(runCli(["status"], inside).stdout).toContain("parent=sup");
+
+    const gptChild = runCli(["spawn", "child-gpt", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], inside);
+    expect(gptChild.exitCode).toBe(1);
+    expect(gptChild.stderr).toContain("supervisor sup may only spawn gemini children; drop --engine gpt");
+    const nested = runCli(["spawn", "child-sup", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], inside);
+    expect(nested.exitCode).toBe(1);
+    expect(nested.stderr).toContain("supervisor sup cannot spawn another supervisor");
+    const forked = runCli(["fork", "child-fork", "sup", "REPORT_ONLY"], inside);
+    expect(forked.exitCode).toBe(1);
+    expect(forked.stderr).toContain('supervisor sup may run spawn, resume, review, kill, close, gate, reply on its children; command "fork" refused');
+    const foreign = runCli(["resume", "plain", "REPORT_ONLY"], inside);
+    expect(foreign.exitCode).toBe(1);
+    expect(foreign.stderr).toContain('supervisor sup may only drive its own children; lane "plain" is not one');
+    const gptReview = runCli(["review", "child", "--engine", "gpt", "look again"], inside);
+    expect(gptReview.exitCode).toBe(1);
+    expect(gptReview.stderr).toContain("supervisor sup may only run gemini reviews");
+    expect(runCli(["close", "child"], inside).exitCode).toBe(0);
+    expect(runCli(["close", "sup"], inside).exitCode).toBe(1);
+
+    // A child of the supervisor is an ordinary worker.
+    const grandchild = runCli(["spawn", "grandchild", "--cd", root, "BUILD_SMALL_THING"], { ...env, CDX_LANE: "child", CDX_ROUND: "1" });
+    expect(grandchild.exitCode).toBe(1);
+    expect(grandchild.stderr).toContain("lane workers cannot drive the harness");
+  }, 30_000);
+
+  test("killing a supervisor kills its running children", async () => {
+    const root = tempPath("supervisor-kill");
+    const state = `${root}/state`;
+    const binCodex = installFakeCodex(root);
+    const binAgy = installFakeAgy(`${root}/agy`);
+    const env = { ...baseEnv(state), PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}` };
+    expect(runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
+    const inside = { ...env, CDX_LANE: "sup", CDX_SUPERVISOR: "sup", CDX_ROUND: "1", CDX_OWNER: "terminal" };
+    expect(runCli(["spawn", "child", "--cd", root, "--bg", "HANG_AGY"], inside).exitCode).toBe(0);
+    const read = () => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    await waitFor(() => read().sup?.codexPid && read().child?.codexPid);
+
+    const killed = runCli(["kill", "sup", "stop everything"], env);
+    expect(killed.exitCode).toBe(0);
+    expect(killed.stdout).toContain("lane=child is a child of sup; stopping it too");
+    await waitFor(() => read().sup.state === "failed" && read().child.state === "failed");
+    expect(read().child.note).toContain("supervisor sup killed");
+  }, 30_000);
 });

@@ -1,3 +1,9 @@
+## 3.5.0
+
+- Adds a Codex model picker. `spawn`, `fork`, `review`, and `adopt` take `--model M` for gpt lanes, where M is an alias from the new `models` config key (`{ "astra": "gpt-6-astra" }`) or a raw model id. The lane records its model; resume, fork, and review of an existing lane keep it; status, the launch line, and `cdx help` show it. The `efforts` allowlist may now include `xhigh` for GPT-6 Astra.
+- Adds supervisor lanes. `spawn --supervisor --engine gpt` gives one Codex lane the right to `spawn`, `resume`, `review`, `kill`, `close`, `gate`, and `reply` gemini child lanes through cdx, one level deep. cdx exports `CDX_SUPERVISOR` only to that lane, strips it from every child, refuses `--engine gpt` and `--supervisor` from inside a supervisor, refuses commands against lanes that are not its children, records `parent` on each child, routes child feed lines to the supervisor's owner session, and kills running children when the supervisor is killed. Supervisor briefs get delegation rules instead of the worker ban.
+- The detached runner no longer inherits `CDX_LANE` from the shell that launched it.
+
 ## 3.4.0
 
 - Adds `cdx job <name> [--cd D] "<cmd>"`: a detached background shell command beside the lanes (a test wall, a deploy chain, a long gate). One log at `logs/job-<name>.log`, one record in `jobs.json`, and one feed line `[cdx] job=<name> state=done|failed exit=N in=<duration> log=<path>` the plugin monitor delivers on exit, so a head never polls a summary file from a sleep loop. `cdx job` with no arguments lists jobs; `cdx wait` and `cdx kill` accept job names; `status` and `brief` show running jobs. Workers cannot start jobs.

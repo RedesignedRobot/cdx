@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.4.0";
+const VERSION = "3.5.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -98,18 +98,48 @@ interface LaneEnvironment {
   lane: string;
   round: number;
   owner?: string;
+  supervisor?: boolean;
 }
 
+// A supervisor lane carries CDX_SUPERVISOR=<its own name>; every other lane,
+// a supervisor's children included, has it removed so delegation stays one
+// level deep.
 function laneChildEnv(codexHome: string | undefined, context: LaneEnvironment, engine: Engine = "gpt") {
-  const env = {
+  const env: Record<string, string | undefined> = {
     ...uncoloredChildEnv(codexHome),
     CDX_HOME: ROOT,
     CDX_LANE: context.lane,
     CDX_ROUND: String(context.round),
     CDX_OWNER: context.owner ?? "terminal",
   };
+  if (context.supervisor) env.CDX_SUPERVISOR = context.lane;
+  else delete env.CDX_SUPERVISOR;
   if (engine === "gemini") delete env.CODEX_HOME;
   return env;
+}
+
+// The runner is a harness process, not a worker: it must never inherit a
+// lane identity from the shell that launched it.
+function runnerEnv(codexHome: string | undefined) {
+  const env: Record<string, string | undefined> = uncoloredChildEnv(codexHome, ROOT);
+  delete env.CDX_LANE;
+  delete env.CDX_ROUND;
+  delete env.CDX_SUPERVISOR;
+  return env;
+}
+
+// Inside a supervisor lane both variables name the same lane. Anything else
+// (a child, a plain worker, the head's shell) is not a supervisor.
+function supervisorLane(): string | undefined {
+  const lane = process.env.CDX_LANE?.trim();
+  const supervisor = process.env.CDX_SUPERVISOR?.trim();
+  return lane && supervisor === lane ? supervisor : undefined;
+}
+
+function requireOwnChild(lane: string, entry: Lane | undefined): void {
+  const supervisor = supervisorLane();
+  if (!supervisor || !entry) return;
+  if (entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
 }
 
 type Effort = string;
@@ -124,6 +154,7 @@ interface GeminiConfig {
 
 interface Config {
   model: string;
+  models?: Record<string, string>;
   efforts: string[];
   defaultEffort: string;
   rules: string[];
@@ -147,6 +178,12 @@ interface GateBaseline {
 
 interface Lane {
   engine?: Engine;
+  // Codex model id of the work thread; absent on gemini lanes.
+  model?: string;
+  // A supervisor lane drives gemini child lanes through cdx.
+  supervisor?: true;
+  // Name of the supervisor lane that spawned this one.
+  parent?: string;
   account?: string;
   codexHome?: string;
   ownerSession?: string;
@@ -223,6 +260,7 @@ interface Spec {
   gateBaselineChecked?: true;
   reviewDir?: string;
   maxRuntimeMins?: number;
+  supervisor?: true;
 }
 
 type Ledger = Record<string, Lane>;
@@ -243,6 +281,8 @@ function fail(message: string): never {
 function configError(message: string): never {
   fail(`${CONFIG_PATH}: ${message}`);
 }
+
+const MODEL_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
 function readConfig(skipFile = false): Config {
   const defaults: Config = {
@@ -271,12 +311,23 @@ function readConfig(skipFile = false): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "efforts", "defaultEffort", "rules", "accounts", "worktreeSetup", "gemini"]);
+  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "worktreeSetup", "gemini"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
   const model = Object.hasOwn(input, "model") ? input.model : defaults.model;
   if (typeof model !== "string" || model.trim().length === 0) configError("model must be a nonempty string");
+
+  let models: Record<string, string> | undefined;
+  if (Object.hasOwn(input, "models")) {
+    const value = input.models;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) configError("models must be an object mapping aliases to Codex model ids");
+    for (const [alias, id] of Object.entries(value as Record<string, unknown>)) {
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(alias)) configError(`models: alias "${alias}" must be lowercase letters, digits, and dashes`);
+      if (typeof id !== "string" || !MODEL_ID.test(id)) configError(`models.${alias} must be a Codex model id`);
+    }
+    models = { ...(value as Record<string, string>) };
+  }
 
   const efforts = Object.hasOwn(input, "efforts") ? input.efforts : defaults.efforts;
   if (!Array.isArray(efforts) || efforts.length === 0) configError("efforts must be a nonempty array of strings");
@@ -347,7 +398,7 @@ function readConfig(skipFile = false): Config {
   }
 
   return {
-    model, efforts: efforts as string[], defaultEffort, rules: rules as string[],
+    model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), ...(worktreeSetup ? { worktreeSetup } : {}), ...(gemini ? { gemini } : {}),
   };
 }
@@ -645,7 +696,13 @@ function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): stri
 // Briefs: standing rules injected once here so per-lane briefs stay short.
 // ---------------------------------------------------------------------------
 
-function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt"): string {
+const SUPERVISOR_RULES = [
+  'You supervise this lane. Delegate bounded work to gemini child lanes through cdx: `cdx spawn <child> --bg [--gate "<cmd>"] [--cd <dir>] "<brief>"` starts one, `cdx wait <child>... --report` collects reports, `cdx review <child> "<attack items>"` reviews, and `cdx send`, `cdx resume`, `cdx kill` steer, retry, and stop. Children are gemini only and cannot delegate further; never pass --engine gpt or --supervisor.',
+  "Brief each child under a page: named files, one outcome, explicit acceptance checks, and a --gate command. Fan out independent children in parallel and wait once. Answer their questions with `cdx questions` and `cdx reply <child> \"<answer>\"`.",
+  "Verify every child's work yourself before reporting: read the report, rerun the gate and the tests it cites, and fix or redo what is wrong. Delegate the bounded parts; keep the judgment.",
+];
+
+function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
   const builtIns = [
     reviewOnly
       ? "READ-ONLY: change nothing in the tree; write only your report."
@@ -653,7 +710,8 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt"): s
     "Your final response is the lane report. Include what changed or what you reviewed, verification evidence, and any risks or follow-ups.",
   ];
   if (!reviewOnly) {
-    builtIns.push("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.");
+    if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
+    else builtIns.push("Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.");
     if (engine === "gemini") {
       builtIns.push("Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself. When the brief leaves a gap that changes the outcome, run cdx ask and wait for the answer; ask small, specific questions, one per gap. If the answer times out, take the narrowest reading, state it in the report, and stop there.");
       builtIns.push("If the task splits into independent parts, parallelize with your own subagent threads rather than working them serially.");
@@ -708,9 +766,9 @@ function reviewFrame(engine: Engine): string {
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -758,7 +816,8 @@ gemini:
 - weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks
 gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
 gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
-gpt: one big brief for sweeping multi-file work.`;
+gpt: one big brief for sweeping multi-file work; --model picks the Codex model (alias or id).
+gpt --supervisor: one lane that plans, spawns gemini children through cdx, verifies, and reports.`;
 
 function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
   const value = parsed.flags.engine;
@@ -786,6 +845,33 @@ function roundEngine(lane: Lane): Engine {
 // thread to protect; its engine may follow the next round.
 function hasWorkThread(lane: Lane): boolean {
   return Boolean(lane.workSessionId) || (lane.kind === "work" && Boolean(lane.sessionId));
+}
+
+function modelAliases(): string {
+  const entries = Object.entries(config.models ?? {});
+  return entries.map(([alias, id]) => `${alias}=${id}`).join(", ");
+}
+
+// --model takes an alias from config.models or a raw Codex model id. Gemini
+// lanes have one model and refuse the flag.
+function modelOf(parsed: Parsed, engine: Engine): string | undefined {
+  const value = parsed.flags.model;
+  if (engine === "gemini") {
+    if (value !== undefined) fail("--model applies to gpt lanes only; gemini always runs the configured gemini model");
+    return undefined;
+  }
+  if (value === undefined) return config.model;
+  const resolved = config.models?.[value];
+  if (resolved) return resolved;
+  if (!MODEL_ID.test(value)) {
+    const aliases = modelAliases();
+    fail(`--model must be a Codex model id${aliases ? ` or one of ${aliases}` : ""}, set in ${CONFIG_PATH}; got "${value}"`);
+  }
+  return value;
+}
+
+function laneModel(lane: Pick<Lane, "model"> | undefined): string {
+  return lane?.model ?? config.model;
 }
 
 function engineEffort(engine: Engine, parsed: Parsed, inherited?: Effort): Effort {
@@ -972,7 +1058,8 @@ function legacyAccountFallback(laneName: string, lane: Lane, ownerSession?: stri
 interface LaneOwner { ownerSession?: string; ownerCwd: string }
 
 function callerOwnership(): LaneOwner {
-  const ownerSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const inherited = supervisorLane() ? process.env.CDX_OWNER?.trim() : undefined;
+  const ownerSession = (inherited && inherited !== "terminal" ? inherited : undefined) ?? process.env.CLAUDE_CODE_SESSION_ID?.trim();
   return { ...(ownerSession ? { ownerSession } : {}), ownerCwd: process.cwd() };
 }
 
@@ -1070,7 +1157,7 @@ function removeWorktree(entry: Lane) {
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; supervisor?: true; parent?: string }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
@@ -1097,6 +1184,9 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       // still reattaches to the right runtime.
       engine: roundEngineType,
       reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
+      model: kind === "work" && roundEngineType === "gpt" ? opts?.model ?? existing?.model : existing?.model,
+      supervisor: opts?.supervisor ?? existing?.supervisor,
+      parent: opts?.parent ?? existing?.parent,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
       codexHome,
@@ -1154,13 +1244,13 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
   const jsonMode = (spec.engine ?? "gpt") === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
-  console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine ?? "gpt"} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
+  console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine ?? "gpt"}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
   console.log(`cdx: log=${logPathOf(spec.lane, spec.round, jsonMode)} report=${reportPathOf(spec.lane, spec.round)}`);
   if (background) {
     const crashLog = openSync(`${ROOT}/logs/${spec.lane}-r${spec.round}.runner.log`, "a");
     const child = nodeSpawn(process.execPath, [SELF, "_run", spec.lane, String(spec.round)], {
       detached: true,
-      env: uncoloredChildEnv(spec.codexHome, ROOT),
+      env: runnerEnv(spec.codexHome),
       stdio: ["ignore", crashLog, crashLog],
     });
     child.unref();
@@ -1492,7 +1582,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const proc = Bun.spawn({
     cmd: gemini ? geminiArgs : appServer ? ["codex", "app-server", "--listen", "stdio://"] : ["codex", ...(spec.codexArgs ?? [])],
     cwd: spec.cwd,
-    env: laneChildEnv(spec.codexHome, { lane, round, owner: spec.ownerSession }, engine),
+    env: laneChildEnv(spec.codexHome, { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
     stdin: appServer || gemini ? "pipe" : "ignore",
     stdout: "pipe",
     stderr: "pipe",
@@ -2605,12 +2695,18 @@ function gateCommand(argv: string[]): void {
 }
 
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "model", "supervisor"]);
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
   if (!lane || !brief) fail(`usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`);
   validLane(lane);
+  const supervisor = parsed.bools.has("supervisor");
+  const parent = supervisorLane();
+  if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and delegates to gemini children");
+  if (supervisor && parent) fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
+  if (parent && engine !== "gemini") fail(`supervisor ${parent} may only spawn gemini children; drop --engine gpt`);
+  const model = modelOf(parsed, engine);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
@@ -2664,9 +2760,10 @@ async function spawnCommand(argv: string[]) {
   }
   const { round } = openRound(lane, "work", cwd, effort, {
     engine, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate: parsed.flags.gate,
+    ...(model ? { model } : {}), ...(supervisor ? { supervisor: true as const } : {}), ...(parent ? { parent } : {}),
   });
   if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
-  const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine)}\n\nTask:\n${brief}`;
+  const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
   const gateBaselineChecked = Boolean(parsed.flags.gate && (worktree || parsed.bools.has("gate-baseline-check")));
   if (gateBaselineChecked) {
     const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
@@ -2685,7 +2782,8 @@ async function spawnCommand(argv: string[]) {
     console.log(`cdx: gate baseline passed cwd=${cwd}`);
   }
   return launch({
-    engine, mode: "spawn", lane, round, cwd, prompt: fullBrief, model: engine === "gemini" ? (config.gemini ?? geminiConfig()).model : config.model,
+    engine, mode: "spawn", lane, round, cwd, prompt: fullBrief, model: engine === "gemini" ? (config.gemini ?? geminiConfig()).model : model,
+    ...(supervisor ? { supervisor: true as const } : {}),
     ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(images.length ? { images } : {}),
     ...(outputSchema !== undefined ? { outputSchema } : {}),
@@ -2703,6 +2801,7 @@ async function resumeCommand(argv: string[]) {
   if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"');
   const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
+  requireOwnChild(lane, before);
   const engine = laneEngine(before);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
@@ -2731,7 +2830,7 @@ async function resumeCommand(argv: string[]) {
         ? "Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
         : "Print your final report. cdx captures it from the transcript.")
     : "Print your final report. cdx captures the last final agent message.";
-  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine)}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
+  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
   // The session keeps its own settings; only an explicit --effort overrides.
   const effortArgs = parsed.flags.effort ? ["-c", `model_reasoning_effort=${effort}`] : [];
   const codexArgs = reviewResume && engine === "gpt"
@@ -2749,7 +2848,7 @@ async function resumeCommand(argv: string[]) {
 }
 
 async function forkCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "bg", "account"]);
+  const parsed = parseArgs(argv, ["effort", "bg", "account", "model"]);
   const [newLane, source, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
   if (!newLane || !source || !brief) fail('usage: cdx fork <newLane> <fromLane|sessionId> [--bg] "<brief>"');
@@ -2757,6 +2856,8 @@ async function forkCommand(argv: string[]) {
   const ledger = readLedger();
   const sourceLane = ledger[source];
   if (sourceLane && laneEngine(sourceLane) === "gemini") fail("gemini has no headless fork; use cdx resume");
+  if (sourceLane && parsed.flags.model !== undefined) fail(`fork inherits the source lane's model (${laneModel(sourceLane)}); drop --model`);
+  const model = sourceLane ? laneModel(sourceLane) : modelOf(parsed, "gpt")!;
   const sessionId = sourceLane
     ? sourceLane.workSessionId ?? sourceLane.sessionId ?? source
     : source;
@@ -2788,13 +2889,13 @@ async function forkCommand(argv: string[]) {
     cwd = sessionCwd ?? process.cwd();
   }
   const owner = callerOwnership();
-  const { round } = openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner });
+  const { round } = openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model });
   const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nPrint your final report. cdx captures the last final agent message.`;
   return launch({ engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 async function reviewCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const intent = await resolveBrief(intentArg);
@@ -2804,6 +2905,13 @@ async function reviewCommand(argv: string[]) {
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
+  const parent = supervisorLane();
+  if (parent && engine !== "gemini") fail(`supervisor ${parent} may only run gemini reviews; drop --engine gpt`);
+  if (parent) requireOwnChild(lane, existing);
+  if (existing && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
+  const model = engine === "gpt" ? existing ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
+  const roundModel = model && !existing ? { model } : {};
+  const roundParent = parent && !existing ? { parent } : {};
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
     console.log(color.yellow("cdx: gemini reviewing a gemini lane; give the intent explicit attack items"));
   }
@@ -2834,15 +2942,15 @@ async function reviewCommand(argv: string[]) {
         ? `Review the diff shown by \`git diff ${target}\` in this repository.`
         : `Review the diff shown by \`git show ${parsed.flags.commit}\` in this repository.`;
       const fullBrief = [reviewFrame(engine), `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${task}`].join("\n\n");
-      const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true });
+      const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundParent });
       return launch({ engine, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, outputSchema: REVIEW_FINDINGS_SCHEMA, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
     }
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
-    const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true });
+    const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel });
     if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
     const codexArgs = [
-      "review", "-c", `review_model=${JSON.stringify(config.model)}`, "-c", `model_reasoning_effort=${effort}`,
+      "review", "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
       "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
     ];
     if (parsed.bools.has("uncommitted")) codexArgs.push("--uncommitted");
@@ -2853,7 +2961,7 @@ async function reviewCommand(argv: string[]) {
   }
 
   const owner = callerOwnership();
-  const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true });
+  const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
   if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
@@ -2861,7 +2969,7 @@ async function reviewCommand(argv: string[]) {
   const fullBrief = [reviewFrame(engine) + scope, `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${intent}`].join("\n\n");
   // Reviews are read-only: enforce it with the sandbox, not just the prompt.
   const codexArgs = engine === "gpt" ? [
-    "exec", "--json", "-m", config.model, "-c", `model_reasoning_effort=${effort}`,
+    "exec", "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
     "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ] : undefined;
@@ -2908,7 +3016,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : "";
   const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
   const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
+  const modelDetail = engine === "gpt" && entry.model ? `  model=${entry.model}` : "";
+  const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd) {
@@ -4544,7 +4654,23 @@ async function killCommand(argv: string[]) {
     if (job) { await killJob(lane, job, note); return; }
   }
   const entry = readLane(lane);
+  requireOwnChild(lane, entry);
   if (!laneRunning(entry)) fail(`lane "${lane}" is not running (latest ${entry.kind} state ${roundStateOf(entry)})`);
+  await killLane(lane, entry, note);
+  if (entry.supervisor) await killChildren(lane, note);
+}
+
+// Killing a supervisor takes its running children with it; nothing else
+// would ever collect them.
+async function killChildren(supervisor: string, note?: string) {
+  const children = Object.entries(readLedger()).filter(([, item]) => item.parent === supervisor && laneRunning(item));
+  for (const [child, item] of children) {
+    console.log(`cdx: lane=${color.magenta(child)} is a child of ${supervisor}; stopping it too`);
+    await killLane(child, item, note ? `${note} (supervisor ${supervisor} killed)` : `supervisor ${supervisor} killed`);
+  }
+}
+
+async function killLane(lane: string, entry: Lane, note?: string) {
   const runnerAlive = pidAlive(entry.pid);
   if (!runnerAlive && !pidAlive(entry.codexPid)) {
     fail(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
@@ -4782,16 +4908,20 @@ async function killJob(name: string, job: Job, note?: string): Promise<void> {
 }
 
 const USAGE = `cdx tracks Codex and Gemini execution lanes
-cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
+cdx policy: model ${config.model}${modelAliases() ? ` (aliases ${modelAliases()})` : ""}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
 Engines:
 ${ENGINE_PICKER}
 
-  spawn  <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
+  spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
   resume <lane> [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
-  fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
-  review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
-  adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd D]
+  fork   <newLane> <fromLane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
+  review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
+  adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
+
+  --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
+  --supervisor (gpt only) lets the lane spawn, review, resume, kill, and close gemini
+  children through cdx, one level deep; killing the supervisor kills its children.
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
   ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
@@ -4823,6 +4953,9 @@ const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "fork", "review", "adopt",
   "kill", "close", "clean", "gate", "reply", "job",
 ]);
+// A supervisor drives its gemini children with these; the commands themselves
+// enforce gemini-only children and the parent relation.
+const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "kill", "close", "gate", "reply"]);
 
 const [command, ...argv] = process.argv.slice(2);
 try {
@@ -4846,7 +4979,11 @@ export {
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
-    fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the head`);
+    const supervisor = supervisorLane();
+    if (supervisor && !SUPERVISOR_COMMANDS.has(command)) {
+      fail(`supervisor ${supervisor} may run ${[...SUPERVISOR_COMMANDS].join(", ")} on its children; command "${command}" refused`);
+    }
+    if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the head`);
   }
 switch (command) {
   case "spawn": await spawnCommand(argv); break;
@@ -4866,8 +5003,9 @@ switch (command) {
     process.exit(await runRound(lane, Number(round)));
   }
   case "adopt": {
-    const parsed = parseArgs(argv, ["engine", "cd", "account"]);
+    const parsed = parseArgs(argv, ["engine", "cd", "account", "model"]);
     const engine = engineOf(parsed, "adopt");
+    const model = modelOf(parsed, engine);
     const [lane, sessionId] = parsed.rest;
     if (!lane || !sessionId) fail("usage: cdx adopt <lane> <sessionId> [--engine gpt|gemini] [--cd <dir>]");
     validLane(lane);
@@ -4879,6 +5017,7 @@ switch (command) {
     withLedger((ledger) => {
       ledger[lane] = {
         engine,
+        ...(model ? { model } : {}),
         ...(account ? { account: account.name, codexHome: account.home } : {}),
         ...owner,
         sessionId, workSessionId: sessionId, cwd: parsed.flags.cd ?? process.cwd(), workCwd: parsed.flags.cd ?? process.cwd(), effort: engine === "gemini" ? "high" : config.defaultEffort,
@@ -4977,6 +5116,7 @@ switch (command) {
     const [lane, note] = parsed.rest;
     if (!lane) fail('usage: cdx close <lane> [--remove-worktree] ["note"]');
     const entry = readLane(lane);
+    requireOwnChild(lane, entry);
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
     withLedger((ledger) => {
       const item = ledger[lane]!;

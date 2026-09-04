@@ -23,7 +23,8 @@ gpt:
 - slow (20-30 min lanes), scarce weekly budget, burns fast
 gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
 gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
-gpt: one big brief for sweeping multi-file work.
+gpt: one big brief for sweeping multi-file work; --model picks the Codex model (alias or id).
+gpt --supervisor: one lane that plans, spawns gemini children through cdx, verifies, and reports.
 ```
 
 The Claude head plans, briefs, reviews, and merges. GPT through Codex is level
@@ -31,6 +32,23 @@ one for the hardest implementation and design work. Gemini 3.8 Flash high
 through Antigravity is level two for bounded investigation, review, tests, and
 small builds. Gemini always uses `gemini-3.8-flash-high`. Its effort is not
 configurable.
+
+`--model M` on a gpt lane picks the Codex model: an alias from `models` in
+`config.json` (for example `astra` for `gpt-6-astra`) or a raw model id. The
+default is the top-level `model`. A lane keeps its model across resume, fork,
+and review.
+
+### Supervisor lanes
+
+`cdx spawn <lane> --engine gpt --model astra --supervisor "<brief>"` starts a
+lane that may drive gemini children through cdx. Inside it, `cdx spawn`,
+`resume`, `review`, `kill`, `close`, `gate`, and `reply` work against its own
+children; `fork`, `adopt`, `clean`, and `job` stay refused. Children are gemini
+only, cannot delegate further, and carry `parent=<supervisor>` in status. Their
+feed lines go to the supervisor's owner session. `cdx kill <supervisor>` also
+kills its running children. Use a supervisor when one Astra lane should own a
+multi-part change end to end: it plans, briefs the bounded parts to gemini,
+waits, verifies, and reports; the head still reviews and merges.
 
 ### Gemini operating rules
 
@@ -47,18 +65,18 @@ configurable.
 ## Commands
 
 ```bash
-cdx spawn  <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
+cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <f>] [--image <f>]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
 cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime <min>] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
-cdx fork   <newLane> <fromLane|sessionId> [--account NAME] [--effort E] [--bg] "<brief>"
+cdx fork   <newLane> <fromLane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
 cdx send   <lane> "<text>"
 cdx ask    [--timeout MIN] "<question>"
 cdx reply  <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
-cdx review <lane> [--engine gpt|gemini] [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
-cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--account NAME] [--cd <dir>]
+cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
+cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
 cdx wait   <lane|job>... [--timeout <sec>] [--json] [--report]
@@ -278,6 +296,10 @@ message for this session. Treat every other target as information only.
   sessions can see each other's workers.
 - Use `cdx resume` to continue a lane. Use `cdx fork` when two lanes should
   start with the same session context.
+- For a multi-part change one model should own end to end, spawn a supervisor
+  (`--engine gpt --model astra --supervisor`) and let it fan out gemini children
+  itself. Watch its children in `cdx status` by `parent=`; kill the supervisor
+  to stop the whole tree.
 - Use `cdx kill <lane> ["note"]` to stop a lane that is running down a wrong
   path instead of waiting it out.
 - Close finished lanes with an outcome note. `close --remove-worktree` also
@@ -312,8 +334,9 @@ cdx stores state under `$CDX_HOME`, which defaults to `~/.cdx`. The optional
 
 ```json
 {
-  "model": "gpt-5.6-sol",
-  "efforts": ["low", "medium", "high"],
+  "model": "gpt-6-astra",
+  "models": { "astra": "gpt-6-astra", "sol": "gpt-5.6-sol" },
+  "efforts": ["low", "medium", "high", "xhigh"],
   "defaultEffort": "medium",
   "rules": [],
   "worktreeSetup": "bun install",
@@ -331,9 +354,11 @@ worktree in place for inspection. A repository may ship an executable
 `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global
 `worktreeSetup` command and fails the spawn on nonzero exit.
 
-Existing top-level model and effort keys configure GPT. The optional `gemini`
-object accepts only `model`, `agent`, and `reviewAgent`; the shown values are
-its defaults. Gemini always runs the configured model at high reasoning and
+Existing top-level model and effort keys configure GPT. `models` is an optional
+map of alias to Codex model id for `--model`; aliases are lowercase letters,
+digits, and dashes. Without it `--model` still accepts a raw id. The optional
+`gemini` object accepts only `model`, `agent`, and `reviewAgent`; the shown
+values are its defaults. Gemini always runs the configured model at high reasoning and
 records effort `high`. cdx ignores a Gemini `--effort` flag with a note. A
 malformed config fails with a message that names the config file.
 
