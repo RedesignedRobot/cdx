@@ -55,6 +55,9 @@ if (args[0] === "--version") { console.log("codex-cli 0.149.1"); process.exit(0)
 if (args[0] === "login" && args[1] === "status") { console.log("Logged in using ChatGPT"); process.exit(0); }
 if (args[0] !== "app-server") {
   if (process.env.FAKE_ENV_TRACE) appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
+  if (process.env.FAKE_ARGS_TRACE) appendFileSync(process.env.FAKE_ARGS_TRACE, args.join(" ") + "\\n");
+  const lastMessage = args.indexOf("--output-last-message");
+  if (lastMessage >= 0) writeFileSync(args[lastMessage + 1], "fake exec report\\n");
   process.exit(0);
 }
 let buffer = "";
@@ -900,7 +903,7 @@ describe("cdx messaging", () => {
     expect(runCli(["spawn", "review-pinned", "--engine", "gpt", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
 
     writeFileSync(envTrace, "");
-    expect(runCli(["review", "review-pinned", "--engine", "gpt", "review this"], env).exitCode).toBe(1);
+    expect(runCli(["review", "review-pinned", "--engine", "gpt", "review this"], env).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["review-pinned"];
     expect(lane.account).toBe("codex-2");
@@ -3039,6 +3042,37 @@ describe("cdx models and supervisors", () => {
     expect(grandchild.exitCode).toBe(1);
     expect(grandchild.stderr).toContain("lane workers cannot drive the harness");
   }, 30_000);
+
+  test("consult runs a read-only gpt lane with the advisor frame and resumes read-only", () => {
+    const root = tempPath("consult");
+    const state = `${root}/state`;
+    const trace = `${root}/args.trace`;
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ARGS_TRACE: trace };
+    const result = runCli(["consult", "advisor", "--model", "gpt-6-astra", "--cd", root, "Should the ledger move to sqlite?"], env);
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).not.toContain("engine gemini (default)");
+    const brief = readFileSync(`${state}/briefs/advisor-r1.md`, "utf8");
+    expect(brief).toContain("CONSULT. You advise the head");
+    expect(brief).toContain("READ-ONLY: change nothing in the tree");
+    expect(brief).not.toContain("ADVERSARIAL REVIEW");
+    const args = readFileSync(trace, "utf8");
+    expect(args).toContain("exec");
+    expect(args).toContain("read-only");
+    expect(args).toContain("gpt-6-astra");
+    expect(readFileSync(`${state}/reports/advisor-r1.md`, "utf8")).toContain("fake exec report");
+    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).advisor;
+    expect(lane.kind).toBe("review");
+    expect(lane.consult).toBe(true);
+    expect(lane.model).toBe("gpt-6-astra");
+    expect(runCli(["status"], env).stdout).toContain("consult ");
+
+    const gemini = runCli(["consult", "advisor2", "--engine", "gemini", "--cd", root, "why"], env);
+    expect(gemini.exitCode).toBe(1);
+    expect(gemini.stderr).toContain("--engine is not valid for this command");
+    const inside = runCli(["consult", "advisor3", "--cd", root, "why"], { ...env, CDX_LANE: "worker" });
+    expect(inside.exitCode).toBe(1);
+    expect(inside.stderr).toContain('command "consult" refused inside lane worker');
+  }, 15_000);
 
   test("killing a supervisor kills its running children", async () => {
     const root = tempPath("supervisor-kill");

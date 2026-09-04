@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.5.0";
+const VERSION = "3.6.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -184,6 +184,8 @@ interface Lane {
   supervisor?: true;
   // Name of the supervisor lane that spawned this one.
   parent?: string;
+  // A read-only advisory lane; resume continues the conversation read-only.
+  consult?: true;
   account?: string;
   codexHome?: string;
   ownerSession?: string;
@@ -762,6 +764,8 @@ function reviewFrame(engine: Engine): string {
   return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
 }
 
+const CONSULT_FRAME = "CONSULT. You advise the head, a Claude session that answers to the owner. Read the tree before you answer. Give one ranked recommendation with the alternatives you rejected and why, cite file paths and mechanisms as evidence, name numbers where they exist, and push back where the question's premise is wrong. Read-only: change nothing. End with a short list titled Decisions for the head.";
+
 // ---------------------------------------------------------------------------
 // Flag parsing
 // ---------------------------------------------------------------------------
@@ -1157,7 +1161,7 @@ function removeWorktree(entry: Lane) {
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; supervisor?: true; parent?: string }): { round: number; sessionId?: string } {
+function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; supervisor?: true; parent?: string; consult?: true }): { round: number; sessionId?: string } {
   const now = new Date().toISOString();
   return withLedger((ledger) => {
     const existing = ledger[lane];
@@ -1184,9 +1188,10 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       // still reattaches to the right runtime.
       engine: roundEngineType,
       reviewEngine: kind === "review" ? opts?.engine ?? laneEngine(existing) : existing?.reviewEngine,
-      model: kind === "work" && roundEngineType === "gpt" ? opts?.model ?? existing?.model : existing?.model,
+      model: roundEngineType === "gpt" ? opts?.model ?? existing?.model : existing?.model,
       supervisor: opts?.supervisor ?? existing?.supervisor,
       parent: opts?.parent ?? existing?.parent,
+      consult: opts?.consult ?? existing?.consult,
       ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
       account,
       codexHome,
@@ -2894,13 +2899,24 @@ async function forkCommand(argv: string[]) {
   return launch({ engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
-async function reviewCommand(argv: string[]) {
+// consult: a read-only gpt lane framed as an advisor rather than a hostile
+// reviewer. It shares the exec review path (read-only sandbox, report as the
+// last message) and resumes read-only for follow-up questions.
+async function consultCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["model", "effort", "cd", "bg", "account"]);
+  const [lane, questionArg] = parsed.rest;
+  if (!lane || !questionArg) fail('usage: cdx consult <lane> [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"');
+  return reviewCommand(["--engine", "gpt", ...argv], { consult: true });
+}
+
+async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const intent = await resolveBrief(intentArg);
   if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
   validLane(lane);
+  if (opts.consult && engine !== "gpt") fail("consult runs on gpt only");
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
@@ -2961,12 +2977,13 @@ async function reviewCommand(argv: string[]) {
   }
 
   const owner = callerOwnership();
-  const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
+  const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent, ...(opts.consult ? { consult: true as const } : {}) });
   if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
     : "";
-  const fullBrief = [reviewFrame(engine) + scope, `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${intent}`].join("\n\n");
+  const frame = opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope;
+  const fullBrief = [frame, `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${intent}`].join("\n\n");
   // Reviews are read-only: enforce it with the sandbox, not just the prompt.
   const codexArgs = engine === "gpt" ? [
     "exec", "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
@@ -3050,8 +3067,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
       : `finished ${fmtAge(entry.reviewUpdatedAt)} ago`;
     const reviewLast = entry.reviewState === "running" ? entry.lastAction ?? "-"
       : [entry.reviewNote, entry.reviewReport ? `report ${displayPath(entry.reviewReport)}` : undefined].filter(Boolean).join(" · ") || "-";
-    lines.push(line("review", `${coloredState(reviewState)}${entry.reviewRound ? ` r${entry.reviewRound}` : ""} · cwd ${displayPath(entry.reviewCwd ?? workCwdOf(entry))} · ${reviewTiming}`));
-    lines.push(line("review last", reviewLast));
+    const label = entry.consult ? "consult" : "review";
+    lines.push(line(label, `${coloredState(reviewState)}${entry.reviewRound ? ` r${entry.reviewRound}` : ""} · cwd ${displayPath(entry.reviewCwd ?? workCwdOf(entry))} · ${reviewTiming}`));
+    lines.push(line(`${label} last`, reviewLast));
   }
   return lines.join("\n");
 }
@@ -4917,6 +4935,7 @@ ${ENGINE_PICKER}
   resume <lane> [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
+  consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only gpt advisor; resume for follow-ups
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
@@ -4950,7 +4969,7 @@ to do the same in a non-worktree spawn. A baseline failure is gate-invalid.
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "fork", "review", "adopt",
+  "spawn", "resume", "fork", "review", "consult", "adopt",
   "kill", "close", "clean", "gate", "reply", "job",
 ]);
 // A supervisor drives its gemini children with these; the commands themselves
@@ -4988,6 +5007,7 @@ async function dispatch(command: string | undefined, argv: string[]) {
 switch (command) {
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
+  case "consult": await consultCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "fork": await forkCommand(argv); break;
   case "send": sendCommand(argv); break;

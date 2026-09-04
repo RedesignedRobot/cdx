@@ -38,6 +38,35 @@ configurable.
 default is the top-level `model`. A lane keeps its model across resume, fork,
 and review.
 
+### The execution loop
+
+Three tiers, one direction of authority: the owner talks to the head (the
+Claude session); the head consults Astra and hands it whole problems; Astra
+delegates bounded parts to Gemini through cdx and verifies them; the head
+reviews and merges. No worktree fan-outs from the head, no rinse and repeat.
+
+1. Consult before building. `cdx consult <lane> --model astra "<question>"`
+   runs Astra read-only against the tree with an advisor frame: one ranked
+   recommendation, rejected alternatives, evidence, pushback, and a closing
+   "Decisions for the head" list. `cdx resume <lane> "<follow-up>"` continues
+   the same conversation read-only. Use it for design questions, audits of
+   cdx or the project, and second opinions on a plan.
+2. Hand Astra the whole change. `cdx spawn <lane> --engine gpt --model astra
+   --supervisor --bg "<brief>"`. Astra briefs the bounded parts to Gemini
+   children, waits, verifies each report against the gate, and reports once.
+   Its `cdx ask` questions reach the head through the feed; answer with
+   `cdx reply`.
+3. Bounded work goes straight to Gemini. When the head already knows exactly
+   what to do, `cdx spawn <lane> --bg --gate "<cmd>" "<brief>"` with no
+   Astra in the loop.
+4. The head reads reports, runs the wall, runs one hostile review (`cdx review
+   --engine gemini` with attack items, or Astra for a design-heavy change),
+   and merges. Nothing lands without the head's review.
+
+Astra's allowance is about a quarter of GPT-5.6's, so the default effort is
+medium; raise to high or xhigh only for a supervisor lane that owns a large
+change.
+
 ### Supervisor lanes
 
 `cdx spawn <lane> --engine gpt --model astra --supervisor "<brief>"` starts a
@@ -76,6 +105,7 @@ cdx questions [lane]
 cdx msg    <lane|session-prefix> "<text>"
 cdx inbox  [-n N]
 cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd <dir>] [--bg] [--uncommitted | --base <b> | --commit <sha>] [--scope "<files>"] ["<intent>"]
+cdx consult <lane> [--model M] [--account NAME] [--effort E] [--cd <dir>] [--bg] "<question>"
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd <dir>]
 cdx status [--all] [--json]
 cdx usage  [--json]
@@ -296,6 +326,8 @@ message for this session. Treat every other target as information only.
   sessions can see each other's workers.
 - Use `cdx resume` to continue a lane. Use `cdx fork` when two lanes should
   start with the same session context.
+- For a design question or an audit, `cdx consult <lane> --model astra "<question>"`
+  (read-only, advisor frame) and `cdx resume <lane>` for follow-ups.
 - For a multi-part change one model should own end to end, spawn a supervisor
   (`--engine gpt --model astra --supervisor`) and let it fan out gemini children
   itself. Watch its children in `cdx status` by `parent=`; kill the supervisor
