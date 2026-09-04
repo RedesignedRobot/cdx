@@ -57,7 +57,7 @@ import { isatty } from "node:tty";
 import { join, relative } from "node:path";
 
 const HOME = process.env.HOME ?? "";
-const ROOT = (process.argv[2] === "_run" ? process.env.CDX_STATE_HOME : undefined)
+const ROOT = (process.argv[2] === "_run" || process.argv[2] === "_job" ? process.env.CDX_STATE_HOME : undefined)
   || process.env.CDX_HOME || `${HOME}/.cdx`;
 const LEDGER = `${ROOT}/ledger.json`;
 const CONFIG_PATH = `${ROOT}/config.json`;
@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.3.0";
+const VERSION = "3.4.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -430,7 +430,12 @@ function readLedger(): Ledger {
 }
 
 function withLedger<T>(mutate: (ledger: Ledger) => T): T {
-  const lock = `${ROOT}/.lock`;
+  return withLockedJson(LEDGER, `${ROOT}/.lock`, readLedger, mutate);
+}
+
+// Read-mutate-write one JSON state file under a mkdir lock, written through a
+// temp file so a reader never sees a torn document.
+function withLockedJson<S, T>(path: string, lock: string, read: () => S, mutate: (state: S) => T): T {
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
@@ -441,16 +446,16 @@ function withLedger<T>(mutate: (ledger: Ledger) => T): T {
       try {
         if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
       } catch { /* raced */ }
-      if (Date.now() > deadline) throw new CmdError("ledger lock timeout");
+      if (Date.now() > deadline) throw new CmdError(`${relative(ROOT, path)} lock timeout`);
       Bun.sleepSync(50);
     }
   }
   try {
-    const ledger = readLedger();
-    const result = mutate(ledger);
-    const tmp = `${LEDGER}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(ledger, null, 2));
-    renameSync(tmp, LEDGER);
+    const state = read();
+    const result = mutate(state);
+    const tmp = `${path}.tmp.${process.pid}`;
+    writeFileSync(tmp, JSON.stringify(state, null, 2));
+    renameSync(tmp, path);
     return result;
   } finally {
     try { rmdirSync(lock); } catch { /* broken by a peer */ }
@@ -2956,7 +2961,7 @@ function statusCommand(argv: string[]) {
   if (quotaState.block) {
     console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
   }
-  if (all.length === 0) { console.log("cdx: no lanes"); return; }
+  if (all.length === 0) { console.log("cdx: no lanes"); printRunningJobs(); return; }
   // Running lanes first (most recent activity on top), then finished ones
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
@@ -2967,18 +2972,24 @@ function statusCommand(argv: string[]) {
   const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
   console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
   if (hidden > 0) console.log(`\n${color.dim(`… ${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`)}`);
+  printRunningJobs();
 }
 
 async function waitCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["timeout", "json", "report"]);
   const json = parsed.bools.has("json");
   const showReport = parsed.bools.has("report");
-  const lanes = parsed.rest;
-  if (lanes.length === 0) fail("usage: cdx wait <lane>... [--timeout <sec>] [--json] [--report]");
-  for (const lane of lanes) readLane(lane);
+  const names = parsed.rest;
+  if (names.length === 0) fail("usage: cdx wait <lane|job>... [--timeout <sec>] [--json] [--report]");
+  const knownLanes = readLedger();
+  const knownJobs = readJobs();
+  const lanes = names.filter((name) => knownLanes[name]);
+  const jobNames = names.filter((name) => !knownLanes[name]);
+  for (const name of jobNames) if (!knownJobs[name]) fail(`"${name}" is neither a lane in ${LEDGER} nor a job in ${JOBS}`);
   const timeoutMs = Number(parsed.flags.timeout ?? 7200) * 1000;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
+  const pendingJobs = new Set(jobNames);
   const reportTextOf = (entry: Lane): string | undefined => {
     const path = roundReportOf(entry);
     try { return path ? readFileSync(path, "utf8") : undefined; } catch { return undefined; }
@@ -2992,7 +3003,7 @@ async function waitCommand(argv: string[]) {
     ...(error ? { error } : {}),
   }));
   let failed = false;
-  while (pending.size > 0) {
+  while (pending.size > 0 || pendingJobs.size > 0) {
     const ledger = readLedger();
     for (const lane of [...pending]) {
       const entry = ledger[lane]!;
@@ -3018,8 +3029,18 @@ async function waitCommand(argv: string[]) {
       }
       pending.delete(lane);
     }
-    if (pending.size === 0) break;
-    if (Date.now() > deadline) fail(`timeout waiting for: ${[...pending].join(", ")}`);
+    if (pendingJobs.size > 0) {
+      for (const name of [...pendingJobs]) {
+        const job = settledJob(name);
+        if (!job) continue;
+        if (json) console.log(JSON.stringify({ job: name, state: job.state, exitCode: job.exitCode ?? null, log: job.log, note: job.note ?? null, cwd: job.cwd, cmd: job.cmd }));
+        else console.log(`cdx: ${renderJobLine(name, job)}`);
+        if (job.state === "failed") failed = true;
+        pendingJobs.delete(name);
+      }
+    }
+    if (pending.size === 0 && pendingJobs.size === 0) break;
+    if (Date.now() > deadline) fail(`timeout waiting for: ${[...pending, ...pendingJobs].join(", ")}`);
     await Bun.sleep(5000);
   }
   process.exit(failed ? 1 : 0);
@@ -4468,6 +4489,7 @@ function briefCommand() {
   const failed = entries.filter(([, entry]) => !laneRunning(entry) && (entry.state === "failed" || entry.state === "gate-invalid" || entry.reviewState === "failed")).sort(byRecency);
   const lanes = [...running, ...failed];
   if (lanes.length > 0) console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
+  printRunningJobs();
 }
 
 // Replay recent feed lines: what completed, stalled, or warned while the
@@ -4516,7 +4538,11 @@ function cleanCommand(argv: string[]) {
 // force path: SIGKILL what remains and finalize the ledger here.
 async function killCommand(argv: string[]) {
   const [lane, note] = argv;
-  if (!lane) fail('usage: cdx kill <lane> ["note"]');
+  if (!lane) fail('usage: cdx kill <lane|job> ["note"]');
+  if (!readLedger()[lane]) {
+    const job = readJobs()[lane];
+    if (job) { await killJob(lane, job, note); return; }
+  }
   const entry = readLane(lane);
   if (!laneRunning(entry)) fail(`lane "${lane}" is not running (latest ${entry.kind} state ${roundStateOf(entry)})`);
   const runnerAlive = pidAlive(entry.pid);
@@ -4560,6 +4586,201 @@ async function killCommand(argv: string[]) {
   console.log(`cdx: lane=${color.magenta(lane)} killed; ${finalized.kind} state=${coloredState("failed")} note=${roundNoteOf(finalized)}`);
 }
 
+// ---------------------------------------------------------------------------
+// Jobs: background shell commands the head runs beside lanes (a wall, a
+// deploy chain, a long gate). No engine, no brief, no report: one log, one
+// exit code, and one feed line the plugin monitor delivers when the job ends,
+// so the head never polls a summary file from a sleep loop.
+
+type JobState = "running" | "done" | "failed";
+interface Job {
+  cmd: string;
+  cwd: string;
+  exitCode?: number;
+  finishedAt?: string;
+  log: string;
+  note?: string;
+  ownerSession?: string;
+  pid?: number;
+  startedAt: string;
+  state: JobState;
+}
+type Jobs = Record<string, Job>;
+const JOBS = `${ROOT}/jobs.json`;
+const JOB_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGKILL: 137, SIGTERM: 143 };
+
+function readJobs(): Jobs {
+  if (!existsSync(JOBS)) return {};
+  return JSON.parse(readFileSync(JOBS, "utf8")) as Jobs;
+}
+
+function withJobs<T>(mutate: (jobs: Jobs) => T): T {
+  return withLockedJson(JOBS, `${ROOT}/.jobs.lock`, readJobs, mutate);
+}
+
+function jobRunning(job: Job): boolean {
+  return job.state === "running";
+}
+
+function jobDuration(job: Job): string {
+  const end = job.finishedAt ? Date.parse(job.finishedAt) : Date.now();
+  const seconds = Math.max(0, Math.round((end - Date.parse(job.startedAt)) / 1000));
+  return seconds >= 60 ? `${Math.floor(seconds / 60)}m${seconds % 60}s` : `${seconds}s`;
+}
+
+function renderJobLine(name: string, job: Job): string {
+  const state = jobRunning(job) && !pidAlive(job.pid) ? "running(dead?)" : job.state;
+  const exit = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
+  const note = job.note ? ` note=${job.note}` : "";
+  return `job=${color.magenta(name)} state=${coloredState(state)}${exit} ${jobDuration(job)} log=${job.log}${note}`;
+}
+
+// A running job whose runner died never finalized itself; record that here so
+// wait and status stop showing it as live.
+function settledJob(name: string): Job | undefined {
+  const job = readJobs()[name];
+  if (!job) return undefined;
+  if (!jobRunning(job)) return job;
+  if (pidAlive(job.pid)) return undefined;
+  return withJobs((jobs) => {
+    const entry = jobs[name]!;
+    if (jobRunning(entry)) {
+      entry.state = "failed";
+      entry.note = "runner died without finalizing";
+      entry.finishedAt = new Date().toISOString();
+    }
+    return entry;
+  });
+}
+
+function printRunningJobs(): void {
+  const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
+  if (running.length === 0) return;
+  console.log(`\njobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`);
+}
+
+function listJobs(): void {
+  const entries = Object.entries(readJobs());
+  if (entries.length === 0) { console.log("cdx: no jobs"); return; }
+  const byRecency = (a: [string, Job], b: [string, Job]) => Date.parse(b[1].startedAt) - Date.parse(a[1].startedAt);
+  const running = entries.filter(([, job]) => jobRunning(job)).sort(byRecency);
+  const finished = entries.filter(([, job]) => !jobRunning(job)).sort(byRecency).slice(0, FINISHED_SHOWN);
+  for (const [name, job] of [...running, ...finished]) console.log(renderJobLine(name, job));
+}
+
+async function jobCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["cd"]);
+  const [name, ...rest] = parsed.rest;
+  if (!name) { listJobs(); return; }
+  if (!JOB_NAME.test(name)) fail(`job name "${name}" must match ${JOB_NAME.source}`);
+  if (readLedger()[name]) fail(`"${name}" is a lane; pick another job name`);
+  let cmd = rest.join(" ");
+  if (cmd === "-") cmd = await Bun.stdin.text();
+  cmd = cmd.trim();
+  if (!cmd) fail('usage: cdx job <name> [--cd <dir>] "<cmd>"   (a "-" command reads stdin; no arguments lists jobs)');
+  const cwd = parsed.flags.cd ?? process.cwd();
+  if (!existsSync(cwd)) fail(`--cd ${cwd} does not exist`);
+  const existing = readJobs()[name];
+  if (existing && jobRunning(existing) && pidAlive(existing.pid)) {
+    fail(`job "${name}" is still running (pid ${existing.pid}); cdx kill ${name} first or pick another name`);
+  }
+  mkdirSync(`${ROOT}/logs`, { recursive: true });
+  const log = `${ROOT}/logs/job-${name}.log`;
+  const startedAt = new Date().toISOString();
+  writeFileSync(log, `# cdx job ${name}\n# cwd ${cwd}\n# cmd ${cmd}\n# started ${startedAt}\n`);
+  const ownerSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  withJobs((jobs) => {
+    jobs[name] = { cmd, cwd, log, startedAt, state: "running", ...(ownerSession ? { ownerSession } : {}) };
+  });
+  const runnerLog = openSync(`${ROOT}/logs/job-${name}.runner.log`, "a");
+  const child = nodeSpawn(process.execPath, [SELF, "_job", name], {
+    detached: true,
+    env: { ...uncoloredChildEnv(undefined, ROOT), CDX_JOB_CMD: cmd, CDX_JOB_CWD: cwd, ...(ownerSession ? { CDX_JOB_OWNER: ownerSession } : {}) },
+    stdio: ["ignore", runnerLog, runnerLog],
+  });
+  child.unref();
+  withJobs((jobs) => { jobs[name]!.pid = child.pid; });
+  console.log(`cdx: job=${color.magenta(name)} pid=${child.pid} cwd=${cwd}`);
+  console.log(`cdx: log=${log}; a feed line arrives on exit; cdx wait ${color.magenta(name)} blocks until then`);
+  process.exit(0);
+}
+
+async function runJob(name: string): Promise<number> {
+  const cmd = process.env.CDX_JOB_CMD;
+  const cwd = process.env.CDX_JOB_CWD;
+  if (!cmd || !cwd) fail("internal: _job needs CDX_JOB_CMD and CDX_JOB_CWD");
+  const job = readJobs()[name];
+  if (!job) fail(`internal: job "${name}" is missing from ${JOBS}`);
+  const log = openSync(job.log, "a");
+  const env = { ...process.env };
+  for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
+  const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", log, log] });
+  let signal: string | undefined;
+  const forward = (sig: NodeJS.Signals) => {
+    signal = sig;
+    try { child.kill(sig); } catch { /* already gone */ }
+  };
+  process.on("SIGTERM", () => forward("SIGTERM"));
+  process.on("SIGINT", () => forward("SIGINT"));
+  const exitCode = await new Promise<number>((resolve) => {
+    child.on("exit", (code, sig) => resolve(code ?? (sig ? SIGNAL_EXIT_CODES[sig] ?? 1 : 1)));
+    child.on("error", () => resolve(1));
+  });
+  closeSync(log);
+  const state: JobState = exitCode === 0 ? "done" : "failed";
+  const note = signal ? `terminated by ${signal}` : undefined;
+  const finished = withJobs((jobs) => {
+    const entry = jobs[name]!;
+    entry.exitCode = exitCode;
+    entry.finishedAt = new Date().toISOString();
+    entry.state = state;
+    if (note) entry.note = note;
+    return entry;
+  });
+  feedOwned(`[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(finished)} log=${finished.log}${note ? ` note=${note}` : ""}`, process.env.CDX_JOB_OWNER);
+  return exitCode;
+}
+
+async function killJob(name: string, job: Job, note?: string): Promise<void> {
+  if (!jobRunning(job)) fail(`job "${name}" is not running (state ${job.state})`);
+  const finalize = (exitCode: number, why: string): Job => withJobs((jobs) => {
+    const entry = jobs[name]!;
+    if (jobRunning(entry)) {
+      entry.exitCode = exitCode;
+      entry.finishedAt = new Date().toISOString();
+      entry.state = "failed";
+      entry.note = why;
+    }
+    return entry;
+  });
+  if (!pidAlive(job.pid)) {
+    const finished = finalize(1, note ?? "runner died without finalizing");
+    console.log(`cdx: ${renderJobLine(name, finished)}`);
+    return;
+  }
+  // The runner is a session leader (detached), so its pid names the process
+  // group: one signal reaches the shell and everything it started.
+  const signalGroup = (sig: NodeJS.Signals) => {
+    try { process.kill(-job.pid!, sig); } catch { try { process.kill(job.pid!, sig); } catch { /* gone */ } }
+  };
+  signalGroup("SIGTERM");
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const current = readJobs()[name];
+    if (current && !jobRunning(current)) {
+      const finished = note ? withJobs((jobs) => { jobs[name]!.note = note; return jobs[name]!; }) : current;
+      console.log(`cdx: ${renderJobLine(name, finished)}`);
+      return;
+    }
+    await Bun.sleep(200);
+  }
+  signalGroup("SIGKILL");
+  const finished = finalize(137, note ?? "killed");
+  feedOwned(`[cdx] job=${name} state=failed exit=137 in=${jobDuration(finished)} log=${finished.log} note=${finished.note}`, finished.ownerSession);
+  console.log(`cdx: ${renderJobLine(name, finished)}`);
+}
+
 const USAGE = `cdx tracks Codex and Gemini execution lanes
 cdx policy: model ${config.model}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
@@ -4583,6 +4804,8 @@ ${ENGINE_PICKER}
   gate   <lane> "<cmd>" | gate <lane> --clear
   kill   <lane> ["note"]  # SIGTERM the runner; force-finalize if it hangs
   close  <lane> [--remove-worktree] ["note"]       clean [--days N]
+  job    <name> [--cd D] "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
+  job                     # list jobs
   doctor [--fix] [--probe]
   brief                   # running/failed lanes only; silent when all settled
 
@@ -4598,7 +4821,7 @@ to do the same in a non-worktree spawn. A baseline failure is gate-invalid.
 
 const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "fork", "review", "adopt",
-  "kill", "close", "clean", "gate", "reply",
+  "kill", "close", "clean", "gate", "reply", "job",
 ]);
 
 const [command, ...argv] = process.argv.slice(2);
@@ -4667,6 +4890,11 @@ switch (command) {
     break;
   }
   case "status": statusCommand(argv); break;
+  case "job": await jobCommand(argv); break;
+  case "_job": {
+    if (!argv[0]) fail("internal: _job <name>");
+    process.exit(await runJob(argv[0]));
+  }
   case "gate": gateCommand(argv); break;
   case "usage": await usageCommand(argv); break;
   case "wait": await waitCommand(argv); break;

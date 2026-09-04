@@ -131,7 +131,8 @@ flowchart LR
 | `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
 | `cdx status` | Show lane state, timing, tokens, steer count, open question, and last activity |
 | `cdx usage` | Codex account limits, Gemini limits, and all-time ledger totals |
-| `cdx wait <lane>...` | Block until lanes finish; exit 1 if any failed; `--report` prints the reports too |
+| `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
+| `cdx job <name> "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
 | `cdx feed` | Replay recent completion and stall lines from the feed |
 | `cdx report <lane>` | Print a lane's final report |
