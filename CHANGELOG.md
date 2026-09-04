@@ -1,3 +1,7 @@
+## 3.7.1
+
+- Astra prompts opened up, per the owner's ruling that Astra is the head's copilot and must never be boxed: the consult frame grants full freedom to challenge the premise, scope, and head, and drops its format rules; gpt workers and supervisors get a challenge rule (the brief is the head's best understanding, not an order; disagree through `cdx ask` and in the report). Every Astra frame (consult, supervisor, gpt worker, gpt review) carries the owner's standard: world class as Apple, OpenAI, Anthropic, Vercel, and Cloudflare build, tear down legacy patterns, delete test bloat, code bloat, and AI slop. Gemini's contract stays strict. SKILL.md states the peer relationship.
+
 ## 3.7.0
 
 Shipped after GPT-6 Astra audited cdx 3.6.0 through `cdx consult` and reproduced nine defects in supervisor mode.
