@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.8.0";
+const VERSION = "3.9.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -5047,13 +5047,37 @@ function viewJSON(value: unknown): string {
   return JSON.stringify(value, (_key, item) => typeof item === "string" ? redactViewText(item) : item);
 }
 
+function viewStatusGroup(state: string): "running" | "done" | "failed" | "other" {
+  if (state === "running" || state === "done") return state;
+  return state === "failed" || state === "gate-invalid" ? "failed" : "other";
+}
+
+function viewActivityOrder(a: { statusGroup: string; lastActivityAt: string }, b: { statusGroup: string; lastActivityAt: string }) {
+  return Number(b.statusGroup === "running") - Number(a.statusGroup === "running")
+    || Date.parse(b.lastActivityAt) - Date.parse(a.lastActivityAt);
+}
+
+function viewLaneSummary(name: string, entry: Lane) {
+  const startedAt = entry.roundStartedAt ?? entry.createdAt;
+  const statusGroup = viewStatusGroup(activeStateOf(entry));
+  const lastActivityAt = [startedAt, entry.updatedAt, entry.lastEventAt, entry.reviewUpdatedAt]
+    .filter((value): value is string => Boolean(value)).sort((a, b) => Date.parse(b) - Date.parse(a))[0]!;
+  return { ...entry, name, engine: roundEngine(entry), startedAt, lastActivityAt, statusGroup,
+    model: roundEngine(entry) === laneEngine(entry) ? entry.model : undefined,
+    stalled: statusGroup === "running" && Date.now() - Date.parse(entry.lastEventAt ?? startedAt) >= 300_000,
+  };
+}
+
 function viewState() {
   return {
-    lanes: Object.entries(readLedger()).map(([name, entry]) => ({ ...entry, name }))
-      .sort((a, b) => Number(laneRunning(b)) - Number(laneRunning(a)) || b.updatedAt.localeCompare(a.updatedAt)),
-    jobs: Object.entries(readJobs()).map(([name, job]) => ({ ...job, name,
-      duration: jobDuration(job), lastLines: readTailLines(job.log, 20),
-    })).sort((a, b) => Number(jobRunning(b)) - Number(jobRunning(a)) || b.startedAt.localeCompare(a.startedAt)),
+    lanes: Object.entries(readLedger()).map(([name, entry]) => viewLaneSummary(name, entry)).sort(viewActivityOrder),
+    jobs: Object.entries(readJobs()).map(([name, job]) => {
+      let activity = Date.parse(job.finishedAt ?? job.startedAt);
+      try { activity = Math.max(activity, statSync(job.log).mtimeMs); } catch { /* A job may not have written output yet. */ }
+      return { ...job, name, engine: "job", statusGroup: viewStatusGroup(job.state), lastActivityAt: new Date(activity).toISOString(),
+        duration: jobDuration(job), lastLines: readTailLines(job.log, 20),
+      };
+    }).sort(viewActivityOrder),
     feed: readTailLines(`${ROOT}/feed.log`, 200),
   };
 }
@@ -5061,7 +5085,7 @@ function viewState() {
 function viewLane(name: string, ledger = readLedger()) {
   const entry = Object.hasOwn(ledger, name) ? ledger[name] : undefined;
   if (!entry) return undefined;
-  return { ...entry, name,
+  return { ...viewLaneSummary(name, entry),
     roundList: Array.from({ length: entry.rounds }, (_, index) => index + 1),
     reports: entry.reports.map((path) => ({ path, text: existsSync(path) ? readFileSync(path, "utf8") : null })),
     parent: entry.parent ? { name: entry.parent, entry: ledger[entry.parent] ?? null } : null,
