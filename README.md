@@ -42,7 +42,13 @@ Works on macOS, Linux, and WSL.
 
 Run `cdx view` in its own terminal, then open `http://127.0.0.1:7477`. Use `cdx view --open` on macOS to open the browser, or `--port N` to choose a port. Ctrl-C stops the server. Nothing runs in the background and the command writes no state.
 
-The page shows lanes grouped under their supervisor, job output, and the latest 200 feed entries. Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up. The page works offline and follows the system light or dark theme.
+The page opens on running lanes and jobs. Running, Done, Failed, and All filters remember your choice across reloads. All keeps running work first, then finished work. Each group sorts by recent activity. Failed includes invalid gates; closed and adopted lanes appear only in All. Parent names stay on each row without changing the order. Expand Feed for the latest 200 entries.
+
+Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up.
+
+Violet orbits mark Astra/GPT, teal scanlines mark Gemini, and amber tickers mark jobs. These show running state, not measured progress. A lane with no events for five minutes gets a quiet warning. New rounds enter once; new transcript lines fade in. The page respects reduced motion, works offline, and follows the system light or dark theme. It uses system fonts and no dependencies.
+
+For browser proof, run `CDX_VIEW_SCREENSHOTS=1 bun test cdx.test.ts -t "serves read-only fixture"`. The test owns a temporary ledger and the server on port 7488, runs Playwright CLI through `npx`, saves `/tmp/cdx-view-2-*.png`, and stops both browser and server. Port 7488 must be free. The normal `bun run check` gate needs no browser or network.
 
 ## Two engines
 

@@ -1,3 +1,9 @@
+## 3.9.0
+
+- Opens `cdx view` on running lanes and jobs. Running, Done, Failed, and All filters persist across reloads. Running work stays first, with recent activity first within running and finished groups. Closed and adopted lanes stay in All.
+- Adds violet Astra/GPT orbits, teal Gemini scanlines, amber job tickers, new-round entrances, transcript reveals, and five-minute quiet warnings. Reduced motion disables animations. Rows persist across live updates.
+- Adds active round engines, status groups, start and activity timestamps, and quiet flags to the view API. Keeps the one-second SSE poll, loopback-only access checks, and credential redaction.
+
 ## 3.8.0
 
 - Adds `cdx view [--port N] [--open]`, a local, view-only browser dashboard for lanes, jobs, feed entries, reports, questions, and live round transcripts. It listens on 127.0.0.1:7477 until Ctrl-C. The page follows disk changes over SSE and redacts credentials before sending text to the browser.
