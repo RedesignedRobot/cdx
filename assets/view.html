@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>cdx / Overview</title>
+<style>
+:root{color-scheme:light dark;--bg:#fff;--text:#171717;--muted:#737373;--line:#eaeaea;--soft:#fafafa;--hover:#f5f5f5;--dot:#171717;--overlay:#0005;font-family:Geist,Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-size:14px}
+@media(prefers-color-scheme:dark){:root{--bg:#0a0a0a;--text:#ededed;--muted:#999;--line:#262626;--soft:#111;--hover:#1a1a1a;--dot:#ededed;--overlay:#000a}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased}button,select{font:inherit;color:inherit}button{cursor:pointer}button:focus-visible,a:focus-visible,select:focus-visible,pre:focus-visible{outline:2px solid var(--text);outline-offset:4px}a{color:inherit}header{border-bottom:1px solid var(--line)}.top{height:72px;display:flex;align-items:center;gap:18px;max-width:1100px;margin:auto;padding:0 32px}.logo{font-size:22px;font-weight:650;letter-spacing:-1px}.slash{color:#b5b5b5;font-size:24px;font-weight:200}.top-label{font-size:13px}.badge{font-size:11px;border:1px solid var(--line);border-radius:20px;padding:4px 9px;color:var(--muted)}.top .badge{margin-left:auto}main{max-width:1100px;margin:0 auto;padding:48px 32px 64px}h1{font-size:28px;letter-spacing:-1px;font-weight:600;margin:0 0 10px}p{color:var(--muted);line-height:1.6;margin:0}.intro{display:flex;align-items:center;justify-content:space-between;margin-bottom:28px}.connection{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--muted);flex:none}.connected .dot,.running .dot{background:var(--dot);box-shadow:0 0 0 3px var(--hover)}.failed .dot,.gate-invalid .dot{background:transparent;border:1.5px solid var(--text)}.closed .dot{background:transparent;border:1px solid var(--muted)}.stats{display:flex;gap:36px;border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:20px 0;margin-bottom:40px}.stat{display:flex;align-items:baseline;gap:9px}.stat strong{font-size:22px;font-weight:550;letter-spacing:-.6px;font-variant-numeric:tabular-nums}.stat span{font-size:12px;color:var(--muted)}section{margin-bottom:36px}.section-head{display:flex;align-items:center;gap:10px;margin-bottom:14px}h2{font-size:14px;font-weight:600;letter-spacing:-.2px;margin:0}.count{font-size:11px;color:var(--muted);background:var(--soft);padding:2px 6px;border:1px solid var(--line);border-radius:5px}.section-head .aside{margin-left:auto;color:var(--muted);font-size:12px}.table{border:1px solid var(--line);border-radius:8px;overflow:hidden}.lane-head,.lane-row{display:grid;grid-template-columns:minmax(190px,2fr) minmax(100px,1fr) 84px 90px 82px;gap:18px;align-items:center;padding:15px 20px}.lane-head{font-size:11px;color:var(--muted);padding-top:11px;padding-bottom:11px;background:var(--soft)}.lane-row{width:100%;border:0;border-top:1px solid var(--line);text-align:left;background:var(--bg)}.lane-row:hover{background:var(--hover)}.lane-row:focus-visible{outline-offset:-3px}.lane-name{font-size:13px;font-weight:550;display:block;overflow-wrap:anywhere}.lane-sub{font-size:11px;color:var(--muted);display:block;margin-top:6px;overflow-wrap:anywhere;line-height:1.5}.identity{padding-left:calc(var(--depth,0)*20px)}.state{display:flex;align-items:center;gap:8px;font-size:12px}.mono,pre,time{font-family:"Geist Mono","SFMono-Regular",Consolas,"Liberation Mono",monospace}.small{font-size:12px}.muted{color:var(--muted)}.empty{padding:36px 20px;text-align:center;color:var(--muted);font-size:13px}.job{padding:18px 20px;border-bottom:1px solid var(--line)}.job:last-child{border:0}.job-top{display:flex;gap:20px;align-items:center}.job-top strong{font-size:13px;font-weight:550;margin-right:auto}.job-meta{font-size:11px;color:var(--muted);margin-top:9px;overflow-wrap:anywhere}.job pre{max-height:100px;margin:12px 0 0;color:var(--muted);font-size:11px}pre{white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;line-height:1.8;font-size:12px;margin:0;overflow:auto;tab-size:2}.log{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:18px 20px;max-height:320px;min-height:140px}.text-button{border:0;background:none;padding:0;color:var(--muted);font-size:12px}.text-button:hover{color:var(--text)}[hidden]{display:none!important}footer{border-top:1px solid var(--line);padding-top:20px;display:flex;justify-content:space-between;font-size:11px;color:var(--muted)}dialog{padding:0;border:1px solid var(--line);background:var(--bg);color:var(--text);width:min(880px,calc(100vw - 32px));max-height:calc(100vh - 48px);border-radius:12px;box-shadow:0 24px 80px #0002}dialog::backdrop{background:var(--overlay)}.panel-head{display:flex;align-items:center;gap:18px;padding:22px 28px;border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--bg);z-index:1}.panel-head h2{font-size:18px;letter-spacing:-.5px;overflow-wrap:anywhere}.panel-head .text-button{margin-left:auto;border:1px solid var(--line);border-radius:5px;padding:5px 8px;font-size:11px}.panel-body{padding:24px 28px}.panel-body section:last-child{margin-bottom:0}.facts{display:grid;grid-template-columns:1fr 1fr;gap:18px 28px;margin:0 0 28px}dt{font-size:11px;color:var(--muted);margin-bottom:6px}dd{font-size:12px;margin:0;overflow-wrap:anywhere;line-height:1.6}.relations{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:24px}select{border:1px solid var(--line);border-radius:5px;background:var(--bg);padding:5px 8px;font-size:12px}.transcript{min-height:230px;max-height:48vh}.report{margin-top:12px}.report summary{cursor:pointer;font-size:12px;padding:12px 0;color:var(--muted)}.report pre{border-top:1px solid var(--line);padding-top:12px}#notice{font-size:12px;color:var(--muted);margin-bottom:18px}#questions pre{margin-bottom:10px}.raw summary{font-size:12px;color:var(--muted);cursor:pointer}.raw pre{margin-top:14px}
+@media(max-width:700px){.top{padding:0 20px;height:60px}main{padding:32px 20px}.intro{align-items:flex-start;gap:16px}h1{font-size:24px}.stats{gap:22px}.stat{display:block}.stat span{display:block;margin-top:4px}.lane-head,.lane-row{grid-template-columns:minmax(120px,1fr) 90px 66px;padding:14px;gap:10px}.owner-col,.tokens-col{display:none}.lane-sub{font-size:10px}.panel-head{padding:18px}.panel-body{padding:20px 18px}.facts{grid-template-columns:1fr}.job-top{gap:12px;flex-wrap:wrap}footer{gap:20px;line-height:1.6}}
+@media(prefers-reduced-motion:no-preference){dialog[open]{animation:enter .15s ease-out}@keyframes enter{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}}
+</style>
+</head>
+<body>
+<header><div class="top"><span class="logo">cdx</span><span class="slash">/</span><span class="top-label">Local workspace</span><span class="badge">View only</span></div></header>
+<main>
+<div class="intro"><div><h1>Overview</h1><p>Lanes, jobs, and recent activity.</p></div><div id="connection" class="connection" role="status"><span class="dot"></span><span id="connection-text">Connecting</span></div></div>
+<div class="stats"><div class="stat"><strong id="running-lanes">0</strong><span>Running lanes</span></div><div class="stat"><strong id="running-jobs">0</strong><span>Running jobs</span></div><div class="stat"><strong id="total-tokens">0</strong><span>Total tokens</span></div></div>
+<p id="notice" role="status" hidden></p>
+<section aria-labelledby="lanes-title"><div class="section-head"><h2 id="lanes-title">Lanes</h2><span id="lane-count" class="count">0</span><span class="aside">Select a lane to inspect</span></div><div class="table"><div class="lane-head"><span>Lane / Model</span><span>State</span><span>Elapsed</span><span class="owner-col">Owner</span><span class="tokens-col">Tokens</span></div><div id="lanes"><div class="empty">Waiting for state</div></div></div></section>
+<section aria-labelledby="jobs-title"><div class="section-head"><h2 id="jobs-title">Jobs</h2><span id="job-count" class="count">0</span></div><div id="jobs" class="table"><div class="empty">Waiting for state</div></div></section>
+<section aria-labelledby="feed-title"><div class="section-head"><h2 id="feed-title">Feed</h2><span class="aside">Latest 200 entries</span><button id="feed-follow" class="text-button" hidden>Jump to latest ↓</button></div><pre id="feed" class="log" tabindex="0" aria-label="Live feed">Waiting for feed</pre></section>
+<footer><span>cdx · Local session</span><span>Stop the terminal command to close this view.</span></footer>
+</main>
+<dialog id="detail" aria-labelledby="detail-title"><div class="panel-head"><h2 id="detail-title"></h2><span id="detail-state"></span><button id="close" class="text-button" aria-label="Close lane details">Close <span class="mono">esc</span></button></div><div class="panel-body"><p id="detail-error" role="status" hidden></p><dl id="facts" class="facts"></dl><div id="relations" class="relations"></div><section><div class="section-head"><h2>Transcript</h2><select id="round" aria-label="Transcript round"></select><span class="aside" id="transcript-status">Following current round</span><button id="transcript-follow" class="text-button" hidden>Jump to latest ↓</button></div><pre id="transcript" class="log transcript" tabindex="0" aria-label="Lane transcript">Waiting for transcript</pre></section><section id="questions-section" hidden><div class="section-head"><h2>Questions</h2></div><div id="questions"></div></section><section><div class="section-head"><h2>Reports</h2></div><div id="reports"></div></section><details class="raw"><summary>All lane fields</summary><pre id="raw"></pre></details></div></dialog>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const make = (tag, text, className) => { const node = document.createElement(tag); if (text !== undefined) node.textContent = text; if (className) node.className = className; return node; };
+const total = tokens => tokens ? Number(tokens.input || 0) + Number(tokens.output || 0) : 0;
+const number = value => new Intl.NumberFormat('en', {notation:'compact', maximumFractionDigits:1}).format(value);
+const tokenDetail = tokens => number(tokens.input || 0) + ' input · ' + number(tokens.cached || 0) + ' cached · ' + number(tokens.output || 0) + ' output';
+const activeState = lane => lane.kind === 'review' ? lane.reviewState || lane.state : lane.state;
+const endedAt = lane => activeState(lane) === 'running' ? undefined : lane.kind === 'review' ? lane.reviewUpdatedAt || lane.updatedAt : lane.updatedAt;
+const date = value => value ? new Date(value).toLocaleString() : 'Not recorded';
+const pretty = value => typeof value === 'object' ? JSON.stringify(value, null, 2) : String(value ?? 'Not recorded');
+let source, selected, selectedRound, laneSignature = '', jobSignature = '', feedSignature = '', transcriptLines = [];
+function status(state) { const el = make('span', undefined, 'state ' + (['running','done','failed','closed','gate-invalid'].includes(state) ? state : '')); el.append(make('span', undefined, 'dot'), make('span', state)); return el; }
+function elapsed(start, end) { if (!start || !Number.isFinite(Date.parse(start))) return '?'; const seconds = Math.max(0, Math.floor(((end ? Date.parse(end) : Date.now()) - Date.parse(start)) / 1000)); return seconds >= 3600 ? Math.floor(seconds / 3600) + 'h ' + Math.floor(seconds % 3600 / 60) + 'm' : seconds >= 60 ? Math.floor(seconds / 60) + 'm ' + seconds % 60 + 's' : seconds + 's'; }
+function timer(start, end) { const el = make('time', elapsed(start, end), 'small'); if (start) el.dataset.start = start; if (end) el.dataset.end = end; return el; }
+setInterval(() => document.querySelectorAll('time[data-start]').forEach(el => { el.textContent = elapsed(el.dataset.start, el.dataset.end); }), 1000);
+function follow(pre, button) { let following = true; const bottom = () => pre.scrollHeight - pre.scrollTop - pre.clientHeight < 30; pre.addEventListener('scroll', () => { following = bottom(); button.hidden = following; }); button.onclick = () => { following = true; pre.scrollTop = pre.scrollHeight; button.hidden = true; }; return { write(text, reset = false) { if (reset) following = true; const top = pre.scrollTop; pre.textContent = text; if (following) pre.scrollTop = pre.scrollHeight; else pre.scrollTop = top; button.hidden = following || bottom(); } }; }
+const feedFollow = follow($('feed'), $('feed-follow'));
+const transcriptFollow = follow($('transcript'), $('transcript-follow'));
+function renderState(state) {
+  $('notice').hidden = true;
+  $('running-lanes').textContent = state.lanes.filter(lane => activeState(lane) === 'running').length;
+  $('running-jobs').textContent = state.jobs.filter(job => job.state === 'running').length;
+  $('total-tokens').textContent = number(state.lanes.reduce((sum, lane) => sum + total(lane.tokens), 0));
+  $('lane-count').textContent = state.lanes.length; $('job-count').textContent = state.jobs.length;
+  const signature = JSON.stringify(state.lanes);
+  if (signature !== laneSignature) {
+    laneSignature = signature;
+    const fragment = document.createDocumentFragment(), seen = new Set(), names = new Set(state.lanes.map(lane => lane.name));
+    const add = (lane, depth) => {
+      if (seen.has(lane.name)) return; seen.add(lane.name);
+      const row = make('button', undefined, 'lane-row'); row.type = 'button'; row.onclick = () => openLane(lane.name); row.setAttribute('aria-label', 'Inspect ' + lane.name);
+      const identity = make('span', undefined, 'identity'); identity.style.setProperty('--depth', Math.min(depth, 4));
+      identity.append(make('span', lane.name, 'lane-name mono'), make('span', [lane.supervisor ? 'supervisor' : lane.consult ? 'consult' : lane.kind, lane.engine || 'gpt', lane.model, 'r' + lane.rounds, lane.parent ? '↳ ' + lane.parent : ''].filter(Boolean).join(' · '), 'lane-sub'));
+      const owner = make('span', (lane.ownerSession || 'terminal').slice(0, 8), 'mono small muted owner-col'); owner.title = lane.ownerSession || 'terminal';
+      row.append(identity, status(activeState(lane)), timer(lane.roundStartedAt || lane.createdAt, endedAt(lane)), owner, make('span', number(total(lane.tokens)), 'mono small muted tokens-col'));
+      row.dataset.lane = lane.name; fragment.append(row); state.lanes.filter(child => child.parent === lane.name).forEach(child => add(child, depth + 1));
+    };
+    state.lanes.filter(lane => !names.has(lane.parent)).forEach(lane => add(lane, 0)); state.lanes.forEach(lane => add(lane, 0));
+    if (!state.lanes.length) fragment.append(make('div', 'No lanes recorded', 'empty')); const focused = document.activeElement.dataset.lane; $('lanes').replaceChildren(fragment); if (focused) Array.from($('lanes').children).find(row => row.dataset.lane === focused)?.focus({preventScroll:true});
+  }
+  const jobs = JSON.stringify(state.jobs.map(({duration, ...job}) => job));
+  if (jobs !== jobSignature) {
+    jobSignature = jobs; const fragment = document.createDocumentFragment();
+    state.jobs.forEach(job => { const row = make('div', undefined, 'job'), top = make('div', undefined, 'job-top'); top.append(make('strong', job.name, 'mono'), status(job.state), timer(job.startedAt, job.finishedAt)); row.append(top, make('div', job.cmd, 'job-meta mono'), make('div', ['Exit ' + (job.exitCode ?? 'pending'), job.log].join(' · '), 'job-meta mono')); if (job.lastLines.length) row.append(make('pre', job.lastLines.join('\n'))); fragment.append(row); });
+    if (!state.jobs.length) fragment.append(make('div', 'No jobs recorded', 'empty')); $('jobs').replaceChildren(fragment);
+  }
+  const feed = state.feed.join('\n'); if (feed !== feedSignature) { feedSignature = feed; feedFollow.write(feed || 'No feed entries yet'); }
+  else if (!state.feed.length) feedFollow.write('No feed entries yet');
+}
+function renderDetail(lane) {
+  if (!lane) { $('detail-error').textContent = 'This lane is no longer in the ledger.'; $('detail-error').hidden = false; return; }
+  $('detail-error').hidden = true; $('detail-state').replaceChildren(status(activeState(lane)));
+  const facts = [['Created',date(lane.createdAt)],['Round started',date(lane.roundStartedAt)],['Owner',lane.ownerSession || 'terminal'],['Engine / model',[lane.engine || 'gpt',lane.model].filter(Boolean).join(' / ')],['Account / effort',[lane.account || 'default',lane.effort].join(' / ')],['Working directory',lane.workCwd || lane.worktreePath || lane.cwd],['Owner directory',lane.ownerCwd],['Worktree',lane.worktreePath],['Last action',lane.lastAction],['Gate',lane.gate || 'None'],['Steers',lane.steers || 0],['Round tokens',lane.roundTokens && tokenDetail(lane.roundTokens)],['Total tokens',lane.tokens && tokenDetail(lane.tokens)]];
+  const fragment = document.createDocumentFragment(); facts.forEach(([label,value]) => { if (value === undefined) return; const cell = make('div'); cell.append(make('dt',label),make('dd',pretty(value),'mono')); fragment.append(cell); }); const age = make('div'), duration = make('dd'); duration.append(timer(lane.roundStartedAt || lane.createdAt, endedAt(lane))); age.append(make('dt','Elapsed'), duration); fragment.append(age); $('facts').replaceChildren(fragment);
+  $('relations').replaceChildren(); const relation = (label,name) => { const button = make('button',label + name,'text-button mono'); button.onclick = () => openLane(name); $('relations').append(button); }; if (lane.parent) relation('Parent / ',lane.parent.name); lane.children.forEach(child => relation('Child / ',child.name));
+  const select = $('round'); select.replaceChildren(); const current = make('option','Current · r' + lane.rounds); current.value = ''; select.append(current); lane.roundList.slice().reverse().forEach(round => { const option = make('option','Round ' + round); option.value = String(round); select.append(option); }); select.value = selectedRound || '';
+  $('questions-section').hidden = !lane.questions.length; $('questions').replaceChildren(...lane.questions.map(question => make('pre', '#' + question.seq + ' · ' + (question.answered ? 'Answered' : question.timedOutAt ? 'Timed out' : question.expiredAt ? 'Expired' : 'Open') + '\n' + question.question + (question.answer ? '\n\n' + question.answer : ''), 'log')));
+  const openReports = new Set(Array.from($('reports').querySelectorAll('details[open]')).map(item => item.dataset.path));
+  const reports = document.createDocumentFragment(); lane.reports.forEach(report => { const item = make('details',undefined,'report'); item.dataset.path = report.path; item.open = openReports.has(report.path); item.append(make('summary',report.path.split('/').pop()),make('pre',report.text ?? 'Report file is missing')); reports.append(item); }); if (!lane.reports.length) reports.append(make('p','No reports yet')); $('reports').replaceChildren(reports);
+  $('raw').textContent = JSON.stringify(lane,null,2);
+}
+function connect() {
+  if (source) source.close();
+  const query = new URLSearchParams(); if (selected) query.set('lane',selected); if (selectedRound) query.set('round',selectedRound);
+  source = new EventSource('/events?' + query);
+  source.onopen = () => { $('connection').classList.add('connected'); $('connection-text').textContent = 'Live'; transcriptLines = []; };
+  source.onerror = () => { $('connection').classList.remove('connected'); $('connection-text').textContent = 'Reconnecting'; };
+  source.addEventListener('state',event => renderState(JSON.parse(event.data)));
+  source.addEventListener('lane',event => renderDetail(JSON.parse(event.data)));
+  source.addEventListener('notice',event => { $('notice').textContent = JSON.parse(event.data); $('notice').hidden = false; });
+  if (selected) source.addEventListener('transcript:' + selected,event => { const data = JSON.parse(event.data); if (data.reset) transcriptLines = []; transcriptLines = transcriptLines.concat(data.lines); transcriptFollow.write(transcriptLines.join('\n') || 'No transcript output yet'); });
+}
+function openLane(name) {
+  selected = name; selectedRound = undefined; transcriptLines = []; $('detail-title').textContent = name;
+  $('facts').replaceChildren(); $('relations').replaceChildren(); $('reports').replaceChildren(); $('raw').textContent = ''; $('round').replaceChildren(); $('questions-section').hidden = true; $('detail-state').replaceChildren(); $('detail-error').hidden = true;
+  if (!$('detail').open) $('detail').showModal(); transcriptFollow.write('Waiting for transcript',true); $('transcript-status').textContent = 'Following current round'; document.title = 'cdx / ' + name; connect();
+}
+$('round').onchange = () => { selectedRound = $('round').value || undefined; transcriptLines = []; transcriptFollow.write('Waiting for transcript',true); $('transcript-status').textContent = selectedRound ? 'Round ' + selectedRound : 'Following current round'; connect(); };
+$('close').onclick = () => $('detail').close();
+$('detail').addEventListener('close', () => { selected = undefined; selectedRound = undefined; document.title = 'cdx / Overview'; connect(); });
+connect();
+</script>
+</body>
+</html>

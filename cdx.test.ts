@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
+import { redactViewText, houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -3226,4 +3226,146 @@ describe("cdx models and supervisors", () => {
     const review = JSON.parse(readFileSync(`${state}/specs/pinned-r2.json`, "utf8"));
     expect(review.agent).toBe("house-review");
   }, 20_000);
+});
+
+describe("cdx view", () => {
+  test("redacts credentials without hiding lane names or standalone git SHAs", () => {
+    const cases = [
+      ['CONTEXT7_API_KEY=example-value ctx7 docs', 'CONTEXT7_API_KEY=[redacted] ctx7 docs'],
+      ['CONTEXT7_API_KEY="value with spaces" ctx7', 'CONTEXT7_API_KEY=[redacted] ctx7'],
+      ["--api-key 'value with spaces' docs", '--api-key [redacted] docs'],
+      ['--api-key example-value docs', '--api-key [redacted] docs'],
+      ['ctx7sk_abcdefgh12345678', '[redacted]'],
+      ['sk-abcdefghijklmnop123456', '[redacted]'],
+      ['Bearer abcdefghijklmnop.1234', '[redacted]'],
+      ['ghp_abcdefghijklmnopqrst1234', '[redacted]'],
+      ...['key', 'token', 'secret', 'password'].map(word => [word + ': ' + 'a1'.repeat(20), word + ': [redacted]']),
+      ['Key received: AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/==', 'Key received: [redacted]'],
+      ['token values ' + 'a'.repeat(32) + ' and ' + 'b'.repeat(32), 'token values [redacted] and [redacted]'],
+      ['key absent\n' + 'a'.repeat(40), 'key absent\n' + 'a'.repeat(40)],
+      ['lane build-view-1 commit ' + 'a1'.repeat(20), 'lane build-view-1 commit ' + 'a1'.repeat(20)],
+    ];
+    for (const [input, expected] of cases) expect(redactViewText(input!)).toBe(expected!);
+  });
+
+  test("serves read-only fixture state, details, incremental transcripts, and live events on loopback", async () => {
+    const state = tempPath('view');
+    mkdirSync(`${state}/logs`, { recursive: true });
+    mkdirSync(`${state}/reports`);
+    mkdirSync(`${state}/questions`);
+    const env = baseEnv(state);
+    const startedAt = '2026-09-05T10:00:00.000Z';
+    const lane = { engine: 'gpt', model: 'gpt-6-astra', kind: 'work', state: 'running', rounds: 1, reports: [], cwd: state, effort: 'medium', createdAt: startedAt, updatedAt: startedAt, roundStartedAt: startedAt, ownerSession: 'fixture-owner', tokens: { input: 1200, cached: 200, output: 300 } };
+    const report = `${state}/reports/done-r1.md`;
+    writeFileSync(report, 'Finished. --api-key fixture-secret');
+    const ledger = { lead: { ...lane, supervisor: true }, child: { ...lane, engine: 'gemini', model: 'gemini-3.8-flash-high', parent: 'lead', parentRound: 1 }, done: { ...lane, state: 'done', reports: [report] } };
+    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeFileSync(`${state}/jobs.json`, JSON.stringify({ check: { state: 'done', startedAt, finishedAt: '2026-09-05T10:00:02.000Z', exitCode: 0, cwd: state, cmd: 'bun run check', log: `${state}/logs/job-check.log` } }));
+    writeFileSync(`${state}/logs/job-check.log`, 'tests passed\nCONTEXT7_API_KEY=fixture-secret\n');
+    writeFileSync(`${state}/feed.log`, 'lead started\n');
+    writeFileSync(`${state}/questions/child-1.json`, JSON.stringify({ lane: 'child', round: 1, seq: 1, askedAt: startedAt, question: 'Which file?', answered: false }));
+    const log = `${state}/logs/lead-r1.jsonl`;
+    const event = (text: string) => JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text } }) + '\n';
+    writeFileSync(log, event('First line'));
+    mkdirSync(`${state}/bin`);
+    symlinkSync(CLI, `${state}/bin/cdx`);
+    const proc = Bun.spawn([process.execPath, `${state}/bin/cdx`, 'view', '--port', '0'], { env, stdout: 'pipe', stderr: 'pipe' });
+    runners.push(proc);
+    const output = proc.stdout.getReader();
+    const first = await output.read();
+    const startup = new TextDecoder().decode(first.value);
+    const url = startup.match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
+    expect(url).toBeDefined();
+    const json = async (path: string) => { const response = await fetch(url + path); expect(response.status).toBe(200); return response.json() as Promise<any>; };
+    const snapshot = await json('/api/state');
+    expect(snapshot.lanes.map((entry: any) => entry.name)).toEqual(['lead', 'child', 'done']);
+    expect(snapshot.lanes[1].parent).toBe('lead');
+    expect(snapshot.jobs[0]).toMatchObject({ name: 'check', exitCode: 0, duration: '2s', lastLines: ['tests passed', 'CONTEXT7_API_KEY=[redacted]'] });
+    expect(snapshot.feed).toEqual(['lead started']);
+    expect((await json('/api/lanes/lead')).children[0].name).toBe('child');
+    expect((await json('/api/lanes/child')).questions[0].question).toBe('Which file?');
+    expect((await json('/api/lanes/done')).reports[0].text).toBe('Finished. --api-key [redacted]');
+    const initial = await json('/api/lanes/lead/transcript');
+    expect(initial.lines).toEqual(['codex: First line']);
+    const nextEvent = Buffer.from(event('Second line 日本語 --api-key fixture-secret'));
+    const split = nextEvent.indexOf(Buffer.from('日')) + 1;
+    writeFileSync(log, nextEvent.subarray(0, split), { flag: 'a' });
+    const partial = await json('/api/lanes/lead/transcript?after=' + encodeURIComponent(initial.cursor));
+    expect(partial.lines).toEqual([]);
+    expect(partial.cursor).toBe(initial.cursor);
+    writeFileSync(log, nextEvent.subarray(split), { flag: 'a' });
+    const next = await json('/api/lanes/lead/transcript?after=' + encodeURIComponent(partial.cursor));
+    expect(next.lines).toEqual(['codex: Second line 日本語 --api-key [redacted]']);
+    expect((await json('/api/lanes/lead/transcript?after=' + encodeURIComponent(next.cursor))).lines).toEqual([]);
+    expect(existsSync(`${state}/specs`)).toBe(false);
+    const tail = runCli(['tail', 'lead', '-n', '20'], env);
+    expect(tail.exitCode).toBe(0);
+    expect(tail.stdout).toBe('codex: First line\ncodex: Second line 日本語 --api-key fixture-secret\n');
+    writeFileSync(log, event('Truncated'));
+    expect(await json('/api/lanes/lead/transcript?after=' + encodeURIComponent(next.cursor))).toMatchObject({ lines: ['codex: Truncated'], reset: true });
+    expect((await fetch(url + '/api/state', { method: 'POST' })).status).toBe(405);
+    expect((await fetch(url + '/api/state', { headers: { Origin: 'https://example.com' } })).status).toBe(403);
+    expect((await fetch(url + '/api/state', { headers: { Host: 'example.com' } })).status).toBe(403);
+    expect((await fetch(url + '/api/lanes/__proto__')).status).toBe(404);
+    expect((await fetch(url + '/api/lanes/lead/transcript?round=2')).status).toBe(404);
+    const page = await fetch(url + '/');
+    expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(await page.text()).toContain('Local workspace');
+    const controller = new AbortController();
+    const stream = await fetch(url + '/events?lane=lead', { signal: controller.signal });
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let events = '';
+    const until = async (text: string) => {
+      const deadline = Date.now() + 5000;
+      while (!events.includes(text)) {
+        if (Date.now() > deadline) throw new Error('SSE event missing: ' + text);
+        const result = await Promise.race([reader.read(), Bun.sleep(5000).then(() => { throw new Error('SSE timeout'); })]);
+        events += decoder.decode(result.value);
+      }
+    };
+    await until('event: transcript:lead');
+    expect(events).toContain('event: state');
+    expect(events).toContain('event: lane');
+    writeFileSync(log, event('Live output'), { flag: 'a' });
+    writeFileSync(`${state}/feed.log`, 'secret: ' + 'z'.repeat(40) + '\n', { flag: 'a' });
+    await until('Live output');
+    await until('event: feed');
+    expect(events).toContain('secret: [redacted]');
+    expect(events).not.toContain('z'.repeat(40));
+    writeFileSync(`${state}/logs/lead-r2.log`, 'New round output\n');
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({ ...ledger, lead: { ...ledger.lead, rounds: 2 } }));
+    await until('New round output');
+    expect(events).toContain('"round":2,"lines":["New round output"]');
+    expect(events).toContain('"reset":true');
+    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    controller.abort();
+    await reader.cancel().catch(() => {});
+    const curl = Bun.spawnSync(['curl', '--silent', '--show-error', `${url}/api/state`], { env });
+    expect(curl.exitCode).toBe(0);
+    if (process.env.CDX_VIEW_PROOF) {
+      console.log(`fixture curl: curl --silent --show-error ${url}/api/state\n${curl.stdout.toString()}`);
+    }
+    proc.kill('SIGINT');
+    expect(await proc.exited).toBe(0);
+    expect(readFileSync(`${state}/ledger.json`, 'utf8')).toBe(JSON.stringify(ledger));
+  }, 15000);
+
+  test('rejects non-loopback bind flags and does not create an empty home', async () => {
+    const state = tempPath('view-empty');
+    const env = baseEnv(state);
+    for (const args of [['--host','0.0.0.0'], ['--hostname','0.0.0.0'], ['--port','7477','0.0.0.0'], ['--port','65536']]) {
+      expect(runCli(['view', ...args], env).exitCode).toBe(1);
+    }
+    expect(existsSync(state)).toBe(false);
+    const proc = Bun.spawn([process.execPath, CLI, 'view', '--port', '0'], { env, stdout: 'pipe', stderr: 'pipe' });
+    runners.push(proc);
+    const startup = await proc.stdout.getReader().read();
+    const url = new TextDecoder().decode(startup.value).match(/http:\/\/127\.0\.0\.1:\d+/)?.[0];
+    expect(url).toBeDefined();
+    expect(await (await fetch(url + '/api/state')).json()).toEqual({ lanes: [], jobs: [], feed: [] });
+    proc.kill('SIGINT');
+    expect(await proc.exited).toBe(0);
+    expect(existsSync(state)).toBe(false);
+  });
 });
