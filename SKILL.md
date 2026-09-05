@@ -148,3 +148,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 `hooks/guard-raw-codex.ts` blocks raw headless Codex and Antigravity work
 commands, and the SessionStart hook runs `cdx brief` (running and failed lanes
 only).
+
+## Browser view
+
+`cdx view [--port N] [--open]` opens a view-only local dashboard at `http://127.0.0.1:7477`. Run it in its own terminal. Ctrl-C stops it. `--open` launches the browser on macOS. Select a lane for live transcripts, rounds, reports, and questions.

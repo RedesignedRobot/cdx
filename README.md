@@ -38,6 +38,12 @@ cdx doctor --probe
 
 Works on macOS, Linux, and WSL.
 
+## Browser view
+
+Run `cdx view` in its own terminal, then open `http://127.0.0.1:7477`. Use `cdx view --open` on macOS to open the browser, or `--port N` to choose a port. Ctrl-C stops the server. Nothing runs in the background and the command writes no state.
+
+The page shows lanes grouped under their supervisor, job output, and the latest 200 feed entries. Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up. The page works offline and follows the system light or dark theme.
+
 ## Two engines
 
 Claude uses a three-level delegation ladder. The head plans, briefs, reviews, and merges. GPT through Codex handles the hardest implementation and design lanes. Gemini 3.8 Flash high through Antigravity handles bounded work with a precise brief.
@@ -163,6 +169,7 @@ cdx inbox  [-n N]
 cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
+cdx view [--port N] [--open]
 cdx status [--all] [--json]
 cdx usage  [--json]
 cdx wait   <lane>... [--timeout S] [--json] [--report]

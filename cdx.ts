@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.7.1";
+const VERSION = "3.8.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -439,9 +439,9 @@ function geminiConfig(): GeminiConfig {
 }
 
 const isHookInvocation = process.argv[2] === "hook";
-const config = readConfig(process.argv[2] === "_run" || isHookInvocation);
+const config = readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || isHookInvocation);
 
-if (!isHookInvocation) {
+if (!isHookInvocation && process.argv[2] !== "view") {
   for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
     try {
       mkdirSync(`${ROOT}/${dir}`, { recursive: true });
@@ -826,9 +826,9 @@ const CONSULT_FRAME = `CONSULT. You are the senior advisor to the head, a Claude
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -3309,7 +3309,7 @@ function renderTail(logPath: string, lines: number): string {
   return rendered.slice(-lines).join("\n");
 }
 
-interface Cursor { round: number; path: string; offset: number; buffer: string; json: boolean; decoder: TextDecoder }
+interface Cursor { committedOffset?: number; round: number; path: string; offset: number; buffer: string; json: boolean; decoder: TextDecoder }
 
 function openCursor(lane: string, entry: Lane, fromEnd: boolean): Cursor | undefined {
   for (let round = entry.rounds; round >= 1; round -= 1) {
@@ -3343,6 +3343,7 @@ function drainCursor(cursor: Cursor, prefix: string, emit = console.log) {
   const lines = cursor.buffer.split("\n");
   cursor.buffer = lines.pop() ?? "";
   for (const line of lines) {
+    if (cursor.committedOffset !== undefined) cursor.committedOffset += Buffer.byteLength(line + "\n");
     if (!line.trim()) continue;
     const out = cursor.json ? renderEventLine(line) : line;
     if (out !== undefined) emit(prefix + out);
@@ -5033,6 +5034,171 @@ async function killJob(name: string, job: Job, note?: string): Promise<void> {
   console.log(`cdx: ${renderJobLine(name, finished)}`);
 }
 
+// The browser receives only rendered, redacted text. Terminal output stays unchanged.
+export function redactViewText(text: string): string {
+  return text
+    .replace(/(CONTEXT7_API_KEY\s*=\s*|--api-key\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;"']+)/gi, "$1[redacted]")
+    .replace(/ctx7sk[-_A-Za-z0-9]{8,}|sk-[A-Za-z0-9_-]{16,}|Bearer [A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9]{20,}/g, "[redacted]")
+    .replace(/\b(key|token|secret|password)\b[^\r\n]*/gi, (line) => line.replace(/[A-Za-z0-9+/_-]{32,}={0,2}/g, "[redacted]"))
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function viewJSON(value: unknown): string {
+  return JSON.stringify(value, (_key, item) => typeof item === "string" ? redactViewText(item) : item);
+}
+
+function viewState() {
+  return {
+    lanes: Object.entries(readLedger()).map(([name, entry]) => ({ ...entry, name }))
+      .sort((a, b) => Number(laneRunning(b)) - Number(laneRunning(a)) || b.updatedAt.localeCompare(a.updatedAt)),
+    jobs: Object.entries(readJobs()).map(([name, job]) => ({ ...job, name,
+      duration: jobDuration(job), lastLines: readTailLines(job.log, 20),
+    })).sort((a, b) => Number(jobRunning(b)) - Number(jobRunning(a)) || b.startedAt.localeCompare(a.startedAt)),
+    feed: readTailLines(`${ROOT}/feed.log`, 200),
+  };
+}
+
+function viewLane(name: string, ledger = readLedger()) {
+  const entry = Object.hasOwn(ledger, name) ? ledger[name] : undefined;
+  if (!entry) return undefined;
+  return { ...entry, name,
+    roundList: Array.from({ length: entry.rounds }, (_, index) => index + 1),
+    reports: entry.reports.map((path) => ({ path, text: existsSync(path) ? readFileSync(path, "utf8") : null })),
+    parent: entry.parent ? { name: entry.parent, entry: ledger[entry.parent] ?? null } : null,
+    children: Object.entries(ledger).filter(([, lane]) => lane.parent === name).map(([name, lane]) => ({ ...lane, name })),
+    questions: existsSync(`${ROOT}/questions`) ? questionFiles(name).map(({ record }) => record) : [],
+  };
+}
+
+function viewTranscript(name: string, round: number, after = "") {
+  const path = [true, false].map((json) => logPathOf(name, round, json)).find(existsSync);
+  if (!path) return { round, lines: [] as string[], cursor: "", reset: after !== "" };
+  const stat = statSync(path);
+  const identity = `${round}:${stat.dev}:${stat.ino}:${stat.birthtimeMs}`;
+  let offset = 0;
+  if (after) {
+    const parts = after.split("@");
+    if (parts[0] === identity && /^\d+$/.test(parts[1] ?? "") && Number(parts[1]) <= stat.size) offset = Number(parts[1]);
+  }
+  const cursor: Cursor = { round, path, offset, committedOffset: offset, buffer: "", json: path.endsWith(".jsonl"), decoder: new TextDecoder() };
+  const lines: string[] = [];
+  drainCursor(cursor, "", (line) => { lines.push(line); });
+  return { round, lines, cursor: `${identity}@${cursor.committedOffset}`, reset: Boolean(after && offset === 0) };
+}
+
+function viewCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["port", "open"]);
+  if (parsed.rest.length) throw new CmdError("usage: cdx view [--port N] [--open]");
+  const port = Number(parsed.flags.port ?? 7477);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new CmdError("--port must be an integer from 0 to 65535");
+  if (parsed.bools.has("open") && process.platform !== "darwin") throw new CmdError("--open requires macOS; run cdx view and open the printed URL");
+  const html = readFileSync(new URL("./assets/view.html", import.meta.url), "utf8");
+  const headers = { "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",
+  };
+  type Client = { send: (event: string, value: unknown) => void; close: () => void; lane?: string; round?: number; cursor: string; detail: string };
+  const clients = new Set<Client>();
+  let previous = "";
+  const feedPath = `${ROOT}/feed.log`;
+  let feedIdentity = "";
+  const feedCursor: Cursor = { round: 0, path: feedPath, offset: 0, buffer: "", json: false, decoder: new TextDecoder() };
+  if (existsSync(feedPath)) {
+    const stat = statSync(feedPath);
+    feedCursor.offset = stat.size;
+    feedIdentity = `${stat.dev}:${stat.ino}`;
+  }
+  const server = Bun.serve({
+    hostname: "127.0.0.1", port,
+    fetch(request, server) {
+      const url = new URL(request.url);
+      const origin = `http://127.0.0.1:${server.port}`;
+      const response = (value: unknown, status = 200) => new Response(viewJSON(value), { status, headers: { ...headers, "Content-Type": "application/json" } });
+      // Reject cross-origin browser reads and DNS rebinding to the loopback listener.
+      if (request.headers.get("host") !== `127.0.0.1:${server.port}` || (request.headers.get("origin") && request.headers.get("origin") !== origin)
+        || request.headers.get("sec-fetch-site") === "cross-site") return response({ error: "Local requests only" }, 403);
+      if (request.method !== "GET") return response({ error: "View only" }, 405);
+      try {
+        if (url.pathname === "/") return new Response(html, { headers: { ...headers, "Content-Type": "text/html; charset=utf-8" } });
+        if (url.pathname === "/api/state") return response(viewState());
+        const match = url.pathname.match(/^\/api\/lanes\/([a-z0-9._-]+)(\/transcript)?$/i);
+        if (match) {
+          const name = match[1]!;
+          const ledger = readLedger();
+          if (!Object.hasOwn(ledger, name)) return response({ error: "Lane not found" }, 404);
+          if (!match[2]) return response(viewLane(name, ledger));
+          const round = Number(url.searchParams.get("round") ?? ledger[name]!.rounds);
+          if (!Number.isInteger(round) || round < 1 || round > ledger[name]!.rounds) return response({ error: "Round not found" }, 404);
+          return response(viewTranscript(name, round, url.searchParams.get("after") ?? ""));
+        }
+        if (url.pathname !== "/events") return response({ error: "Not found" }, 404);
+        const lane = url.searchParams.get("lane") ?? undefined;
+        const ledger = readLedger();
+        if (lane && (!/^[a-z0-9][a-z0-9._-]*$/i.test(lane) || !Object.hasOwn(ledger, lane))) return response({ error: "Lane not found" }, 404);
+        const round = url.searchParams.has("round") ? Number(url.searchParams.get("round")) : undefined;
+        if (round !== undefined && (!lane || !Number.isInteger(round) || round < 1 || round > ledger[lane]!.rounds)) return response({ error: "Round not found" }, 404);
+        server.timeout(request, 0);
+        let client: Client;
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const encoder = new TextEncoder();
+            client = { lane, round, cursor: "", detail: "",
+              close() { clients.delete(client); request.signal.removeEventListener("abort", client.close); try { controller.close(); } catch {} },
+              send(event, value) {
+                if ((controller.desiredSize ?? 0) < -1_048_576) { client.close(); return; }
+                try { controller.enqueue(encoder.encode(`event: ${event}\ndata: ${viewJSON(value)}\n\n`)); } catch { client.close(); }
+              },
+            };
+            clients.add(client);
+            request.signal.addEventListener("abort", client.close, { once: true });
+            try { client.send("state", viewState()); updateLane(client, ledger, true); }
+            catch { client.send("notice", "State is temporarily unreadable. Retrying."); }
+          },
+          cancel() { client.close(); },
+        }, { highWaterMark: 1_048_576, size: (chunk) => chunk.byteLength });
+        return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
+      } catch { return response({ error: "State is temporarily unreadable" }, 503); }
+    },
+  });
+  function updateLane(client: Client, ledger: Ledger, initial = false) {
+    if (!client.lane) return;
+    const detail = viewLane(client.lane, ledger);
+    const serialized = viewJSON(detail ?? null);
+    if (serialized !== client.detail) { client.send("lane", detail ?? null); client.detail = serialized; }
+    if (!detail) return;
+    const transcript = viewTranscript(client.lane, client.round ?? detail.rounds, client.cursor);
+    if (initial || transcript.cursor !== client.cursor || transcript.reset) client.send(`transcript:${client.lane}`, transcript);
+    client.cursor = transcript.cursor;
+  }
+  const timer = setInterval(() => {
+    if (!clients.size) return;
+    try {
+      const state = viewState();
+      const serialized = viewJSON(state);
+      if (serialized !== previous) { for (const client of clients) client.send("state", state); previous = serialized; }
+      if (existsSync(feedPath)) {
+        const stat = statSync(feedPath);
+        const identity = `${stat.dev}:${stat.ino}`;
+        if (identity !== feedIdentity || stat.size < feedCursor.offset) {
+          feedCursor.offset = 0; feedCursor.buffer = ""; feedCursor.decoder = new TextDecoder();
+        }
+        feedIdentity = identity;
+        drainCursor(feedCursor, "", (line) => { for (const client of clients) client.send("feed", line); });
+      }
+      const ledger = readLedger();
+      for (const client of clients) {
+        try { updateLane(client, ledger); }
+        catch { client.send("notice", "Lane files are temporarily unreadable. Retrying."); }
+      }
+    } catch { for (const client of clients) client.send("notice", "State is temporarily unreadable. Retrying."); }
+  }, 1000);
+  const stop = () => { clearInterval(timer); for (const client of clients) client.close(); void server.stop(true); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); };
+  process.on("SIGINT", stop);
+  process.on("SIGTERM", stop);
+  const url = `http://127.0.0.1:${server.port}`;
+  console.log(`cdx: ${url} (view only; Ctrl-C to stop)`);
+  if (parsed.bools.has("open")) Bun.spawn(["open", url], { stdout: "ignore", stderr: "inherit" });
+}
+
 const USAGE = `cdx tracks Codex and Gemini execution lanes
 cdx policy: model ${config.model}${modelAliases() ? ` (aliases ${modelAliases()})` : ""}; efforts ${config.efforts.join(", ")}; default effort ${config.defaultEffort}; set in ${CONFIG_PATH}
 
@@ -5056,6 +5222,7 @@ ${ENGINE_PICKER}
   status [--json]         wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
+  view   [--port N] [--open] # local browser view; Ctrl-C stops it
   feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
   gate   <lane> "<cmd>" | gate <lane> --clear
@@ -5156,6 +5323,7 @@ switch (command) {
     console.log(`cdx: adopted lane=${lane} session=${sessionId}`);
     break;
   }
+  case "view": viewCommand(argv); break;
   case "status": statusCommand(argv); break;
   case "job": await jobCommand(argv); break;
   case "_job": {
