@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { redactViewText, houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
@@ -3254,14 +3254,32 @@ describe("cdx view", () => {
     mkdirSync(`${state}/reports`);
     mkdirSync(`${state}/questions`);
     const env = baseEnv(state);
-    const startedAt = '2026-09-05T10:00:00.000Z';
+    const startedAt = new Date(Date.now() - 120_000).toISOString();
+    const later = new Date(Date.parse(startedAt) + 60_000).toISOString();
+    const quietAt = new Date(Date.now() - 600_000).toISOString();
     const lane = { engine: 'gpt', model: 'gpt-6-astra', kind: 'work', state: 'running', rounds: 1, reports: [], cwd: state, effort: 'medium', createdAt: startedAt, updatedAt: startedAt, roundStartedAt: startedAt, ownerSession: 'fixture-owner', tokens: { input: 1200, cached: 200, output: 300 } };
     const report = `${state}/reports/done-r1.md`;
     writeFileSync(report, 'Finished. --api-key fixture-secret');
-    const ledger = { lead: { ...lane, supervisor: true }, child: { ...lane, engine: 'gemini', model: 'gemini-3.8-flash-high', parent: 'lead', parentRound: 1 }, done: { ...lane, state: 'done', reports: [report] } };
+    const ledger = {
+      lead: { ...lane, supervisor: true, lastAction: 'Tracing the dispatcher and checking contracts' },
+      child: { ...lane, engine: 'gemini', model: 'gemini-3.8-flash-high', parent: 'lead', parentRound: 1, lastEventAt: later, lastAction: 'Reading changed files for the next patch' },
+      done: { ...lane, state: 'done', updatedAt: later, reports: [report] },
+      failed: { ...lane, state: 'failed', updatedAt: later, lastAction: 'Check failed. Review the round report.' },
+      gate: { ...lane, state: 'gate-invalid' },
+      closed: { ...lane, state: 'closed' },
+      adopted: { ...lane, state: 'adopted' },
+      consult: { ...lane, state: 'done', consult: true },
+      review: { ...lane, kind: 'review', state: 'done', reviewState: 'running', reviewEngine: 'gemini', reviewUpdatedAt: later },
+      legacy: { ...lane, engine: undefined, roundStartedAt: undefined, createdAt: quietAt },
+    };
     writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
-    writeFileSync(`${state}/jobs.json`, JSON.stringify({ check: { state: 'done', startedAt, finishedAt: '2026-09-05T10:00:02.000Z', exitCode: 0, cwd: state, cmd: 'bun run check', log: `${state}/logs/job-check.log` } }));
+    const finishedAt = new Date(Date.parse(startedAt) + 2_000).toISOString();
+    const job = { state: 'done', startedAt, finishedAt, exitCode: 0, cwd: state, cmd: 'bun run check', log: `${state}/logs/job-check.log` };
+    writeFileSync(`${state}/jobs.json`, JSON.stringify({ check: job, build: { ...job, state: 'running', finishedAt: undefined, exitCode: undefined, log: `${state}/logs/job-build.log` }, failed: { ...job, state: 'failed', exitCode: 1, log: `${state}/logs/missing.log` } }));
     writeFileSync(`${state}/logs/job-check.log`, 'tests passed\nCONTEXT7_API_KEY=fixture-secret\n');
+    writeFileSync(`${state}/logs/job-build.log`, 'Building cdx.ts\nChecking the test suite\n');
+    utimesSync(`${state}/logs/job-check.log`, new Date(later), new Date(later));
+    utimesSync(`${state}/logs/job-build.log`, new Date(later), new Date(later));
     writeFileSync(`${state}/feed.log`, 'lead started\n');
     writeFileSync(`${state}/questions/child-1.json`, JSON.stringify({ lane: 'child', round: 1, seq: 1, askedAt: startedAt, question: 'Which file?', answered: false }));
     const log = `${state}/logs/lead-r1.jsonl`;
@@ -3269,7 +3287,7 @@ describe("cdx view", () => {
     writeFileSync(log, event('First line'));
     mkdirSync(`${state}/bin`);
     symlinkSync(CLI, `${state}/bin/cdx`);
-    const proc = Bun.spawn([process.execPath, `${state}/bin/cdx`, 'view', '--port', '0'], { env, stdout: 'pipe', stderr: 'pipe' });
+    const proc = Bun.spawn([process.execPath, `${state}/bin/cdx`, 'view', '--port', process.env.CDX_VIEW_SCREENSHOTS ? '7488' : '0'], { env, stdout: 'pipe', stderr: 'pipe' });
     runners.push(proc);
     const output = proc.stdout.getReader();
     const first = await output.read();
@@ -3278,11 +3296,19 @@ describe("cdx view", () => {
     expect(url).toBeDefined();
     const json = async (path: string) => { const response = await fetch(url + path); expect(response.status).toBe(200); return response.json() as Promise<any>; };
     const snapshot = await json('/api/state');
-    expect(snapshot.lanes.map((entry: any) => entry.name)).toEqual(['lead', 'child', 'done']);
-    expect(snapshot.lanes[1].parent).toBe('lead');
-    expect(snapshot.jobs[0]).toMatchObject({ name: 'check', exitCode: 0, duration: '2s', lastLines: ['tests passed', 'CONTEXT7_API_KEY=[redacted]'] });
+    expect(snapshot.lanes.map((entry: any) => entry.name)).toEqual(['child', 'review', 'lead', 'legacy', 'done', 'failed', 'gate', 'closed', 'adopted', 'consult']);
+    expect(snapshot.lanes[0]).toMatchObject({ parent: 'lead', engine: 'gemini', statusGroup: 'running', startedAt, lastActivityAt: later, stalled: false });
+    expect(snapshot.lanes.find((entry: any) => entry.name === 'review')).toMatchObject({ engine: 'gemini', statusGroup: 'running', lastActivityAt: later });
+    expect(snapshot.lanes.find((entry: any) => entry.name === 'legacy')).toMatchObject({ engine: 'gpt', startedAt: quietAt, stalled: true });
+    expect(snapshot.lanes.find((entry: any) => entry.name === 'review').model).toBeUndefined();
+    expect(Object.fromEntries(snapshot.lanes.map((entry: any) => [entry.name, entry.statusGroup]))).toEqual({ child: 'running', review: 'running', lead: 'running', legacy: 'running', done: 'done', failed: 'failed', gate: 'failed', closed: 'other', adopted: 'other', consult: 'done' });
+    expect(snapshot.jobs.map((entry: any) => entry.name)).toEqual(['build', 'check', 'failed']);
+    expect(snapshot.jobs[0]).toMatchObject({ engine: 'job', statusGroup: 'running', startedAt, lastActivityAt: later });
+    expect(snapshot.jobs[1]).toMatchObject({ name: 'check', engine: 'job', statusGroup: 'done', lastActivityAt: later, exitCode: 0, duration: '2s', lastLines: ['tests passed', 'CONTEXT7_API_KEY=[redacted]'] });
+    expect(snapshot.jobs[2]).toMatchObject({ statusGroup: 'failed', lastActivityAt: finishedAt, lastLines: [] });
     expect(snapshot.feed).toEqual(['lead started']);
     expect((await json('/api/lanes/lead')).children[0].name).toBe('child');
+    expect(await json('/api/lanes/review')).toMatchObject({ engine: 'gemini', startedAt, statusGroup: 'running', lastActivityAt: later, stalled: false });
     expect((await json('/api/lanes/child')).questions[0].question).toBe('Which file?');
     expect((await json('/api/lanes/done')).reports[0].text).toBe('Finished. --api-key [redacted]');
     const initial = await json('/api/lanes/lead/transcript');
@@ -3306,11 +3332,63 @@ describe("cdx view", () => {
     expect((await fetch(url + '/api/state', { method: 'POST' })).status).toBe(405);
     expect((await fetch(url + '/api/state', { headers: { Origin: 'https://example.com' } })).status).toBe(403);
     expect((await fetch(url + '/api/state', { headers: { Host: 'example.com' } })).status).toBe(403);
+    expect((await fetch(url + '/api/state', { headers: { 'Sec-Fetch-Site': 'cross-site' } })).status).toBe(403);
     expect((await fetch(url + '/api/lanes/__proto__')).status).toBe(404);
     expect((await fetch(url + '/api/lanes/lead/transcript?round=2')).status).toBe(404);
     const page = await fetch(url + '/');
     expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
     expect(await page.text()).toContain('Local workspace');
+    if (process.env.CDX_VIEW_SCREENSHOTS) {
+      const browser = async (...args: string[]) => {
+        const command = Bun.spawn(['npx', '--yes', '--package', '@playwright/cli', 'playwright-cli', '-s=cdx-view-2-proof', ...args], { stdout: 'pipe', stderr: 'pipe' });
+        const [stdout, stderr, exit] = await Promise.all([new Response(command.stdout).text(), new Response(command.stderr).text(), command.exited]);
+        expect(exit, stderr).toBe(0);
+        expect(stdout, stdout).not.toContain('### Error');
+      };
+      try {
+        await browser('open', url!);
+        await browser('snapshot');
+        await browser('run-code', `async page => {
+          const errors = []; page.on('pageerror', error => errors.push(error.message));
+          await page.setViewportSize({width:1200,height:960});
+          await page.emulateMedia({colorScheme:'dark'});
+          await page.evaluate(() => localStorage.removeItem('cdx.view.filter'));
+          await page.reload();
+          await page.locator('.lane-row').first().waitFor();
+          const check = (ok, message) => { if (!ok) throw new Error(message); };
+          const groups = () => page.locator('.lane-row').evaluateAll(rows => rows.map(row => row.dataset.group));
+          check((await groups()).every(group => group === 'running'), 'Default must show only running work');
+          await page.screenshot({path:'/tmp/cdx-view-2-running.png',fullPage:true,animations:'disabled'});
+          const signal = await page.locator('[data-key="lane:lead"] .signal').elementHandle();
+          const animation = await signal.evaluate(el => el.getAnimations()[0]?.currentTime);
+          await page.waitForTimeout(1200);
+          check(await signal.evaluate(el => el.isConnected), 'SSE replaced the live indicator');
+          check(await signal.evaluate((el, before) => el.getAnimations()[0]?.currentTime > before, animation), 'SSE restarted the animation');
+          for (const filter of ['done','failed','all']) {
+            await page.locator('[data-filter=' + filter + ']').click();
+            const states = await groups();
+            if (filter !== 'all') check(states.length > 0 && states.every(group => group === filter), 'Wrong filter contents');
+            else check(states.slice(0,5).every(group => group === 'running') && states.slice(5).every(group => group !== 'running'), 'Running work must stay first');
+            await page.screenshot({path:'/tmp/cdx-view-2-' + filter + '.png',fullPage:true,animations:'disabled'});
+          }
+          await page.reload();
+          await page.locator('.lane-row').first().waitFor();
+          check(await page.locator('[data-filter=all]').getAttribute('aria-pressed') === 'true', 'Filter did not survive reload');
+          await page.getByRole('button', {name:'Inspect lead',exact:true}).click();
+          await page.locator('#transcript .transcript-line').first().waitFor();
+          await page.screenshot({path:'/tmp/cdx-view-2-transcript.png',fullPage:true,animations:'disabled'});
+          await page.getByRole('button', {name:'Close lane details'}).click();
+          await page.locator('[data-filter=running]').click();
+          await page.emulateMedia({reducedMotion:'reduce',colorScheme:'light'});
+          await page.setViewportSize({width:390,height:844});
+          await page.mouse.move(0,0);
+          check(await page.evaluate(() => document.getAnimations().length) === 0, 'Reduced motion still animates');
+          check(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), 'Mobile layout overflows');
+          await page.screenshot({path:'/tmp/cdx-view-2-mobile.png',fullPage:true,animations:'disabled'});
+          check(errors.length === 0, errors.join('; '));
+        }`);
+      } finally { await browser('close'); }
+    }
     const controller = new AbortController();
     const stream = await fetch(url + '/events?lane=lead', { signal: controller.signal });
     const reader = stream.body!.getReader();
@@ -3349,7 +3427,7 @@ describe("cdx view", () => {
     proc.kill('SIGINT');
     expect(await proc.exited).toBe(0);
     expect(readFileSync(`${state}/ledger.json`, 'utf8')).toBe(JSON.stringify(ledger));
-  }, 15000);
+  }, process.env.CDX_VIEW_SCREENSHOTS ? 120_000 : 15000);
 
   test('rejects non-loopback bind flags and does not create an empty home', async () => {
     const state = tempPath('view-empty');
