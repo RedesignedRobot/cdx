@@ -629,20 +629,22 @@ async function watchCommand(argv: string[]): Promise<void> {
   const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
   const claudePid = Number(process.env.CLAUDE_PID);
   if (argv.length || !session || session === "terminal" || !Number.isInteger(claudePid) || claudePid < 1) fail("cdx watch needs CLAUDE_CODE_SESSION_ID and CLAUDE_PID from the plugin monitor, with no arguments");
-  const acquired = withEvents((state) => {
+  // A live holder keeps the lease; this watcher stands by and takes over
+  // when the holder exits (a plugin reload starts the new monitor first).
+  const acquire = () => withEvents((state) => {
     const current = delivery(state, session);
+    if (current.lease?.pid === process.pid) return true;
     if (current.lease && pidAlive(current.lease.pid) && pidAlive(current.lease.claudePid)) return false;
     current.lease = { pid: process.pid, claudePid };
     return true;
   });
-  if (!acquired) return;
   let stopped = false;
   const stop = () => { stopped = true; };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
   try {
     while (!stopped && pidAlive(claudePid)) {
-      deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
+      if (acquire()) deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
       await Bun.sleep(500);
     }
   } finally {
@@ -711,12 +713,17 @@ function takeoverCommand(argv: string[]): void {
       for (const [owner, recipient] of Object.entries(state.bindings)) if (recipient === previous) state.bindings[owner] = session;
       state.bindings[previous] = session;
     }
-    // Replay retained events for the newly connected head. Recovery also reads the ledger.
+    // The new head continues where the previous head stopped reading; what
+    // was never delivered anywhere is covered by the summary, not replayed.
+    const inherited = state.sessions[previous];
+    const latest = readEvents().at(-1)?.id ?? 0;
     const cursor = delivery(state, session);
-    cursor.wake = 0;
-    cursor.quiet = 0;
+    cursor.wake = inherited?.wake ?? latest;
+    cursor.quiet = inherited?.quiet ?? latest;
   }));
   console.log(`cdx: ownership connected to session=${session}; target=${target}`);
+  const summary = sessionSummary(session);
+  if (summary) console.log(summary);
 }
 
 function normalizeLane(entry: any): void {
@@ -4383,7 +4390,6 @@ function announceAccountSelection(lane: string, selection: AccountSelection) {
   for (const { choice, snapshot } of selection.skipped) {
     const message = `[cdx] account ${choice.name} consumed (resets ${rateLimitResetDate(snapshot.exhaustedUntil ?? snapshot.resetsAt)}); ${lane} using ${selection.choice.name}`;
     console.error(color.yellow(message.replace(/^\[cdx\]/, "cdx:")));
-
   }
 }
 
@@ -5347,7 +5353,7 @@ function cleanCommand(argv: string[]) {
   const removed: string[] = [];
   withLedger((ledger) => {
     for (const [lane, entry] of Object.entries(ledger)) {
-      if (!owned(entry.ownerSession, lane) || entry.work.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
+      if (entry.work.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
       // Anchor on "-r<digits>" plus a separator so lane "foo" never matches
       // "foo-review-r1".
       const escaped = lane.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
