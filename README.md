@@ -84,7 +84,7 @@ intermittently. Find the race, fix it, and prove it with 20 green runs."
 # Three workers in parallel, detached, each in its own git worktree
 cdx spawn api-docs   --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-docs --bg "Document every public endpoint in openapi.yaml."
 cdx spawn dead-code  --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-dead --bg "Find and delete unreachable code. List every deletion."
-cdx spawn slow-query --engine gpt --cd ~/code/myapp --worktree ~/code/myapp-perf --bg --effort high "Profile the /search endpoint and fix the N+1."
+cdx spawn slow-query --engine gpt --cd ~/code/myapp --worktree ~/code/myapp-perf --bg "Profile the /search endpoint and fix the N+1."
 cdx wait api-docs dead-code slow-query
 
 # Watch a worker think, live
@@ -280,7 +280,7 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the Astra cap below, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini values shown.
 
 - Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
-- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, fork, review, and consult after alias resolution. The built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only; `high` and `xhigh` fail with the allowed list. An inherited effort above the cap (a lane recorded before the cap, or a Gemini review round that stored `high` on a gpt lane) clamps to the cap on resume and fork with a note. Set `"effortCaps": {}` to lift the cap.
+- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, fork, review, consult, and the doctor probe after alias resolution. The built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only; an explicit `--effort high` or `xhigh` fails with the allowed list. Any other source above the cap (the config `defaultEffort`, a lane recorded before the cap, a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note, and the clamped value travels with every turn, including `codex exec resume` of a review-only session. Config may add caps for other models or lower a built-in cap; raising `gpt-6-astra` above `medium` is a config error. `efforts` must stay within `minimal`, `low`, `medium`, `high`, `xhigh`.
 - `gemini` is optional. Its shown values are the defaults. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
@@ -304,6 +304,8 @@ A new GPT spawn, review, or consult picks the account by this rule, and `cdx usa
 1. The lane's demand sets the headroom it needs on the weekly window: consult and review 5%, work 15%, supervisor 25%. A lane never changes account, so it must start with room to finish.
 2. Among accounts with that headroom, the one whose weekly window resets soonest goes first; whatever is unspent at reset is lost. Equal deadlines prefer the fuller account.
 3. Accounts short of the headroom come next, fullest first, with a warning that the lane may hit the limit mid-run. Accounts whose usage could not be probed come after them. Exhausted windows come last, and only when every account is exhausted does a lane start on one (soonest reset), with a feed warning.
+
+The evidence behind the rule is a usage snapshot under 30 minutes old that holds every rate-limit window and whose windows have not reset. Anything older, from before 3.10, or past a reset is probed again first; if the probe fails the account counts as unknown, never as empty or exhausted on stale numbers. Exhaustion is judged across every live window, so a spent five-hour window blocks the account even when the weekly one has room.
 
 `cdx usage` shows the spend order with each account's remaining share, reset time, and the pace in percent per day that would spend the remainder exactly at reset; a pace far above real burn means the window will expire unused. `usage --json` carries the same `advice` object. The primary account (first entry) is only used by `doctor` for the version check and by raw-session forks and adopts without `--account`.
 
