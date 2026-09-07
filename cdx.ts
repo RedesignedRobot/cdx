@@ -206,7 +206,19 @@ interface GateBaseline {
   checkedAt: string;
 }
 
+interface RoundRecord<S extends WorkState = WorkState> {
+  exitCode?: number;
+  note?: string;
+  state: S;
+  round?: number;
+  cwd: string;
+  report?: string;
+  updatedAt?: string;
+}
+
 interface Lane {
+  work: RoundRecord;
+  review?: RoundRecord<ReviewState>;
   engine?: Engine;
   // Codex model id of the work thread; absent on gemini lanes.
   model?: string;
@@ -227,15 +239,10 @@ interface Lane {
   workSessionId?: string;
   transcriptPath?: string;
   reviewEngine?: Engine;
-  // cwd and state remain the stable work values for old ledger consumers.
+  // Public status consumers use these work aliases.
   cwd: string;
-  workCwd?: string;
   effort: Effort;
   state: WorkState;
-  workState?: WorkState;
-  workRound?: number;
-  workUpdatedAt?: string;
-  workReport?: string;
   kind: "work" | "review";
   rounds: number;
   reports: string[];
@@ -248,19 +255,10 @@ interface Lane {
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
-  reviewState?: ReviewState;
-  reviewCwd?: string;
-  reviewRound?: number;
-  reviewExitCode?: number;
-  reviewNote?: string;
-  reviewReport?: string;
-  reviewUpdatedAt?: string;
   pid?: number;
   codexPid?: number;
   lastAction?: string;
   lastEventAt?: string;
-  exitCode?: number;
-  note?: string;
   lastResultError?: string;
   diffEmpty?: true;
   worktreePath?: string;
@@ -272,6 +270,7 @@ interface Lane {
 }
 
 interface Spec {
+  effort?: Effort;
   engine?: Engine;
   mode: Mode;
   lane: string;
@@ -533,13 +532,48 @@ function feedOwned(line: string, ownerSession?: string): boolean {
   return feed(`${line}${ownerSuffix(ownerSession)}`);
 }
 
+function normalizeLane(entry: any): void {
+  entry.work ??= {
+    state: entry.workState ?? (entry.kind === "review" && entry.state === "running" ? entry.workSessionId ? "done" : "adopted" : entry.state),
+    round: entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined),
+    cwd: entry.workCwd ?? entry.worktreePath ?? entry.cwd,
+    exitCode: entry.exitCode,
+    note: entry.note,
+    report: entry.workReport,
+    updatedAt: entry.workUpdatedAt,
+  };
+  if (!entry.review && (entry.reviewState || entry.kind === "review")) {
+    entry.review = {
+      state: entry.reviewState ?? entry.state,
+      round: entry.reviewRound ?? (entry.kind === "review" ? entry.rounds : undefined),
+      cwd: entry.reviewCwd ?? entry.work.cwd,
+      exitCode: entry.reviewExitCode,
+      note: entry.reviewNote,
+      report: entry.reviewReport,
+      updatedAt: entry.reviewUpdatedAt,
+    };
+  }
+  for (const key of ["workState", "workRound", "workCwd", "workReport", "workUpdatedAt", "exitCode", "note", "reviewState", "reviewRound", "reviewCwd", "reviewExitCode", "reviewNote", "reviewReport", "reviewUpdatedAt"]) delete entry[key];
+  entry.state = entry.work.state;
+  entry.cwd = entry.work.cwd;
+}
+
 function readLedger(): Ledger {
   if (!existsSync(LEDGER)) return {};
-  return JSON.parse(readFileSync(LEDGER, "utf8")) as Ledger;
+  const ledger = JSON.parse(readFileSync(LEDGER, "utf8"));
+  for (const entry of Object.values(ledger) as any[]) normalizeLane(entry);
+  return ledger;
 }
 
 function withLedger<T>(mutate: (ledger: Ledger) => T): T {
-  return withLockedJson(LEDGER, `${ROOT}/.lock`, readLedger, mutate);
+  return withLockedJson(LEDGER, `${ROOT}/.lock`, readLedger, (ledger) => {
+    const result = mutate(ledger);
+    for (const entry of Object.values(ledger)) {
+      entry.state = entry.work.state;
+      entry.cwd = entry.work.cwd;
+    }
+    return result;
+  });
 }
 
 // Read-mutate-write one JSON state file under a mkdir lock, written through a
@@ -578,20 +612,15 @@ function readLane(lane: string): Lane {
 }
 
 function workCwdOf(entry: Lane): string {
-  return entry.workCwd ?? entry.worktreePath ?? entry.cwd;
+  return entry.work.cwd;
 }
 
 function workStateOf(entry: Lane): WorkState {
-  if (entry.workState) return entry.workState;
-  // Old ledgers used state for the active review. A recorded work session
-  // proves that a work round completed before that review started.
-  if (entry.kind === "review" && entry.state === "running") return entry.workSessionId ? "done" : "adopted";
-  return entry.state;
+  return entry.work.state;
 }
 
 function activeStateOf(entry: Lane): WorkState | ReviewState {
-  if (entry.kind === "review") return entry.reviewState ?? entry.state;
-  return entry.state;
+  return entry.kind === "review" ? entry.review!.state : entry.work.state;
 }
 
 function laneRunning(entry: Lane): boolean {
@@ -599,19 +628,19 @@ function laneRunning(entry: Lane): boolean {
 }
 
 function roundStateOf(entry: Lane): WorkState | ReviewState {
-  return entry.kind === "review" ? entry.reviewState ?? entry.state : entry.state;
+  return activeStateOf(entry);
 }
 
 function roundExitCodeOf(entry: Lane): number | undefined {
-  return entry.kind === "review" ? entry.reviewExitCode : entry.exitCode;
+  return entry.kind === "review" ? entry.review?.exitCode : entry.work.exitCode;
 }
 
 function roundNoteOf(entry: Lane): string | undefined {
-  return entry.kind === "review" ? entry.reviewNote : entry.note;
+  return entry.kind === "review" ? entry.review?.note : entry.work.note;
 }
 
 function roundReportOf(entry: Lane): string | undefined {
-  const direct = entry.kind === "review" ? entry.reviewReport : entry.workReport;
+  const direct = entry.kind === "review" ? entry.review?.report : entry.work.report;
   if (direct) return direct;
   const fallback = entry.reports.at(-1);
   return fallback?.endsWith(`-r${entry.rounds}.md`) ? fallback : undefined;
@@ -1316,19 +1345,12 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
         : existing?.workSessionId,
       gate: opts?.preserveGate ? existing?.gate : opts?.gate,
       cwd: workCwd,
-      workCwd,
       effort,
       state: workState,
-      workState,
-      workRound: kind === "work" ? rounds : existing?.workRound,
-      workUpdatedAt: kind === "work" ? now : existing?.workUpdatedAt,
-      reviewState: kind === "review" ? "running" : existing?.reviewState,
-      reviewCwd: kind === "review" ? cwd : existing?.reviewCwd,
-      reviewRound: kind === "review" ? rounds : existing?.reviewRound,
-      reviewExitCode: kind === "review" ? undefined : existing?.reviewExitCode,
-      reviewNote: kind === "review" ? undefined : existing?.reviewNote,
-      reviewReport: kind === "review" ? undefined : existing?.reviewReport,
-      reviewUpdatedAt: kind === "review" ? now : existing?.reviewUpdatedAt,
+      work: kind === "work"
+        ? { state: workState, round: rounds, cwd: workCwd, updatedAt: now, report: existing?.work.report }
+        : existing?.work ?? { state: workState, cwd: workCwd },
+      review: kind === "review" ? { state: "running", cwd, round: rounds, updatedAt: now } : existing?.review,
       roundStartedAt: now,
       // Reserve the lane with the parent's pid so a concurrent launch is
       // rejected before the runner records its own pid.
@@ -1346,8 +1368,6 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       // or note as its own.
       lastAction: undefined,
       lastEventAt: undefined,
-      note: kind === "work" ? undefined : existing?.note,
-      exitCode: kind === "work" ? undefined : existing?.exitCode,
       diffEmpty: undefined,
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
@@ -1357,7 +1377,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
 }
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
-  // The detached runner starts without the config file; pin what it needs.
+  spec.effort ??= readLedger()[spec.lane]?.effort ?? config.defaultEffort;
   if (spec.engine === "gemini") {
     const policy = config.gemini ?? geminiConfig();
     spec.model ??= policy.model;
@@ -1530,13 +1550,12 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
   writeFileSync(reportPath, `# Gate baseline\n\n\`${command}\` exited ${result.exitCode} in ${cwd} before worker startup.\n\n\`\`\`\n${gateOutputForReport(result.output)}\n\`\`\`\n`);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
-    item.state = "gate-invalid";
-    item.workState = "gate-invalid";
+    item.work.state = "gate-invalid";
     item.gateBaseline = { round, command, cwd, exitCode: result.exitCode, checkedAt };
-    item.exitCode = result.exitCode;
-    item.note = note;
-    item.workReport = reportPath;
-    item.workUpdatedAt = checkedAt;
+    item.work.exitCode = result.exitCode;
+    item.work.note = note;
+    item.work.report = reportPath;
+    item.work.updatedAt = checkedAt;
     item.pid = undefined;
     item.codexPid = undefined;
     item.reports.push(reportPath);
@@ -1552,16 +1571,13 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
 function failActiveRound(lane: string, item: Lane, note: string): void {
   const now = new Date().toISOString();
   if (item.kind === "review") {
-    item.reviewState = "failed";
-    item.reviewNote = note;
-    item.reviewUpdatedAt = now;
-    item.state = workStateOf(item);
-    item.workState = item.state;
+    item.review!.state = "failed";
+    item.review!.note = note;
+    item.review!.updatedAt = now;
   } else {
-    item.state = "failed";
-    item.workState = "failed";
-    item.note = note;
-    item.workUpdatedAt = now;
+    item.work.state = "failed";
+    item.work.note = note;
+    item.work.updatedAt = now;
   }
   item.pid = undefined;
   item.codexPid = undefined;
@@ -1668,9 +1684,133 @@ function extractFinalAgentResponse(responses: Map<string, { stepIndex: string; n
   return undefined;
 }
 
+async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAgentResponse, isReview, childRunning, geminiContinuations, turnFailureReason, touchLedger, now, reportPath }: {
+  lane: string; round: number; ownerSession?: string; result: any; finalAgentResponse?: string; isReview: boolean;
+  childRunning: boolean; geminiContinuations: number; turnFailureReason?: string;
+  touchLedger: (patch: (item: Lane) => void, force?: boolean) => void;
+  now: string; reportPath: string;
+}): Promise<{ turnFailureReason?: string; geminiContinuations: number; continueTurn: boolean }> {
+  let continueTurn = false;
+  const rawError = result.error?.message ?? result.error;
+  const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
+  const errorCandidates = [
+    errorText,
+    typeof result.response === "string" ? result.response : "",
+  ].filter((s) => s.trim().length > 0);
+  const effectiveError = (errorText.trim() || (typeof result.response === "string" ? result.response : "")).trim();
+  const recordedError = effectiveError.slice(0, 300);
+
+  const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
+  const previousResultError = readLedger()[lane]?.lastResultError;
+  const isVerbatimReplay = Boolean(!isTransportError && previousResultError && effectiveError === previousResultError);
+
+  let treatedAsReplay = false;
+  let success = result.status === "SUCCESS";
+
+  if (!success) {
+    if (isVerbatimReplay && finalAgentResponse) {
+      treatedAsReplay = true;
+      success = true;
+    } else {
+      const quotaCandidate = errorCandidates.find((c) => /Individual quota reached/i.test(c));
+      if (quotaCandidate) {
+        let usageSnapshot: GeminiUsageSnapshot | undefined;
+        try { usageSnapshot = await refreshGeminiUsage(); } catch {}
+        if (usageSnapshot && usageSnapshot.fiveHour.remainingPercent >= 5) {
+          if (finalAgentResponse) {
+            treatedAsReplay = true;
+            success = true;
+          } else {
+            touchLedger((item) => { item.lastResultError = recordedError; }, true);
+            turnFailureReason = `agy reported quota exhausted but usage shows ${usageSnapshot.fiveHour.remainingPercent}% five-hour remaining; no block written`;
+          }
+        } else {
+          touchLedger((item) => { item.lastResultError = recordedError; }, true);
+          const delayMs = parseQuotaResetDelayMs(quotaCandidate);
+          const observedAt = new Date().toISOString();
+          const blockedUntil = new Date(Date.now() + (delayMs ?? (30 * 60 * 1000))).toISOString();
+          writeGeminiQuota({ blockedUntil, observedAt, lane, round });
+          turnFailureReason = `gemini five-hour quota exhausted; resets at ${blockedUntil}; resume this lane after the reset`;
+          const resetDetail = delayMs !== undefined ? `resets at ${blockedUntil}` : "reset time unknown; assuming 30m";
+          feedOwned(`[cdx] lane=${lane} round=${round} gemini quota exhausted; ${resetDetail}`, ownerSession);
+        }
+      } else {
+        touchLedger((item) => { item.lastResultError = recordedError; }, true);
+        if (isTransportError && childRunning && geminiContinuations < 2) {
+          geminiContinuations += 1;
+          touchLedger((item) => {
+            item.continuations = geminiContinuations;
+            item.lastEventAt = now;
+          }, true);
+          const reason = singleLine(effectiveError).slice(0, 80);
+          feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, ownerSession);
+          continueTurn = true;
+        } else {
+          const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
+          turnFailureReason ??= detail || "gemini result status ERROR";
+        }
+      }
+    }
+  }
+
+  if (success) {
+    if (result.status === "SUCCESS") {
+      touchLedger((item) => {
+        delete item.lastResultError;
+      }, true);
+    }
+    if (treatedAsReplay) {
+      feedOwned(`[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, ownerSession);
+    }
+    const qualified = qualifyGeminiReport(result, finalAgentResponse, isReview);
+    if (qualified.report !== undefined) writeFileSync(reportPath, qualified.report);
+    if (qualified.findings !== undefined) {
+      writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify({ findings: qualified.findings }, null, 2)}\n`);
+    }
+    turnFailureReason = qualified.failureReason ?? turnFailureReason;
+  } else {
+    if (typeof result.response === "string" && result.response.trim()) {
+      writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
+    }
+  }
+  return { turnFailureReason, geminiContinuations, continueTurn };
+}
+
+function qualifyGeminiReport(result: { structured_output?: any; response?: unknown }, finalAgentResponse: string | undefined, isReview: boolean): { report?: string; findings?: unknown[]; failureReason?: string } {
+  const structured = result.structured_output;
+  const hasStructuredReport = isReview && structured && typeof structured === "object" && !Array.isArray(structured) && typeof structured.report === "string";
+  const raw = hasStructuredReport ? structured.report : finalAgentResponse || (typeof result.response === "string" ? result.response.trim() : "");
+  const report = hasStructuredReport ? `${raw.trim()}\n` : isReview ? `${raw}\n\n## Harness note\n\nStructured output was missing.\n` : raw ? `${raw}\n` : undefined;
+  const failureReason = isReview && !hasStructuredReport && !raw
+    ? "agy finished without a report or structured output"
+    : isAgyCancellationTemplate(raw) ? "agy returned its cancellation template as the report; no qualifying report" : undefined;
+  return { report, failureReason, ...(hasStructuredReport && Array.isArray(structured.findings) ? { findings: structured.findings } : {}) };
+}
+
+async function* readJsonLines(stream: ReadableStream<Uint8Array>, options: { onChunk?: (chunk: Uint8Array) => void; ignoreMalformed?: boolean } = {}): AsyncGenerator<any> {
+  const decoder = new TextDecoder();
+  let buffer = "";
+  const parse = (line: string) => {
+    try { return JSON.parse(line); } catch (error) { if (!options.ignoreMalformed) throw error; }
+  };
+  for await (const chunk of stream) {
+    options.onChunk?.(chunk);
+    buffer += decoder.decode(chunk, { stream: true });
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      if (line.trim()) { const value = parse(line); if (value !== undefined) yield value; }
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer.trim()) { const value = parse(buffer); if (value !== undefined) yield value; }
+}
+
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
   const startingLane = readLedger()[lane];
+  spec.effort ??= startingLane?.effort ?? config.defaultEffort;
   const engine = spec.engine ?? laneEngine(startingLane);
   const gemini = engine === "gemini";
   const appServer = !gemini && appServerWorkRound(spec, startingLane);
@@ -1684,8 +1824,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   withLedger((ledger) => {
     const item = ledger[lane]!;
     item.pid = process.pid;
-    if (item.kind === "review") item.reviewState = "running";
-    else { item.state = "running"; item.workState = "running"; }
+    if (item.kind === "review") item.review!.state = "running";
+    else { item.work.state = "running"; }
     if (gemini && hooksInstalled) item.hooksActive = true;
     else delete item.hooksActive;
   });
@@ -1811,9 +1951,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     return details.length ? details.join(": ") : lastProtocolError;
   };
 
-  const handleEvent = async (line: string) => {
-    let event: any;
-    try { event = JSON.parse(line); } catch { return; }
+  const handleGeminiEvent = async (event: any) => {
     noteActivity();
     const now = new Date().toISOString();
     if (event.event === "init" && event.conversation_id) {
@@ -1880,132 +2018,24 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const isReview = startingLane?.kind === "review";
       const finalAgentResponse = extractFinalAgentResponse(turnAgentResponses);
 
-      const rawError = result.error?.message ?? result.error;
-      const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
-      const errorCandidates = [
-        errorText,
-        typeof result.response === "string" ? result.response : "",
-      ].filter((s) => s.trim().length > 0);
-      const effectiveError = (errorText.trim() || (typeof result.response === "string" ? result.response : "")).trim();
-      const recordedError = effectiveError.slice(0, 300);
-
-      const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
-      const previousResultError = readLedger()[lane]?.lastResultError;
-      const isVerbatimReplay = Boolean(!isTransportError && previousResultError && effectiveError === previousResultError);
-
-      let treatedAsReplay = false;
-      let success = result.status === "SUCCESS";
-
-      if (!success) {
-        if (isVerbatimReplay && finalAgentResponse) {
-          treatedAsReplay = true;
-          success = true;
-        } else {
-          const quotaCandidate = errorCandidates.find((c) => /Individual quota reached/i.test(c));
-          if (quotaCandidate) {
-            let usageSnapshot: GeminiUsageSnapshot | undefined;
-            try { usageSnapshot = await refreshGeminiUsage(); } catch {}
-            if (usageSnapshot && usageSnapshot.fiveHour.remainingPercent >= 5) {
-              if (finalAgentResponse) {
-                treatedAsReplay = true;
-                success = true;
-              } else {
-                touchLedger((item) => { item.lastResultError = recordedError; }, true);
-                turnFailureReason = `agy reported quota exhausted but usage shows ${usageSnapshot.fiveHour.remainingPercent}% five-hour remaining; no block written`;
-              }
-            } else {
-              touchLedger((item) => { item.lastResultError = recordedError; }, true);
-              const delayMs = parseQuotaResetDelayMs(quotaCandidate);
-              const observedAt = new Date().toISOString();
-              const blockedUntil = new Date(Date.now() + (delayMs ?? (30 * 60 * 1000))).toISOString();
-              writeGeminiQuota({ blockedUntil, observedAt, lane, round });
-              turnFailureReason = `gemini five-hour quota exhausted; resets at ${blockedUntil}; resume this lane after the reset`;
-              const resetDetail = delayMs !== undefined ? `resets at ${blockedUntil}` : "reset time unknown; assuming 30m";
-              feedOwned(`[cdx] lane=${lane} round=${round} gemini quota exhausted; ${resetDetail}`, spec.ownerSession);
-            }
-          } else {
-            touchLedger((item) => { item.lastResultError = recordedError; }, true);
-            if (isTransportError && proc.exitCode === null && geminiContinuations < 2) {
-              geminiContinuations += 1;
-              touchLedger((item) => {
-                item.continuations = geminiContinuations;
-                item.lastEventAt = now;
-              }, true);
-              const reason = singleLine(effectiveError).slice(0, 80);
-              feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, spec.ownerSession);
-              writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
-            } else {
-              const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
-              turnFailureReason ??= detail || "gemini result status ERROR";
-            }
-          }
-        }
-      }
-
-      if (success) {
-        if (result.status === "SUCCESS") {
-          touchLedger((item) => {
-            delete item.lastResultError;
-          }, true);
-        }
-        if (treatedAsReplay) {
-          feedOwned(`[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, spec.ownerSession);
-        }
-        if (isReview) {
-          const structured = result.structured_output;
-          const hasStructuredReport = Boolean(
-            structured && typeof structured === "object" && !Array.isArray(structured) && typeof structured.report === "string"
-          );
-          if (hasStructuredReport) {
-            writeFileSync(reportPath, `${structured.report.trim()}\n`);
-            if (Array.isArray(structured.findings)) {
-              writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify({ findings: structured.findings }, null, 2)}\n`);
-            }
-            if (isAgyCancellationTemplate(structured.report)) {
-              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
-            }
-          } else {
-            const rawResponse = finalAgentResponse || (typeof result.response === "string" ? result.response.trim() : "");
-            const fallbackReport = `${rawResponse}\n\n## Harness note\n\nStructured output was missing.\n`;
-            writeFileSync(reportPath, fallbackReport);
-            // The harness note is not a report; an empty response must not
-            // finish the review as done on the strength of it.
-            if (!rawResponse) {
-              turnFailureReason = "agy finished without a report or structured output";
-            } else if (isAgyCancellationTemplate(rawResponse)) {
-              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
-            }
-          }
-        } else if (spec.outputSchema !== undefined) {
-          const schemaResponse = finalAgentResponse || (typeof result.response === "string" ? result.response.trim() : "");
-          if (schemaResponse) {
-            writeFileSync(reportPath, `${schemaResponse}\n`);
-            if (isAgyCancellationTemplate(schemaResponse)) {
-              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
-            }
-          }
-        } else {
-          let chosenReport = finalAgentResponse;
-          if (!chosenReport && typeof result.response === "string" && result.response.trim()) {
-            chosenReport = result.response.trim();
-          }
-          if (chosenReport) {
-            writeFileSync(reportPath, `${chosenReport}\n`);
-            if (isAgyCancellationTemplate(chosenReport)) {
-              turnFailureReason = "agy returned its cancellation template as the report; no qualifying report";
-            }
-          }
-        }
-      } else {
-        if (typeof result.response === "string" && result.response.trim()) {
-          writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
-        }
-      }
+      const qualified = await qualifyGeminiResult({
+        lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+        childRunning: proc.exitCode === null, geminiContinuations, turnFailureReason, touchLedger, now, reportPath,
+      });
+      turnFailureReason = qualified.turnFailureReason;
+      geminiContinuations = qualified.geminiContinuations;
+      if (qualified.continueTurn) writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
       geminiTurnsCompleted += 1;
       const wake = geminiTurnWake;
       geminiTurnWake = undefined;
       wake?.();
-    } else if (event.method === "thread/started" && event.params?.thread?.id) {
+    }
+  };
+
+  const handleCodexEvent = async (event: any) => {
+    noteActivity();
+    const now = new Date().toISOString();
+    if (event.method === "thread/started" && event.params?.thread?.id) {
       touchLedger((item) => { item.sessionId = event.params.thread.id; item.lastEventAt = now; }, true);
     } else if (event.method === "error" && event.params?.error) {
       const error = event.params.error;
@@ -2081,17 +2111,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   };
 
   const pumpJson = async (stream: ReadableStream<Uint8Array>) => {
-    const decoder = new TextDecoder();
-    let buffer = "";
-    for await (const chunk of stream) {
-      log.write(chunk);
-      log.flush();
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split("\n");
-      buffer = lines.pop() ?? "";
-      for (const line of lines) if (line.trim()) await handleEvent(line);
+    for await (const event of readJsonLines(stream, { ignoreMalformed: true, onChunk: (chunk) => { log.write(chunk); log.flush(); } })) {
+      await (gemini ? handleGeminiEvent(event) : handleCodexEvent(event));
     }
-    if (buffer.trim()) await handleEvent(buffer);
   };
   const pumpRaw = async (stream: ReadableStream<Uint8Array>, sink: typeof log) => {
     for await (const chunk of stream) {
@@ -2205,30 +2227,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     };
     const notify = (method: string) => writeRpc({ method });
     const pumpRpc = async (stream: ReadableStream<Uint8Array>) => {
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for await (const chunk of stream) {
-        log.write(chunk);
-        log.flush();
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          await handleEvent(line);
-          let message: any;
-          try { message = JSON.parse(line); } catch { continue; }
-          if (typeof message.id === "number" && pending.has(message.id)) {
-            const waiter = pending.get(message.id)!;
-            pending.delete(message.id);
-            if (message.error) waiter.reject(new Error(`${message.error.message ?? "app-server request failed"}${message.error.data ? `: ${JSON.stringify(message.error.data)}` : ""}`));
-            else waiter.resolve(message.result);
-          } else if (message.id !== undefined && message.method) {
-            writeRpc({ id: message.id, error: { code: -32601, message: `cdx does not handle server request ${message.method}` } });
-          }
+      for await (const message of readJsonLines(stream, { ignoreMalformed: true, onChunk: (chunk) => { log.write(chunk); log.flush(); } })) {
+        await handleCodexEvent(message);
+        if (typeof message.id === "number" && pending.has(message.id)) {
+          const waiter = pending.get(message.id)!;
+          pending.delete(message.id);
+          if (message.error) waiter.reject(new Error(`${message.error.message ?? "app-server request failed"}${message.error.data ? `: ${JSON.stringify(message.error.data)}` : ""}`));
+          else waiter.resolve(message.result);
+        } else if (message.id !== undefined && message.method) {
+          writeRpc({ id: message.id, error: { code: -32601, message: `cdx does not handle server request ${message.method}` } });
         }
       }
-      if (buffer.trim()) await handleEvent(buffer);
       rpcClosed = true;
       const error = new Error("app-server closed before replying");
       for (const waiter of pending.values()) waiter.reject(error);
@@ -2266,7 +2275,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         // A raw-session fork carries the requested model; a lane fork
         // inherits its source thread's model and sends none.
         ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : spec.mode === "fork" && spec.model ? { model: spec.model } : {}),
-        effort: readLedger()[lane]?.effort ?? config.defaultEffort,
+        effort: spec.effort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
       });
       const turnId = result?.turn?.id;
@@ -2443,9 +2452,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   log.end();
   errLog.end();
 
-  // Text modes (resume/fork/native review) have no -o support: if the worker
-  // did not write the report file, salvage the final agent message from the
-  // transcript (the block after the last bare "codex" line, before "tokens used").
+  return finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
+}
+
+async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+  spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
+  logPath: string; reportPath: string;
+  reviewSnapshot?: ReturnType<typeof captureReviewTree>;
+  workTreeStartSnapshot?: ReturnType<typeof captureReviewTree>;
+  exitCode: number; turnFailureReason?: string; receivedSignal?: "SIGTERM" | "SIGINT";
+  maxRuntimeHit: boolean; geminiContinuations: number; roundCleanupWarning?: string;
+}): Promise<number> {
   if (!jsonMode && !existsSync(reportPath)) {
     const lines = readFileSync(logPath, "utf8").split("\n");
     const start = lines.lastIndexOf("codex");
@@ -2541,20 +2558,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
     if (unchangedWork) item.diffEmpty = true;
     if (item.kind === "review") {
-      item.reviewState = roundState;
-      item.reviewExitCode = exitCode;
-      item.reviewNote = roundNote;
-      item.reviewReport = existsSync(reportPath) ? reportPath : undefined;
-      item.reviewUpdatedAt = new Date().toISOString();
-      item.state = workStateOf(item);
-      item.workState = item.state;
+      item.review!.state = roundState;
+      item.review!.exitCode = exitCode;
+      item.review!.note = roundNote;
+      item.review!.report = existsSync(reportPath) ? reportPath : undefined;
+      item.review!.updatedAt = new Date().toISOString();
     } else {
-      item.state = roundState;
-      item.workState = roundState;
-      item.exitCode = exitCode;
-      item.note = roundNote;
-      item.workReport = existsSync(reportPath) ? reportPath : undefined;
-      item.workUpdatedAt = new Date().toISOString();
+      item.work.state = roundState;
+      item.work.exitCode = exitCode;
+      item.work.note = roundNote;
+      item.work.report = existsSync(reportPath) ? reportPath : undefined;
+      item.work.updatedAt = new Date().toISOString();
     }
     item.pid = undefined;
     item.codexPid = undefined;
@@ -2579,7 +2593,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
   }
   const finalRoundState = roundStateOf(entry);
-  const finalRoundNote = entry.kind === "review" ? entry.reviewNote : entry.note;
+  const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
   feedOwned(`[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
@@ -3174,7 +3188,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const stale = active && !pidAlive(entry.pid);
   const workState = workStateOf(entry);
   const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
-  const workRound = entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined);
+  const workRound = entry.work.round ?? (entry.kind === "work" ? entry.rounds : undefined);
   const engine = laneEngine(entry);
   const steerMode = entry.kind === "work" && active && engine === "gemini"
     ? `  steer=${entry.hooksActive ? "in-turn" : "follow-up"}`
@@ -3195,28 +3209,28 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   }
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
-    : `finished ${fmtAge(entry.workUpdatedAt ?? entry.updatedAt)} ago`;
+    : `finished ${fmtAge(entry.work.updatedAt ?? entry.updatedAt)} ago`;
   const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
   const tokenLabel = active && entry.roundTokens
     ? `${fmtTokens(entry.roundTokens)} round / ${fmtTokens(entry.tokens)} total`
     : fmtTokens(entry.tokens);
   const tokenDetail = `${tokenLabel} · ${engine === "gemini" ? "gemini conversation" : "codex session"} ${(entry.workSessionId ?? entry.sessionId)?.slice(0, 8) ?? "-"}`;
-  const report = entry.workReport ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
-  const lastParts = [entry.diffEmpty ? "no tree change" : undefined, entry.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
+  const report = entry.work.report ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
+  const lastParts = [entry.diffEmpty ? "no tree change" : undefined, entry.work.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
   const last = entry.kind === "work" && active ? entry.lastAction ?? "-"
     : lastParts.join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
   const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
   if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
-  if (entry.reviewState) {
-    const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.reviewState;
-    const reviewTiming = entry.reviewState === "running"
+  if (entry.review?.state) {
+    const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.review?.state;
+    const reviewTiming = entry.review?.state === "running"
       ? `running ${fmtAge(entry.roundStartedAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt)}`
-      : `finished ${fmtAge(entry.reviewUpdatedAt)} ago`;
-    const reviewLast = entry.reviewState === "running" ? entry.lastAction ?? "-"
-      : [entry.reviewNote, entry.reviewReport ? `report ${displayPath(entry.reviewReport)}` : undefined].filter(Boolean).join(" · ") || "-";
+      : `finished ${fmtAge(entry.review?.updatedAt)} ago`;
+    const reviewLast = entry.review?.state === "running" ? entry.lastAction ?? "-"
+      : [entry.review?.note, entry.review?.report ? `report ${displayPath(entry.review?.report)}` : undefined].filter(Boolean).join(" · ") || "-";
     const label = entry.consult ? "consult" : "review";
-    lines.push(line(label, `${coloredState(reviewState)}${entry.reviewRound ? ` r${entry.reviewRound}` : ""} · cwd ${displayPath(entry.reviewCwd ?? workCwdOf(entry))} · ${reviewTiming}`));
+    lines.push(line(label, `${coloredState(reviewState)}${entry.review?.round ? ` r${entry.review?.round}` : ""} · cwd ${displayPath(entry.review?.cwd ?? workCwdOf(entry))} · ${reviewTiming}`));
     lines.push(line(`${label} last`, reviewLast));
   }
   return lines.join("\n");
@@ -3452,7 +3466,7 @@ async function followAll() {
       const cursor = openCursor(lane, entry, true);
       if (cursor) {
         cursors.set(lane, cursor);
-        console.log(`${color.magenta(`[${lane}]`)} --- attached (round ${cursor.round}, ${entry.effort}, ${entry.kind === "review" ? entry.reviewCwd ?? workCwdOf(entry) : workCwdOf(entry)}) ---`);
+        console.log(`${color.magenta(`[${lane}]`)} --- attached (round ${cursor.round}, ${entry.effort}, ${entry.kind === "review" ? entry.review?.cwd ?? workCwdOf(entry) : workCwdOf(entry)}) ---`);
       }
     }
     for (const [lane, cursor] of cursors) {
@@ -3571,27 +3585,9 @@ async function readAccountUsage(codexHome?: string): Promise<AccountUsage | unde
 
     const response = await Promise.race([
       (async () => {
-        const decoder = new TextDecoder();
-        let buffer = "";
-        for await (const chunk of proc!.stdout) {
-          buffer += decoder.decode(chunk, { stream: true });
-          let newline = buffer.indexOf("\n");
-          while (newline >= 0) {
-            const line = buffer.slice(0, newline).trim();
-            buffer = buffer.slice(newline + 1);
-            if (line) {
-              const message = JSON.parse(line) as { id?: number };
-              if (message.id === 2) return message;
-            }
-            newline = buffer.indexOf("\n");
-          }
-        }
-        buffer += decoder.decode();
-        if (buffer.trim()) {
-          const message = JSON.parse(buffer) as { id?: number };
+        for await (const message of readJsonLines(proc!.stdout)) {
           if (message.id === 2) return message;
         }
-        throw new Error("app server exited before the usage response");
       })(),
       new Promise<never>((_, reject) => {
         timeout = setTimeout(() => {
@@ -3647,26 +3643,17 @@ function readUsageSnapshot(account?: AccountChoice): UsageSnapshot | undefined {
 }
 
 function writeUsageSnapshot(snapshot: UsageSnapshot, account?: AccountChoice) {
-  const tmp = `${USAGE_PATH}.tmp.${process.pid}`;
-  try {
-    let value: UsageSnapshot | { accounts: Record<string, UsageSnapshot> } = snapshot;
-    if (account) {
-      let accounts: Record<string, UsageSnapshot> = {};
-      try {
-        const current = JSON.parse(readFileSync(USAGE_PATH, "utf8")) as { accounts?: unknown };
-        if (current?.accounts && typeof current.accounts === "object" && !Array.isArray(current.accounts)) {
-          accounts = Object.fromEntries(Object.entries(current.accounts as Record<string, unknown>)
-            .filter((entry): entry is [string, UsageSnapshot] => isUsageSnapshot(entry[1])));
-        }
-      } catch { /* missing, flat, or malformed means an empty account cache */ }
-      value = { accounts: { ...accounts, [account.name]: snapshot } };
-    }
-    writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
-    renameSync(tmp, USAGE_PATH);
-  } catch (error) {
-    try { rmSync(tmp, { force: true }); } catch { /* best-effort */ }
-    throw error;
-  }
+  withLockedJson<Record<string, any>, void>(USAGE_PATH, `${ROOT}/.usage-write.lock`, () => {
+    try {
+      const value = JSON.parse(readFileSync(USAGE_PATH, "utf8"));
+      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    } catch { return {}; }
+  }, (value) => {
+    const accounts = account && value.accounts && typeof value.accounts === "object" && !Array.isArray(value.accounts)
+      ? Object.fromEntries(Object.entries(value.accounts).filter((entry) => isUsageSnapshot(entry[1]))) : {};
+    for (const key of Object.keys(value)) delete value[key];
+    Object.assign(value, account ? { accounts: { ...accounts, [account.name]: snapshot } } : snapshot);
+  });
 }
 
 function withUsageLock<T>(action: () => T): T | undefined {
@@ -4291,31 +4278,22 @@ async function probeAppServer(account?: AccountChoice): Promise<{ reply: string;
   };
   const reader = (async () => {
     try {
-      const decoder = new TextDecoder();
-      let buffer = "";
-      for await (const chunk of proc.stdout) {
-        buffer += decoder.decode(chunk, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() ?? "";
-        for (const line of lines) {
-          if (!line.trim()) continue;
-          const event = JSON.parse(line);
-          if (typeof event.id === "number" && pending.has(event.id)) {
-            const waiter = pending.get(event.id)!;
-            pending.delete(event.id);
-            if (event.error) waiter.reject(new Error(event.error.message ?? "app-server probe request failed"));
-            else waiter.resolve(event.result);
-          } else if (event.method === "item/completed" && event.params?.item?.type === "agentMessage") {
-            reply = event.params.item.text ?? reply;
-          } else if (event.method === "thread/tokenUsage/updated" && event.params?.tokenUsage?.last) {
-            const last = event.params.tokenUsage.last;
-            usage = `${last.inputTokens ?? "?"} in / ${last.outputTokens ?? "?"} out`;
-          } else if (event.method === "turn/completed") {
-            const resolve = turnResolve;
-            turnResolve = undefined;
-            turnReject = undefined;
-            resolve?.(event.params.turn as AppTurn);
-          }
+      for await (const event of readJsonLines(proc.stdout)) {
+        if (typeof event.id === "number" && pending.has(event.id)) {
+          const waiter = pending.get(event.id)!;
+          pending.delete(event.id);
+          if (event.error) waiter.reject(new Error(event.error.message ?? "app-server probe request failed"));
+          else waiter.resolve(event.result);
+        } else if (event.method === "item/completed" && event.params?.item?.type === "agentMessage") {
+          reply = event.params.item.text ?? reply;
+        } else if (event.method === "thread/tokenUsage/updated" && event.params?.tokenUsage?.last) {
+          const last = event.params.tokenUsage.last;
+          usage = `${last.inputTokens ?? "?"} in / ${last.outputTokens ?? "?"} out`;
+        } else if (event.method === "turn/completed") {
+          const resolve = turnResolve;
+          turnResolve = undefined;
+          turnReject = undefined;
+          resolve?.(event.params.turn as AppTurn);
         }
       }
     } finally {
@@ -4557,7 +4535,7 @@ async function hookCommand(argv: string[]): Promise<void> {
       const entry = ledger[lane];
       if (!entry) passThrough();
       const currentRound = process.env.CDX_ROUND;
-      const isReview = entry.kind === "review" || (entry.reviewState === "running" && currentRound !== undefined && String(entry.reviewRound) === String(currentRound));
+      const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
       const toolName = input.toolCall?.name;
       if (isReview && toolName && REVIEW_DENIED_TOOLS.has(toolName)) {
         console.log(JSON.stringify({
@@ -4575,7 +4553,7 @@ async function hookCommand(argv: string[]): Promise<void> {
       const entry = ledger[lane];
       if (!entry) passThrough();
       const currentRound = process.env.CDX_ROUND;
-      const isReview = entry.kind === "review" || (entry.reviewState === "running" && currentRound !== undefined && String(entry.reviewRound) === String(currentRound));
+      const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
       if (isReview || entry.kind !== "work") {
         console.log("{}");
         return;
@@ -5008,7 +4986,7 @@ function briefCommand() {
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
   const entries = Object.entries(readLedger());
   const running = entries.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
-  const failed = entries.filter(([, entry]) => !laneRunning(entry) && (entry.state === "failed" || entry.state === "gate-invalid" || entry.reviewState === "failed")).sort(byRecency);
+  const failed = entries.filter(([, entry]) => !laneRunning(entry) && (entry.state === "failed" || entry.state === "gate-invalid" || entry.review?.state === "failed")).sort(byRecency);
   const lanes = [...running, ...failed];
   if (lanes.length > 0) console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
   printRunningJobs();
@@ -5110,8 +5088,8 @@ async function killLane(lane: string, entry: Lane, note?: string) {
           withLedger((ledger) => {
             const item = ledger[lane];
             if (item) {
-              if (item.kind === "review") item.reviewNote = item.reviewNote ? `${item.reviewNote}; ${note}` : note;
-              else item.note = item.note ? `${item.note}; ${note}` : note;
+              if (item.kind === "review") item.review!.note = item.review!.note ? `${item.review!.note}; ${note}` : note;
+              else item.work.note = item.work.note ? `${item.work.note}; ${note}` : note;
               item.updatedAt = new Date().toISOString();
             }
           });
@@ -5129,8 +5107,8 @@ async function killLane(lane: string, entry: Lane, note?: string) {
   const finalized = withLedger((ledger) => {
     const item = ledger[lane]!;
     failActiveRound(lane, item, note ? `killed: ${note}` : "killed");
-    if (item.kind === "review") item.reviewExitCode = undefined;
-    else item.exitCode = undefined;
+    if (item.kind === "review") item.review!.exitCode = undefined;
+    else item.work.exitCode = undefined;
     return item;
   });
   feedOwned(`[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)}`, finalized.ownerSession);
@@ -5361,9 +5339,9 @@ function viewActivityOrder(a: { statusGroup: string; lastActivityAt: string }, b
 function viewLaneSummary(name: string, entry: Lane) {
   const startedAt = entry.roundStartedAt ?? entry.createdAt;
   const statusGroup = viewStatusGroup(activeStateOf(entry));
-  const lastActivityAt = [startedAt, entry.updatedAt, entry.lastEventAt, entry.reviewUpdatedAt]
+  const lastActivityAt = [startedAt, entry.updatedAt, entry.lastEventAt, entry.review?.updatedAt]
     .filter((value): value is string => Boolean(value)).sort((a, b) => Date.parse(b) - Date.parse(a))[0]!;
-  return { ...entry, name, engine: roundEngine(entry), startedAt, lastActivityAt, statusGroup,
+  return { ...entry, reviewState: entry.review?.state, name, engine: roundEngine(entry), startedAt, lastActivityAt, statusGroup,
     model: roundEngine(entry) === laneEngine(entry) ? entry.model : undefined,
     stalled: statusGroup === "running" && Date.now() - Date.parse(entry.lastEventAt ?? startedAt) >= 300_000,
   };
@@ -5592,6 +5570,7 @@ try {
 }
 
 export {
+  readJsonLines, qualifyGeminiReport, writeUsageSnapshot,
   isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA,
   GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, requireGeminiQuota, geminiQuotaState,
 };
@@ -5640,9 +5619,9 @@ switch (command) {
         ...(model ? { model } : {}),
         ...(account ? { account: account.name, codexHome: account.home } : {}),
         ...owner,
-        sessionId, workSessionId: sessionId, cwd: parsed.flags.cd ?? process.cwd(), workCwd: parsed.flags.cd ?? process.cwd(), effort: engine === "gemini" ? "high" : config.defaultEffort,
-        state: "adopted", workState: "adopted", kind: "work", rounds: ledger[lane]?.rounds ?? 0,
-        reports: ledger[lane]?.reports ?? [], createdAt: ledger[lane]?.createdAt ?? now, updatedAt: now, workUpdatedAt: now,
+        sessionId, workSessionId: sessionId, cwd: parsed.flags.cd ?? process.cwd(), work: { state: "adopted", cwd: parsed.flags.cd ?? process.cwd(), updatedAt: now }, effort: engine === "gemini" ? "high" : config.defaultEffort,
+        state: "adopted", kind: "work", rounds: ledger[lane]?.rounds ?? 0,
+        reports: ledger[lane]?.reports ?? [], createdAt: ledger[lane]?.createdAt ?? now, updatedAt: now,
       };
     });
     console.log(`cdx: adopted lane=${lane} session=${sessionId}`);
@@ -5741,9 +5720,8 @@ switch (command) {
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
     withLedger((ledger) => {
       const item = ledger[lane]!;
-      item.state = "closed";
-      item.workState = "closed";
-      if (note) item.note = note;
+      item.work.state = "closed";
+      if (note) item.work.note = note;
       item.updatedAt = new Date().toISOString();
     });
     console.log(`cdx: closed lane=${lane}`);
