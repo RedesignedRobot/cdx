@@ -34,10 +34,13 @@ verifies them; you review and merge. Nothing lands without your review.
 4. Read the reports, run the wall, run one hostile review (`cdx review <lane>
    "<attack items>"` on Gemini, or Astra for a design-heavy change), merge.
 
-Astra's allowance is about a quarter of GPT-5.6's. The default effort is
-medium; raise it only for a supervisor that owns a large change. Gemini is the
-workhorse: a precise brief finishes in about nine minutes against forty to
-fifty for a gpt lane.
+Astra runs at `low` or `medium` only; cdx refuses `high` and above (the
+`effortCaps` config). The default is medium. Gemini is the workhorse: a
+precise brief finishes in about nine minutes against forty to fifty for a gpt
+lane. Several Codex accounts share the load: cdx starts each new gpt lane on
+the account whose weekly window resets soonest and still has headroom for the
+lane's size, and `cdx usage` prints the same advice with the pace per day that
+would empty each window before its reset.
 
 ## Astra is a peer, Gemini is a worker
 

@@ -1,3 +1,9 @@
+## 3.10.0
+
+- Account advisor. A new gpt spawn, review, or consult picks the Codex account by deadline and headroom: among accounts with enough weekly-window headroom for the lane's demand (consult/review 5%, work 15%, supervisor 25%), the one whose window resets soonest goes first, since unspent share is lost at reset; equal deadlines prefer the fuller account. Accounts short of headroom rank next (fullest first, with a mid-run limit warning), unknown usage after them, exhausted windows last. The spawn output names the account and the reason. `cdx usage` and `cdx doctor` print the same spend order with each account's remaining share, reset time, and the pace per day that would empty it before reset; `usage --json` carries an `advice` object. Usage snapshots now keep every rate-limit window so the weekly deadline survives a busy five-hour window.
+- Effort caps. `effortCaps` in config maps a model id to its highest effort; the built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only. Spawn, resume, fork, review, and consult refuse an explicit `--effort` above the cap after alias resolution; an inherited effort above it (a lane recorded before the cap, or a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note.
+- `gpt-6-astra` is the built-in default model; `gpt-5.6-sol` is retired from the docs (a raw id still works on `--model`).
+
 ## 3.9.0
 
 - Opens `cdx view` on running lanes and jobs. Running, Done, Failed, and All filters persist across reloads. Running work stays first, with recent activity first within running and finished groups. Closed and adopted lanes stay in All.

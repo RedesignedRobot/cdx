@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.9.0";
+const VERSION = "3.10.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -181,9 +181,17 @@ interface Config {
   defaultEffort: string;
   rules: string[];
   accounts?: Record<string, string>;
+  // Highest effort a Codex model may run at, by model id. Astra is capped at
+  // medium by default because high and above burn the weekly window on churn.
+  effortCaps: Record<string, string>;
   worktreeSetup?: string;
   gemini?: GeminiConfig;
 }
+
+// Codex reasoning efforts from cheapest to most expensive; effortCaps compare
+// against this order.
+const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh"];
+const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium" };
 
 interface Tokens { input: number; cached: number; output: number }
 
@@ -313,10 +321,11 @@ const MODEL_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
 function readConfig(skipFile = false): Config {
   const defaults: Config = {
-    model: "gpt-5.6-sol",
+    model: "gpt-6-astra",
     efforts: ["low", "medium", "high"],
     defaultEffort: "medium",
     rules: [],
+    effortCaps: DEFAULT_EFFORT_CAPS,
   };
   if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
 
@@ -338,7 +347,7 @@ function readConfig(skipFile = false): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "worktreeSetup", "gemini"]);
+  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -392,6 +401,22 @@ function readConfig(skipFile = false): Config {
     accounts = Object.fromEntries(parsedAccounts);
   }
 
+  let effortCaps: Record<string, string> = defaults.effortCaps;
+  if (Object.hasOwn(input, "effortCaps")) {
+    const value = input.effortCaps;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      configError("effortCaps must be an object mapping Codex model ids to the highest allowed effort");
+    }
+    effortCaps = {};
+    for (const [modelId, cap] of Object.entries(value as Record<string, unknown>)) {
+      if (!MODEL_ID.test(modelId)) configError(`effortCaps key "${modelId}" is not a Codex model id`);
+      if (typeof cap !== "string" || !EFFORT_ORDER.includes(cap)) {
+        configError(`effortCaps.${modelId} must be one of ${EFFORT_ORDER.join(", ")}`);
+      }
+      effortCaps[modelId] = cap;
+    }
+  }
+
   let worktreeSetup: string | undefined;
   if (Object.hasOwn(input, "worktreeSetup")) {
     if (typeof input.worktreeSetup !== "string" || input.worktreeSetup.trim().length === 0) {
@@ -426,7 +451,7 @@ function readConfig(skipFile = false): Config {
 
   return {
     model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
-    ...(accounts ? { accounts } : {}), ...(worktreeSetup ? { worktreeSetup } : {}), ...(gemini ? { gemini } : {}),
+    ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), ...(gemini ? { gemini } : {}),
   };
 }
 
@@ -942,6 +967,24 @@ function engineEffort(engine: Engine, parsed: Parsed, inherited?: Effort): Effor
     return "high";
   }
   return parsed.flags.effort ? configuredEffort(parsed.flags.effort) : inherited ?? configuredEffort(config.defaultEffort);
+}
+
+// Caps are keyed by model id, so an alias resolves before the check. An
+// explicit --effort above the cap is refused. An inherited effort above it
+// (a lane recorded before the cap, or a gemini review round that stored
+// "high" on a gpt lane) clamps to the cap with a note, so nothing runs Astra
+// above medium by accident and nothing blocks a resume over bookkeeping.
+function cappedEffort(model: string | undefined, effort: Effort, explicit = true): Effort {
+  const cap = model ? config.effortCaps[model] : undefined;
+  if (!cap) return effort;
+  const capIndex = EFFORT_ORDER.indexOf(cap);
+  if (EFFORT_ORDER.indexOf(effort) <= capIndex) return effort;
+  if (!explicit) {
+    console.error(color.yellow(`cdx: recorded effort ${effort} exceeds the cap for ${model}; running at ${cap}`));
+    return cap;
+  }
+  const allowed = EFFORT_ORDER.slice(0, capIndex + 1).filter((candidate) => config.efforts.includes(candidate));
+  fail(`effort ${effort} exceeds the cap for ${model} (max ${cap}); allowed: ${allowed.join(", ")}. Set effortCaps in ${CONFIG_PATH} to change it`);
 }
 
 function requireEngineBinary(engine: Engine): void {
@@ -2799,6 +2842,7 @@ async function spawnCommand(argv: string[]) {
   let cwd = parsed.flags.cd ?? process.cwd();
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = engineEffort(engine, parsed);
+  if (engine === "gpt") cappedEffort(model, effort);
   const maxRuntime = maxRuntimeOf(parsed);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
@@ -2832,7 +2876,7 @@ async function spawnCommand(argv: string[]) {
     worktree = createWorktree(cwd, parsed.flags.worktree, lane);
     cwd = worktree.path;
   }
-  const selection = engine === "gpt" ? existingLane ? undefined : await selectAccount(parsed.flags.account) : undefined;
+  const selection = engine === "gpt" ? existingLane ? undefined : await selectAccount(parsed.flags.account, supervisor ? "supervisor" : "work") : undefined;
   const account = engine === "gpt" ? existingLane ? laneAccount(existingLane) : selection!.choice : undefined;
   const fallbackHome = engine === "gpt" && existingLane ? legacyAccountFallback(lane, existingLane, existingLane.ownerSession) : undefined;
   if (engine === "gpt" && (existingLane || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
@@ -2899,7 +2943,8 @@ async function resumeCommand(argv: string[]) {
   const fallbackHome = engine === "gpt" ? legacyAccountFallback(lane, before, before.ownerSession) : undefined;
   if (engine === "gpt") warnCachedUsageBeforeLaunch(account);
   const owner = storedOwnership(before);
-  const effort = engineEffort(engine, parsed, before.effort);
+  const inheritedEffort = engineEffort(engine, parsed, before.effort);
+  const effort = engine === "gpt" ? cappedEffort(laneModel(before), inheritedEffort, parsed.flags.effort !== undefined) : inheritedEffort;
   // Resume targets the lane's work thread even when the latest round was a
   // review; only a lane that never had a work session continues read-only.
   const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
@@ -2949,9 +2994,9 @@ async function forkCommand(argv: string[]) {
     ? sourceLane.workSessionId ?? sourceLane.sessionId ?? source
     : source;
   if (!/^[0-9a-f-]{36}$/.test(sessionId)) fail(`"${source}" is neither a lane with a session nor a session UUID`);
-  const effort = parsed.flags.effort
+  const effort = cappedEffort(model, parsed.flags.effort
     ? effortOf(parsed)
-    : configuredEffort(sourceLane?.effort ?? config.defaultEffort);
+    : configuredEffort(sourceLane?.effort ?? config.defaultEffort), parsed.flags.effort !== undefined);
   let account: AccountChoice | undefined;
   let fallbackHome: string | undefined;
   if (sourceLane) {
@@ -3019,6 +3064,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = engineEffort(engine, parsed);
+  if (engine === "gpt") cappedEffort(model, effort);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
   if (targets.length === 1 && intent) fail("native review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
@@ -3026,7 +3072,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   if (targets.length === 0 && !intent) fail("exec review needs an intent (or pass a native target flag)");
   if (existing && engine === "gpt") rejectPinnedAccountFlag(lane, existing, parsed.flags.account);
 
-  const selection = engine === "gpt" ? existing ? undefined : await selectAccount(parsed.flags.account) : undefined;
+  const selection = engine === "gpt" ? existing ? undefined : await selectAccount(parsed.flags.account, "light") : undefined;
   const account = engine === "gpt" ? existing ? laneAccount(existing) : selection!.choice : undefined;
   const fallbackHome = engine === "gpt" && existing ? legacyAccountFallback(lane, existing, existing.ownerSession) : undefined;
   if (engine === "gpt" && (existing || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
@@ -3446,6 +3492,9 @@ interface UsageSnapshot {
   planType: string;
   resetCreditsAvailable: number;
   reached: boolean;
+  // Every window the probe returned; the folded fields above keep the most
+  // consumed one, the advisor needs the weekly one for its deadline.
+  windows?: RateLimitWindow[];
   warnedAt?: string;
   probeFailedAt?: string;
 }
@@ -3562,7 +3611,8 @@ function isUsageSnapshot(value: unknown): value is UsageSnapshot {
     && typeof snapshot.resetCreditsAvailable === "number"
     && typeof snapshot.reached === "boolean"
     && (snapshot.warnedAt === undefined || typeof snapshot.warnedAt === "string")
-    && (snapshot.probeFailedAt === undefined || typeof snapshot.probeFailedAt === "string");
+    && (snapshot.probeFailedAt === undefined || typeof snapshot.probeFailedAt === "string")
+    && (snapshot.windows === undefined || (Array.isArray(snapshot.windows) && snapshot.windows.every(isRateLimitWindow)));
 }
 
 function readUsageSnapshot(account?: AccountChoice): UsageSnapshot | undefined {
@@ -3639,6 +3689,7 @@ function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
     planType: usage.planType,
     resetCreditsAvailable: usage.resetCredits,
     reached: window.usedPercent >= 99 || usage.rateLimitReachedType != null || usage.spendControlReached,
+    windows,
   };
 }
 
@@ -3706,7 +3757,151 @@ function warnCachedUsageBeforeLaunch(account?: AccountChoice) {
 }
 
 interface ReachedAccount { choice: AccountChoice; snapshot: UsageSnapshot }
-interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; allReached: boolean }
+interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; allReached: boolean; pick?: AccountStanding; demand?: Demand }
+
+// What a new lane asks of an account, as weekly-window headroom in percent.
+// A consult or review is one read-only turn; a work lane runs an hour or
+// more; a supervisor runs its own turns plus every child report. A lane never
+// changes account, so it must start with room to finish.
+type Demand = "light" | "work" | "supervisor";
+const HEADROOM_PERCENT: Record<Demand, number> = { light: 5, work: 15, supervisor: 25 };
+const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "work", supervisor: "supervisor" };
+
+interface AccountStanding {
+  choice: AccountChoice;
+  snapshot?: UsageSnapshot;
+  // The longest window the probe returned, weekly on ChatGPT plans. Its reset
+  // is the deadline: whatever is unspent then is lost.
+  weekly?: RateLimitWindow;
+  remainingPercent: number;
+  // Percent of the weekly window per day that spends the remainder exactly at
+  // reset; a pace far above real burn means the window will expire unused.
+  paceToEmpty?: number;
+  reached: boolean;
+  reason: string;
+}
+
+function fmtUntil(unixSeconds: number): string {
+  const ms = unixSeconds * 1000 - Date.now();
+  if (ms <= 0) return "now";
+  const minutes = Math.round(ms / 60_000);
+  if (minutes < 60) return `in ${minutes}m`;
+  if (minutes < 24 * 60) return `in ${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return `in ${(minutes / 1440).toFixed(1)}d`;
+}
+
+function weeklyWindow(snapshot: UsageSnapshot): RateLimitWindow {
+  const windows = snapshot.windows ?? [];
+  return windows.reduce((longest, window) => window.windowDurationMins > longest.windowDurationMins ? window : longest, windows[0] ?? snapshot);
+}
+
+function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
+  if (!snapshot || snapshot.planType === "unknown") {
+    return { choice, remainingPercent: 0, reached: false, reason: "usage unknown (probe failed; codex login?)" };
+  }
+  const weekly = weeklyWindow(snapshot);
+  const reached = snapshotReached(snapshot);
+  const remainingPercent = Math.max(0, Math.round(100 - weekly.usedPercent));
+  const daysToReset = Math.max(0, weekly.resetsAt * 1000 - Date.now()) / 86_400_000;
+  const paceToEmpty = daysToReset > 0 ? Math.round(remainingPercent / daysToReset) : undefined;
+  if (reached) {
+    const window = rateLimitWindowName(snapshot.windowDurationMins);
+    return { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached, reason: `${window} window exhausted, back ${fmtUntil(snapshot.resetsAt)}` };
+  }
+  const pace = paceToEmpty !== undefined ? `, ${paceToEmpty}%/day empties it` : "";
+  return { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached, reason: `${remainingPercent}% left, resets ${rateLimitResetDate(weekly.resetsAt)} ${fmtUntil(weekly.resetsAt)}${pace}` };
+}
+
+// Earliest deadline first. An account whose window resets soonest loses its
+// unspent share first, so it is spent first; among equal deadlines the fuller
+// one goes first. Accounts short of the demand's headroom rank next (fullest
+// first), unknown usage after them, exhausted windows last (soonest reset
+// first, for the warning).
+function standingTier(standing: AccountStanding, demand: Demand): number {
+  if (standing.reached) return 3;
+  if (!standing.snapshot) return 2;
+  return standing.remainingPercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
+}
+
+function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStanding[] {
+  return standings.map((standing, index) => ({ standing, index })).sort((a, b) => {
+    const tier = standingTier(a.standing, demand);
+    const tierDelta = tier - standingTier(b.standing, demand);
+    if (tierDelta !== 0) return tierDelta;
+    if (tier === 0) {
+      const deadline = a.standing.weekly!.resetsAt - b.standing.weekly!.resetsAt;
+      if (deadline !== 0) return deadline;
+      return b.standing.remainingPercent - a.standing.remainingPercent;
+    }
+    if (tier === 1) return b.standing.remainingPercent - a.standing.remainingPercent;
+    if (tier === 3) return a.standing.snapshot!.resetsAt - b.standing.snapshot!.resetsAt;
+    return a.index - b.index;
+  }).map(({ standing }) => standing);
+}
+
+// Cached usage is good for 30 minutes; a failed probe is not retried for 5.
+// A stale snapshot still beats no snapshot: windows move slowly.
+async function accountSnapshot(choice: AccountChoice): Promise<UsageSnapshot | undefined> {
+  const cached = readUsageSnapshot(choice);
+  if (snapshotFresh(cached, 30 * 60 * 1000) || probeFailedRecently(cached)) return cached;
+  const refreshed = await refreshUsageSnapshot({ account: choice });
+  return refreshed?.snapshot ?? cached;
+}
+
+async function accountStandings(): Promise<AccountStanding[]> {
+  const standings: AccountStanding[] = [];
+  for (const [name, home] of Object.entries(config.accounts ?? {})) {
+    const choice = { name, home };
+    standings.push(standingOf(choice, await accountSnapshot(choice)));
+  }
+  return standings;
+}
+
+function cachedAccountStandings(): AccountStanding[] {
+  return Object.entries(config.accounts ?? {}).map(([name, home]) => {
+    const choice = { name, home };
+    return standingOf(choice, readUsageSnapshot(choice));
+  });
+}
+
+interface AccountAdvice {
+  order: string[];
+  picks: Record<Demand, string | undefined>;
+  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
+}
+
+function accountAdvice(standings: AccountStanding[]): AccountAdvice {
+  const ranked = rankAccounts(standings, "light");
+  const pickFor = (demand: Demand) => {
+    const first = rankAccounts(standings, demand)[0];
+    return first && !first.reached ? first.choice.name : undefined;
+  };
+  return {
+    order: ranked.map((standing) => standing.choice.name),
+    picks: { light: pickFor("light"), work: pickFor("work"), supervisor: pickFor("supervisor") },
+    accounts: ranked.map((standing) => ({
+      account: standing.choice.name,
+      remainingPercent: standing.remainingPercent,
+      reached: standing.reached,
+      ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt } : {}),
+      ...(standing.paceToEmpty !== undefined ? { paceToEmpty: standing.paceToEmpty } : {}),
+      reason: standing.reason,
+    })),
+  };
+}
+
+function adviceLines(standings: AccountStanding[]): string[] {
+  if (standings.length < 2) return [];
+  const ranked = rankAccounts(standings, "light");
+  const advice = accountAdvice(standings);
+  const spend = ranked.filter((standing) => !standing.reached).map((standing) => `${standing.choice.name} (${standing.reason})`);
+  const out = ranked.filter((standing) => standing.reached).map((standing) => `${standing.choice.name} ${standing.reason}`);
+  const lines = [`advice: ${spend.length ? `spend ${spend.join(", then ")}` : "every account is exhausted"}${out.length ? `; ${out.join("; ")}` : ""}`];
+  const picks = (Object.keys(HEADROOM_PERCENT) as Demand[])
+    .map((demand) => `${DEMAND_LABEL[demand]} ${advice.picks[demand] ?? "none"}`).join(" · ");
+  lines.push(`  picks by headroom (${(Object.keys(HEADROOM_PERCENT) as Demand[]).map((demand) => `${DEMAND_LABEL[demand]} ${HEADROOM_PERCENT[demand]}%`).join(", ")}): ${picks}`);
+  return lines;
+}
 
 function snapshotFresh(snapshot: UsageSnapshot | undefined, maxAgeMs: number): snapshot is UsageSnapshot {
   if (!snapshot) return false;
@@ -3728,27 +3923,19 @@ function probeFailedRecently(snapshot: UsageSnapshot | undefined): boolean {
   return Number.isFinite(failedAt) && Date.now() - failedAt < 5 * 60 * 1000;
 }
 
-async function selectAccount(forced?: string): Promise<AccountSelection> {
+async function selectAccount(forced: string | undefined, demand: Demand): Promise<AccountSelection> {
   if (!config.accounts) {
     if (forced !== undefined) configuredAccount(forced);
     return { skipped: [], allReached: false };
   }
   if (forced !== undefined) return { choice: configuredAccount(forced), skipped: [], allReached: false };
 
-  const reached: ReachedAccount[] = [];
-  for (const [name, home] of Object.entries(config.accounts)) {
-    const choice = { name, home };
-    const cached = readUsageSnapshot(choice);
-    const fresh = snapshotFresh(cached, 30 * 60 * 1000);
-    const refreshed = fresh || probeFailedRecently(cached) ? undefined : await refreshUsageSnapshot({ account: choice });
-    const snapshot = refreshed?.snapshot ?? (fresh ? cached : undefined);
-    if (!snapshot || !snapshotReached(snapshot)) return { choice, skipped: reached, allReached: false };
-    reached.push({ choice, snapshot });
-  }
-
-  const selected = reached.reduce((best, candidate) =>
-    candidate.snapshot.resetsAt < best.snapshot.resetsAt ? candidate : best);
-  return { choice: selected.choice, skipped: reached, allReached: true };
+  const standings = await accountStandings();
+  const pick = rankAccounts(standings, demand)[0]!;
+  const skipped = standings
+    .filter((standing) => standing.reached && standing.snapshot)
+    .map((standing) => ({ choice: standing.choice, snapshot: standing.snapshot! }));
+  return { choice: pick.choice, skipped, allReached: pick.reached, pick, demand };
 }
 
 // Feed lines are broadcast to every open Claude session, so exhaustion
@@ -3769,7 +3956,15 @@ function feedExhaustionOnce(accounts: AccountChoice[], message: string, ownerSes
 }
 
 function announceAccountSelection(lane: string, selection: AccountSelection, ownerSession?: string) {
-  if (!selection.choice || selection.skipped.length === 0) return;
+  if (!selection.choice) return;
+  const { pick, demand } = selection;
+  if (pick && demand && Object.keys(config.accounts ?? {}).length > 1 && !selection.allReached) {
+    console.log(`cdx: account=${color.bold(pick.choice.name)} for ${DEMAND_LABEL[demand]} lane: ${pick.reason}`);
+    if (pick.snapshot && pick.remainingPercent < HEADROOM_PERCENT[demand]) {
+      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${pick.remainingPercent}% and ${lane} may hit the limit mid-run`));
+    }
+  }
+  if (selection.skipped.length === 0) return;
   if (selection.allReached) {
     const accounts = selection.skipped.map(({ choice, snapshot }) => {
       const credit = snapshot.resetCreditsAvailable > 0 ? ", reset credit available" : "";
@@ -3933,7 +4128,8 @@ async function usageCommand(argv: string[]) {
         ledgerTokens: ledgerTotals?.tokens ?? null,
       };
     });
-    console.log(JSON.stringify({ codex: rows, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
+    const advice = config.accounts ? accountAdvice(cachedAccountStandings()) : null;
+    console.log(JSON.stringify({ codex: rows, advice, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
     return;
   }
   for (const [index, account] of accounts.entries()) {
@@ -3954,6 +4150,7 @@ async function usageCommand(argv: string[]) {
     const ledgerTotals = totals.get(key);
     if (ledgerTotals) console.log(color.dim(`  lanes ${ledgerTotals.lanes} · ledger tokens ${fmtTokensFull(ledgerTotals.tokens)}`));
   }
+  for (const line of adviceLines(cachedAccountStandings())) console.log(color.cyan(line));
   const gemini = geminiUsage ?? readGeminiUsageSnapshot();
   if (!gemini) {
     console.log(`${color.bold("gemini")}: ${color.yellow("usage probe failed (agy installed and signed in?)")}`);
@@ -4593,6 +4790,7 @@ async function doctorCommand(argv: string[]) {
         good(`  usage: ${formatted.detail}`);
       }
     }
+    for (const line of adviceLines(cachedAccountStandings())) console.log(color.cyan(line));
   } else if (version?.success) {
     const login = Bun.spawnSync({ cmd: ["codex", "login", "status"] });
     const loginMsg = (login.stdout.toString() + login.stderr.toString()).trim();
