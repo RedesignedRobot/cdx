@@ -684,7 +684,7 @@ async function sessionCommand(): Promise<void> {
     const current = delivery(state, session);
     const hooks = createHash("sha256").update(readFileSync(`${REPO_ROOT}/hooks/hooks.json`)).digest("hex");
     const observed = current.plugin?.version === VERSION && current.plugin.hooks === hooks ? current.plugin.observed : [];
-    current.plugin = { root: REPO_ROOT, version: VERSION, hooks, observed: [...new Set([...observed, event])] };
+    current.plugin = { root: realpathSync(REPO_ROOT), version: VERSION, hooks, observed: [...new Set([...observed, event])] };
   });
   const summary = event === "SessionStart" ? sessionSummary(session) : "";
   let emitted = false;
@@ -703,23 +703,23 @@ function takeoverCommand(argv: string[]): void {
   if (!target || extra || !session || session === "terminal") fail("usage: cdx takeover <lane|full-session-id> from a Claude session");
   withLedger((ledger) => withEvents((state) => {
     const entry = ledger[target];
-    const previous = entry ? recipientOf(entry.ownerSession, target, state) : recipientOf(target, undefined, state);
-    if (!entry && (target.length <= 8 || target === "terminal")) fail("takeover needs a lane name or full session id; terminal work must be claimed by lane");
-    if (entry && previous === "terminal") {
+    if (entry) {
+      // A lane claim moves that lane and its children only; the previous
+      // head keeps everything else it owns.
       const tree = new Set([target]);
       for (const [name, lane] of Object.entries(ledger)) if (lane.parent === target) tree.add(name);
       for (const name of tree) state.lanes[name] = session;
     } else {
+      if (target.length <= 8 || target === "terminal") fail("takeover needs a lane name or full session id; terminal work must be claimed by lane");
+      const previous = recipientOf(target, undefined, state);
       for (const [owner, recipient] of Object.entries(state.bindings)) if (recipient === previous) state.bindings[owner] = session;
       state.bindings[previous] = session;
     }
-    // The new head continues where the previous head stopped reading; what
-    // was never delivered anywhere is covered by the summary, not replayed.
-    const inherited = state.sessions[previous];
+    // Nothing is replayed: the summary below carries what needs attention.
     const latest = readEvents().at(-1)?.id ?? 0;
     const cursor = delivery(state, session);
-    cursor.wake = inherited?.wake ?? latest;
-    cursor.quiet = inherited?.quiet ?? latest;
+    cursor.wake = Math.max(cursor.wake, latest);
+    cursor.quiet = Math.max(cursor.quiet, latest);
   }));
   console.log(`cdx: ownership connected to session=${session}; target=${target}`);
   const summary = sessionSummary(session);
@@ -5979,6 +5979,7 @@ switch (command) {
     const owner = callerOwnership();
     const now = new Date().toISOString();
     withLedger((ledger) => {
+      requireOwnChild(lane, ledger[lane]);
       ledger[lane] = {
         engine,
         ...(model ? { model } : {}),
