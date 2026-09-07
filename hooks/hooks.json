@@ -16,7 +16,30 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" brief 2>/dev/null || true"
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" _session",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" _session",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" _session",
+            "timeout": 5
           }
         ]
       }

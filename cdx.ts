@@ -68,7 +68,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "5.0.0";
+const VERSION = "6.0.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -148,11 +148,12 @@ function supervisorLane(): string | undefined {
 }
 
 // One ownership policy for every mutation a supervisor may issue: it may
-// touch only lanes it spawned. The head (no lane identity) is unrestricted.
+// touch only lanes it spawned. Heads must hold the resolved ownership.
 function requireOwnChild(lane: string, entry: Lane | undefined): void {
   const supervisor = supervisorLane();
-  if (!supervisor || !entry) return;
-  if (entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
+  if (!entry) return;
+  if (!owned(entry.ownerSession, lane)) fail(`lane "${lane}" belongs to another session; use cdx takeover ${lane} first`);
+  if (supervisor && entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
 }
 
 interface Lineage { supervisor: boolean; parent?: string; parentRound?: number }
@@ -478,7 +479,7 @@ function geminiConfig(): GeminiConfig {
 // A plain import (the tests) sees defaults and touches no user state; the
 // CLI reads the config file except on the paths that pin what they need.
 const config: Config = import.meta.main
-  ? readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || process.argv[2] === "hook")
+  ? readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || process.argv[2] === "hook" || process.argv[2] === "watch" || process.argv[2] === "_session")
   : readConfig(true);
 
 if (import.meta.main) {
@@ -523,23 +524,199 @@ function readTailLines(path: string, limit: number, accept: (line: string) => bo
   }
 }
 
-// One line per lane completion; the plugin monitor tails this file and
-// delivers each line to the Claude session as a notification.
-function feed(line: string): boolean {
+type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message";
+interface FeedEvent {
+  id: number;
+  timestamp: string;
+  kind: EventKind;
+  owner: string;
+  recipient?: string;
+  from?: string;
+  lane?: string;
+  round?: number;
+  job?: string;
+  message: string;
+}
+interface SessionDelivery {
+  wake: number;
+  quiet: number;
+  lease?: { pid: number; claudePid: number };
+  plugin?: { root: string; version: string; hooks: string; observed: string[] };
+}
+interface SessionState {
+  sequence: number;
+  bindings: Record<string, string>;
+  lanes: Record<string, string>;
+  sessions: Record<string, SessionDelivery>;
+}
+const SESSION_STATE = `${ROOT}/sessions.json`;
+const WAKE_EVENTS = new Set<EventKind>(["question", "stalled", "terminal", "job-exit", "message"]);
+function readSessions(): SessionState {
+  return existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8"))
+    : { sequence: 0, bindings: {}, lanes: {}, sessions: {} };
+}
+function withEvents<T>(action: (state: SessionState) => T, persist = true): T {
+  if (!persist && !existsSync(ROOT)) return action(readSessions());
+  mkdirSync(ROOT, { recursive: true });
+  return withLockedJson(SESSION_STATE, `${ROOT}/.events.lock`, readSessions, action, persist);
+}
+function recipientOf(owner: string | undefined, lane?: string, state = readSessions()): string {
+  const token = state.lanes[lane ?? ""] ?? owner ?? "terminal";
+  return state.bindings[token] ?? token;
+}
+function callerSession(): string {
+  // A worker's inherited owner wins even when it is explicitly terminal.
+  const owner = (process.env.CDX_LANE ? process.env.CDX_OWNER?.trim() : undefined)
+    || process.env.CLAUDE_CODE_SESSION_ID?.trim() || "terminal";
+  return process.env.CDX_LANE ? recipientOf(owner, process.env.CDX_LANE) : owner;
+}
+function owned(owner?: string, lane?: string, session = callerSession(), state = readSessions()): boolean {
+  return recipientOf(owner, lane, state) === session;
+}
+function parseFeedEvent(line: string): FeedEvent | undefined {
   try {
-    writeFileSync(`${ROOT}/feed.log`, `${singleLine(line)}\n`, { flag: "a" });
+    const event = JSON.parse(line);
+    if (Number.isSafeInteger(event.id) && event.id > 0 && typeof event.timestamp === "string"
+      && typeof event.owner === "string" && typeof event.message === "string"
+      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message"].includes(event.kind)) return event;
+  } catch { /* Version 5 free-text records are deliberately ignored. */ }
+}
+function readEvents(): FeedEvent[] {
+  if (!existsSync(`${ROOT}/feed.log`)) return [];
+  return readFileSync(`${ROOT}/feed.log`, "utf8").split("\n").flatMap((line) => {
+    const event = parseFeedEvent(line);
+    return event ? [event] : [];
+  });
+}
+function renderEvent(event: FeedEvent): string {
+  if (event.kind === "message") return `[cdx] msg to=${event.recipient} from=${event.from}: ${event.message}`;
+  return `${event.message} owner=${event.owner}`;
+}
+function eventOwned(event: FeedEvent, session: string, state: SessionState): boolean {
+  return recipientOf(event.recipient ?? event.owner, event.lane, state) === session;
+}
+function feedEvent(kind: EventKind, message: string, owner?: string, identity: { lane?: string; round?: number; job?: string; recipient?: string; from?: string } = {}): void {
+  return withEvents((state) => {
+    // Recover sequence after a crash between append and state rename.
+    const records = readEvents();
+    state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
+    if (kind === "terminal" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
+    if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
+    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity, message: singleLine(message) };
+    appendFileSync(`${ROOT}/feed.log`, `${JSON.stringify(event)}\n`);
+  });
+}
+function scopedEvents(limit: number, session = callerSession(), messagesOnly = false): string[] {
+  return withEvents((state) => readEvents().filter((event) => eventOwned(event, session, state)
+    && (!messagesOnly || event.kind === "message")).slice(-limit).map(renderEvent), false);
+}
+function delivery(state: SessionState, session: string): SessionDelivery {
+  return state.sessions[session] ??= { wake: 0, quiet: 0 };
+}
+function deliverEvents(session: string, channel: "wake" | "quiet", emit: (text: string) => void, leasePid?: number): void {
+  withEvents((state) => {
+    const cursor = delivery(state, session);
+    if (leasePid !== undefined && cursor.lease?.pid !== leasePid) fail("watcher lease was replaced");
+    const records = readEvents();
+    const events = records.filter((event) => event.id > cursor[channel] && eventOwned(event, session, state)
+      && WAKE_EVENTS.has(event.kind) === (channel === "wake"));
+    if (events.length) emit(events.map(renderEvent).join("\n"));
+    // Persist only after stdout succeeds. A crash may replay, never acknowledge early.
+    cursor[channel] = Math.max(cursor[channel], records.at(-1)?.id ?? 0);
+  });
+}
+async function watchCommand(argv: string[]): Promise<void> {
+  const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const claudePid = Number(process.env.CLAUDE_PID);
+  if (argv.length || !session || session === "terminal" || !Number.isInteger(claudePid) || claudePid < 1) fail("cdx watch needs CLAUDE_CODE_SESSION_ID and CLAUDE_PID from the plugin monitor, with no arguments");
+  const acquired = withEvents((state) => {
+    const current = delivery(state, session);
+    if (current.lease && pidAlive(current.lease.pid) && pidAlive(current.lease.claudePid)) return false;
+    current.lease = { pid: process.pid, claudePid };
     return true;
-  } catch {
-    return false;
+  });
+  if (!acquired) return;
+  let stopped = false;
+  const stop = () => { stopped = true; };
+  process.on("SIGTERM", stop);
+  process.on("SIGINT", stop);
+  try {
+    while (!stopped && pidAlive(claudePid)) {
+      deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
+      await Bun.sleep(500);
+    }
+  } finally {
+    withEvents((state) => {
+      const current = delivery(state, session);
+      if (current.lease?.pid === process.pid) delete current.lease;
+    });
+    process.removeListener("SIGTERM", stop);
+    process.removeListener("SIGINT", stop);
   }
 }
-
-function ownerSuffix(ownerSession?: string): string {
-  return ` owner=${ownerSession?.slice(0, 8) || "terminal"}`;
+function sessionSummary(session: string): string {
+  const state = readSessions();
+  const ledger = readLedger();
+  const lines = Object.entries(ledger).filter(([lane, entry]) => owned(entry.ownerSession, lane, session, state)
+    && entry.work.state !== "closed").sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt))
+    .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${roundStateOf(entry)} report=${entry.reports.at(-1) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
+  for (const { record } of questionFiles()) {
+    const entry = ledger[record.lane];
+    if (entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state)) {
+      lines.push(`lane=${record.lane} r${record.round} QUESTION #${record.seq}: ${record.question}; cdx reply ${record.lane} --id ${record.seq} "<answer>"`);
+    }
+  }
+  for (const [name, job] of Object.entries(readJobs())) {
+    if (owned(job.ownerSession, undefined, session, state)) lines.push(renderJobLine(name, job));
+  }
+  return lines.join("\n");
 }
-
-function feedOwned(line: string, ownerSession?: string): boolean {
-  return feed(`${line}${ownerSuffix(ownerSession)}`);
+async function sessionCommand(): Promise<void> {
+  const input = JSON.parse(await Bun.stdin.text());
+  if (typeof input.session_id !== "string" || !input.session_id.trim() || input.session_id === "terminal") fail("session hook needs session_id");
+  if (input.agent_id) return;
+  const event = input.hook_event_name;
+  if (!["SessionStart", "PostToolBatch", "UserPromptSubmit"].includes(event)) fail("unsupported session hook event");
+  const session = input.session_id.trim();
+  withEvents((state) => {
+    const current = delivery(state, session);
+    const hooks = createHash("sha256").update(readFileSync(`${REPO_ROOT}/hooks/hooks.json`)).digest("hex");
+    const observed = current.plugin?.version === VERSION && current.plugin.hooks === hooks ? current.plugin.observed : [];
+    current.plugin = { root: REPO_ROOT, version: VERSION, hooks, observed: [...new Set([...observed, event])] };
+  });
+  const summary = event === "SessionStart" ? sessionSummary(session) : "";
+  let emitted = false;
+  deliverEvents(session, "quiet", (delta) => {
+    emitted = true;
+    const additionalContext = [summary, delta].filter(Boolean).join("\n");
+    writeFileSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext } }) + "\n");
+  });
+  if (summary && !emitted) {
+    writeFileSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: summary } }) + "\n");
+  }
+}
+function takeoverCommand(argv: string[]): void {
+  const [target, extra] = argv;
+  const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  if (!target || extra || !session || session === "terminal") fail("usage: cdx takeover <lane|full-session-id> from a Claude session");
+  withLedger((ledger) => withEvents((state) => {
+    const entry = ledger[target];
+    const previous = entry ? recipientOf(entry.ownerSession, target, state) : recipientOf(target, undefined, state);
+    if (!entry && (target.length <= 8 || target === "terminal")) fail("takeover needs a lane name or full session id; terminal work must be claimed by lane");
+    if (entry && previous === "terminal") {
+      const tree = new Set([target]);
+      for (const [name, lane] of Object.entries(ledger)) if (lane.parent === target) tree.add(name);
+      for (const name of tree) state.lanes[name] = session;
+    } else {
+      for (const [owner, recipient] of Object.entries(state.bindings)) if (recipient === previous) state.bindings[owner] = session;
+      state.bindings[previous] = session;
+    }
+    // Replay retained events for the newly connected head. Recovery also reads the ledger.
+    const cursor = delivery(state, session);
+    cursor.wake = 0;
+    cursor.quiet = 0;
+  }));
+  console.log(`cdx: ownership connected to session=${session}; target=${target}`);
 }
 
 function normalizeLane(entry: any): void {
@@ -614,7 +791,7 @@ function withLedger<T>(mutate: (ledger: Ledger) => T): T {
 
 // Read-mutate-write one JSON state file under a mkdir lock, written through a
 // temp file so a reader never sees a torn document.
-function withLockedJson<S, T>(path: string, lock: string, read: () => S, mutate: (state: S) => T): T {
+function withLockedJson<S, T>(path: string, lock: string, read: () => S, mutate: (state: S) => T, persist = true): T {
   const deadline = Date.now() + 10_000;
   for (;;) {
     try {
@@ -632,9 +809,14 @@ function withLockedJson<S, T>(path: string, lock: string, read: () => S, mutate:
   try {
     const state = read();
     const result = mutate(state);
-    const tmp = `${path}.tmp.${process.pid}`;
-    writeFileSync(tmp, JSON.stringify(state, null, 2));
-    renameSync(tmp, path);
+    if (persist) {
+      const serialized = JSON.stringify(state, null, 2);
+      if (!existsSync(path) || readFileSync(path, "utf8") !== serialized) {
+        const tmp = `${path}.tmp.${process.pid}`;
+        writeFileSync(tmp, serialized);
+        renameSync(tmp, path);
+      }
+    }
     return result;
   } finally {
     try { rmdirSync(lock); } catch { /* broken by a peer */ }
@@ -1202,8 +1384,9 @@ function rejectPinnedAccountFlag(laneName: string, lane: Lane, requested?: strin
 interface LaneOwner { ownerSession?: string; ownerCwd: string }
 
 function callerOwnership(): LaneOwner {
-  const inherited = supervisorLane() ? process.env.CDX_OWNER?.trim() : undefined;
-  const ownerSession = (inherited && inherited !== "terminal" ? inherited : undefined) ?? process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const parent = supervisorLane();
+  const inherited = parent ? readSessions().lanes[parent] ?? readLedger()[parent]?.ownerSession ?? "terminal" : undefined;
+  const ownerSession = inherited === "terminal" ? undefined : inherited ?? process.env.CLAUDE_CODE_SESSION_ID?.trim();
   return { ...(ownerSession ? { ownerSession } : {}), ownerCwd: process.cwd() };
 }
 
@@ -1315,6 +1498,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       // Commit reconciliation, then refresh before making an admission decision.
       if (engine === "gpt" && Object.entries(config.accounts ?? {}).some(([name, home]) => readUsageSnapshot({ name, home })?.invalidatedAt)) return undefined;
       const existing = ledger[lane];
+      if (process.argv[2] !== "_run") requireOwnChild(lane, existing);
       if (existing && laneRunning(existing) && (pidAlive(existing.pid) || pidAlive(existing.codexPid))
         && !(existing.switchingAccount && existing.pid === process.pid)) {
         throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
@@ -1327,7 +1511,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       const activeAccount = selection?.choice;
       const account = kind === "review" && existing ? existing.account : activeAccount?.name;
       const codexHome = kind === "review" && existing ? existing.codexHome : activeAccount?.home;
-      const ownerSession = opts?.preserveOwner ? existing?.ownerSession : opts?.owner?.ownerSession;
+      const ownerSession = existing ? existing.ownerSession : opts?.owner?.ownerSession;
       const ownerCwd = opts?.preserveOwner ? existing?.ownerCwd : opts?.owner?.ownerCwd;
       const workCwd = kind === "work" ? cwd : existing ? workCwdOf(existing) : cwd;
       const workState = kind === "work" ? "running" : existing ? workStateOf(existing) : "adopted";
@@ -1411,7 +1595,6 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
       const historySpec = spec.sourceLane ? { ...spec, lane: spec.sourceLane } : spec;
       freshAccountSpec(spec, entry, recoveryPrompt(historySpec, historyLane));
       brief = spec.prompt;
-      feedOwned(`[cdx] lane=${spec.lane} round=${spec.round} account=${choice?.name ?? "default"} fresh session after account switch`, spec.ownerSession);
     }
   }
   if (spec.engine === "gemini") {
@@ -1421,6 +1604,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   }
   writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
+  if (supervisorLane()) feedEvent("started", `[cdx] lane=${spec.lane} round=${spec.round} started report=${reportPathOf(spec.lane, spec.round)}`, spec.ownerSession, { lane: spec.lane, round: spec.round });
   const jsonMode = spec.engine === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
@@ -1598,7 +1782,7 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
     item.updatedAt = checkedAt;
     return item;
   });
-  feedOwned(`[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath}`, entry.ownerSession);
+  feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath}`, entry.ownerSession, { lane, round });
   console.error(`cdx: lane=${color.magenta(lane)} state=${color.red("gate-invalid")} review the gate command before starting work`);
   console.error(`cdx: ${note}`);
   console.error(`cdx: gate log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log`);
@@ -1780,6 +1964,7 @@ async function runRound(lane: string, round: number): Promise<number> {
       try { await refreshGeminiUsage(); } catch { /* best-effort */ }
     }
     if (spec.engine !== "gpt" || !entry.quotaFailure || code === 0) {
+      if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${entry.reports.at(-1) ?? "-"}`, entry.ownerSession, { lane, round });
       if (code !== 0 && entry.supervisor) await killChildren(lane, `supervisor ${lane} failed`);
       return code;
     }
@@ -1800,13 +1985,13 @@ async function runRound(lane: string, round: number): Promise<number> {
       freshAccountSpec(spec, next, prompt);
       writeFileSync(specPathOf(lane, spec.round), JSON.stringify(spec, null, 2));
       writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, spec.prompt);
-      feedOwned(`[cdx] lane=${lane} round=${spec.round} auto-switch from=${previousAccount} to=${spec.account ?? "default"} reason=quota-exhausted fresh-session=true`, spec.ownerSession);
+      feedEvent("account", `[cdx] lane=${lane} round=${spec.round} auto-switch from=${previousAccount} to=${spec.account ?? "default"} reason=quota-exhausted fresh-session=true`, spec.ownerSession, { lane, round: spec.round });
       round = spec.round;
     } catch (error) {
       const note = `account failover unavailable: ${error instanceof Error ? error.message : String(error)}`;
       withLedger((ledger) => failActiveRound(lane, ledger[lane]!, note));
       if (entry.supervisor) await killChildren(lane, note);
-      feedOwned(`[cdx] lane=${lane} round=${round} state=failed note=${note}`, spec.ownerSession);
+      feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=failed note=${note}`, spec.ownerSession, { lane, round });
       console.error(`cdx: ${note}`);
       return 1;
     }
@@ -1883,7 +2068,7 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
           writeGeminiQuota({ blockedUntil, observedAt, lane, round });
           turnFailureReason = `gemini five-hour quota exhausted; resets at ${blockedUntil}; resume this lane after the reset`;
           const resetDetail = delayMs !== undefined ? `resets at ${blockedUntil}` : "reset time unknown; assuming 30m";
-          feedOwned(`[cdx] lane=${lane} round=${round} gemini quota exhausted; ${resetDetail}`, ownerSession);
+          feedEvent("account", `[cdx] lane=${lane} round=${round} gemini quota exhausted; ${resetDetail}`, ownerSession, { lane, round });
         }
       } else {
         touchLedger((item) => { item.lastResultError = recordedError; }, true);
@@ -1894,7 +2079,7 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
             item.lastEventAt = now;
           }, true);
           const reason = singleLine(effectiveError).slice(0, 80);
-          feedOwned(`[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, ownerSession);
+          feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, ownerSession, { lane, round });
           continueTurn = true;
         } else {
           const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
@@ -1911,7 +2096,7 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
       }, true);
     }
     if (treatedAsReplay) {
-      feedOwned(`[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, ownerSession);
+      feedEvent("progress", `[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, ownerSession, { lane, round });
     }
     const qualified = qualifyGeminiReport(result, finalAgentResponse, isReview);
     if (qualified.report !== undefined) writeFileSync(reportPath, qualified.report);
@@ -1922,6 +2107,7 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
   } else {
     if (typeof result.response === "string" && result.response.trim()) {
       writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
+      feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, ownerSession, { lane, round });
     }
   }
   return { turnFailureReason, geminiContinuations, continueTurn };
@@ -2038,7 +2224,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   let lastEventMs = Date.now();
   let lastStallWarn = 0;
   const noteActivity = () => {
-    if (lastStallWarn) feedOwned(`[cdx] lane=${lane} round=${round} active again after quiet stretch`, spec.ownerSession);
+    if (lastStallWarn) feedEvent("active", `[cdx] lane=${lane} round=${round} active again after quiet stretch`, spec.ownerSession, { lane, round });
     lastStallWarn = 0;
     lastEventMs = Date.now();
   };
@@ -2061,9 +2247,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     : undefined;
   const watchdog = setInterval(() => {
     const quiet = Date.now() - lastEventMs;
-    if (quiet >= 300_000 && Date.now() - lastStallWarn >= 600_000) {
+    if (quiet >= 300_000 && !lastStallWarn) {
       lastStallWarn = Date.now();
-      feedOwned(`[cdx] lane=${lane} round=${round} running but quiet ${Math.round(quiet / 60_000)}m (codex pid ${proc.pid}); cdx tail ${lane} to inspect`, spec.ownerSession);
+      feedEvent("stalled", `[cdx] lane=${lane} round=${round} running but quiet ${Math.round(quiet / 60_000)}m (codex pid ${proc.pid}); cdx tail ${lane} to inspect`, spec.ownerSession, { lane, round });
     }
   }, 60_000);
 
@@ -2071,6 +2257,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const turnWaiters = new Map<string, Array<(turn: AppTurn) => void>>();
   let reportOrder = 0;
   let writtenReportOrder = 0;
+  let partialAnnounced = false;
+  const announcePartial = () => {
+    if (partialAnnounced) return;
+    partialAnnounced = true;
+    feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, spec.ownerSession, { lane, round });
+  };
   let latestReportCandidate: { text: string; turnId: string; order: number } | undefined;
   let turnFailureReason: string | undefined;
   let lastProtocolError: string | undefined;
@@ -2100,6 +2292,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const qualifying = item.phase === "final_answer" || item.phase == null;
     if (!qualifying) {
       writeFileSync(partialReportPathOf(lane, round), `${item.text.trim()}\n`);
+      announcePartial();
       return;
     }
     latestReportCandidate = { text: item.text, turnId, order: ++reportOrder };
@@ -2197,6 +2390,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const now = new Date().toISOString();
     if (event.method === "item/agentMessage/delta" && typeof event.params?.delta === "string") {
       appendFileSync(partialReportPathOf(lane, round), event.params.delta);
+      announcePartial();
     } else if (event.method === "thread/started" && event.params?.thread?.id) {
       touchLedger((item) => { item.sessionId = event.params.thread.id; item.lastEventAt = now; }, true);
     } else if (event.method === "error" && event.params?.error) {
@@ -2330,7 +2524,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       for (const record of toDeliver) {
         writeUserTurn(record.text);
         const flat = singleLine(record.text);
-        feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession);
+        feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession, { lane, round });
       }
     };
     const queueControlDrain = () => {
@@ -2466,7 +2660,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         const item = ledger[lane];
         if (item) { item.steers = (item.steers ?? 0) + 1; item.updatedAt = new Date().toISOString(); }
       });
-      feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=${mode}: ${short}`, spec.ownerSession);
+      feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=${mode}: ${short}`, spec.ownerSession, { lane, round });
     };
     const deliverControl = async (record: ControlRecord): Promise<"steered" | "follow-up-turn" | undefined> => {
       const expectedTurnId = activeTurnId;
@@ -2491,7 +2685,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         const reason = steerError instanceof Error ? steerError.message : String(steerError);
         if (!reportedControlFailures.has(controlIndex)) {
           reportedControlFailures.add(controlIndex);
-          feedOwned(`[cdx] lane=${lane} round=${round} steer rejected and retained: ${reason.slice(0, 160)}`, spec.ownerSession);
+          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer rejected and retained: ${reason.slice(0, 160)}`, spec.ownerSession, { lane, round });
         }
         return undefined;
       }
@@ -2588,7 +2782,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       }
       await Promise.allSettled([stdoutPump, stderrPump]);
       if (roundCleanupWarning) {
-        feedOwned(`[cdx] lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`, spec.ownerSession);
+        feedEvent("progress", `[cdx] lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`, spec.ownerSession, { lane, round });
         console.error(`cdx: lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`);
       }
     } catch (error) {
@@ -2776,7 +2970,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const finalRoundState = roundStateOf(entry);
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  feedOwned(`[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession);
+  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession, { lane, round });
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
@@ -2856,11 +3050,12 @@ function sendCommand(argv: string[]): void {
   const record: ControlRecord = {
     text,
     sentAt: new Date().toISOString(),
-    ...(process.env.CLAUDE_CODE_SESSION_ID ? { from: process.env.CLAUDE_CODE_SESSION_ID.slice(0, 8) } : {}),
+    ...(process.env.CLAUDE_CODE_SESSION_ID ? { from: process.env.CLAUDE_CODE_SESSION_ID } : {}),
   };
   requireOwnChild(lane, readLedger()[lane]);
   const entry = withLedger((ledger) => {
     const current = ledger[lane];
+    requireOwnChild(lane, current);
     if (!current) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
     if (!laneRunning(current) || !pidAlive(current.pid)) throw new CmdError(`lane "${lane}" is not running`);
     if (current.kind === "review") throw new CmdError(`lane "${lane}" is a review lane; review turns do not accept steering`);
@@ -2900,7 +3095,7 @@ async function askCommand(argv: string[]): Promise<void> {
     writeQuestion(path, record);
     return { path, record };
   });
-  feedOwned(`[cdx] lane=${lane} round=${round} QUESTION #${created.record.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner);
+  feedEvent("question", `[cdx] lane=${lane} round=${round} QUESTION #${created.record.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner, { lane, round });
   const deadline = Date.now() + timeoutMinutes * 60_000;
   while (Date.now() < deadline) {
     const current = readQuestion(created.path);
@@ -2937,6 +3132,7 @@ function replyCommand(argv: string[]): void {
   if (requestedId !== undefined && (!Number.isInteger(requestedId) || requestedId < 1)) fail("--id must be a positive integer");
   requireOwnChild(lane, readLedger()[lane]);
   const answered = withLedger((ledger) => {
+    requireOwnChild(lane, ledger[lane]);
     const currentRound = ledger[lane]?.rounds;
     if (!currentRound) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
     const open = questionFiles(lane).filter(({ record }) => record.round === currentRound && questionOpen(record));
@@ -2952,8 +3148,6 @@ function replyCommand(argv: string[]): void {
     writeQuestion(target.path, current);
     return current;
   });
-  const laneOwner = readLedger()[lane]?.ownerSession;
-  feedOwned(`[cdx] lane=${lane} round=${answered.round} ANSWER #${answered.seq}: ${answer}`, answered.owner || laneOwner);
   console.log(`cdx: answered lane=${lane} question #${answered.seq}`);
 }
 
@@ -2962,7 +3156,7 @@ function questionsCommand(argv: string[]): void {
   if (extra) fail("usage: cdx questions [lane]");
   const ledger = readLedger();
   if (lane && !ledger[lane]) fail(`unknown lane "${lane}" (cdx status lists lanes)`);
-  const open = questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[record.lane]?.rounds === record.round);
+  const open = questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[record.lane]?.rounds === record.round && owned(ledger[record.lane]?.ownerSession, record.lane));
   if (open.length === 0) {
     console.log(lane ? `cdx: lane=${lane} has no open questions` : "cdx: no open questions");
     return;
@@ -2976,29 +3170,21 @@ function msgCommand(argv: string[]): void {
   const [target, ...parts] = argv;
   const message = singleLine(parts.join(" "));
   if (!target || !message) fail('usage: cdx msg <target> "<text>"');
-  const caller = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-  if (!caller) fail("cdx msg needs CLAUDE_CODE_SESSION_ID from the calling Claude Code session");
+  const caller = callerSession();
+  if (caller === "terminal") fail("cdx msg needs a Claude session owner");
   const lane = readLedger()[target];
-  const resolved = lane ? lane.ownerSession : target;
-  if (!resolved) fail(`lane "${target}" has no Claude session owner`);
-  if (resolved.length < 8) fail("message target must be a lane name or an 8-character session prefix");
-  const target8 = resolved.slice(0, 8);
-  const from8 = caller.slice(0, 8);
-  feed(`[cdx] msg to=${target8} from=${from8}: ${message}`);
-  console.log(`cdx: message sent to=${target8} from=${from8}`);
+  const recipient = lane ? recipientOf(lane.ownerSession, target) : target;
+  if (recipient === "terminal" || recipient.length <= 8) fail("message target must be a lane name or full session id");
+  feedEvent("message", message, caller, { recipient, from: caller });
+  console.log(`cdx: message sent to=${recipient} from=${caller}`);
 }
 
 function inboxCommand(argv: string[]): void {
   const parsed = parseArgs(argv, ["n"]);
   if (parsed.rest.length) fail("usage: cdx inbox [-n <lines>]");
-  const caller = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-  if (!caller) fail("cdx inbox needs CLAUDE_CODE_SESSION_ID from the calling Claude Code session");
   const limit = Number(parsed.flags.n ?? 20);
   if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
-  const path = `${ROOT}/feed.log`;
-  if (!existsSync(path)) { console.log("cdx: inbox empty"); return; }
-  const prefix = `[cdx] msg to=${caller.slice(0, 8)} `;
-  const messages = readTailLines(path, limit, (line) => line.startsWith(prefix));
+  const messages = scopedEvents(limit, callerSession(), true);
   console.log(messages.length ? messages.join("\n") : "cdx: inbox empty");
 }
 
@@ -3025,6 +3211,7 @@ function gateCommand(argv: string[]): void {
   const next = parsed.bools.has("clear") ? undefined : command;
   withLedger((ledger) => {
     const item = ledger[lane]!;
+    requireOwnChild(lane, item);
     item.gate = next;
     item.updatedAt = new Date().toISOString();
   });
@@ -3095,7 +3282,6 @@ async function spawnCommand(argv: string[]) {
     if (words > 1500) {
       const warning = `cdx: gemini brief is ${words} words; gemini works best on one outcome per lane, consider splitting into parallel lanes`;
       console.error(warning);
-      feed(warning);
     }
   }
   const { round, selection } = await openRound(lane, "work", cwd, effort, {
@@ -3116,7 +3302,7 @@ async function spawnCommand(argv: string[]) {
       throw error;
     }
   }
-  if (selection) announceAccountSelection(lane, selection, owner?.ownerSession);
+  if (selection) announceAccountSelection(lane, selection);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
   const gateBaselineChecked = Boolean(gate && parsed.bools.has("gate-baseline-check"));
   if (gateBaselineChecked) {
@@ -3180,7 +3366,7 @@ async function resumeCommand(argv: string[]) {
     ...(parsed.flags.gate !== undefined ? { gate: parsed.flags.gate } : {}),
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
-  if (selection) announceAccountSelection(lane, selection, owner?.ownerSession);
+  if (selection) announceAccountSelection(lane, selection);
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const structuredInstruction = reviewResume && engine === "gemini"
     ? "\n\nYour final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
@@ -3269,7 +3455,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
   const parent = supervisorLane();
-  if (parent) requireOwnChild(lane, existing);
+  requireOwnChild(lane, existing);
   if (existing && laneEngine(existing) === "gpt" && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
   // A consult lane must never acquire a work thread: resume would then pick
   // the writable session over the read-only one. Fresh names only.
@@ -3311,7 +3497,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
     const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
-    if (selection) announceAccountSelection(lane, selection, owner?.ownerSession);
+    if (selection) announceAccountSelection(lane, selection);
     const codexArgs = [
       "review", "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
       "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
@@ -3325,7 +3511,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
 
   const owner = callerOwnership();
   const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent, ...(opts.consult ? { consult: true as const } : {}) });
-  if (selection) announceAccountSelection(lane, selection, owner?.ownerSession);
+  if (selection) announceAccountSelection(lane, selection);
   const scope = parsed.flags.scope
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
     : "";
@@ -3385,12 +3571,13 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
-  if (entry.ownerCwd) {
+  if (entry.ownerCwd || entry.ownerSession || readSessions().lanes[lane]) {
     const currentSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-    const ownerId = entry.ownerSession?.slice(0, 8) || "terminal";
-    const relation = !entry.ownerSession || !currentSession ? "(terminal)"
-      : entry.ownerSession === currentSession ? "(this session)" : "(other session)";
-    owner = `${ownerId} ${relation}  from ${displayPath(entry.ownerCwd)}`;
+    const resolvedOwner = recipientOf(entry.ownerSession, lane);
+    const ownerId = resolvedOwner === "terminal" ? "terminal" : resolvedOwner.slice(0, 8);
+    const relation = resolvedOwner === "terminal" || !currentSession ? "(terminal)"
+      : resolvedOwner === currentSession ? "(this session)" : "(other session)";
+    owner = `${ownerId} ${relation}  from ${entry.ownerCwd ? displayPath(entry.ownerCwd) : "-"}`;
   }
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
@@ -3869,10 +4056,10 @@ function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
   };
 }
 
-function usageFeedWarning(snapshot: UsageSnapshot, account?: AccountChoice, ownerSession?: string): string {
+function usageFeedWarning(snapshot: UsageSnapshot, account?: AccountChoice): string {
   const credit = snapshot.resetCreditsAvailable > 0 ? ", reset credit available" : "";
   const owner = account ? `usage for account ${account.name}` : "usage";
-  return `[cdx] WARNING: OpenAI Codex ${owner} ${snapshot.usedPercent}% consumed (${rateLimitWindowName(snapshot.windowDurationMins)} window, resets ${rateLimitResetDate(snapshot.resetsAt)})${credit}${ownerSuffix(ownerSession)}`;
+  return `[cdx] WARNING: OpenAI Codex ${owner} ${snapshot.usedPercent}% consumed (${rateLimitWindowName(snapshot.windowDurationMins)} window, resets ${rateLimitResetDate(snapshot.resetsAt)})${credit}`;
 }
 
 async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: AccountChoice; ownerSession?: string } = {}): Promise<RefreshedUsage | undefined> {
@@ -3911,12 +4098,10 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
     if (options.warnFeed && snapshotReached(snapshot)) {
       const warnedAt = snapshot.warnedAt ? Date.parse(snapshot.warnedAt) : Number.NaN;
       if (!Number.isFinite(warnedAt) || Date.now() - warnedAt >= 3_600_000) {
-        const beforeWarning = snapshot;
         const warned = { ...snapshot, warnedAt: new Date().toISOString() };
         storeUsageSnapshot(state, warned, options.account);
-        if (feed(usageFeedWarning(warned, options.account, options.ownerSession))) return warned;
-        storeUsageSnapshot(state, beforeWarning, options.account);
-        return beforeWarning;
+        feedEvent("account", usageFeedWarning(warned, options.account), options.ownerSession);
+        return warned;
       }
     }
     storeUsageSnapshot(state, snapshot, options.account);
@@ -4181,24 +4366,7 @@ function invalidateAccountUsage(account?: AccountChoice): void {
   });
 }
 
-// Feed lines are broadcast to every open Claude session, so exhaustion
-// notices share the hourly warnedAt dedupe; the per-spawn console line stays.
-function feedExhaustionOnce(accounts: AccountChoice[], message: string, ownerSession?: string) {
-  withUsageState((state) => {
-    const due = accounts.some((choice) => {
-      const warnedAt = usageSnapshotFrom(state, choice)?.warnedAt;
-      const parsed = warnedAt ? Date.parse(warnedAt) : Number.NaN;
-      return !Number.isFinite(parsed) || Date.now() - parsed >= 3_600_000;
-    });
-    if (!due || !feedOwned(message, ownerSession)) return;
-    for (const choice of accounts) {
-      const current = usageSnapshotFrom(state, choice);
-      if (current) storeUsageSnapshot(state, { ...current, warnedAt: new Date().toISOString() }, choice);
-    }
-  });
-}
-
-function announceAccountSelection(lane: string, selection: AccountSelection, ownerSession?: string) {
+function announceAccountSelection(lane: string, selection: AccountSelection) {
   if (!selection.choice) return;
   const { pick, demand } = selection;
   if (pick && demand) {
@@ -4215,7 +4383,7 @@ function announceAccountSelection(lane: string, selection: AccountSelection, own
   for (const { choice, snapshot } of selection.skipped) {
     const message = `[cdx] account ${choice.name} consumed (resets ${rateLimitResetDate(snapshot.exhaustedUntil ?? snapshot.resetsAt)}); ${lane} using ${selection.choice.name}`;
     console.error(color.yellow(message.replace(/^\[cdx\]/, "cdx:")));
-    feedExhaustionOnce([choice], message, ownerSession);
+
   }
 }
 
@@ -4739,7 +4907,7 @@ async function hookCommand(argv: string[]): Promise<void> {
           });
           newlyDelivered += 1;
           const flat = singleLine(record.text);
-          feedOwned(`[cdx] lane=${lane} round=${round} steer delivered mode=in-turn: ${flat.slice(0, 120)}`, item.ownerSession);
+          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=in-turn: ${flat.slice(0, 120)}`, item.ownerSession, { lane, round });
         }
         writeDeliveredCount(lane, round, lines.length);
         if (newlyDelivered > 0) {
@@ -5067,9 +5235,33 @@ async function doctorCommand(argv: string[]) {
   if (!existsSync(guard)) bad("plugin", "guard-raw-codex.ts missing", "restore the hooks/ folder of the cdx plugin");
   else if (!(statSync(guard).mode & 0o111)) bad("plugin", "guard-raw-codex.ts not executable", `chmod +x ${guard}`);
   else good("plugin: guard hook present and executable");
-  const monitor = Bun.spawnSync({ cmd: ["pgrep", "-f", `tail -n 0 -F ${ROOT}/feed.log`] });
-  if (monitor.success) good("plugin: lane monitor running");
-  else warn("plugin: lane monitor not running (it starts with a Claude Code session)");
+  const pluginLink = `${HOME}/.claude/skills/cdx`;
+  const currentSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const receipt = currentSession ? readSessions().sessions[currentSession] : undefined;
+  const expectedEvents = ["PreToolUse", "SessionStart", "PostToolBatch", "UserPromptSubmit"];
+  try {
+    const pluginRoot = realpathSync(pluginLink);
+    const manifest = JSON.parse(readFileSync(`${pluginRoot}/.claude-plugin/plugin.json`, "utf8"));
+    const hookText = readFileSync(`${pluginRoot}/hooks/hooks.json`, "utf8");
+    const hooks = JSON.parse(hookText).hooks;
+    if (manifest.name !== "cdx") throw new Error("plugin name is not cdx");
+    good(`plugin: cdx@skills-dir personal path=${pluginRoot} version=${manifest.version}`);
+    const missing = expectedEvents.filter((event) => !hooks?.[event]?.some((group: any) => group.hooks?.some((hook: any) =>
+      hook.type === "command" && hook.command?.includes(event === "PreToolUse" ? "guard-raw-codex.ts" : "cdx.ts\" _session"))));
+    if (missing.length) warn(`plugin: missing hooks ${missing.join(", ")}; restore hooks/hooks.json and /reload-plugins`);
+    else good(`plugin: hook set ${expectedEvents.join(", ")}`);
+    const hash = createHash("sha256").update(hookText).digest("hex");
+    if (receipt?.plugin?.root === pluginRoot && receipt.plugin.version === manifest.version && receipt.plugin.hooks === hash) {
+      good(`plugin: this session observed ${receipt.plugin.observed.join(", ")}`);
+    } else warn("plugin: this session has no current hook receipt; /reload-plugins or restart, then submit a prompt");
+    const monitors = JSON.parse(readFileSync(`${pluginRoot}/monitors/monitors.json`, "utf8"));
+    if (!monitors.some((monitor: any) => monitor.command === '\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" watch')) warn("plugin: scoped watcher declaration missing; /reload-plugins after restoring monitors/monitors.json");
+  } catch {
+    warn("plugin: cdx@skills-dir personal link or plugin files unavailable; check ~/.claude/skills/cdx");
+  }
+  if (receipt?.lease && receipt.lease.claudePid === Number(process.env.CLAUDE_PID)
+    && pidAlive(receipt.lease.pid) && pidAlive(receipt.lease.claudePid)) good("plugin: this session's watcher holds its lease");
+  else warn("plugin: this session has no live watcher lease; /reload-plugins or restart");
 
   if (parsed.bools.has("fix")) withLedger(() => {});
   good(`ledger: ${LEDGER} (${Object.keys(readLedger()).length} lanes)`);
@@ -5134,32 +5326,18 @@ async function doctorCommand(argv: string[]) {
   if (failures > 0) process.exitCode = 1;
 }
 
-// Prints nothing when all lanes are settled, so the SessionStart hook costs
-// zero context in the common case.
 function briefCommand() {
   const quotaState = geminiQuotaState();
-  if (quotaState.block) {
-    console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
-  }
-  const byRecency = (a: [string, Lane], b: [string, Lane]) =>
-    Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
-  const entries = Object.entries(readLedger());
-  const running = entries.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
-  const failed = entries.filter(([, entry]) => !laneRunning(entry) && (entry.work.state === "failed" || entry.work.state === "gate-invalid" || entry.review?.state === "failed")).sort(byRecency);
-  const lanes = [...running, ...failed];
-  if (lanes.length > 0) console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
-  printRunningJobs();
+  if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
+  const summary = sessionSummary(callerSession());
+  if (summary) console.log(summary);
 }
 
-// Replay recent feed lines: what completed, stalled, or warned while the
-// caller was away (the live monitor only delivers lines to open sessions).
 function feedCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["n"]);
-  const path = `${ROOT}/feed.log`;
-  if (!existsSync(path)) { console.log("cdx: no feed yet"); return; }
   const limit = Number(parsed.flags.n ?? 20);
   if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
-  console.log(readTailLines(path, limit, (line) => line.trim().length > 0).join("\n"));
+  console.log(scopedEvents(limit).join("\n"));
 }
 
 function cleanCommand(argv: string[]) {
@@ -5169,7 +5347,7 @@ function cleanCommand(argv: string[]) {
   const removed: string[] = [];
   withLedger((ledger) => {
     for (const [lane, entry] of Object.entries(ledger)) {
-      if (entry.work.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
+      if (!owned(entry.ownerSession, lane) || entry.work.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
       // Anchor on "-r<digits>" plus a separator so lane "foo" never matches
       // "foo-review-r1".
       const escaped = lane.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -5182,12 +5360,21 @@ function cleanCommand(argv: string[]) {
       delete ledger[lane];
       removed.push(lane);
     }
+    withEvents((state) => {
+      for (const lane of removed) delete state.lanes[lane];
+      const records = readEvents();
+      state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
+      const keep = records.filter((record, index) => {
+        if (record.lane && removed.includes(record.lane)) return false;
+        if (index >= records.length - 2000) return true;
+        const session = state.sessions[recipientOf(record.recipient ?? record.owner, record.lane, state)];
+        return session && record.id > session[WAKE_EVENTS.has(record.kind) ? "wake" : "quiet"];
+      });
+      const temporary = `${ROOT}/feed.log.tmp.${process.pid}`;
+      writeFileSync(temporary, keep.map((record) => JSON.stringify(record) + "\n").join(""));
+      renameSync(temporary, `${ROOT}/feed.log`);
+    });
   });
-  const feedPath = `${ROOT}/feed.log`;
-  if (existsSync(feedPath)) {
-    const tail = readTailLines(feedPath, 2000, (line) => line.trim().length > 0);
-    writeFileSync(feedPath, tail.length ? `${tail.join("\n")}\n` : "");
-  }
   console.log(removed.length > 0 ? `cdx: pruned closed lanes older than ${days}d: ${removed.join(", ")}` : `cdx: nothing to prune (closed lanes older than ${days}d)`);
 }
 
@@ -5270,7 +5457,7 @@ async function killLane(lane: string, entry: Lane, note?: string) {
     else item.work.exitCode = undefined;
     return item;
   });
-  feedOwned(`[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)}`, finalized.ownerSession);
+  feedEvent("terminal", `[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)}`, finalized.ownerSession, { lane, round: finalized.rounds });
   console.log(`cdx: lane=${color.magenta(lane)} killed; ${finalized.kind} state=${coloredState("failed")} note=${roundNoteOf(finalized)}`);
 }
 
@@ -5343,7 +5530,7 @@ function settledJob(name: string): Job | undefined {
 }
 
 function printRunningJobs(): void {
-  const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
+  const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job) && owned(job.ownerSession));
   if (running.length === 0) return;
   console.log(`\njobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`);
 }
@@ -5378,6 +5565,7 @@ async function jobCommand(argv: string[]) {
   // check, and a concurrent wait never sees a running job without a pid.
   withJobs((jobs) => {
     const existing = jobs[name];
+    if (existing && !owned(existing.ownerSession)) fail(`job "${name}" belongs to another session; explicit takeover required`);
     if (existing && jobRunning(existing) && pidAlive(existing.pid)) {
       throw new CmdError(`job "${name}" is still running (pid ${existing.pid}); cdx kill ${name} first or pick another name`);
     }
@@ -5429,11 +5617,12 @@ async function runJob(name: string): Promise<number> {
     if (note) entry.note = note;
     return entry;
   });
-  feedOwned(`[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(finished)} log=${finished.log}${note ? ` note=${note}` : ""}`, process.env.CDX_JOB_OWNER);
+  feedEvent("job-exit", `[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(finished)} log=${finished.log}${note ? ` note=${note}` : ""}`, process.env.CDX_JOB_OWNER, { job: name });
   return exitCode;
 }
 
 async function killJob(name: string, job: Job, note?: string): Promise<void> {
+  if (!owned(job.ownerSession)) fail(`job "${name}" belongs to another session; use cdx takeover ${job.ownerSession} first`);
   if (!jobRunning(job)) fail(`job "${name}" is not running (state ${job.state})`);
   const finalize = (exitCode: number, why: string): Job => withJobs((jobs) => {
     const entry = jobs[name]!;
@@ -5468,7 +5657,7 @@ async function killJob(name: string, job: Job, note?: string): Promise<void> {
   }
   signalGroup("SIGKILL");
   const finished = finalize(137, note ?? "killed");
-  feedOwned(`[cdx] job=${name} state=failed exit=137 in=${jobDuration(finished)} log=${finished.log} note=${finished.note}`, finished.ownerSession);
+  feedEvent("job-exit", `[cdx] job=${name} state=failed exit=137 in=${jobDuration(finished)} log=${finished.log} note=${finished.note}`, finished.ownerSession, { job: name });
   console.log(`cdx: ${renderJobLine(name, finished)}`);
 }
 
@@ -5516,7 +5705,7 @@ function viewState() {
         duration: jobDuration(job), lastLines: readTailLines(job.log, 20),
       };
     }).sort(viewActivityOrder),
-    feed: readTailLines(`${ROOT}/feed.log`, 200),
+    feed: withEvents(() => readEvents().slice(-200).map(renderEvent), false),
   };
 }
 
@@ -5564,11 +5753,12 @@ function viewCommand(argv: string[]) {
   const feedPath = `${ROOT}/feed.log`;
   let feedIdentity = "";
   const feedCursor: Cursor = { round: 0, path: feedPath, offset: 0, buffer: "", json: false, decoder: new TextDecoder() };
-  if (existsSync(feedPath)) {
+  withEvents(() => {
+    if (!existsSync(feedPath)) return;
     const stat = statSync(feedPath);
     feedCursor.offset = stat.size;
     feedIdentity = `${stat.dev}:${stat.ino}`;
-  }
+  }, false);
   const server = Bun.serve({
     hostname: "127.0.0.1", port,
     fetch(request, server) {
@@ -5637,15 +5827,19 @@ function viewCommand(argv: string[]) {
       const state = viewState();
       const serialized = viewJSON(state);
       if (serialized !== previous) { for (const client of clients) client.send("state", state); previous = serialized; }
-      if (existsSync(feedPath)) {
+      withEvents(() => {
+        if (!existsSync(feedPath)) return;
         const stat = statSync(feedPath);
         const identity = `${stat.dev}:${stat.ino}`;
         if (identity !== feedIdentity || stat.size < feedCursor.offset) {
           feedCursor.offset = 0; feedCursor.buffer = ""; feedCursor.decoder = new TextDecoder();
         }
         feedIdentity = identity;
-        drainCursor(feedCursor, "", (line) => { for (const client of clients) client.send("feed", line); });
-      }
+        drainCursor(feedCursor, "", (line) => {
+          const event = parseFeedEvent(line);
+          if (event) for (const client of clients) client.send("feed", renderEvent(event));
+        });
+      }, false);
       const ledger = readLedger();
       for (const client of clients) {
         try { updateLane(client, ledger); }
@@ -5680,7 +5874,9 @@ ${ENGINE_PICKER}
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
   ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
-  msg    <lane|session-prefix> "<text>"  inbox [-n N]
+  msg    <lane|full-session-id> "<text>"  inbox [-n N]
+  takeover <lane|full-session-id> # explicitly connect ownership to this head
+  watch                    # plugin monitor; identity comes from its environment
   status [--json]         wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
@@ -5693,7 +5889,7 @@ ${ENGINE_PICKER}
   job    <name> [--cd D] "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
   job                     # list jobs
   doctor [--fix] [--probe]
-  brief                   # running/failed lanes only; silent when all settled
+  brief                   # owned lanes, completed work awaiting attention, and open questions
 
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
 one blocking call over many lanes. Foreground lanes print the report on exit.
@@ -5706,7 +5902,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 
 const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "fork", "review", "consult", "adopt",
-  "kill", "close", "clean", "gate", "reply", "job",
+  "kill", "close", "clean", "gate", "reply", "job", "takeover", "watch", "_session",
 ]);
 // A supervisor drives its children with these; each mutation checks ownership.
 const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "kill", "close", "gate", "reply"]);
@@ -5744,6 +5940,9 @@ async function dispatch(command: string | undefined, argv: string[]) {
     if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the liaison`);
   }
 switch (command) {
+  case "watch": await watchCommand(argv); break;
+  case "_session": await sessionCommand(); break;
+  case "takeover": takeoverCommand(argv); break;
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
@@ -5880,6 +6079,7 @@ switch (command) {
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
     withLedger((ledger) => {
       const item = ledger[lane]!;
+      requireOwnChild(lane, item);
       item.work.state = "closed";
       if (note) item.work.note = note;
       item.updatedAt = new Date().toISOString();

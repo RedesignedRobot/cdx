@@ -1,5 +1,5 @@
 {
   "name": "cdx",
   "description": "Run OpenAI Codex and Google Antigravity work and review lanes from Claude Code, with completion notifications and a guard against raw work commands",
-  "version": "5.0.0"
+  "version": "6.0.0"
 }
