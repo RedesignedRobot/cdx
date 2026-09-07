@@ -796,7 +796,7 @@ function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): stri
 const LANE_ROLE = "The Claude session is the owner's liaison. It briefs outcomes, answers questions, reviews, and merges. Your final report is its handoff.";
 const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what tests start. The liaison integrates after independent review.";
 const READ_ONLY = "READ-ONLY: change nothing in the tree; write only your report. The runtime sandbox or before-and-after tree check enforces this.";
-const WORK_REPORT = "A final report is required. Lead with the outcome, then changed files, verification commands and exit codes, and remaining risks. Include child outcomes and report paths. Use plain prose and short lists. No em dashes, filler, or praise.";
+const WORK_REPORT = "A final report is required. Lead with the outcome, then changed files and remaining risks. Include child outcomes and report paths. Use plain prose and short lists. No em dashes, filler, or praise.";
 const REVIEW_REPORT = "A final report is required. State the conclusion and evidence in plain prose and short lists. No em dashes or filler.";
 const ASK_RULE = 'Use `cdx ask "<question>"` only for a missing answer that changes the outcome or authorization. Read available evidence first. A timeout is not approval: continue independent authorized work, stop dependent work, and report the unanswered question.';
 const WORKER_BAN = "This worker cannot drive other cdx lanes or jobs. Use cdx ask for dependencies that need the supervisor or liaison.";
@@ -809,7 +809,7 @@ const ASTRA_RULES = [
   "Finish the authorized outcome. Resolve routine choices and make reasonable assumptions for reversible work. Prepare a concrete result before asking for a decision. Incorporate steering and answer side questions without dropping the task.",
   "The brief and liaison replies outrank project and skill guidance within runtime constraints. If an instruction file blocks work, name its path, quote the instruction, and explain the conflict. Do not invent approval requirements.",
   "Delegate bounded work or exploration when it saves time or improves quality. Give writers exclusive files and join subagents before reporting. Native subagents and cdx child lanes must not delegate further.",
-  "Run the acceptance gate and tests for changed behavior. Keep one test per real rule; remove fixture restatements and implementation mirrors. Repeat checks only after edits, failures, or unresolved concerns.",
+  "Do not run the test suite or the wall; the lane gate runs it once after your report and the liaison merges on that result. Keep one test per real rule; remove fixture restatements and implementation mirrors.",
   ASK_RULE,
 ];
 const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
@@ -817,7 +817,7 @@ const GEMINI_WORKER_RULES = [
   WORKER_BAN,
   "Execute the assigned outcome within your files. The parent owns design and scope. Do not spawn subagents.",
   ASK_RULE,
-  "Remove temporary diagnostics and run the acceptance gate before reporting. Cite only checks you ran. End with Assumptions, or 'none'.",
+  "Remove temporary diagnostics before reporting. Do not run the test suite; the gate runs it once after your report. End with Assumptions, or 'none'.",
 ];
 const SUPERVISOR_RULES = [
   "You are the owner's driver. Own design and cross-cutting decisions; delegate bounded execution to Gemini children. Use GPT children, consults, or native subagents when useful. Keep delegation one level deep.",
@@ -825,7 +825,7 @@ const SUPERVISOR_RULES = [
   'Start children with `cdx spawn <child> --bg --gate "<cmd>" "<brief>"`; Gemini is default, `--engine gpt` selects GPT. `cdx consult <child> --bg "<question>"` starts a read-only advisor. `cdx wait <child>... --report` returns exit 2 for questions; answer with `cdx reply`.',
   "Each child needs an outcome, exclusive files, gate, and relevant facts. Start independent children together. Separate worktrees start from committed HEAD; use disjoint files in one tree when children need your edits.",
   "Drive only your own children. Answer questions promptly. Never change a child's gate; ask the liaison if it is wrong. Jobs, fork, adopt, and clean belong to the liaison because they can outlive this lane or affect unrelated history.",
-  "Read child reports and verify the combined change. Join native subagents before reporting. Ending this round stops running cdx children; reporting with a running child fails the round.",
+  "Read child reports and their gate results; do not rerun their gates or the suite. Join native subagents before reporting. Ending this round stops running cdx children; reporting with a running child fails the round.",
 ];
 
 function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
@@ -866,7 +866,7 @@ const REVIEW_FINDINGS_SCHEMA = {
   },
 };
 
-const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Find defects in behavior, contracts, data handling, or verification. For each finding give severity, file and line, and the input or state that produces the wrong result. P1 breaks users or data; P2 fails under realistic conditions; P3 is a smaller defect. Mark traced paths CONFIRMED and unverified paths PLAUSIBLE. Rank findings by severity. If clean, list what you checked and how. Omit praise and style remarks.";
+const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Find defects in behavior, contracts, data handling, or verification. For each finding give severity, file and line, and the input or state that produces the wrong result. P1 breaks users or data; P2 fails under realistic conditions; P3 is a smaller defect. Mark traced paths CONFIRMED and unverified paths PLAUSIBLE. Rank findings by severity. If clean, say so in one line. Omit praise and style remarks. Do not run the test suite; the lane gate already ran it and its result is in the report.";
 const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End with fenced JSON: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
 const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 
