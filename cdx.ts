@@ -68,7 +68,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.0.0";
+const VERSION = "6.0.1";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -548,12 +548,12 @@ interface SessionState {
   bindings: Record<string, string>;
   lanes: Record<string, string>;
   sessions: Record<string, SessionDelivery>;
+  heads: Record<string, string>;
 }
 const SESSION_STATE = `${ROOT}/sessions.json`;
 const WAKE_EVENTS = new Set<EventKind>(["question", "stalled", "terminal", "job-exit", "message"]);
 function readSessions(): SessionState {
-  return existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8"))
-    : { sequence: 0, bindings: {}, lanes: {}, sessions: {} };
+  return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, heads: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
 }
 function withEvents<T>(action: (state: SessionState) => T, persist = true): T {
   if (!persist && !existsSync(ROOT)) return action(readSessions());
@@ -626,12 +626,19 @@ function deliverEvents(session: string, channel: "wake" | "quiet", emit: (text: 
   });
 }
 async function watchCommand(argv: string[]): Promise<void> {
-  const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
   const claudePid = Number(process.env.CLAUDE_PID);
-  if (argv.length || !session || session === "terminal" || !Number.isInteger(claudePid) || claudePid < 1) fail("cdx watch needs CLAUDE_CODE_SESSION_ID and CLAUDE_PID from the plugin monitor, with no arguments");
+  if (argv.length || !Number.isInteger(claudePid) || claudePid < 1) fail("cdx watch needs CLAUDE_PID from the plugin monitor, with no arguments");
+  // The monitor's own CLAUDE_CODE_SESSION_ID is a child id. The head's id is
+  // the session hook receipt keyed by the Claude process; /clear changes it.
+  const headSession = () => readSessions().heads[String(claudePid)];
+  let held: string | undefined;
+  const release = () => withEvents((state) => {
+    if (held && state.sessions[held]?.lease?.pid === process.pid) delete state.sessions[held]!.lease;
+    held = undefined;
+  });
   // A live holder keeps the lease; this watcher stands by and takes over
   // when the holder exits (a plugin reload starts the new monitor first).
-  const acquire = () => withEvents((state) => {
+  const acquire = (session: string) => withEvents((state) => {
     const current = delivery(state, session);
     if (current.lease?.pid === process.pid) return true;
     if (current.lease && pidAlive(current.lease.pid) && pidAlive(current.lease.claudePid)) return false;
@@ -644,14 +651,16 @@ async function watchCommand(argv: string[]): Promise<void> {
   process.on("SIGINT", stop);
   try {
     while (!stopped && pidAlive(claudePid)) {
-      if (acquire()) deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
+      const session = headSession();
+      if (held && session !== held) release();
+      if (session && acquire(session)) {
+        held = session;
+        deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
+      }
       await Bun.sleep(500);
     }
   } finally {
-    withEvents((state) => {
-      const current = delivery(state, session);
-      if (current.lease?.pid === process.pid) delete current.lease;
-    });
+    release();
     process.removeListener("SIGTERM", stop);
     process.removeListener("SIGINT", stop);
   }
@@ -681,6 +690,7 @@ async function sessionCommand(): Promise<void> {
   if (!["SessionStart", "PostToolBatch", "UserPromptSubmit"].includes(event)) fail("unsupported session hook event");
   const session = input.session_id.trim();
   withEvents((state) => {
+    if (process.env.CLAUDE_PID) state.heads[process.env.CLAUDE_PID] = session;
     const current = delivery(state, session);
     const hooks = createHash("sha256").update(readFileSync(`${REPO_ROOT}/hooks/hooks.json`)).digest("hex");
     const observed = current.plugin?.version === VERSION && current.plugin.hooks === hooks ? current.plugin.observed : [];
@@ -5368,6 +5378,7 @@ function cleanCommand(argv: string[]) {
     }
     withEvents((state) => {
       for (const lane of removed) delete state.lanes[lane];
+      for (const pid of Object.keys(state.heads)) if (!pidAlive(Number(pid))) delete state.heads[pid];
       const records = readEvents();
       state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
       const keep = records.filter((record, index) => {
@@ -5882,7 +5893,7 @@ ${ENGINE_PICKER}
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   takeover <lane|full-session-id> # explicitly connect ownership to this head
-  watch                    # plugin monitor; identity comes from its environment
+  watch                    # plugin monitor; finds its head through CLAUDE_PID
   status [--json]         wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes

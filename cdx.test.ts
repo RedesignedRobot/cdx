@@ -4026,7 +4026,9 @@ function fixtureLane(state: string, ownerSession?: string, extra: Record<string,
     createdAt: now, updatedAt: now, sessionId: "11111111-1111-4111-8111-111111111111", ownerSession, ...extra };
 }
 function startWatcher(env: Record<string, string>) {
-  const proc = Bun.spawn({ cmd: [process.execPath, CLI, "watch"], env: { ...env, CLAUDE_PID: String(process.pid) }, stdout: "pipe", stderr: "pipe" });
+  // The head's hook maps this process to its session; the monitor's own session id is a child id and is ignored.
+  expect(hookResult({ ...env, CLAUDE_PID: String(process.pid) }, "UserPromptSubmit").exitCode).toBe(0);
+  const proc = Bun.spawn({ cmd: [process.execPath, CLI, "watch"], env: { ...env, CLAUDE_PID: String(process.pid), CLAUDE_CODE_SESSION_ID: "monitor-child-session" }, stdout: "pipe", stderr: "pipe" });
   runners.push(proc);
   const output = { text: "" };
   const drained = (async () => {

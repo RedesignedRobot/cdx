@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx 6.0.0
+# cdx 6.0.1
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -111,9 +111,10 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 ## Plugin
 
 cdx loads as `cdx@skills-dir` in personal scope through `~/.claude/skills/cdx`.
-The plugin monitor runs `cdx watch` with no argument, using
-`CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`. It fails closed without identity.
-No setup call is needed. One persisted lease prevents duplicate watchers.
+The plugin monitor runs `cdx watch` with no argument. Its own session id is
+a child id, so it finds the head through `CLAUDE_PID` and the session hook's
+receipt. It fails closed without `CLAUDE_PID` and waits until the hook has
+run. No setup call is needed. One persisted lease prevents duplicate watchers.
 
 `hooks/guard-raw-codex.ts` keeps the raw-work guard. SessionStart,
 PostToolBatch, and UserPromptSubmit run `_session`; native subagent calls
