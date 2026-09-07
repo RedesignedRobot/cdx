@@ -3656,17 +3656,63 @@ describe("cdx account advisor", () => {
     expect(supervisor.stdout).toContain("cdx: account=far for supervisor lane");
   }, 20000);
 
-  test("warns when no account has the headroom and still picks the fullest", () => {
+  test("refuses a work lane when no account has the headroom, warns a light lane, and --account forces", () => {
     const now = Math.floor(Date.now() / 1000);
-    const { root, env } = setup("advisor-short", {
+    const { root, env, homes, envTrace } = setup("advisor-short", {
       "a": snapshot(92, now + 1 * DAY),
       "b": snapshot(90, now + 6 * DAY),
     });
-    const work = runCli(["spawn", "tight", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
-    expect(work.exitCode).toBe(0);
-    expect(work.stdout).toContain("cdx: account=b for work lane: 10% left");
-    expect(work.stderr).toContain("WARNING: no account has 15% headroom for a work lane; b has 10%");
-  }, 15000);
+    const work = runCli(["spawn", "tight", "--engine", "gpt", "--cd", root, "--worktree", `${root}/tight-wt`, "REPORT_ONLY"], env);
+    expect(work.exitCode).toBe(1);
+    expect(work.stderr).toContain("no account has 15% free headroom for a work lane (b: 10% left");
+    expect(work.stderr).toContain("force one with --account NAME");
+    // Refused before the worktree existed.
+    expect(existsSync(`${root}/tight-wt`)).toBe(false);
+    const ledgerPath = `${env.CDX_HOME}/ledger.json`;
+    expect(existsSync(ledgerPath) ? JSON.parse(readFileSync(ledgerPath, "utf8")).tight : undefined).toBeUndefined();
+
+    const review = runCli(["review", "peek", "--engine", "gpt", "--cd", root, "look"], env);
+    expect(review.exitCode).toBe(0);
+    expect(review.stdout).toContain("cdx: account=a for consult/review lane: 8% left");
+
+    writeFileSync(envTrace, "");
+    const forced = runCli(["spawn", "forced", "--engine", "gpt", "--account", "a", "--cd", root, "REPORT_ONLY"], env);
+    expect(forced.exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes.a);
+  }, 20000);
+
+  test("a running lane holds its headroom on its account until it finishes", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { root, env } = setup("advisor-reserve", {
+      "soon": snapshot(75, now + 1 * DAY),
+      "late": snapshot(20, now + 6 * DAY),
+    });
+    // 25% free on the deadline account: the first work lane takes it.
+    const first = runCli(["spawn", "hold", "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], env);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toContain("cdx: account=soon for work lane: 25% left");
+    const read = () => JSON.parse(readFileSync(`${env.CDX_HOME}/ledger.json`, "utf8"));
+    await waitFor(() => read().hold?.codexPid);
+
+    // 15% held by the running lane leaves 10%: the next work lane moves on.
+    const second = runCli(["spawn", "next", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(second.exitCode).toBe(0);
+    expect(second.stdout).toContain("cdx: account=late for work lane: 80% left");
+    const usage = runCli(["usage"], env);
+    expect(usage.stdout).toContain("soon (25% left, resets ");
+    expect(usage.stdout).toContain("15% held by 1 running lane)");
+    const json = JSON.parse(runCli(["usage", "--json"], env).stdout);
+    const soon = json.advice.accounts.find((entry: { account: string }) => entry.account === "soon");
+    expect(soon.reservedPercent).toBe(15);
+    expect(soon.freePercent).toBe(10);
+
+    // A light lane still fits in the 10% that is free.
+    expect(runCli(["review", "glance", "--engine", "gpt", "--cd", root, "look"], env).stdout).toContain("cdx: account=soon for consult/review lane");
+
+    expect(runCli(["kill", "hold"], env).exitCode).toBe(0);
+    await waitFor(() => read().hold.state === "failed");
+    expect(runCli(["spawn", "after", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).stdout).toContain("cdx: account=soon for work lane: 25% left");
+  }, 30000);
 
   test("unknown usage ranks after known capacity and --account still forces", () => {
     const now = Math.floor(Date.now() / 1000);
@@ -3748,8 +3794,11 @@ describe("cdx account advisor", () => {
 
     const single = setup("advisor-single", { "only": snapshot(98, now + 2 * DAY) });
     const boss = runCli(["spawn", "boss", "--engine", "gpt", "--supervisor", "--cd", single.root, "REPORT_ONLY"], single.env);
-    expect(boss.exitCode).toBe(0);
-    expect(boss.stdout).not.toContain("cdx: account=");
-    expect(boss.stderr).toContain("WARNING: no account has 25% headroom for a supervisor lane; only has 2%");
+    expect(boss.exitCode).toBe(1);
+    expect(boss.stderr).toContain("no account has 25% free headroom for a supervisor lane (only: 2% left");
+    const peek = runCli(["consult", "peek", "--cd", single.root, "look"], single.env);
+    expect(peek.exitCode).toBe(0);
+    expect(peek.stdout).not.toContain("cdx: account=");
+    expect(peek.stderr).toContain("WARNING: no account has 5% free headroom for a consult/review lane; only has 2%");
   }, 20000);
 });
