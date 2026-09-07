@@ -147,7 +147,7 @@ flowchart LR
 | `cdx inbox` | Print messages addressed to the calling Claude session |
 | `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
 | `cdx status` | Show lane state, timing, tokens, steer count, open question, and last activity |
-| `cdx usage` | Codex account limits, Gemini limits, and all-time ledger totals |
+| `cdx usage` | Codex account limits, which account to spend next and why, Gemini limits, and all-time ledger totals |
 | `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
 | `cdx job <name> "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
@@ -263,9 +263,10 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 ```json
 {
   "model": "gpt-6-astra",
-  "models": { "astra": "gpt-6-astra", "sol": "gpt-5.6-sol" },
-  "efforts": ["medium", "high", "xhigh"],
+  "models": { "astra": "gpt-6-astra" },
+  "efforts": ["low", "medium"],
   "defaultEffort": "medium",
+  "effortCaps": { "gpt-6-astra": "medium" },
   "rules": [],
   "worktreeSetup": "bun install",
   "gemini": {
@@ -276,27 +277,37 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 }
 ```
 
-That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-5.6-sol`, efforts `low`, `medium`, `high` with `medium` as the default, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini values shown.
+That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the Astra cap below, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini values shown.
 
 - Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
+- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, fork, review, and consult after alias resolution. The built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only; `high` and `xhigh` fail with the allowed list. An inherited effort above the cap (a lane recorded before the cap, or a Gemini review round that stored `high` on a gpt lane) clamps to the cap on resume and fork with a note. Set `"effortCaps": {}` to lift the cap.
 - `gemini` is optional. Its shown values are the defaults. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
 
-### Two accounts, automatic failover
+### Accounts: earliest reset first, with headroom
 
-Each account needs its own Codex home. cdx sets `CODEX_HOME` for every Codex process in a lane, which keeps login data and session files tied to that account.
+Each account needs its own Codex home. cdx sets `CODEX_HOME` for every Codex process in a lane, which keeps login data and session files tied to that account. Log a new home in with `CODEX_HOME=~/.codex-3 codex login`, then add it here; an account listed before its login is picked as "usage unknown" only after every known account.
 
 ```json
 {
   "accounts": {
     "codex-1": "~/.codex",
-    "codex-2": "~/.codex-2"
+    "codex-2": "~/.codex-2",
+    "codex-3": "~/.codex-3"
   }
 }
 ```
 
-The first entry is primary. A new GPT spawn or review chooses the first account with capacity. Pass `--account codex-2` to force one. Every command that reopens a GPT lane uses the account and Codex home recorded in its ledger row. A lane never changes account after spawn. Gemini lanes do not take part in Codex account selection and reject `--account`.
+A new GPT spawn, review, or consult picks the account by this rule, and `cdx usage` and `cdx doctor` print the same advice:
+
+1. The lane's demand sets the headroom it needs on the weekly window: consult and review 5%, work 15%, supervisor 25%. A lane never changes account, so it must start with room to finish.
+2. Among accounts with that headroom, the one whose weekly window resets soonest goes first; whatever is unspent at reset is lost. Equal deadlines prefer the fuller account.
+3. Accounts short of the headroom come next, fullest first, with a warning that the lane may hit the limit mid-run. Accounts whose usage could not be probed come after them. Exhausted windows come last, and only when every account is exhausted does a lane start on one (soonest reset), with a feed warning.
+
+`cdx usage` shows the spend order with each account's remaining share, reset time, and the pace in percent per day that would spend the remainder exactly at reset; a pace far above real burn means the window will expire unused. `usage --json` carries the same `advice` object. The primary account (first entry) is only used by `doctor` for the version check and by raw-session forks and adopts without `--account`.
+
+Pass `--account codex-2` to force one. Every command that reopens a GPT lane uses the account and Codex home recorded in its ledger row. A lane never changes account after spawn. Gemini lanes do not take part in Codex account selection and reject `--account`.
 
 A GPT lane fork inherits the parent's account and Codex home, and records both on the new lane. A raw-session-ID fork is GPT-only. GPT adopt and raw-session-ID fork accept `--account` and otherwise use the primary account.
 

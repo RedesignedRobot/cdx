@@ -625,7 +625,7 @@ describe("cdx messaging", () => {
     expect(thread.params.config.sandbox_workspace_write.writable_roots).toEqual([realpathSync(extra)]);
     expect(thread.params.approvalPolicy).toBe("never");
     expect(thread.params.sandbox).toBe("danger-full-access");
-    expect(thread.params.model).toBe("gpt-5.6-sol");
+    expect(thread.params.model).toBe("gpt-6-astra");
     expect(turn.params.input).toContainEqual({ type: "localImage", path: realpathSync(image) });
     expect(turn.params.outputSchema.type).toBe("object");
     expect(turn.params.sandboxPolicy).toEqual({ type: "dangerFullAccess" });
@@ -2931,6 +2931,7 @@ describe("cdx models and supervisors", () => {
     mkdirSync(state, { recursive: true });
     writeFileSync(`${state}/config.json`, JSON.stringify({
       model: "gpt-5.6-sol", models: { astra: "gpt-6-astra" }, efforts: ["medium", "high", "xhigh"], defaultEffort: "medium",
+      effortCaps: { "gpt-6-astra": "xhigh" },
     }));
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_TRACE: trace };
 
@@ -3024,11 +3025,11 @@ describe("cdx models and supervisors", () => {
 
     const spawned = runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env);
     expect(spawned.exitCode).toBe(0);
-    expect(spawned.stdout).toContain("engine=gpt model=gpt-5.6-sol supervisor mode=spawn");
+    expect(spawned.stdout).toContain("engine=gpt model=gpt-6-astra supervisor mode=spawn");
     await waitFor(() => existsSync(supervisorTrace) && readFileSync(supervisorTrace, "utf8").trim() === "sup");
     expect(readFileSync(`${state}/briefs/sup-r1.md`, "utf8")).toContain("You supervise this lane");
     expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBe(true);
-    expect(runCli(["status"], env).stdout).toContain("engine=gpt  model=gpt-5.6-sol  supervisor");
+    expect(runCli(["status"], env).stdout).toContain("engine=gpt  model=gpt-6-astra  supervisor");
 
     // A plain gpt worker gets no supervisor variable.
     writeFileSync(supervisorTrace, "");
@@ -3446,4 +3447,190 @@ describe("cdx view", () => {
     expect(await proc.exited).toBe(0);
     expect(existsSync(state)).toBe(false);
   });
+});
+
+describe("cdx effort caps", () => {
+  const config = (extra: Record<string, unknown> = {}) => JSON.stringify({
+    model: "gpt-5.6-sol", models: { astra: "gpt-6-astra" }, efforts: ["low", "medium", "high", "xhigh"], defaultEffort: "medium", rules: [], ...extra,
+  });
+
+  test("astra refuses high and above by default, on spawn, review, consult, fork, and resume", () => {
+    const root = tempPath("effort-cap");
+    const state = `${root}/state`;
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, config());
+    const env = baseEnv(state, installFakeCodex(root));
+
+    for (const effort of ["high", "xhigh"]) {
+      const spawned = runCli(["spawn", `cap-${effort}`, "--engine", "gpt", "--model", "astra", "--effort", effort, "--cd", root, "REPORT_ONLY"], env);
+      expect(spawned.exitCode).toBe(1);
+      expect(spawned.stderr).toContain(`effort ${effort} exceeds the cap for gpt-6-astra (max medium); allowed: low, medium`);
+    }
+    const review = runCli(["review", "cap-review", "--engine", "gpt", "--model", "astra", "--effort", "high", "--cd", root, "review this"], env);
+    expect(review.exitCode).toBe(1);
+    expect(review.stderr).toContain("exceeds the cap for gpt-6-astra");
+    const consult = runCli(["consult", "cap-consult", "--model", "astra", "--effort", "high", "--cd", root, "advise"], env);
+    expect(consult.exitCode).toBe(1);
+    expect(consult.stderr).toContain("exceeds the cap for gpt-6-astra");
+
+    for (const effort of ["low", "medium"]) {
+      expect(runCli(["spawn", `ok-${effort}`, "--engine", "gpt", "--model", "astra", "--effort", effort, "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    }
+    const resume = runCli(["resume", "ok-medium", "--effort", "high", "REPORT_ONLY"], env);
+    expect(resume.exitCode).toBe(1);
+    expect(resume.stderr).toContain("exceeds the cap for gpt-6-astra");
+    const fork = runCli(["fork", "cap-fork", "ok-medium", "--effort", "xhigh", "REPORT_ONLY"], env);
+    expect(fork.exitCode).toBe(1);
+    expect(fork.stderr).toContain("exceeds the cap for gpt-6-astra");
+
+    // Other models keep the full allowlist.
+    expect(runCli(["spawn", "sol-high", "--engine", "gpt", "--effort", "high", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+  }, 30000);
+
+  test("a lane recorded above the cap resumes and forks clamped to the cap with a note", () => {
+    const root = tempPath("effort-cap-legacy");
+    const state = `${root}/state`;
+    const trace = `${root}/requests.jsonl`;
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/config.json`, config({ effortCaps: {} }));
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_TRACE: trace };
+    expect(runCli(["spawn", "legacy-high", "--engine", "gpt", "--model", "astra", "--effort", "high", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+
+    writeFileSync(`${state}/config.json`, config());
+    writeFileSync(trace, "");
+    const resumed = runCli(["resume", "legacy-high", "REPORT_ONLY"], env);
+    expect(resumed.exitCode).toBe(0);
+    expect(resumed.stderr).toContain("recorded effort high exceeds the cap for gpt-6-astra; running at medium");
+    const turn = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((request) => request.method === "turn/start");
+    expect(turn.params.effort).toBe("medium");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["legacy-high"].effort).toBe("medium");
+
+    const forked = runCli(["fork", "legacy-fork", "legacy-high", "REPORT_ONLY"], env);
+    expect(forked.exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["legacy-fork"].effort).toBe("medium");
+  }, 20000);
+
+  test("effortCaps config is validated", () => {
+    const root = tempPath("effort-cap-config");
+    const state = `${root}/state`;
+    mkdirSync(state, { recursive: true });
+    const env = baseEnv(state, installFakeCodex(root));
+    writeFileSync(`${state}/config.json`, config({ effortCaps: ["medium"] }));
+    expect(runCli(["status"], env).stderr).toContain("effortCaps must be an object");
+    writeFileSync(`${state}/config.json`, config({ effortCaps: { "gpt-6-astra": "ultra" } }));
+    expect(runCli(["status"], env).stderr).toContain("effortCaps.gpt-6-astra must be one of minimal, low, medium, high, xhigh");
+    writeFileSync(`${state}/config.json`, config({ effortCaps: { "Bad Model": "medium" } }));
+    expect(runCli(["status"], env).stderr).toContain('effortCaps key "Bad Model" is not a Codex model id');
+  });
+});
+
+describe("cdx account advisor", () => {
+  const DAY = 86_400;
+  const WEEK_MINS = 10_080;
+  const window = (usedPercent: number, resetsAt: number, windowDurationMins = WEEK_MINS) => ({ usedPercent, windowDurationMins, resetsAt });
+  const snapshot = (usedPercent: number, resetsAt: number, extra: Record<string, unknown> = {}) => ({
+    checkedAt: new Date().toISOString(), usedPercent, windowDurationMins: WEEK_MINS, resetsAt, planType: "pro",
+    resetCreditsAvailable: 0, reached: usedPercent >= 99, windows: [window(usedPercent, resetsAt)], ...extra,
+  });
+
+  function setup(label: string, usage: Record<string, unknown>) {
+    const root = tempPath(label);
+    const state = `${root}/state`;
+    mkdirSync(state, { recursive: true });
+    const homes: Record<string, string> = {};
+    for (const name of Object.keys(usage)) {
+      homes[name] = `${root}/${name}`;
+      mkdirSync(homes[name], { recursive: true });
+    }
+    writeFileSync(`${state}/config.json`, JSON.stringify({
+      model: "gpt-5.6-sol", efforts: ["medium"], defaultEffort: "medium", rules: [], accounts: homes,
+    }));
+    writeFileSync(`${state}/usage.json`, JSON.stringify({ accounts: usage }));
+    const envTrace = `${root}/env.trace`;
+    // Both fakes share ${root}/bin, so the usage command's gemini probe stays local too.
+    const bin = installFakeCodex(root);
+    installFakeAgy(root);
+    const env = { ...baseEnv(state, bin), FAKE_ENV_TRACE: envTrace };
+    return { root, state, homes, env, envTrace };
+  }
+
+  test("spends the account whose window resets soonest and skips exhausted ones", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { root, homes, env, envTrace } = setup("advisor-edf", {
+      "codex-1": snapshot(100, now + 2 * DAY),
+      "codex-2": snapshot(3, now + 7 * DAY),
+      "codex-3": snapshot(0, now + 5 * DAY),
+    });
+    const spawned = runCli(["spawn", "edf", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(spawned.exitCode).toBe(0);
+    expect(spawned.stdout).toContain("cdx: account=codex-3 for work lane: 100% left");
+    expect(spawned.stderr).toContain("account codex-1 consumed");
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes["codex-3"]);
+    expect(JSON.parse(readFileSync(`${env.CDX_HOME}/ledger.json`, "utf8")).edf.account).toBe("codex-3");
+  }, 15000);
+
+  test("headroom moves long runs to a fuller account while short ones drain the deadline", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { root, env, envTrace } = setup("advisor-headroom", {
+      "near": snapshot(90, now + 1 * DAY),
+      "far": snapshot(20, now + 6 * DAY),
+    });
+    const review = runCli(["review", "light", "--engine", "gpt", "--cd", root, "review this"], env);
+    expect(review.exitCode).toBe(0);
+    expect(review.stdout).toContain("cdx: account=near for consult/review lane: 10% left");
+
+    writeFileSync(envTrace, "");
+    const work = runCli(["spawn", "long", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(work.exitCode).toBe(0);
+    expect(work.stdout).toContain("cdx: account=far for work lane: 80% left");
+
+    const supervisor = runCli(["spawn", "boss", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], env);
+    expect(supervisor.exitCode).toBe(0);
+    expect(supervisor.stdout).toContain("cdx: account=far for supervisor lane");
+  }, 20000);
+
+  test("warns when no account has the headroom and still picks the fullest", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { root, env } = setup("advisor-short", {
+      "a": snapshot(92, now + 1 * DAY),
+      "b": snapshot(90, now + 6 * DAY),
+    });
+    const work = runCli(["spawn", "tight", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(work.exitCode).toBe(0);
+    expect(work.stdout).toContain("cdx: account=b for work lane: 10% left");
+    expect(work.stderr).toContain("WARNING: no account has 15% headroom for a work lane; b has 10%");
+  }, 15000);
+
+  test("unknown usage ranks after known capacity and --account still forces", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { root, homes, env, envTrace } = setup("advisor-unknown", {
+      "mystery": { checkedAt: new Date(0).toISOString(), usedPercent: 0, windowDurationMins: 0, resetsAt: 0, planType: "unknown", resetCreditsAvailable: 0, reached: false, probeFailedAt: new Date().toISOString() },
+      "known": snapshot(50, now + 3 * DAY),
+    });
+    expect(runCli(["spawn", "pick-known", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).stdout).toContain("cdx: account=known for work lane");
+    writeFileSync(envTrace, "");
+    expect(runCli(["spawn", "forced", "--engine", "gpt", "--account", "mystery", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes.mystery);
+  }, 15000);
+
+  test("usage prints the spend order, picks per headroom, and the pace to empty; --json carries the same advice", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const { env } = setup("advisor-usage", {
+      "codex-1": snapshot(100, now + 2 * DAY),
+      "codex-2": snapshot(3, now + 7 * DAY),
+      "codex-3": snapshot(0, now + 7 * DAY),
+    });
+    const usage = runCli(["usage"], env);
+    expect(usage.exitCode).toBe(0);
+    expect(usage.stdout).toContain("advice: spend codex-3 (100% left, resets ");
+    expect(usage.stdout).toContain("%/day empties it), then codex-2 (97% left");
+    expect(usage.stdout).toContain("codex-1 weekly window exhausted, back in 2.0d");
+    expect(usage.stdout).toContain("picks by headroom (consult/review 5%, work 15%, supervisor 25%): consult/review codex-3 · work codex-3 · supervisor codex-3");
+
+    const json = JSON.parse(runCli(["usage", "--json"], env).stdout);
+    expect(json.advice.order).toEqual(["codex-3", "codex-2", "codex-1"]);
+    expect(json.advice.picks).toEqual({ light: "codex-3", work: "codex-3", supervisor: "codex-3" });
+    expect(json.advice.accounts[0].paceToEmpty).toBe(14);
+    expect(json.advice.accounts[2].reached).toBe(true);
+  }, 20000);
 });
