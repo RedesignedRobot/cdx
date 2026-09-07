@@ -326,11 +326,12 @@ function readConfig(skipFile = false): Config {
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
   };
-  if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
+  const configPath = process.env.CDX_HOME ? `${process.env.CDX_HOME}/config.json` : CONFIG_PATH;
+  if (skipFile || !existsSync(configPath)) return defaults;
 
   let text: string;
   try {
-    text = readFileSync(CONFIG_PATH, "utf8");
+    text = readFileSync(configPath, "utf8");
   } catch (error) {
     configError(`cannot read config: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -468,14 +469,52 @@ function geminiConfig(): GeminiConfig {
   };
 }
 
-const isHookInvocation = process.argv[2] === "hook";
-const config = readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || isHookInvocation);
+let _cachedConfig: Config | undefined;
+let _cachedConfigHome: string | undefined;
 
-if (!isHookInvocation && process.argv[2] !== "view") {
-  for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
-    try {
-      mkdirSync(`${ROOT}/${dir}`, { recursive: true });
-    } catch { /* ignore if read-only or raced */ }
+function loadConfig(): Config {
+  if (import.meta.main) {
+    if (!_cachedConfig) {
+      const isHook = process.argv[2] === "hook";
+      const skip = process.argv[2] === "_run" || process.argv[2] === "view" || isHook;
+      _cachedConfig = readConfig(skip);
+    }
+    return _cachedConfig;
+  }
+  const currentHome = process.env.CDX_HOME;
+  if (_cachedConfig && _cachedConfigHome === currentHome) {
+    return _cachedConfig;
+  }
+  const userHome = `${process.env.HOME || HOME}/.cdx`;
+  const skip = !currentHome || currentHome === userHome;
+  _cachedConfig = readConfig(skip);
+  _cachedConfigHome = currentHome;
+  return _cachedConfig;
+}
+
+const config: Config = new Proxy({} as Config, {
+  get(_target, prop, receiver) {
+    return Reflect.get(loadConfig(), prop, receiver);
+  },
+  has(_target, prop) {
+    return Reflect.has(loadConfig(), prop);
+  },
+  ownKeys(_target) {
+    return Reflect.ownKeys(loadConfig());
+  },
+  getOwnPropertyDescriptor(_target, prop) {
+    return Reflect.getOwnPropertyDescriptor(loadConfig(), prop);
+  },
+});
+
+if (import.meta.main) {
+  const isHookInvocation = process.argv[2] === "hook";
+  if (!isHookInvocation && process.argv[2] !== "view") {
+    for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
+      try {
+        mkdirSync(`${ROOT}/${dir}`, { recursive: true });
+      } catch { /* ignore if read-only or raced */ }
+    }
   }
 }
 
@@ -818,7 +857,7 @@ const GEMINI_WORKER_RULES = [
   ASK_RULE,
   "Do the work in this conversation and do not spawn subagents. The harness tracks one worker per lane; a subagent's edits and mistakes would be invisible to it.",
   "Before reporting, remove the temporary diagnostics you added while debugging (a print, a log line, a fixture) and re-run every test you cite. Logging the task asked for stays.",
-  "The report lists exactly which files changed, the commands you ran with their exit codes, and an Assumptions heading (write 'none' if empty).",
+  "End with an Assumptions heading (write 'none' if empty).",
 ];
 
 const SUPERVISOR_RULES = [
@@ -1364,8 +1403,6 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       steerOpen: kind === "work",
       continuations: 0,
       ...(hooksActive ? { hooksActive: true } : {}),
-      // A fresh round must never display the previous round's final message
-      // or note as its own.
       lastAction: undefined,
       lastEventAt: undefined,
       diffEmpty: undefined,
@@ -2987,12 +3024,10 @@ async function resumeCommand(argv: string[]) {
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
-  const reportInstruction = reviewResume
-    ? (engine === "gemini"
-        ? "Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
-        : "Print your final report. cdx captures it from the transcript.")
-    : "Print your final report. cdx captures the last final agent message.";
-  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}\n\nTask:\n${followUp}\n\n${reportInstruction}`;
+  const structuredInstruction = reviewResume && engine === "gemini"
+    ? "\n\nYour final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
+    : "";
+  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}\n\nTask:\n${followUp}${structuredInstruction}`;
   // The resolved effort always travels with the turn: a resumed session would
   // otherwise keep the effort it was created with, cap or no cap.
   const codexArgs = reviewResume && engine === "gpt"
@@ -3054,7 +3089,7 @@ async function forkCommand(argv: string[]) {
   }
   const owner = callerOwnership();
   const { round } = openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model });
-  const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}\n\nPrint your final report. cdx captures the last final agent message.`;
+  const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
   return launch({ engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, ...(sourceLane ? {} : { model }), sourceThreadId: sessionId, ...accountSpec(account, fallbackHome), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
@@ -3908,8 +3943,6 @@ function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStan
   }).map(({ standing }) => standing);
 }
 
-// Cached usage is good for 30 minutes; a failed probe is not retried for 5.
-// A stale snapshot still beats no snapshot: windows move slowly.
 // A cached snapshot serves for 30 minutes unless a window has reset or it
 // predates per-window storage; after a failed refresh the stale copy stays
 // on disk and standingOf decides how much of it to trust.
@@ -5554,25 +5587,28 @@ const REFUSED_INSIDE_LANE = new Set([
 // enforce gemini-only children and the parent relation.
 const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "kill", "close", "gate", "reply"]);
 
-const [command, ...argv] = process.argv.slice(2);
-try {
-  await dispatch(command, argv);
-} catch (err) {
-  if (command === "hook") {
-    const isPreTool = argv[0] === "pre-tool";
-    console.log(isPreTool ? JSON.stringify({ decision: "allow" }) : "{}");
-    process.exit(0);
+if (import.meta.main) {
+  const [command, ...argv] = process.argv.slice(2);
+  try {
+    await dispatch(command, argv);
+  } catch (err) {
+    if (command === "hook") {
+      const isPreTool = argv[0] === "pre-tool";
+      console.log(isPreTool ? JSON.stringify({ decision: "allow" }) : "{}");
+      process.exit(0);
+    }
+    // CmdError is a user-facing refusal thrown from inside withLedger callbacks,
+    // where process.exit would strand the lock. Convert it here, after unlock.
+    if (err instanceof CmdError) fail(err.message);
+    throw err;
   }
-  // CmdError is a user-facing refusal thrown from inside withLedger callbacks,
-  // where process.exit would strand the lock. Convert it here, after unlock.
-  if (err instanceof CmdError) fail(err.message);
-  throw err;
 }
 
 export {
   readJsonLines, qualifyGeminiReport, writeUsageSnapshot,
   isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA,
   GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, requireGeminiQuota, geminiQuotaState,
+  rankAccounts, standingOf, withReservations, laneDemand, cappedEffort, snapshotExpired, config,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
