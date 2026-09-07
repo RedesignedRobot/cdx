@@ -2886,12 +2886,13 @@ async function spawnCommand(argv: string[]) {
     try { outputSchema = JSON.parse(readFileSync(parsed.flags.schema, "utf8")); }
     catch (error) { fail(`--schema must name valid JSON: ${error instanceof Error ? error.message : String(error)}`); }
   }
+  // Admission runs before the worktree exists so a refusal strands nothing.
+  const selection = engine === "gpt" ? existingLane ? undefined : await selectAccount(parsed.flags.account, supervisor ? "supervisor" : "work") : undefined;
   let worktree: WorktreeInfo | undefined;
   if (parsed.flags.worktree) {
     worktree = createWorktree(cwd, parsed.flags.worktree, lane);
     cwd = worktree.path;
   }
-  const selection = engine === "gpt" ? existingLane ? undefined : await selectAccount(parsed.flags.account, supervisor ? "supervisor" : "work") : undefined;
   const account = engine === "gpt" ? existingLane ? laneAccount(existingLane) : selection!.choice : undefined;
   const fallbackHome = engine === "gpt" && existingLane ? legacyAccountFallback(lane, existingLane, existingLane.ownerSession) : undefined;
   if (engine === "gpt" && (existingLane || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
@@ -3792,11 +3793,49 @@ interface AccountStanding {
   // is the deadline: whatever is unspent then is lost.
   weekly?: RateLimitWindow;
   remainingPercent: number;
+  // Headroom running gpt lanes on this account still hold (their demand,
+  // until they finish), and what is left for a new lane after it.
+  reservedPercent: number;
+  reservedLanes: number;
+  freePercent: number;
   // Percent of the weekly window per day that spends the remainder exactly at
   // reset; a pace far above real burn means the window will expire unused.
   paceToEmpty?: number;
   reached: boolean;
   reason: string;
+}
+
+// The headroom a lane asked for at launch, from its ledger row.
+function laneDemand(entry: Pick<Lane, "supervisor" | "consult" | "kind">): Demand {
+  if (entry.supervisor) return "supervisor";
+  return entry.consult || entry.kind === "review" ? "light" : "work";
+}
+
+// Two launches that read the same snapshot would otherwise both claim the
+// same share. A running gpt lane holds its demand on its account until it
+// finishes; nothing is stored, the ledger is the reservation.
+function reservedHeadroom(ledger: Ledger): Record<string, { percent: number; lanes: number }> {
+  const held: Record<string, { percent: number; lanes: number }> = {};
+  for (const entry of Object.values(ledger)) {
+    if (!entry.account || laneEngine(entry) !== "gpt" || !laneRunning(entry)) continue;
+    const slot = held[entry.account] ?? { percent: 0, lanes: 0 };
+    slot.percent += HEADROOM_PERCENT[laneDemand(entry)];
+    slot.lanes += 1;
+    held[entry.account] = slot;
+  }
+  return held;
+}
+
+function withReservations(standings: AccountStanding[], ledger: Ledger): AccountStanding[] {
+  const held = reservedHeadroom(ledger);
+  return standings.map((standing) => {
+    const slot = held[standing.choice.name];
+    if (!slot || !standing.snapshot) return standing;
+    const freePercent = Math.max(0, standing.remainingPercent - slot.percent);
+    const reason = standing.reached ? standing.reason
+      : `${standing.reason}, ${slot.percent}% held by ${slot.lanes} running lane${slot.lanes === 1 ? "" : "s"}`;
+    return { ...standing, reservedPercent: slot.percent, reservedLanes: slot.lanes, freePercent, reason };
+  });
 }
 
 function fmtUntil(unixSeconds: number): string {
@@ -3825,7 +3864,7 @@ function snapshotExpired(snapshot: UsageSnapshot): boolean {
 }
 
 function unknownStanding(choice: AccountChoice, reason: string): AccountStanding {
-  return { choice, remainingPercent: 0, reached: false, reason: `usage unknown: ${reason}` };
+  return { choice, remainingPercent: 0, reservedPercent: 0, reservedLanes: 0, freePercent: 0, reached: false, reason: `usage unknown: ${reason}` };
 }
 
 function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
@@ -3847,11 +3886,12 @@ function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined):
   const remainingPercent = Math.max(0, 100 - weekly.usedPercent);
   const daysToReset = (weekly.resetsAt * 1000 - now) / 86_400_000;
   const paceToEmpty = Math.round(remainingPercent / daysToReset);
+  const base = { choice, snapshot, weekly, remainingPercent, reservedPercent: 0, reservedLanes: 0, freePercent: remainingPercent, paceToEmpty, reached };
   if (reached) {
     const blocking = live.filter((window) => window.usedPercent >= 99).sort((a, b) => a.resetsAt - b.resetsAt)[0] ?? snapshot;
-    return { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached, reason: `${rateLimitWindowName(blocking.windowDurationMins)} window exhausted, back ${fmtUntil(blocking.resetsAt)}` };
+    return { ...base, reason: `${rateLimitWindowName(blocking.windowDurationMins)} window exhausted, back ${fmtUntil(blocking.resetsAt)}` };
   }
-  return { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached, reason: `${Math.round(remainingPercent)}% left, resets ${rateLimitResetDate(weekly.resetsAt)} ${fmtUntil(weekly.resetsAt)}, ${paceToEmpty}%/day empties it` };
+  return { ...base, reason: `${Math.round(remainingPercent)}% left, resets ${rateLimitResetDate(weekly.resetsAt)} ${fmtUntil(weekly.resetsAt)}, ${paceToEmpty}%/day empties it` };
 }
 
 // Earliest deadline first. An account whose window resets soonest loses its
@@ -3862,7 +3902,7 @@ function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined):
 function standingTier(standing: AccountStanding, demand: Demand): number {
   if (standing.reached) return 3;
   if (!standing.snapshot) return 2;
-  return standing.remainingPercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
+  return standing.freePercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
 }
 
 function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStanding[] {
@@ -3873,9 +3913,9 @@ function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStan
     if (tier === 0) {
       const deadline = a.standing.weekly!.resetsAt - b.standing.weekly!.resetsAt;
       if (deadline !== 0) return deadline;
-      return b.standing.remainingPercent - a.standing.remainingPercent;
+      return b.standing.freePercent - a.standing.freePercent;
     }
-    if (tier === 1) return b.standing.remainingPercent - a.standing.remainingPercent;
+    if (tier === 1) return b.standing.freePercent - a.standing.freePercent;
     if (tier === 3) return a.standing.snapshot!.resetsAt - b.standing.snapshot!.resetsAt;
     return a.index - b.index;
   }).map(({ standing }) => standing);
@@ -3897,23 +3937,24 @@ async function accountSnapshot(choice: AccountChoice): Promise<UsageSnapshot | u
 }
 
 async function accountStandings(): Promise<AccountStanding[]> {
-  return Promise.all(Object.entries(config.accounts ?? {}).map(async ([name, home]) => {
+  const standings = await Promise.all(Object.entries(config.accounts ?? {}).map(async ([name, home]) => {
     const choice = { name, home };
     return standingOf(choice, await accountSnapshot(choice));
   }));
+  return withReservations(standings, readLedger());
 }
 
 function cachedAccountStandings(): AccountStanding[] {
-  return Object.entries(config.accounts ?? {}).map(([name, home]) => {
+  return withReservations(Object.entries(config.accounts ?? {}).map(([name, home]) => {
     const choice = { name, home };
     return standingOf(choice, readUsageSnapshot(choice));
-  });
+  }), readLedger());
 }
 
 interface AccountAdvice {
   order: string[];
   picks: Record<Demand, string | null>;
-  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
+  accounts: Array<{ account: string; remainingPercent: number; reservedPercent: number; freePercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
 }
 
 function accountAdvice(standings: AccountStanding[]): AccountAdvice {
@@ -3928,6 +3969,8 @@ function accountAdvice(standings: AccountStanding[]): AccountAdvice {
     accounts: ranked.map((standing) => ({
       account: standing.choice.name,
       remainingPercent: standing.remainingPercent,
+      reservedPercent: standing.reservedPercent,
+      freePercent: standing.freePercent,
       reached: standing.reached,
       ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt } : {}),
       ...(standing.paceToEmpty !== undefined ? { paceToEmpty: standing.paceToEmpty } : {}),
@@ -3978,6 +4021,13 @@ async function selectAccount(forced: string | undefined, demand: Demand): Promis
 
   const standings = await accountStandings();
   const pick = rankAccounts(standings, demand)[0]!;
+  // Admission: a work or supervisor lane never changes account, so it does
+  // not start where the evidence says it cannot finish. Unknown evidence
+  // admits with a warning; a light lane only warns; --account forces.
+  if (demand !== "light" && pick.snapshot && standingTier(pick, demand) !== 0) {
+    const detail = rankAccounts(standings, demand).map((standing) => `${standing.choice.name}: ${standing.reason}`).join("; ");
+    fail(`no account has ${HEADROOM_PERCENT[demand]}% free headroom for a ${DEMAND_LABEL[demand]} lane (${detail}). Wait for a reset, run it on gemini, or force one with --account NAME`);
+  }
   const skipped = standings
     .filter((standing) => standing.reached && standing.snapshot)
     .map((standing) => ({ choice: standing.choice, snapshot: standing.snapshot! }));
@@ -4010,8 +4060,8 @@ function announceAccountSelection(lane: string, selection: AccountSelection, own
     if (Object.keys(config.accounts ?? {}).length > 1) console.log(`cdx: account=${color.bold(pick.choice.name)} for ${DEMAND_LABEL[demand]} lane: ${pick.reason}`);
     if (!pick.snapshot) {
       console.error(color.yellow(`cdx: WARNING: ${pick.choice.name} ${pick.reason}; ${lane} starts on it unverified`));
-    } else if (pick.remainingPercent < HEADROOM_PERCENT[demand]) {
-      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.remainingPercent)}% and ${lane} may hit the limit mid-run`));
+    } else if (pick.freePercent < HEADROOM_PERCENT[demand]) {
+      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% free headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.freePercent)}% and ${lane} may hit the limit mid-run`));
     }
   }
   if (selection.skipped.length === 0) return;
