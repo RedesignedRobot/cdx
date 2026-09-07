@@ -2829,7 +2829,7 @@ function gateCommand(argv: string[]): void {
   if (!parsed.bools.has("clear") && command!.trim() === "") fail("gate command cannot be empty; use --clear");
   const before = readLane(lane);
   requireOwnChild(lane, before);
-  if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the head's acceptance check (cdx ask if it is wrong)`);
+  if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the liaison's acceptance check (cdx ask if it is wrong)`);
   if (laneRunning(before) && pidAlive(before.pid)) fail(`lane "${lane}" is running; stop it before changing the gate`);
   const next = parsed.bools.has("clear") ? undefined : command;
   withLedger((ledger) => {
@@ -2864,7 +2864,7 @@ async function spawnCommand(argv: string[]) {
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gemini" && (parsed.lists.image?.length ?? 0) > 0) fail("--image is not supported for gemini");
-  let cwd = parsed.flags.cd ?? process.cwd();
+  let cwd = parsed.flags.cd ?? (existingLane ? workCwdOf(existingLane) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = engine === "gpt" ? cappedEffort(model, engineEffort(engine, parsed), parsed.flags.effort !== undefined) : engineEffort(engine, parsed);
   const maxRuntime = maxRuntimeOf(parsed);
@@ -2879,7 +2879,8 @@ async function spawnCommand(argv: string[]) {
     rejectEngineMismatch(lane, existingLane, engine);
     if (engine === "gpt") rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   }
-  const gate = parent && existingLane ? existingLane.gate : parsed.flags.gate;
+  // A respawn keeps the stored gate and cwd unless the caller passes new ones.
+  const gate = parsed.flags.gate ?? existingLane?.gate;
   const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
     if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
     return realpathSync(dir);
@@ -3076,11 +3077,11 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   const existing = readLedger()[lane];
   const parent = supervisorLane();
   if (parent) requireOwnChild(lane, existing);
-  if (existing && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
+  if (existing && laneEngine(existing) === "gpt" && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
   // A consult lane must never acquire a work thread: resume would then pick
   // the writable session over the read-only one. Fresh names only.
   if (opts.consult && existing && !existing.consult) fail(`lane "${lane}" has work history; consult needs a fresh name so its resume stays read-only`);
-  const model = engine === "gpt" ? existing ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
+  const model = engine === "gpt" ? existing && laneEngine(existing) === "gpt" ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
   const roundModel = model && !existing ? { model } : {};
   const roundParent = !existing ? { lineage: callerLineage(false) } : {};
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
@@ -5036,7 +5037,7 @@ async function killCommand(argv: string[]) {
   if (!readLedger()[lane]) {
     const job = readJobs()[lane];
     if (job) {
-      if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not stop jobs; jobs belong to the head`);
+      if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not stop jobs; jobs belong to the liaison`);
       await killJob(lane, job, note);
       return;
     }
@@ -5577,7 +5578,7 @@ async function dispatch(command: string | undefined, argv: string[]) {
     if (supervisor && !SUPERVISOR_COMMANDS.has(command)) {
       fail(`supervisor ${supervisor} may run ${[...SUPERVISOR_COMMANDS].join(", ")} on its children; command "${command}" refused`);
     }
-    if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the head`);
+    if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the liaison`);
   }
 switch (command) {
   case "spawn": await spawnCommand(argv); break;
