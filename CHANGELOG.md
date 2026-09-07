@@ -4,6 +4,10 @@ A major release: the account advisor admits and reserves, the runner and ledger 
 
 - Admission control. A work or supervisor lane is refused when no account has its headroom free (15% and 25% of the weekly window), with each account's standing in the message; `--account NAME` overrides, a consult or review lane still starts with a warning, and an unprobed account admits with a warning when it is the best on offer. Account selection runs before the worktree is created, so a refused spawn strands nothing.
 - Reservations. A running gpt lane holds its demand on its account until it finishes, derived from the ledger at ranking time. Free headroom is what remains after those holds, so two work lanes started together land on two accounts. `cdx usage` shows the held share per account and `usage --json` carries `reservedPercent` and `freePercent`.
+- Runner split. `runRoundInner` hands Gemini result qualification to `qualifyGeminiResult` and `qualifyGeminiReport` and the round tail to `finalizeRound`; Gemini and Codex events have separate handlers, and the ordinary and schema work reports share one path. One `readJsonLines` generator frames every app-server and agy stream (the runner, the usage probe, and `doctor --probe`), and an unterminated final app-server response now resolves its request instead of leaving it pending.
+- Ledger round records. A lane holds `work` and `review` records instead of fourteen flat fields. A 3.x ledger loads unchanged and is rewritten as records on its next write; `state` and `cwd` stay as aliases of the work record. `status --json` exposes the records.
+- Pinned effort. The effort resolved at spawn, resume, fork, or review travels in the round spec; the runner never rereads it from the ledger mid-round. A spec written before 4.0 falls back to the ledger value once at start.
+- Usage writes run under the same lock mechanics as the ledger, so parallel account probes cannot drop each other's snapshot.
 
 ## 3.10.1
 

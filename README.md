@@ -120,7 +120,8 @@ flowchart LR
     state -->|feed.log → monitor| head
 ```
 
-- **One ledger entry per lane**: engine, session ID, working directory, state, rounds, token spend, last activity.
+- **One ledger entry per lane**: engine, session ID, working directory, effort, rounds, token spend, last activity, and two round records: `work` (state, round, cwd, exit code, note, report, updated time) and `review` when the lane has been reviewed. A ledger written by cdx 3.x loads unchanged; its flat fields are normalized into records on read and rewritten as records on the next write. `state` and `cwd` stay at the top level as aliases of the work record for status consumers.
+- **The runner is three functions**: `runRoundInner` spawns the engine child and pumps its stream through one newline-delimited JSON reader shared with the usage probe and the doctor probe; `qualifyGeminiResult` decides whether an agy result is a report, a replayed error, a quota block, or a transport error worth a continuation; `finalizeRound` compares the tree, reruns the gate, writes the round record, and posts the feed line. The effort a round runs at is pinned into its spec at launch, so `cdx resume --effort` on a running lane changes the next round, never the running one.
 - **Detached lanes** keep running after your shell exits.
 - **One engine child per work round**: GPT uses a Codex app-server over stdio. Gemini uses Antigravity stream JSON over stdio and keeps the conversation ID for resume.
 - **Reports captured per round**: Both GPT and Gemini work reports capture the final agent message of the turn, not concatenated turn text. Non-success Gemini results write `reports/<lane>-r<n>.partial.md` and never overwrites full reports.
