@@ -248,7 +248,7 @@ A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini -
 
 ## Claude Code integration
 
-cdx 6.0.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` or `monitors/monitors.json` require `/reload-plugins` or a restart. `SKILL.md` changes are live.
+cdx 6.0.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
 
 The plugin monitor runs `cdx watch` with no argument. The monitor's own `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's, so the watcher ignores it. It reads `CLAUDE_PID` and looks up the head's session id in the receipt the session hook wrote for that process; `/clear` writes a new receipt and the watcher follows it. It refuses to run without `CLAUDE_PID` and stands by until the receipt exists. No head setup call is needed. A persisted lease allows one live watcher per full session id, tied to that Claude process. A watcher that finds a live lease stands by and takes over when the holder exits, so a reload that starts the new monitor before the old one stops still ends with one watcher resuming the saved wake cursor.
 
