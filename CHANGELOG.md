@@ -8,6 +8,8 @@ A major release: the account advisor admits and reserves, the runner and ledger 
 - Ledger round records. A lane holds `work` and `review` records instead of fourteen flat fields. A 3.x ledger loads unchanged and is rewritten as records on its next write; `state` and `cwd` stay as aliases of the work record. `status --json` exposes the records.
 - Pinned effort. The effort resolved at spawn, resume, fork, or review travels in the round spec; the runner never rereads it from the ledger mid-round. A spec written before 4.0 falls back to the ledger value once at start.
 - Usage writes run under the same lock mechanics as the ledger, so parallel account probes cannot drop each other's snapshot.
+- Importing `cdx.ts` is inert: the command dispatch, the config read, and the state directories only happen when the file is the program entry, so the test process and any script importing the module see defaults and touch no user state. The advisor and effort-cap policy functions (`rankAccounts`, `standingOf`, `withReservations`, `laneDemand`, `cappedEffort`, `snapshotExpired`) are exported and tested in memory.
+- Prompts. The report rule lives in the house rules alone; `resume` and `fork` no longer append their own copy, and the Gemini worker rules keep only the Assumptions heading. A Gemini review resume still gets the structured-output sentence.
 
 ## 3.10.1
 
