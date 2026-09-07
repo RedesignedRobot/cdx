@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx
+# cdx 6.0.0
 
 **Codex and Antigravity execution lanes for Claude Code.**
 
@@ -42,7 +42,7 @@ Works on macOS, Linux, and WSL.
 
 ## Browser view
 
-Run `cdx view` in its own terminal, then open `http://127.0.0.1:7477`. Use `cdx view --open` on macOS to open the browser, or `--port N` to choose a port. Ctrl-C stops the server. Nothing runs in the background and the command writes no state.
+Run `cdx view` in its own terminal, then open `http://127.0.0.1:7477`. Use `cdx view --open` on macOS to open the browser, or `--port N` to choose a port. Ctrl-C stops the server. Journal reads take the event lock without changing stored state.
 
 The page opens on running lanes and jobs. Running, Done, Failed, and All filters remember your choice across reloads. All keeps running work first, then finished work. Each group sorts by recent activity. Failed includes invalid gates; closed and adopted lanes appear only in All. Parent names stay on each row without changing the order. Expand Feed for the latest 200 entries. The dashboard reads discrete `work` and `review` round records directly, without flat state or cwd fallbacks.
 
@@ -142,7 +142,7 @@ flowchart LR
 | `cdx ask "<question>"` | Ask the owning liaison from inside a work lane and wait for its answer |
 | `cdx reply <lane> "<answer>"` | Answer the oldest open question from the lane's current round, or select one with `--id` |
 | `cdx questions [lane]` | List current-round open questions across all lanes or one lane |
-| `cdx msg <target> "<text>"` | Send a feed message to a session prefix or a lane's owning session |
+| `cdx msg <target> "<text>"` | Send a feed message to a full session id or a lane's owning session |
 | `cdx inbox` | Print messages addressed to the calling Claude session |
 | `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
 | `cdx status` | Show lane state, timing, tokens, steer count, open question, and last activity |
@@ -169,8 +169,10 @@ cdx send   <lane> "<text>"
 cdx ask    [--timeout MIN] "<question>"
 cdx reply  <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
-cdx msg    <lane|session-prefix> "<text>"
+cdx msg    <lane|full-session-id> "<text>"
 cdx inbox  [-n N]
+cdx takeover <lane|full-session-id>
+cdx watch                  # plugin monitor, no arguments
 cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
@@ -198,11 +200,11 @@ When a round fails, cdx writes the engine error to the lane note and completion 
 
 ### Communication channels
 
-`cdx send <lane> "<text>"` appends a control record with the text, send time, and optional sender prefix. GPT steers the active turn when possible and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx` entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands. `cdx hook pre-invocation` delivers pending `cdx send` records into the running turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends fall back to follow-up turns (`mode=follow-up-turn`). Set `CDX_AGY_CONFIG_HOME` and `CDX_AGY_STATE_HOME` as test overrides for Antigravity configuration and state paths. cdx never consumes a control record before delivery. `send` refuses review lanes.
+`cdx send <lane> "<text>"` appends a control record with the text, send time, and optional sender session id. GPT steers the active turn when possible and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx` entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands. `cdx hook pre-invocation` delivers pending `cdx send` records into the running turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends fall back to follow-up turns (`mode=follow-up-turn`). Set `CDX_AGY_CONFIG_HOME` and `CDX_AGY_STATE_HOME` as test overrides for Antigravity configuration and state paths. cdx never consumes a control record before delivery. `send` refuses review lanes.
 
-A worker can run `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines, so `ask` can identify its lane and owner. Brief and liaison replies govern project and skill guidance within runtime constraints; if paused, workers identify the exact conflicting instruction. Workers make reasonable assumptions for reversible work, and ask through `cdx ask` only for missing decisions about outcome or authorization. The command writes `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time, and `answered: false`. It posts a `QUESTION` line with the lane owner's suffix and polls for an answer. The default and maximum timeout is 30 minutes. A larger value is clamped to 30 and prints a note. `cdx reply <lane> "<answer>"` answers the oldest open question in the lane's current round by default. Add `--id <seq>` to select a specific question. `cdx questions [lane]` lists open questions only from each lane's current round. Round completion and failure close every remaining question from that round with `expired: round ended`, so a later reply cannot match it by default. While a question remains open, `cdx status` shows `waiting on question #<seq>`. On timeout, `ask` exits 0. Timeout is not approval; the worker reports the unresolved dependency and stops only the work that depends on it, continuing independent authorized work without guessing. A timed-out question does not fail the round.
+A worker can run `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines, so `ask` can identify its lane and owner. Brief and liaison replies govern project and skill guidance within runtime constraints; if paused, workers identify the exact conflicting instruction. Workers make reasonable assumptions for reversible work, and ask through `cdx ask` only for missing decisions about outcome or authorization. The command writes `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time, and `answered: false`. It posts a `QUESTION` line with the lane owner's full session id and polls for an answer. The default and maximum timeout is 30 minutes. A larger value is clamped to 30 and prints a note. `cdx reply <lane> "<answer>"` answers the oldest open question in the lane's current round by default. Add `--id <seq>` to select a specific question. `cdx questions [lane]` lists open questions only from each lane's current round. Round completion and failure close every remaining question from that round with `expired: round ended`, so a later reply cannot match it by default. While a question remains open, `cdx status` shows `waiting on question #<seq>`. On timeout, `ask` exits 0. Timeout is not approval; the worker reports the unresolved dependency and stops only the work that depends on it, continuing independent authorized work without guessing. A timed-out question does not fail the round.
 
-Claude sessions can run `cdx msg <target> "<text>"`. A target can be an eight-character session prefix or a lane name, which resolves to that lane's owner. The caller must have `CLAUDE_CODE_SESSION_ID`. cdx writes `[cdx] msg to=<target8> from=<caller8>: <text>` to `feed.log`. cdx replaces CR and LF characters with spaces in `msg`, `send`, `ask`, and `reply` text before any feed or control write. User text cannot inject a second record into either line-based file. `cdx inbox [-n N]` reads only the needed tail and prints messages addressed to the caller, newest last. It defaults to the newest 20 messages.
+Claude sessions can run `cdx msg <lane|full-session-id> "<text>"`. A lane resolves to its owning head through the persisted takeover binding. Recipient and sender ids are stored as fields in a structured event. Message text never determines routing. Eight-character addresses are rejected. `cdx inbox [-n N]` prints only messages addressed to the caller, newest last, with a default of 20. `msg`, `send`, `ask`, and `reply` replace CR and LF with spaces before writing records.
 
 `spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in the lane cwd. Exit 0 appends a `## Gate` section to the report. A nonzero exit fails the round with `gate failed (exit N)`. Work resumes rerun the stored gate. Reviews never run one. The gate is the harness's own verification, so a worker's optimistic done claim cannot finalize green.
 
@@ -246,14 +248,35 @@ A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini -
 
 ## Claude Code integration
 
-Installed as a plugin (the clone into `~/.claude/skills/` above), cdx wires itself into the session:
+cdx 6.0.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` or `monitors/monitors.json` require `/reload-plugins` or a restart. `SKILL.md` changes are live.
 
-- No polling: Lane events and messages append to `$HOME/.cdx/feed.log`; a monitor tails it and Claude Code surfaces new lines as notifications.
-- Session attribution: Every lane feed event ends with `owner=<session prefix>`, so parallel Claude Code sessions can identify which lane events belong to them.
-- Peer messages: `cdx msg` addresses a feed line to one session prefix. A matching `msg to=` line is a request from that peer. Other targets remain visible as shared feed information.
-- Session opener: A SessionStart hook runs `cdx brief`, which prints only running or failed lanes and stays silent when everything is settled.
-- Guard rail: A PreToolUse hook blocks raw headless Codex and Antigravity work commands and points the caller to `cdx`. Login, model listing, help, update, and version checks remain available.
-- /cdx skill: The playbook that teaches the session the commands and patterns above.
+The plugin monitor runs `cdx watch` with no argument. It reads `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID` from the monitor environment and refuses to run without them. No head setup call is needed. A persisted lease allows one live watcher per full session id, tied to that Claude process. A replacement watcher reclaims a dead process's lease and resumes its saved wake cursor.
+
+The watcher delivers owned questions, stalls, final work or review results, job exits, and peer messages. A stall produces one event per quiet episode. Gate failure is part of the final lane event. GPT quota failover emits a quiet account update on success and one terminal failure when no alternate remains. Spawn results stay in command output; supervisor child starts and partial report paths arrive through quiet hooks. Partial reports produce at most one event per round.
+
+`SessionStart`, including compact and resume, restores owned lanes, completed work awaiting attention, open questions, and jobs. Completed lanes remain in recovery until closed. `PostToolBatch` and `UserPromptSubmit` deliver quiet events through `hookSpecificOutput.additionalContext`. Hook calls with `agent_id` do nothing. Missing `session_id` is an error. Wake and quiet cursors are separate, so a hook cannot consume a pending monitor notification. The raw Codex guard stays on `PreToolUse`. There is no Stop hook.
+
+`cdx doctor` checks the `cdx@skills-dir` personal path, installed hook set, hooks observed in the current session, and that session's watcher lease. An installed file alone is not proof of a loaded hook. Doctor reports a missing or stale receipt and asks for a reload or restart. Claude runtime delivery still needs an interactive check.
+
+### Ownership and takeover
+
+Full session ids determine ownership. Directories, session titles, and id prefixes do not. `resume`, `send`, `reply`, `gate`, `close`, `kill`, review, and replacement of an existing lane refuse a caller from another head. Supervisors retain the owning head and may mutate only their own children. Inherited `CDX_OWNER=terminal` stays terminal even if the environment also contains a Claude session id.
+
+A new Claude session must explicitly run `cdx takeover <lane|full-session-id>` before driving another head's work. For session-owned work, a lane target identifies its owning session; takeover transfers that owner's whole group, including jobs and peer messages. The binding redirects already-running producers without changing their saved specs. The previous head then loses mutation authority and delivery. Reusing the same full session id reconnects without takeover. A fork or a new session never claims work automatically.
+
+For terminal-owned work, target a lane by name. This claims that lane and its existing supervisor children, and future children inherit its binding. Other terminal lanes remain terminal-owned. Terminal jobs cannot be claimed by lane. `cdx adopt` still imports an engine session; it is not the takeover command and its existing behavior is unchanged.
+
+`brief`, `questions`, `feed`, `inbox`, and running-job summaries are scoped to the caller. An ordinary terminal sees terminal-owned work through those readers. The explicit dashboard and status remain shared diagnostic views.
+
+### Journal migration and rollout
+
+`feed.log` now contains JSON records with monotonic ids, timestamps, event kinds, full owner or recipient ids, lane and round or job identity, and message text. Old free-text lines are ignored by every reader and removed by `cdx clean`. They are not guessed into ownership. `sessions.json` stores the sequence, takeover bindings, leases, and delivery cursors. Journal append, cursor updates, and cleanup use the same event lock. Cleanup keeps the latest 2000 records plus records pending for connected sessions. An inactive session can therefore retain older records.
+
+Cursor acknowledgement follows stdout emission. A crash between those steps can replay an event; Claude provides no durable receipt for the final delivery. Compaction recovery reads the ledger and open questions even if a notification was already emitted.
+
+Before rollout, stop old cdx writers and cancel every old global-tail monitor or restart those Claude sessions. Existing monitors retain their old commands and can broadcast the new journal records. Reload the plugin or start fresh sessions after updating. Do not mix version 5 and version 6 runners. The lane ledger remains version 5; the breaking changes are feed format, routing, and mutation ownership.
+
+The liaison should verify two real Claude terminals after reload. Each should show its own live lease in `cdx doctor`. Start work in each, leave one head idle, and have its worker ask a question. Only that head should receive it. Finish one lane, compact its head, and confirm recovery includes the report and any open questions. Verify a foreign mutation fails, then explicitly take over and confirm future events move to the new head.
 
 ## Configuration
 
@@ -354,12 +377,11 @@ $CDX_HOME/
   specs/         the runner inputs recorded for each round
   control/       queued steering records, one JSONL file per round
   questions/     worker questions and their answer or timeout state
-  feed.log       newest lane events and peer messages, tailed by the plugin monitor
+  feed.log       structured lane events and peer messages
+  sessions.json  ownership bindings, watcher leases, delivery cursors, and event sequence
 ```
 
-Everything is plain files. `cat` works on all of it. `cdx feed` and `cdx inbox`
-read only the tail needed for their requested output. `cdx clean` truncates
-`feed.log` to its newest 2000 lines.
+Everything is plain files. `cdx feed` and `cdx inbox` render scoped events. `cdx clean` retains the latest 2000 records and undelivered records for connected sessions.
 
 </details>
 

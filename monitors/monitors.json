@@ -1,7 +1,7 @@
 [
   {
     "name": "cdx-lanes",
-    "command": "touch \"$HOME/.cdx/feed.log\" && exec tail -n 0 -F \"$HOME/.cdx/feed.log\"",
-    "description": "cdx lane completions"
+    "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" watch",
+    "description": "Session-owned cdx questions and completions"
   }
 ]

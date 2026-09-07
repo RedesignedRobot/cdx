@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx
+# cdx 6.0.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -59,7 +59,8 @@ cdx usage   [--json]
 cdx kill    <lane|job> ["note"]
 cdx close   <lane> [--remove-worktree] ["note"]
 cdx job     <name> [--cd D] "<cmd>"   # detached shell job with a feed line on exit
-cdx msg     <lane|session-prefix> "<text>" | cdx inbox [-n N]
+cdx msg     <lane|full-session-id> "<text>" | cdx inbox [-n N]
+cdx takeover <lane|full-session-id>   # connect ownership explicitly
 cdx adopt   <lane> <sessionId> [--engine gpt|gemini] [--model M] [--cd D]
 cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 ```
@@ -91,9 +92,14 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   `cdx kill <supervisor>` stops the tree.
 - A consult lane keeps its name for consults only; spawning work under it is
   refused so its resume stays read-only.
-- Feed lines end in `owner=`. A different owner is another Claude session's
-  lane: information only, never resume or close it unasked. After a
-  compaction, `cdx feed -n 30` replays what the monitor delivered.
+- Events reach only their owning full session id. Another head must run
+  `cdx takeover <lane|full-session-id>` before mutating that owner's work.
+  Session-owned takeover transfers the owner's group. Terminal-owned takeover
+  claims the named lane and its supervisor children. `adopt` imports an engine
+  session and keeps its existing behavior.
+- SessionStart restores owned running and completed work and open questions,
+  including after compaction. Close completed lanes when handled. Hooks supply
+  quiet updates; the plugin watcher wakes the head for questions and completions.
 - With configured accounts, `cdx usage` and launch admission share one decision. Work needs 15% weekly capacity, supervisors 25%, and light turns prefer 5% but can use less; every tier refuses exhausted accounts. Active rounds hold fixed demand against the account during execution: light holds 5%, work holds 15%, and supervisors hold 25%. Admission subtracts active holds from remaining headroom before account selection. Dead runners release their hold during admission while preserving live child holds. Consuming round completion invalidates the account snapshot to force fresh usage probes. Thresholds guide placement; they do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish. `--account` obeys exhaustion eligibility instead of forcing a depleted account. A GPT quota exhaustion failure triggers automatic account failover: cdx starts a fresh round on an available account carrying the brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
 - `doctor` compares secondary Codex homes against the primary home. Running `cdx doctor --fix` synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` across configured homes while preserving credentials, auth sessions, and account-specific settings.
 - Close finished lanes with an outcome note. `close --remove-worktree` deletes
@@ -103,10 +109,17 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 
 ## Plugin
 
-`monitors/monitors.json` tails `~/.cdx/feed.log` into the session,
-`hooks/guard-raw-codex.ts` blocks raw headless Codex and Antigravity work
-commands, and the SessionStart hook runs `cdx brief` (running and failed lanes
-only).
+cdx loads as `cdx@skills-dir` in personal scope through `~/.claude/skills/cdx`.
+The plugin monitor runs `cdx watch` with no argument, using
+`CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`. It fails closed without identity.
+No setup call is needed. One persisted lease prevents duplicate watchers.
+
+`hooks/guard-raw-codex.ts` keeps the raw-work guard. SessionStart,
+PostToolBatch, and UserPromptSubmit run `_session`; native subagent calls
+are skipped. Run `cdx doctor` to check this session's hook receipt and lease.
+Hook and monitor changes need `/reload-plugins` or a restart. Skill edits are live.
+Cancel old global-tail monitors or restart their sessions before upgrading.
+Version 6 ignores old free-text feed lines; cleanup removes them.
 
 ## Browser view
 
