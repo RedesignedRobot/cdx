@@ -1,3 +1,7 @@
+## 6.0.1
+
+- The plugin monitor's `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's. `cdx watch` now resolves the head through `CLAUDE_PID` and the receipt the session hook records for that process, follows a `/clear`, and stands by until the receipt exists. `cdx clean` drops receipts of dead processes.
+
 ## 6.0.0
 
 cdx routes native Claude Code events to the owning session before delivery.
