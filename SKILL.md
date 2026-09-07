@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx 6.0.1
+# cdx 6.1.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -33,6 +33,8 @@ The brief and liaison replies outrank project and skill guidance within runtime 
 Reuse verified evidence and use targeted reads with compact output. Skip status checks that change nothing. Keep child updates to one sentence and reports short; end supervisor reports with duplicated investigation or rework observed.
 
 Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Owner ruling, 2026-09-07: the suite runs once per batch, as the lane gate after the report. Workers and reviewers never run it, and you merge on the gate result instead of running your own wall.
+
+For changes to cdx itself, use `--gate "bun run check"`. It builds the CLI and runs only the pure ownership and feed parsing tests. The owner deleted the 135 end-to-end tests after a 226-second run. Keep tests free of spawned processes, sleeps, fake engines, and temporary homes, with the whole test run within about two seconds. Do not restore the end-to-end suite. The build checks syntax and bundling, not TypeScript types.
 
 cdx injects these rules before `config.json` rules and the repository's `.cdx-rules.md`. Gemini children and native subagents must not delegate further. Supervisors must join native subagents before reporting; cdx only tracks cdx children. See [README.md](README.md#two-engines) for the enforced limits and their reasons.
 
