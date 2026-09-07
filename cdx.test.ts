@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { redactViewText, houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
+import { readJsonLines, qualifyGeminiReport, redactViewText, houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -138,7 +138,10 @@ for await (const chunk of Bun.stdin.stream()) {
         complete("stopped at 10");
       }
     } else if (request.method === "thread/unsubscribe") {
-      if (process.env.FAKE_CLEANUP_FAIL) {
+      if (process.env.FAKE_UNTERMINATED_RESPONSE) {
+        process.stdout.write(JSON.stringify({ id: request.id, result: { status: "unsubscribed" } }));
+        setTimeout(() => process.exit(0), 10);
+      } else if (process.env.FAKE_CLEANUP_FAIL) {
         appendFileSync(process.env.FAKE_CLEANUP_FAIL, existsSync(process.env.FAKE_REPORT_PATH || "") ? "report-present\\n" : "report-missing\\n");
         send({ id: request.id, error: { code: -32603, message: "cleanup exploded" } });
         setTimeout(() => process.exit(42), 5);
@@ -661,7 +664,7 @@ describe("cdx messaging", () => {
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).commentary;
     expect(result.exitCode).toBe(1);
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("no final report");
+    expect(lane.work.note).toContain("no final report");
     expect(existsSync(`${state}/reports/commentary-r1.md`)).toBe(false);
     expect(existsSync(gateMarker)).toBe(false);
   });
@@ -683,7 +686,7 @@ describe("cdx messaging", () => {
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["failed-turn"];
     const feed = readFileSync(`${state}/feed.log`, "utf8");
     expect(result.exitCode).toBe(1);
-    expect(lane.note).toContain("context window exceeded");
+    expect(lane.work.note).toContain("context window exceeded");
     expect(feed).toContain("context window exceeded");
   });
 
@@ -969,7 +972,7 @@ describe("cdx messaging", () => {
     expect(elapsed).toBeGreaterThanOrEqual(10_500);
     expect(elapsed).toBeLessThan(16_000);
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("max runtime");
+    expect(lane.work.note).toContain("max runtime");
   }, 20_000);
 
   test("counts all model calls in a Codex round", () => {
@@ -1003,8 +1006,8 @@ describe("cdx messaging", () => {
     expect(runCli(["kill", "kill-signal"], env).exitCode).toBe(0);
     await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["kill-signal"]?.state === "failed");
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["kill-signal"];
-    expect(lane.exitCode).toBe(143);
-    expect(lane.note).toContain("signal (exit 143)");
+    expect(lane.work.exitCode).toBe(143);
+    expect(lane.work.note).toContain("signal (exit 143)");
   }, 12_000);
 
   test("does not print a report from an earlier round", () => {
@@ -1014,7 +1017,7 @@ describe("cdx messaging", () => {
     expect(runCli(["spawn", "stale-report", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
     const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
     ledger["stale-report"].rounds = 2;
-    ledger["stale-report"].workReport = undefined;
+    ledger["stale-report"].work.report = undefined;
     writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
     const waited = runCli(["wait", "stale-report", "--report"], env);
     expect(waited.exitCode).toBe(0);
@@ -1093,7 +1096,7 @@ describe("cdx execution engines", () => {
     expect(reviewGpt.exitCode).toBe(0);
     expect(reviewGpt.stdout).toContain("cdx: engine gemini (default)");
     const gptLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gpt-lane"];
-    expect(gptLane.reviewState).toBe("done");
+    expect(gptLane.review.state).toBe("done");
     expect(gptLane.engine).toBe("gpt");
     expect(gptLane.reviewEngine).toBe("gemini");
     expect(runCli(["resume", "gpt-lane", "REPORT_ONLY"], env).exitCode).toBe(0);
@@ -1107,7 +1110,7 @@ describe("cdx execution engines", () => {
     expect(reviewGemini.stdout).toContain("cdx: engine gemini (default)");
     expect(reviewGemini.stdout).toContain("cdx: gemini reviewing a gemini lane; give the intent explicit attack items");
     const geminiLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-lane"];
-    expect(geminiLane.reviewState).toBe("done");
+    expect(geminiLane.review.state).toBe("done");
   }, 15000);
 
   test("a review-only lane follows the engine of its latest review and resumes there", () => {
@@ -1175,7 +1178,7 @@ describe("cdx execution engines", () => {
     expect(result.exitCode).toBe(1);
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["cancel-lane"];
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("agy returned its cancellation template as the report; no qualifying report");
+    expect(lane.work.note).toContain("agy returned its cancellation template as the report; no qualifying report");
     expect(readFileSync(`${state}/reports/cancel-lane-r1.md`, "utf8")).toContain("User initiated cancellation");
     expect(existsSync(gateMarker)).toBe(false);
   });
@@ -1204,7 +1207,7 @@ describe("cdx execution engines", () => {
     expect(failing.exitCode).toBe(1);
     const red = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate-red"];
     expect(red.state).toBe("failed");
-    expect(red.note).toContain("gate failed (exit 3)");
+    expect(red.work.note).toContain("gate failed (exit 3)");
   });
 
   test("a commit made during the round counts as landed work under a gate", () => {
@@ -1504,7 +1507,7 @@ describe("cdx execution engines", () => {
     expect(result.exitCode).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(5000);
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("max runtime");
+    expect(lane.work.note).toContain("max runtime");
   }, 6000);
 
   test("fails a gemini lane when agy returns ERROR", () => {
@@ -1514,7 +1517,7 @@ describe("cdx execution engines", () => {
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-error"];
     expect(result.exitCode).toBe(1);
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("scripted agy failure");
+    expect(lane.work.note).toContain("scripted agy failure");
     expect(readFileSync(`${state}/reports/gemini-error-r1.partial.md`, "utf8")).toContain("scripted agy failure");
   });
 
@@ -1555,7 +1558,7 @@ describe("cdx execution engines", () => {
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-fail-3x"];
     expect(lane.state).toBe("failed");
     expect(lane.continuations).toBe(2);
-    expect(lane.note).toMatch(/^turn failed after 2 auto-continues/);
+    expect(lane.work.note).toMatch(/^turn failed after 2 auto-continues/);
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
     expect(feed).toContain("auto-continue 1/2");
@@ -1572,8 +1575,8 @@ describe("cdx execution engines", () => {
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-non-transport"];
     expect(lane.state).toBe("failed");
     expect(lane.continuations ?? 0).toBe(0);
-    expect(lane.note).not.toContain("auto-continue");
-    expect(lane.note).toContain("non-transport fatal error");
+    expect(lane.work.note).not.toContain("auto-continue");
+    expect(lane.work.note).toContain("non-transport fatal error");
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
     expect(feed).not.toContain("auto-continue");
@@ -1594,7 +1597,7 @@ describe("cdx execution engines", () => {
 
     const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-partial"];
     expect(lane.state).toBe("failed");
-    expect(lane.workReport).toBe(`${state}/reports/gemini-partial-r1.md`);
+    expect(lane.work.report).toBe(`${state}/reports/gemini-partial-r1.md`);
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
     expect(feed).toContain(`report=${state}/reports/gemini-partial-r1.md`);
@@ -1622,7 +1625,7 @@ describe("cdx execution engines", () => {
 
     const clean = runCli(["review", "gemini-review-clean", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env);
     expect(clean.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-review-clean"].reviewState).toBe("done");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-review-clean"].review.state).toBe("done");
 
     writeFileSync(trace, "");
     const native = runCli(["review", "gemini-review-native", "--engine", "gemini", "--cd", root, "--uncommitted"], env);
@@ -1642,8 +1645,8 @@ describe("cdx execution engines", () => {
     const dirty = runCli(["review", "gemini-review-dirty", "--engine", "gemini", "--cd", root, "REVIEW_WRITE"], env);
     expect(dirty.exitCode).toBe(1);
     const dirtyLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-review-dirty"];
-    expect(dirtyLane.reviewState).toBe("failed");
-    expect(dirtyLane.reviewNote).toContain("review modified the tree: fake-review-change.txt");
+    expect(dirtyLane.review.state).toBe("failed");
+    expect(dirtyLane.review.note).toContain("review modified the tree: fake-review-change.txt");
     expect(existsSync(`${state}/reports/gemini-review-dirty-r1.md`)).toBe(true);
   }, 15000);
 
@@ -2448,9 +2451,9 @@ describe("gemini quota handling", () => {
     const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
     const lane = ledger["quota-lane"];
     expect(lane.state).toBe("failed");
-    expect(lane.note).toBe(`turn failed: gemini five-hour quota exhausted; resets at ${quota.blockedUntil}; resume this lane after the reset`);
-    expect(lane.note).not.toContain("Individual quota reached");
-    expect(lane.note).not.toContain("trailing chatter");
+    expect(lane.work.note).toBe(`turn failed: gemini five-hour quota exhausted; resets at ${quota.blockedUntil}; resume this lane after the reset`);
+    expect(lane.work.note).not.toContain("Individual quota reached");
+    expect(lane.work.note).not.toContain("trailing chatter");
     expect(lane.continuations ?? 0).toBe(0);
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
@@ -2875,7 +2878,7 @@ describe("gemini quota handling", () => {
     expect(readFileSync(reportPath, "utf8")).toContain("# Review Replayed");
 
     const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
-    expect(ledger["rev-lane"].reviewState).toBe("done");
+    expect(ledger["rev-lane"].review.state).toBe("done");
   });
 
   test("spawn --worktree with bad --add-dir path exits nonzero and leaves no worktree directory and no branch", () => {
@@ -2918,7 +2921,7 @@ describe("gemini quota handling", () => {
     const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
     const lane = ledger["healthy-lane"];
     expect(lane.state).toBe("failed");
-    expect(lane.note).toContain("agy reported quota exhausted but usage shows 91% five-hour remaining; no block written");
+    expect(lane.work.note).toContain("agy reported quota exhausted but usage shows 91% five-hour remaining; no block written");
     expect(lane.lastResultError).toContain("Individual quota reached");
   });
 });
@@ -3164,8 +3167,8 @@ describe("cdx models and supervisors", () => {
     await waitFor(() => read().sup.state === "failed" && read().child.state === "failed");
     // The supervisor's runner settles its children as part of its own
     // finalization; the CLI cascade is the fallback for a dead runner.
-    expect(read().sup.note).toContain("stop everything");
-    expect(read().child.note).toContain("supervisor sup killed");
+    expect(read().sup.work.note).toContain("stop everything");
+    expect(read().child.work.note).toContain("supervisor sup killed");
   }, 30_000);
 
   test("a supervisor that finishes with a child still running fails and stops the child", async () => {
@@ -3184,8 +3187,8 @@ describe("cdx models and supervisors", () => {
     // The steer completes the supervisor's turn while the child still hangs.
     expect(runCli(["send", "sup", "finish now"], env).exitCode).toBe(0);
     await waitFor(() => read().sup.state === "failed" && read().child.state === "failed", 15_000);
-    expect(read().sup.note).toBe("supervisor ended with running children: child (stopped)");
-    expect(read().child.note).toContain("supervisor sup round 1 ended");
+    expect(read().sup.work.note).toBe("supervisor ended with running children: child (stopped)");
+    expect(read().child.work.note).toContain("supervisor sup round 1 ended");
   }, 30_000);
 
   test("wait returns exit 2 as soon as a waited lane asks a question", async () => {
@@ -3222,7 +3225,7 @@ describe("cdx models and supervisors", () => {
     expect(work.args).toContain("gemini-custom-pro");
     expect(work.args).toContain("house-lane");
     expect(runCli(["review", "pinned", "--bg", "attack the change"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.reviewState !== "running");
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.review.state !== "running");
     const review = JSON.parse(readFileSync(`${state}/specs/pinned-r2.json`, "utf8"));
     expect(review.agent).toBe("house-review");
   }, 20_000);
@@ -3801,4 +3804,113 @@ describe("cdx account advisor", () => {
     expect(peek.stdout).not.toContain("cdx: account=");
     expect(peek.stderr).toContain("WARNING: no account has 5% free headroom for a consult/review lane; only has 2%");
   }, 20000);
+});
+
+
+describe("4.0 runner and ledger", () => {
+  test("frames split UTF-8, blank lines and an unterminated RPC response", async () => {
+    const bytes = new TextEncoder().encode(' {"text":"é"}\n\n{"id":2}');
+    const stream = new ReadableStream<Uint8Array>({ start(controller) {
+      for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+      controller.close();
+    } });
+    expect(await Array.fromAsync(readJsonLines(stream))).toEqual([{ text: "é" }, { id: 2 }]);
+    const malformed = () => new ReadableStream<Uint8Array>({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('bad\n{"id":3}')); controller.close();
+    } });
+    expect(await Array.fromAsync(readJsonLines(malformed(), { ignoreMalformed: true }))).toEqual([{ id: 3 }]);
+    await expect(Array.fromAsync(readJsonLines(malformed()))).rejects.toThrow();
+  });
+
+  test("qualifies structured reviews and fallback reports without accepting a harness note", () => {
+    expect(qualifyGeminiReport({ structured_output: { report: " report ", findings: [] } }, undefined, true))
+      .toEqual({ report: "report\n", findings: [], failureReason: undefined });
+    expect(qualifyGeminiReport({}, undefined, true)).toEqual({
+      report: "\n\n## Harness note\n\nStructured output was missing.\n",
+      failureReason: "agy finished without a report or structured output",
+    });
+    expect(qualifyGeminiReport({ response: "User initiated cancellation" }, undefined, false).failureReason)
+      .toContain("cancellation template");
+    expect(qualifyGeminiReport({ response: "fallback" }, "captured", false).report).toBe("captured\n");
+  });
+
+  test("loads a 3.10 work lane with a failed review and rewrites records", () => {
+    const state = tempPath("flat-ledger");
+    mkdirSync(`${state}/reports`, { recursive: true });
+    const now = new Date().toISOString();
+    const report = `${state}/reports/legacy-r2.md`;
+    writeFileSync(report, "review failed\n");
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({ legacy: {
+      cwd: state, workCwd: state, state: "done", workState: "done", workRound: 1,
+      workReport: `${state}/reports/legacy-r1.md`, workUpdatedAt: now, exitCode: 0,
+      kind: "review", rounds: 2, reports: [report], effort: "medium",
+      reviewState: "failed", reviewRound: 2, reviewCwd: state, reviewExitCode: 7,
+      reviewNote: "review failed", reviewReport: report, reviewUpdatedAt: now,
+      createdAt: now, updatedAt: now,
+    } }));
+    const env = baseEnv(state);
+    const status = runCli(["status", "--json"], env);
+    expect(status.exitCode).toBe(0);
+    const lane = JSON.parse(status.stdout).legacy;
+    expect(lane.work).toMatchObject({ state: "done", round: 1, exitCode: 0 });
+    expect(lane.review).toMatchObject({ state: "failed", round: 2, exitCode: 7, report });
+    const waited = runCli(["wait", "legacy", "--json", "--report"], env);
+    expect(waited.exitCode).toBe(1);
+    expect(JSON.parse(waited.stdout)).toMatchObject({ state: "done", roundState: "failed", report, exitCode: 7 });
+    expect(runCli(["close", "legacy"], env).exitCode).toBe(0);
+    const written = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).legacy;
+    expect(written.work.state).toBe("closed");
+    expect(written.review).toEqual(lane.review);
+    expect(written.workState).toBeUndefined();
+    expect(written.reviewState).toBeUndefined();
+    expect(JSON.parse(runCli(["status", "--json"], env).stdout).legacy.work).toEqual(written.work);
+  });
+
+  test.each([false, true])("pins effort across a ledger edit and follow-up turn, legacy spec=%s", async (legacy) => {
+    const root = tempPath("pinned-effort");
+    const state = `${root}/state`;
+    const trace = `${root}/trace`;
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_REJECT_STEER: "1", FAKE_TRACE: trace };
+    if (legacy) {
+      for (const dir of ["reports", "logs", "specs"]) mkdirSync(`${state}/${dir}`, { recursive: true });
+      const now = new Date().toISOString();
+      writeFileSync(`${state}/ledger.json`, JSON.stringify({ pinned: { state: "running", cwd: root, kind: "work", rounds: 1, reports: [], effort: "low", engine: "gpt", createdAt: now, updatedAt: now } }));
+      writeFileSync(`${state}/specs/pinned-r1.json`, JSON.stringify({ mode: "spawn", lane: "pinned", round: 1, cwd: root, engine: "gpt", prompt: "STEER_REJECTED_AFTER_COMPLETION" }));
+      runners.push(Bun.spawn([process.execPath, CLI, "_run", "pinned", "1"], { env: { ...env, CDX_STATE_HOME: state }, stdout: "pipe", stderr: "pipe" }));
+    } else {
+      expect(runCli(["spawn", "pinned", "--engine", "gpt", "--effort", "low", "--cd", root, "--bg", "STEER_REJECTED_AFTER_COMPLETION"], env).exitCode).toBe(0);
+    }
+    const starts = () => existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((item) => item.method === "turn/start") : [];
+    await waitFor(() => starts().length === 1);
+    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    ledger.pinned.effort = "high";
+    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    expect(runCli(["send", "pinned", "finish"], env).exitCode).toBe(0);
+    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned.state === "done");
+    expect(starts().map((item) => item.params.effort)).toEqual(["low", "low"]);
+    expect(JSON.parse(readFileSync(`${state}/specs/pinned-r1.json`, "utf8")).effort).toBe(legacy ? undefined : "low");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned.review).toBeUndefined();
+  }, 12000);
+
+  test("resolves an unterminated app-server response before closing pending requests", () => {
+    const root = tempPath("unterminated-rpc");
+    const state = `${root}/state`;
+    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_UNTERMINATED_RESPONSE: "1" };
+    const result = runCli(["spawn", "trailing", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
+    expect(result.exitCode).toBe(0);
+    expect(readFileSync(`${state}/feed.log`, "utf8")).not.toContain("cleanup warning");
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).trailing.work.note).toBeUndefined();
+  });
+
+  test("preserves both account snapshots under concurrent writers", async () => {
+    const state = tempPath("usage-writers");
+    mkdirSync(state, { recursive: true });
+    const script = `import { writeUsageSnapshot } from ${JSON.stringify(CLI)};
+      for (let i = 0; i < 40; i++) writeUsageSnapshot({ checkedAt: new Date().toISOString(), usedPercent: i, windowDurationMins: 300, resetsAt: 1, planType: "pro", resetCreditsAvailable: 0, reached: false }, { name: process.argv[1], home: "/tmp" });`;
+    const writers = ["one", "two"].map((name) => Bun.spawn([process.execPath, "-e", script, name], { env: baseEnv(state), stdout: "pipe", stderr: "pipe" }));
+    expect(await Promise.all(writers.map((proc) => proc.exited))).toEqual([0, 0]);
+    const usage = JSON.parse(readFileSync(`${state}/usage.json`, "utf8"));
+    expect(usage.accounts.one.usedPercent).toBe(39);
+    expect(usage.accounts.two.usedPercent).toBe(39);
+  });
 });
