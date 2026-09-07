@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 6.0.0
+# cdx 6.1.0
 
 **Codex and Antigravity execution lanes for Claude Code.**
 
@@ -36,7 +36,7 @@ cdx doctor --probe
 
 Every configured Codex home must match the primary home's `AGENTS.md`, complete MCP definitions, and `hooks.json`. Sync removes extra secondary MCP definitions and shared keys absent from primary. The first configured account is primary; without an accounts map, doctor uses `CODEX_HOME` or `~/.codex`. Running `cdx doctor --fix` synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` across configured homes while preserving credentials, auth sessions, and account-specific settings.
 
-Use `CDX_AGY_CONFIG_HOME` and `CDX_AGY_STATE_HOME` to override Antigravity paths in tests. Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code session. The symlink also makes cdx available as a terminal command.
+Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code session. The symlink also makes cdx available as a terminal command.
 
 Works on macOS, Linux, and WSL.
 
@@ -49,8 +49,6 @@ The page opens on running lanes and jobs. Running, Done, Failed, and All filters
 Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up.
 
 Violet orbits mark Astra/GPT, teal scanlines mark Gemini, and amber tickers mark jobs. These show running state, not measured progress. A lane with no events for five minutes gets a quiet warning. New rounds enter once; new transcript lines fade in. The page respects reduced motion, works offline, and follows the system light or dark theme. It uses system fonts and no dependencies.
-
-For browser proof, run `CDX_VIEW_SCREENSHOTS=1 bun test cdx.test.ts -t "serves read-only fixture"`. The test owns a temporary ledger and the server on port 7488, runs Playwright CLI through `npx`, saves `/tmp/cdx-view-2-*.png`, and stops both browser and server. Port 7488 must be free. The normal `bun run check` gate needs no browser or network.
 
 ## Two engines
 
@@ -200,7 +198,7 @@ When a round fails, cdx writes the engine error to the lane note and completion 
 
 ### Communication channels
 
-`cdx send <lane> "<text>"` appends a control record with the text, send time, and optional sender session id. GPT steers the active turn when possible and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx` entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands. `cdx hook pre-invocation` delivers pending `cdx send` records into the running turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends fall back to follow-up turns (`mode=follow-up-turn`). Set `CDX_AGY_CONFIG_HOME` and `CDX_AGY_STATE_HOME` as test overrides for Antigravity configuration and state paths. cdx never consumes a control record before delivery. `send` refuses review lanes.
+`cdx send <lane> "<text>"` appends a control record with the text, send time, and optional sender session id. GPT steers the active turn when possible and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx` entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands. `cdx hook pre-invocation` delivers pending `cdx send` records into the running turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends fall back to follow-up turns (`mode=follow-up-turn`). cdx never consumes a control record before delivery. `send` refuses review lanes.
 
 A worker can run `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines, so `ask` can identify its lane and owner. Brief and liaison replies govern project and skill guidance within runtime constraints; if paused, workers identify the exact conflicting instruction. Workers make reasonable assumptions for reversible work, and ask through `cdx ask` only for missing decisions about outcome or authorization. The command writes `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time, and `answered: false`. It posts a `QUESTION` line with the lane owner's full session id and polls for an answer. The default and maximum timeout is 30 minutes. A larger value is clamped to 30 and prints a note. `cdx reply <lane> "<answer>"` answers the oldest open question in the lane's current round by default. Add `--id <seq>` to select a specific question. `cdx questions [lane]` lists open questions only from each lane's current round. Round completion and failure close every remaining question from that round with `expired: round ended`, so a later reply cannot match it by default. While a question remains open, `cdx status` shows `waiting on question #<seq>`. On timeout, `ask` exits 0. Timeout is not approval; the worker reports the unresolved dependency and stops only the work that depends on it, continuing independent authorized work without guessing. A timed-out question does not fail the round.
 
@@ -248,7 +246,7 @@ A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini -
 
 ## Claude Code integration
 
-cdx 6.0.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
+cdx 6.1.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
 
 The plugin monitor runs `cdx watch` with no argument. The monitor's own `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's, so the watcher ignores it. It reads `CLAUDE_PID` and looks up the head's session id in the receipt the session hook wrote for that process; `/clear` writes a new receipt and the watcher follows it. It refuses to run without `CLAUDE_PID` and stands by until the receipt exists. No head setup call is needed. A persisted lease allows one live watcher per full session id, tied to that Claude process. A watcher that finds a live lease stands by and takes over when the holder exits, so a reload that starts the new monitor before the old one stops still ends with one watcher resuming the saved wake cursor.
 
@@ -384,6 +382,18 @@ $CDX_HOME/
 Everything is plain files. `cdx feed` and `cdx inbox` render scoped events. `cdx clean` retains the latest 2000 records and undelivered records for connected sessions.
 
 </details>
+
+## Testing
+
+`bun run check` is the acceptance gate for changes to cdx. It builds the CLI, then runs the pure ownership and feed parsing tests in `cdx.test.ts`:
+
+```bash
+bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts
+```
+
+The build checks syntax and bundling, not TypeScript types. The tests protect full-session ownership routing and reject malformed feed records without spawning processes, sleeping, using fake engines, or creating temporary homes. Keep the test run within about two seconds.
+
+The owner removed the 135 end-to-end tests after a run took 226 seconds. Process lifecycle, engine integration, watchdogs, question timeouts, gate execution, and browser behavior no longer have automated end-to-end coverage. Do not rebuild that suite. The lane gate runs once after the report; workers and reviewers reuse its result.
 
 ## License
 

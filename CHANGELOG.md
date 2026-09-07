@@ -1,3 +1,7 @@
+## 6.1.0
+
+- Removed the 135 end-to-end tests because a 226-second run delayed every cdx gate. Only pure ownership routing and feed parsing tests survive, with no spawned processes, sleeps, fake engines, or temporary homes. `bun run check` still builds the CLI before those tests.
+
 ## 6.0.1
 
 - The plugin monitor's `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's. `cdx watch` now resolves the head through `CLAUDE_PID` and the receipt the session hook records for that process, follows a `/clear`, and stands by until the receipt exists. `cdx clean` drops receipts of dead processes.

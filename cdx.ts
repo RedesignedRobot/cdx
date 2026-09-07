@@ -68,7 +68,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.0.1";
+const VERSION = "6.1.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -476,7 +476,7 @@ function geminiConfig(): GeminiConfig {
   };
 }
 
-// A plain import (the tests) sees defaults and touches no user state; the
+// Pure tests import defaults without reading or writing user state. The
 // CLI reads the config file except on the paths that pin what they need.
 const config: Config = import.meta.main
   ? readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || process.argv[2] === "hook" || process.argv[2] === "watch" || process.argv[2] === "_session")
@@ -910,8 +910,7 @@ function writeDeliveredCount(lane: string, round: number, count: number): void {
 }
 
 function geminiTranscriptPath(conversationId: string): string {
-  const base = process.env.CDX_AGY_STATE_HOME ?? `${HOME}/.gemini/antigravity-cli`;
-  return `${base}/brain/${conversationId}/.system_generated/logs/transcript_full.jsonl`;
+  return `${HOME}/.gemini/antigravity-cli/brain/${conversationId}/.system_generated/logs/transcript_full.jsonl`;
 }
 
 function pidAlive(pid?: number): boolean {
@@ -4736,7 +4735,7 @@ function installAgentLink(name: string, sourceName: "cdx-lane" | "cdx-review"): 
 }
 
 function agyConfigHome(): string {
-  return process.env.CDX_AGY_CONFIG_HOME || `${HOME}/.gemini/config`;
+  return `${HOME}/.gemini/config`;
 }
 
 function hooksJsonPath(): string {
@@ -5679,7 +5678,7 @@ async function killJob(name: string, job: Job, note?: string): Promise<void> {
 }
 
 // The browser receives only rendered, redacted text. Terminal output stays unchanged.
-export function redactViewText(text: string): string {
+function redactViewText(text: string): string {
   return text
     .replace(/(CONTEXT7_API_KEY\s*=\s*|--api-key\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;"']+)/gi, "$1[redacted]")
     .replace(/ctx7sk[-_A-Za-z0-9]{8,}|sk-[A-Za-z0-9_-]{16,}|Bearer [A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9]{20,}/g, "[redacted]")
@@ -5941,12 +5940,7 @@ if (import.meta.main) {
   }
 }
 
-export {
-  readJsonLines, qualifyGeminiReport, writeUsageSnapshot,
-  isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA,
-  GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, requireGeminiQuota, geminiQuotaState,
-  rankAccounts, standingOf, decideAccount, withAccountHolds, isCodexQuotaFailure, cappedEffort, resolveEffort, snapshotExpired, config,
-};
+export { parseFeedEvent, recipientOf, owned, eventOwned };
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
