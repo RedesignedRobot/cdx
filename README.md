@@ -328,7 +328,7 @@ cdx injects the role, report contract, and engine rules, followed by `config.jso
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. A blocking instruction must be named and quoted. Questions are for missing decisions that affect outcome or authorization; timeout is not approval. Workers continue independent work and report unresolved dependencies.
 
-Reports name the outcome, changed files, verification commands and exit codes, and remaining risks. Run the required gate and tests for real behavior. Remove duplicated and implementation-mirroring tests; repeat checks only after changes, failures, or unresolved concerns.
+Reports name the outcome, changed files, and remaining risks. The test suite runs once per lane, as the gate after the report; workers, supervisors, and reviewers do not run it. Remove duplicated and implementation-mirroring tests.
 
 Each engine handles its own context. cdx does not set a fixed context size.
 

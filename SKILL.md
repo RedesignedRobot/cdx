@@ -19,7 +19,7 @@ Owner ruling, 2026-09-07: Astra drives execution and technical design. You brief
    `cdx spawn <lane> --engine gpt --model gpt-6-astra --supervisor --bg --gate "<cmd>" "<brief>"`.
    Astra owns the design and delegates bounded execution to Gemini. It can use GPT children, read-only consults, or native subagents when useful.
 2. Wait for its report with `cdx wait <lane> --report`. Exit 2 means a question is open; answer with `cdx reply`. Use `cdx send` for corrections without dropping the task.
-3. Read the report, run required checks, arrange one independent review, and merge. Lanes must not commit, push, or deploy.
+3. Read the report and the gate result, arrange one read-only review, and merge. Lanes must not commit, push, or deploy.
 
 For an already-defined small task, use Gemini directly with named files and a gate. The CLI defaults to Gemini. Astra requires `--engine gpt`; its effort cap stays at `medium`. Gemini always uses `gemini-3.8-flash-high`. A standalone `cdx consult <lane> --model gpt-6-astra "<question>"` gives read-only advice; follow up with `cdx resume`.
 
@@ -30,7 +30,7 @@ State the outcome, constraints, acceptance command, and facts the lane would oth
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
 
-Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Run the acceptance gate and targeted regressions; repeat only after edits, failures, or unresolved concerns.
+Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Owner ruling, 2026-09-07: the suite runs once per batch, as the lane gate after the report. Workers and reviewers never run it, and you merge on the gate result instead of running your own wall.
 
 cdx injects these rules before `config.json` rules and the repository's `.cdx-rules.md`. Gemini children and native subagents must not delegate further. Supervisors must join native subagents before reporting; cdx only tracks cdx children. See [README.md](README.md#two-engines) for the enforced limits and their reasons.
 
