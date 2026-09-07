@@ -1311,7 +1311,7 @@ describe("cdx execution engines", () => {
 
     const spawnResult = runCli(["spawn", "nested", "--cd", root, "DO_WORK"], env);
     expect(spawnResult.exitCode).toBe(1);
-    expect(spawnResult.stderr).toContain('cdx: lane workers cannot drive the harness (command "spawn" refused inside lane some-lane); use cdx ask for anything you need from the head');
+    expect(spawnResult.stderr).toContain('cdx: lane workers cannot drive the harness (command "spawn" refused inside lane some-lane); use cdx ask for anything you need from the liaison');
 
     const statusResult = runCli(["status"], env);
     expect(statusResult.exitCode).toBe(0);
