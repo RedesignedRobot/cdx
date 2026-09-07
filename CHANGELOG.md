@@ -1,3 +1,20 @@
+## 5.0.0
+
+cdx 5.0.0 removes legacy aliases, schedules accounts with demand holds, fails over exhausted GPT quotas, and enforces explicit baseline checks.
+
+- Version 5 ledger format writes `{ version: 5, lanes: { ... } }` and `.ledger-version` to reject older writers. The writer migrates 3.x and 4.0 ledgers once on write under lock and rejects legacy shapes thereafter. Public flat `state` and `cwd` aliases are removed from the ledger and view summaries; lanes hold explicit `work` and optional `review` records.
+- Status and wait JSON contracts reflect version 5 records. `cdx status --json` remains a name-to-record map. `cdx wait --json` includes discrete `work` and `review` records.
+- Pre-4 effort and account fallbacks are removed. Every round spec requires an explicit engine and effort. Incomplete account records fail explicitly. Unattributed migrated lanes use account admission and start a fresh session when the selected home differs from the default home.
+- Each configured home has one account name; duplicate homes and relative paths are refused.
+- Account doctor `--fix` synchronizes secondary Codex account homes from the primary home. It synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` while preserving credentials, auth sessions, and account-specific settings.
+- Atomic ledger admission schedules accounts with fixed demand holds. Light rounds hold 5% headroom, work rounds hold 15%, and supervisors hold 25%. Admission subtracts active holds before selecting an account. `--account` obeys exhaustion eligibility instead of forcing a depleted account.
+- Admission reconciles dead runners. Crashed runners release their hold during admission while preserving live child holds. Consuming round completion invalidates the account snapshot to force fresh usage probes. Thresholds guide placement; they do not guarantee full completion within quota.
+- Automatic GPT quota failover recovers exhausted accounts across work, review, and consult lanes. When Codex hits quota exhaustion, cdx marks the account exhausted with its reset time and starts a fresh round on an eligible alternate account. The recovery prompt transfers the original brief, round history, and the latest report or partial report. If no alternate account is eligible, the lane fails with reset notes.
+- Codex account sync refuses literal MCP credentials and hardcoded MCP account-home overrides. Doctor checks environment header references without printing credential values. Unshared TOML values survive sync; formatting may change.
+- Baseline gate checks are opt-in only via `--gate-baseline-check` for all spawns, including worktrees. Worktree spawns no longer run baseline checks by default. A failed baseline check stops the round as `gate-invalid` before worker startup.
+- The browser dashboard at `assets/view.html` reads `work` and `review` records directly. All flat `state`, `cwd`, and `reviewState` legacy fallbacks are removed.
+- From the release review: an exhaustion record overrides the cached usage numbers instead of being overridden by them; account homes compare as configured, so a home is never resolved through symlinks; an empty `{}` ledger is an empty ledger; the version marker is written under the ledger lock; `doctor --fix` waits up to three seconds for a SIGTERMed engine child before reconciling; doctor names the header whose environment reference is unset and never echoes its value.
+
 ## 4.0.0
 
 Astra drives whole changes through one supervisor lane. The liaison briefs outcomes, answers questions, arranges independent review, and merges.
