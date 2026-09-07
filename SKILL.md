@@ -30,6 +30,8 @@ State the outcome, constraints, acceptance command, and facts the lane would oth
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
 
+Reuse verified evidence and use targeted reads with compact output. Skip status checks that change nothing. Keep child updates to one sentence and reports short; end supervisor reports with duplicated investigation or rework observed.
+
 Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Owner ruling, 2026-09-07: the suite runs once per batch, as the lane gate after the report. Workers and reviewers never run it, and you merge on the gate result instead of running your own wall.
 
 cdx injects these rules before `config.json` rules and the repository's `.cdx-rules.md`. Gemini children and native subagents must not delegate further. Supervisors must join native subagents before reporting; cdx only tracks cdx children. See [README.md](README.md#two-engines) for the enforced limits and their reasons.
@@ -74,9 +76,10 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - Calling `cdx resume` on an active running lane is refused by the harness;
   wait for the active round to settle before resuming.
 - The gate is the verdict. An unchanged tree does not fail a gated round; the
-  gate runs and the feed line says `diff=empty` so you can judge. A worktree
-  spawn runs the gate once on the untouched tree first; a red baseline stops
-  the lane as `gate-invalid`.
+  gate runs and the feed line says `diff=empty` so you can judge. Only
+  `--gate-baseline-check` runs the gate on the untouched baseline tree before
+  worker startup, including worktrees. A baseline failure stops the round as
+  `gate-invalid`.
 - Lanes touching the same repository get `--worktree`, or disjoint files in
   one tree with no other writer. Never run a Gemini review against a tree
   another lane is editing; its write protection is detection after the fact.
@@ -91,8 +94,8 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - Feed lines end in `owner=`. A different owner is another Claude session's
   lane: information only, never resume or close it unasked. After a
   compaction, `cdx feed -n 30` replays what the monitor delivered.
-- With configured accounts, `cdx usage` and launch share a decision. Work needs 15% weekly capacity and supervisors 25%. Known sufficient accounts come first, then unknown accounts with a warning, otherwise refusal. Light turns prefer 5% but may launch on an exhausted account. `--account` overrides selection; existing GPT affinity remains pinned. There are no reservations in 4.0, so concurrent launches may pick the same account.
-- `doctor` compares every Codex home with the primary for directives and MCP definitions, and validates its hooks file. For Codex homes, `--fix` copies `AGENTS.md` only and reports manual config or hook repairs.
+- With configured accounts, `cdx usage` and launch admission share one decision. Work needs 15% weekly capacity, supervisors 25%, and light turns prefer 5% but can use less; every tier refuses exhausted accounts. Active rounds hold fixed demand against the account during execution: light holds 5%, work holds 15%, and supervisors hold 25%. Admission subtracts active holds from remaining headroom before account selection. Dead runners release their hold during admission while preserving live child holds. Consuming round completion invalidates the account snapshot to force fresh usage probes. Thresholds guide placement; they do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish. `--account` obeys exhaustion eligibility instead of forcing a depleted account. A GPT quota exhaustion failure triggers automatic account failover: cdx starts a fresh round on an available account carrying the brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
+- `doctor` compares secondary Codex homes against the primary home. Running `cdx doctor --fix` synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` across configured homes while preserving credentials, auth sessions, and account-specific settings.
 - Close finished lanes with an outcome note. `close --remove-worktree` deletes
   a merged, clean worktree and its branch; otherwise it prints the commands.
 - Gemini's five-hour window drains under heavy fan-out; cdx refuses Gemini
@@ -113,4 +116,4 @@ The default filter shows running lanes and jobs only. Running, Done, Failed, and
 
 Astra/GPT uses violet orbits, Gemini teal scanlines, and jobs amber tickers. Motion shows running state, not progress. Quiet warnings start after five minutes without a lane event. Reduced motion disables animations. The page has no network fonts or runtime dependencies.
 
-Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines because the ledger has no model for that review. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.
+The dashboard reads discrete `work` and `review` round records. Version 5 removes flat `state`, `cwd`, and `reviewState` aliases. Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines because the ledger has no model for that review. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.

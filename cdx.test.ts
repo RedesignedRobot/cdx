@@ -5,14 +5,15 @@ import { join } from "node:path";
 import {
   readJsonLines, redactViewText, isAgyCancellationTemplate,
   REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso,
-  geminiQuotaState,
+  geminiQuotaState, withAccountHolds, standingOf, decideAccount,
 } from "./cdx.ts";
+import { syncAccountHomes } from "./account-sync.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
 
 function tempPath(label: string): string {
-  return `${tmpdir()}/cdx-test-${label}-${process.pid}-${crypto.randomUUID()}`;
+  return `${realpathSync(tmpdir())}/cdx-test-${label}-${process.pid}-${crypto.randomUUID()}`;
 }
 
 function baseEnv(state: string, bin?: string): Record<string, string> {
@@ -27,6 +28,29 @@ function baseEnv(state: string, bin?: string): Record<string, string> {
   delete env.CODEX_HOME;
   return env;
 }
+
+function readJson(path: string): any {
+  const raw = JSON.parse(readFileSync(path, "utf8"));
+  if (path.endsWith("ledger.json") && raw && raw.version === 5 && raw.lanes) {
+    return raw.lanes;
+  }
+  return raw;
+}
+
+function writeLedger(state: string, lanes: Record<string, any>): void {
+  lanes = Object.fromEntries(Object.entries(lanes).map(([name, lane]) => [name, { engine: "gpt", ...lane }]));
+  mkdirSync(state, { recursive: true });
+  writeFileSync(`${state}/ledger.json`, JSON.stringify({ version: 5, lanes }, null, 2));
+  writeFileSync(`${state}/.ledger-version`, "5\n");
+}
+
+const DAY = 86_400;
+const WEEK_MINS = 10_080;
+const fixtureWindow = (usedPercent: number, resetsAt: number, windowDurationMins = WEEK_MINS) => ({ usedPercent, windowDurationMins, resetsAt });
+const fixtureUsageSnapshot = (usedPercent: number, resetsAt: number, extra: Record<string, unknown> = {}) => ({
+  checkedAt: new Date().toISOString(), usedPercent, windowDurationMins: WEEK_MINS, resetsAt, planType: "pro",
+  resetCreditsAvailable: 0, reached: usedPercent >= 99, windows: [fixtureWindow(usedPercent, resetsAt)], ...extra,
+});
 
 function fixtureCodexHome(home: string, options: { agents?: string; configToml?: string; hooksJson?: string } = {}): void {
   mkdirSync(home, { recursive: true });
@@ -68,6 +92,11 @@ if (args[0] === "login" && args[1] === "status") { console.log("Logged in using 
 if (args[0] !== "app-server") {
   if (process.env.FAKE_ENV_TRACE) appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
   if (process.env.FAKE_ARGS_TRACE) appendFileSync(process.env.FAKE_ARGS_TRACE, args.join(" ") + "\\n");
+  const fullArgs = args.join(" ");
+  if (fullArgs.includes("QUOTA_ERROR") && !fullArgs.includes("Continue in a fresh session")) {
+    process.stderr.write("429 Too Many Requests: quota exceeded\\n");
+    process.exit(1);
+  }
   const lastMessage = args.indexOf("--output-last-message");
   if (lastMessage >= 0) writeFileSync(args[lastMessage + 1], "fake exec report\\n");
   process.exit(0);
@@ -98,7 +127,7 @@ for await (const chunk of Bun.stdin.stream()) {
     if (!line.trim()) continue;
     const request = JSON.parse(line);
     if (process.env.FAKE_TRACE) appendFileSync(process.env.FAKE_TRACE, line + "\\n");
-    if (process.env.FAKE_ENV_TRACE && request.method === "initialize") appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
+    if (process.env.FAKE_ENV_TRACE && ["thread/start", "thread/resume", "thread/fork"].includes(request.method)) appendFileSync(process.env.FAKE_ENV_TRACE, String(process.env.CODEX_HOME || "") + "\\n");
     if (process.env.FAKE_SUPERVISOR_TRACE && request.method === "initialize") appendFileSync(process.env.FAKE_SUPERVISOR_TRACE, String(process.env.CDX_SUPERVISOR || "none") + "\\n");
     if (request.method === "initialized") continue;
     if (request.method === "initialize") send({ id: request.id, result: { userAgent: "fake", codexHome: "/tmp", platformFamily: "unix", platformOs: "test" } });
@@ -112,6 +141,11 @@ for await (const chunk of Bun.stdin.stream()) {
       send({ method: "turn/started", params: { threadId, turn: { id: activeTurn, status: "inProgress", items: [], itemsView: { type: "all" }, error: null, startedAt: 1, completedAt: null, durationMs: null } } });
       const text = request.params.input.find((item) => item.type === "text")?.text || "";
       if (doctorDies) setTimeout(() => process.exit(44), 10);
+      else if (text.includes("QUOTA_ERROR") && !text.includes("Continue in a fresh session")) fallback = setTimeout(() => {
+        const turnId = activeTurn;
+        activeTurn = "";
+        finishTurn(turnId, undefined, undefined, "failed", { message: "429 Too Many Requests: quota exceeded" });
+      }, 20);
       else if (text.includes("COMMENTARY_ONLY")) fallback = setTimeout(() => complete("still working", "commentary"), 20);
       else if (text.includes("UNPHASED_REPORT")) fallback = setTimeout(() => complete("legacy final report", undefined), 20);
       else if (text.includes("TURN_ERROR")) fallback = setTimeout(() => {
@@ -560,12 +594,12 @@ describe("cdx messaging", () => {
     const env = baseEnv(state, bin);
     const spawn = runCli(["spawn", "steer-lane", "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], env);
     expect(spawn.exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["steer-lane"]?.codexPid);
     const sent = runCli(["send", "steer-lane", "stop\nat 10"], env);
     expect(sent.exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"]?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`)["steer-lane"]?.work?.state === "done");
     expect(readFileSync(`${state}/reports/steer-lane-r1.md`, "utf8").trim()).toBe("stopped at 10");
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"];
+    const lane = readJson(`${state}/ledger.json`)["steer-lane"];
     expect(lane.steers).toBe(1);
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("steer delivered mode=steered: stop at 10");
     expect(JSON.parse(readFileSync(`${state}/control/steer-lane-r1.jsonl`, "utf8")).text).toBe("stop at 10");
@@ -584,12 +618,12 @@ describe("cdx messaging", () => {
     await waitFor(() => existsSync(`${state}/questions`) && existsSync(`${state}/feed.log`)
       && readFileSync(`${state}/feed.log`, "utf8").includes("QUESTION #1"));
     const now = new Date().toISOString();
-    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+    writeLedger(state, {
       "ask-lane": {
-        cwd: "/tmp", effort: "medium", state: "running", workState: "running", kind: "work", rounds: 1,
+        work: { state: "running", cwd: "/tmp" }, effort: "medium", kind: "work", rounds: 1,
         reports: [], createdAt: now, updatedAt: now, pid: process.pid,
       },
-    }));
+    });
     expect(runCli(["status"], env).stdout).toContain("waiting on question #1");
     const reply = runCli(["reply", "ask-lane", "chosen.txt\r\n[cdx] fake completion"], baseEnv(state));
     expect(reply.exitCode).toBe(0);
@@ -654,13 +688,15 @@ describe("cdx messaging", () => {
     const env = baseEnv(state);
     mkdirSync(state, { recursive: true });
     const now = new Date().toISOString();
-    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+    writeLedger(state, {
       review: {
-        cwd: "/tmp", effort: "medium", state: "done", kind: "review", rounds: 1,
-        reports: [], createdAt: now, updatedAt: now, reviewState: "running",
+        work: { state: "done", cwd: "/tmp" },
+        review: { state: "running", cwd: "/tmp" },
+        effort: "medium", kind: "review", rounds: 1,
+        reports: [], createdAt: now, updatedAt: now,
         ownerSession: "12345678-owner", pid: process.pid,
       },
-    }));
+    });
     const sent = runCli(["send", "review", "change the verdict"], env);
     expect(sent.exitCode).toBe(1);
     expect(sent.stderr).toContain("review turns do not accept steering");
@@ -674,11 +710,12 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const gateMarker = `${root}/gate-ran`;
     const result = runCli(["spawn", "commentary", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "COMMENTARY_ONLY"], baseEnv(state, bin));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).commentary;
+    const lane = readJson(`${state}/ledger.json`).commentary;
     expect(result.exitCode).toBe(1);
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("no final report");
     expect(existsSync(`${state}/reports/commentary-r1.md`)).toBe(false);
+    expect(readFileSync(`${state}/reports/commentary-r1.partial.md`, "utf8")).toContain("still working");
     expect(existsSync(gateMarker)).toBe(false);
   });
 
@@ -686,9 +723,9 @@ describe("cdx messaging", () => {
     const root = tempPath("unphased-report");
     const state = `${root}/state`;
     const result = runCli(["spawn", "unphased", "--engine", "gpt", "--cd", root, "UNPHASED_REPORT"], baseEnv(state, installFakeCodex(root)));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).unphased;
+    const lane = readJson(`${state}/ledger.json`).unphased;
     expect(result.exitCode).toBe(0);
-    expect(lane.state).toBe("done");
+    expect(lane.work.state).toBe("done");
     expect(readFileSync(`${state}/reports/unphased-r1.md`, "utf8").trim()).toBe("legacy final report");
   });
 
@@ -696,7 +733,7 @@ describe("cdx messaging", () => {
     const root = tempPath("turn-error");
     const state = `${root}/state`;
     const result = runCli(["spawn", "failed-turn", "--engine", "gpt", "--cd", root, "TURN_ERROR"], baseEnv(state, installFakeCodex(root)));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["failed-turn"];
+    const lane = readJson(`${state}/ledger.json`)["failed-turn"];
     const feed = readFileSync(`${state}/feed.log`, "utf8");
     expect(result.exitCode).toBe(1);
     expect(lane.work.note).toContain("context window exceeded");
@@ -714,11 +751,11 @@ describe("cdx messaging", () => {
       FAKE_REPORT_PATH: report,
     };
     const result = runCli(["spawn", "cleanup", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).cleanup;
+    const lane = readJson(`${state}/ledger.json`).cleanup;
     expect(result.exitCode).toBe(0);
     expect(readFileSync(report, "utf8").trim()).toBe("final report from app-server");
     expect(readFileSync(cleanupTrace, "utf8").trim()).toBe("report-present");
-    expect(lane.state).toBe("done");
+    expect(lane.work.state).toBe("done");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("cleanup warning: thread unsubscribe failed after completed turn: cleanup exploded");
   });
 
@@ -727,9 +764,9 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_REJECT_STEER: "1" };
     expect(runCli(["spawn", "follow-up", "--engine", "gpt", "--cd", root, "--bg", "STEER_REJECTED_AFTER_COMPLETION"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["follow-up"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["follow-up"]?.codexPid);
     expect(runCli(["send", "follow-up", "deliver this later"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["follow-up"]?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`)["follow-up"]?.work?.state === "done");
     expect(readFileSync(`${state}/reports/follow-up-r1.md`, "utf8").trim()).toBe("follow-up delivered");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("steer delivered mode=follow-up-turn: deliver this later");
   }, 12000);
@@ -739,18 +776,18 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = baseEnv(state, installFakeCodex(root));
     expect(runCli(["spawn", "questions", "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).questions?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`).questions?.codexPid);
     const questionDir = `${state}/questions`;
     const askedAt = new Date().toISOString();
     writeFileSync(`${questionDir}/questions-r1-1.json`, JSON.stringify({ lane: "questions", round: 1, seq: 1, question: "old?", askedAt, answered: false }));
     expect(runCli(["send", "questions", "finish"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).questions?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`).questions?.work?.state === "done");
     const expired = JSON.parse(readFileSync(`${questionDir}/questions-r1-1.json`, "utf8"));
     expect(expired.status).toBe("expired: round ended");
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     ledger.questions.rounds = 2;
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
     writeFileSync(`${questionDir}/questions-r1-2.json`, JSON.stringify({ lane: "questions", round: 1, seq: 2, question: "forged stale?", askedAt, answered: false }));
     writeFileSync(`${questionDir}/questions-r2-3.json`, JSON.stringify({ lane: "questions", round: 2, seq: 3, question: "current?", askedAt, answered: false }));
     const listed = runCli(["questions", "questions"], env).stdout;
@@ -847,7 +884,7 @@ describe("cdx messaging", () => {
     writeFileSync(envTrace, "");
     expect(runCli(["fork", "pinned-fork", "pinned", "REPORT_ONLY"], env).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
-    const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["pinned-fork"];
+    const fork = readJson(`${state}/ledger.json`)["pinned-fork"];
     expect(fork.account).toBe("codex-2");
     expect(fork.codexHome).toBe(pinnedHome);
   }, 15000);
@@ -867,7 +904,7 @@ describe("cdx messaging", () => {
     const source = "22222222-2222-4222-8222-222222222222";
     expect(runCli(["fork", "raw-fork", source, "--account", "codex-2", "--model", "gpt-6-astra", "REPORT_ONLY"], { ...env, FAKE_TRACE: `${root}/requests.trace` }).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
-    const fork = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["raw-fork"];
+    const fork = readJson(`${state}/ledger.json`)["raw-fork"];
     expect(fork.account).toBe("codex-2");
     expect(fork.codexHome).toBe(pinnedHome);
     expect(fork.model).toBe("gpt-6-astra");
@@ -929,7 +966,7 @@ describe("cdx messaging", () => {
     writeFileSync(envTrace, "");
     expect(runCli(["review", "review-pinned", "--engine", "gpt", "review this"], env).exitCode).toBe(0);
     expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["review-pinned"];
+    const lane = readJson(`${state}/ledger.json`)["review-pinned"];
     expect(lane.account).toBe("codex-2");
     expect(lane.codexHome).toBe(pinnedHome);
 
@@ -939,7 +976,7 @@ describe("cdx messaging", () => {
     expect(readFileSync(envTrace, "utf8").trim().split("\n").at(-1)).toBe(primaryHome);
   }, 10000);
 
-  test("pre-upgrade lane resumes with the default Codex home and writes a feed note", () => {
+  test("pre-upgrade lane without recorded account continues with fresh account selection", () => {
     const root = tempPath("legacy-account-fallback");
     const state = `${root}/state`;
     const pinnedHome = `${root}/codex-2`;
@@ -953,18 +990,17 @@ describe("cdx messaging", () => {
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_ENV_TRACE: envTrace };
     delete env.CODEX_HOME;
     expect(runCli(["spawn", "legacy", "--engine", "gpt", "--account", "codex-2", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     delete ledger.legacy.account;
     delete ledger.legacy.codexHome;
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
 
     writeFileSync(envTrace, "");
     expect(runCli(["resume", "legacy", "REPORT_ONLY"], env).exitCode).toBe(0);
-    expect(readFileSync(envTrace, "utf8").trim()).toBe(`${env.HOME}/.codex`);
-    const feed = readFileSync(`${state}/feed.log`, "utf8");
-    expect(feed).toContain("lane=legacy");
-    expect(feed).toContain("pre-upgrade lane has no recorded account");
-    expect(feed).toContain(`${env.HOME}/.codex`);
+    expect(readFileSync(envTrace, "utf8").trim()).toBe(pinnedHome);
+    const resumed = readJson(`${state}/ledger.json`).legacy;
+    expect(resumed.account).toBe("codex-2");
+    expect(resumed.codexHome).toBe(pinnedHome);
   });
 
   test("fails doctor promptly when the app-server dies before completion", () => {
@@ -988,12 +1024,12 @@ describe("cdx messaging", () => {
     const started = Date.now();
     const result = runCli(["spawn", "runtime", "--engine", "gpt", "--cd", root, "--max-runtime", "0.02", "IGNORE_SIGTERM"], env);
     const elapsed = Date.now() - started;
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).runtime;
+    const lane = readJson(`${state}/ledger.json`).runtime;
     expect(result.exitCode).toBe(1);
     expect(readFileSync(signalTrace, "utf8")).toContain("SIGTERM");
     expect(elapsed).toBeGreaterThanOrEqual(10_500);
     expect(elapsed).toBeLessThan(16_000);
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("max runtime");
   }, 20_000);
 
@@ -1001,7 +1037,7 @@ describe("cdx messaging", () => {
     const root = tempPath("multi-call-tokens");
     const state = `${root}/state`;
     const result = runCli(["spawn", "multi-call", "--engine", "gpt", "--cd", root, "MULTI_CALL_USAGE"], baseEnv(state, installFakeCodex(root)));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["multi-call"];
+    const lane = readJson(`${state}/ledger.json`)["multi-call"];
     expect(result.exitCode).toBe(0);
     expect(lane.roundTokens).toEqual({ input: 21, cached: 6, output: 9 });
     expect(lane.tokens).toEqual({ input: 21, cached: 6, output: 9 });
@@ -1012,7 +1048,7 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = baseEnv(state, installFakeCodex(root));
     expect(runCli(["spawn", "close-running", "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["close-running"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["close-running"]?.codexPid);
     const closed = runCli(["close", "close-running"], env);
     expect(closed.exitCode).toBe(1);
     expect(closed.stderr).toContain("kill it first");
@@ -1024,10 +1060,10 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = baseEnv(state, installFakeCodex(root));
     expect(runCli(["spawn", "kill-signal", "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["kill-signal"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["kill-signal"]?.codexPid);
     expect(runCli(["kill", "kill-signal"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["kill-signal"]?.state === "failed");
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["kill-signal"];
+    await waitFor(() => readJson(`${state}/ledger.json`)["kill-signal"]?.work?.state === "failed");
+    const lane = readJson(`${state}/ledger.json`)["kill-signal"];
     expect(lane.work.exitCode).toBe(143);
     expect(lane.work.note).toContain("signal (exit 143)");
   }, 12_000);
@@ -1037,10 +1073,10 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = baseEnv(state, installFakeCodex(root));
     expect(runCli(["spawn", "stale-report", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     ledger["stale-report"].rounds = 2;
     ledger["stale-report"].work.report = undefined;
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
     const waited = runCli(["wait", "stale-report", "--report"], env);
     expect(waited.exitCode).toBe(0);
     expect(waited.stdout).not.toContain("final report from app-server");
@@ -1051,9 +1087,9 @@ describe("cdx messaging", () => {
     const state = `${root}/state`;
     const env = baseEnv(state, installFakeCodex(root));
     expect(runCli(["spawn", "seed", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     for (let index = 0; index < 200; index += 1) ledger[`copy-${index}`] = { ...ledger.seed };
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
     const result = runCli(["status", "--json"], env);
     expect(result.exitCode).toBe(0);
     expect(result.stdout.length).toBeGreaterThan(70_000);
@@ -1081,13 +1117,13 @@ describe("cdx execution engines", () => {
     const spawnResult = runCli(["spawn", "default-spawn", "--cd", root, "BUILD_SMALL_THING"], env);
     expect(spawnResult.exitCode).toBe(0);
     expect(spawnResult.stdout).toContain("cdx: engine gemini (default)");
-    const spawnLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["default-spawn"];
+    const spawnLane = readJson(`${state}/ledger.json`)["default-spawn"];
     expect(spawnLane.engine).toBe("gemini");
 
     const adoptResult = runCli(["adopt", "default-adopt", "44444444-4444-4444-8444-444444444444", "--cd", root], env);
     expect(adoptResult.exitCode).toBe(0);
     expect(adoptResult.stdout).toContain("cdx: engine gemini (default)");
-    const adoptLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["default-adopt"];
+    const adoptLane = readJson(`${state}/ledger.json`)["default-adopt"];
     expect(adoptLane.engine).toBe("gemini");
 
     const spawnBad = runCli(["spawn", "bad-engine", "--engine", "claude", "--cd", root, "REPORT_ONLY"], env);
@@ -1123,14 +1159,14 @@ describe("cdx execution engines", () => {
     const reviewGpt = runCli(["review", "gpt-lane", "--cd", root, "REVIEW_CLEAN"], env);
     expect(reviewGpt.exitCode).toBe(0);
     expect(reviewGpt.stdout).toContain("cdx: engine gemini (default)");
-    const gptLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gpt-lane"];
+    const gptLane = readJson(`${state}/ledger.json`)["gpt-lane"];
     expect(gptLane.review.state).toBe("done");
     expect(gptLane.engine).toBe("gpt");
     expect(gptLane.reviewEngine).toBe("gemini");
     expect(gptLane.account).toBe("acc-primary");
     expect(gptLane.codexHome).toBe(accHome);
     expect(runCli(["resume", "gpt-lane", "REPORT_ONLY"], env).exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gpt-lane"].account).toBe("acc-primary");
+    expect(readJson(`${state}/ledger.json`)["gpt-lane"].account).toBe("acc-primary");
 
     const spawnGemini = runCli(["spawn", "gemini-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
     expect(spawnGemini.exitCode).toBe(0);
@@ -1139,13 +1175,15 @@ describe("cdx execution engines", () => {
     expect(reviewGemini.exitCode).toBe(0);
     expect(reviewGemini.stdout).toContain("cdx: engine gemini (default)");
     expect(reviewGemini.stdout).toContain("cdx: gemini reviewing a gemini lane; give the intent explicit attack items");
-    const geminiLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-lane"];
+    const geminiLane = readJson(`${state}/ledger.json`)["gemini-lane"];
     expect(geminiLane.review.state).toBe("done");
 
-    // Review GPT on Gemini lane without account selects configured account
+    // A GPT review of a Gemini lane selects an account for the round without pinning the lane
     const gptReviewOfGemini = runCli(["review", "gemini-lane", "--engine", "gpt", "--cd", root, "REVIEW_CLEAN"], env);
     expect(gptReviewOfGemini.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-lane"].account).toBe("acc-primary");
+    const reviewedGeminiLane = readJson(`${state}/ledger.json`)["gemini-lane"];
+    expect(reviewedGeminiLane.roundAccount.name).toBe("acc-primary");
+    expect(reviewedGeminiLane.account).toBeUndefined();
   }, 15000);
 
   test("a review-only lane follows the engine of its latest review and resumes there", () => {
@@ -1171,16 +1209,16 @@ describe("cdx execution engines", () => {
     // leaves behind: kind review, engine gpt, a codex session id, no work thread.
     expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
     const ledgerPath = `${state}/ledger.json`;
-    const seeded = JSON.parse(readFileSync(ledgerPath, "utf8"));
+    const seeded = readJson(ledgerPath);
     expect(seeded.audit.kind).toBe("review");
     expect(seeded.audit.workSessionId).toBeUndefined();
     seeded.audit.engine = "gpt";
     seeded.audit.reviewEngine = "gpt";
     seeded.audit.sessionId = "22222222-2222-4222-8222-222222222222";
-    writeFileSync(ledgerPath, JSON.stringify(seeded, null, 2));
+    writeLedger(state, seeded);
 
     expect(runCli(["review", "audit", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env).exitCode).toBe(0);
-    const switched = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).audit;
+    const switched = readJson(`${state}/ledger.json`).audit;
     expect(switched.engine).toBe("gemini");
     expect(switched.reviewEngine).toBe("gemini");
 
@@ -1211,8 +1249,8 @@ describe("cdx execution engines", () => {
 
     const result = runCli(["spawn", "cancel-lane", "--engine", "gemini", "--cd", root, "--gate", `touch ${gateMarker}`, "AGY_CANCEL_TEMPLATE"], env);
     expect(result.exitCode).toBe(1);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["cancel-lane"];
-    expect(lane.state).toBe("failed");
+    const lane = readJson(`${state}/ledger.json`)["cancel-lane"];
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("agy returned its cancellation template as the report; no qualifying report");
     expect(readFileSync(`${state}/reports/cancel-lane-r1.md`, "utf8")).toContain("User initiated cancellation");
     expect(existsSync(gateMarker)).toBe(false);
@@ -1230,8 +1268,8 @@ describe("cdx execution engines", () => {
     const env = baseEnv(state, bin);
     const result = runCli(["spawn", "empty-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "REPORT_ONLY"], env);
     expect(result.exitCode).toBe(0);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate"];
-    expect(lane.state).toBe("done");
+    const lane = readJson(`${state}/ledger.json`)["empty-gate"];
+    expect(lane.work.state).toBe("done");
     expect(lane.diffEmpty).toBe(true);
     expect(existsSync(gateMarker)).toBe(true);
     expect(readFileSync(`${state}/reports/empty-gate-r1.md`, "utf8")).toContain("This round changed no files.");
@@ -1240,8 +1278,8 @@ describe("cdx execution engines", () => {
     // A failing gate is still the verdict, changed tree or not.
     const failing = runCli(["spawn", "empty-gate-red", "--engine", "gpt", "--cd", root, "--gate", "exit 3", "REPORT_ONLY"], env);
     expect(failing.exitCode).toBe(1);
-    const red = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-gate-red"];
-    expect(red.state).toBe("failed");
+    const red = readJson(`${state}/ledger.json`)["empty-gate-red"];
+    expect(red.work.state).toBe("failed");
     expect(red.work.note).toContain("gate failed (exit 3)");
   });
 
@@ -1256,8 +1294,8 @@ describe("cdx execution engines", () => {
 
     const result = runCli(["spawn", "commit-gate", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "COMMIT_WORK"], baseEnv(state, bin));
     expect(result.exitCode).toBe(0);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["commit-gate"];
-    expect(lane.state).toBe("done");
+    const lane = readJson(`${state}/ledger.json`)["commit-gate"];
+    expect(lane.work.state).toBe("done");
     expect(existsSync(gateMarker)).toBe(true);
   });
 
@@ -1272,8 +1310,8 @@ describe("cdx execution engines", () => {
     const env = baseEnv(state, bin);
     const result = runCli(["spawn", "empty-nogate", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
     expect(result.exitCode).toBe(0);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["empty-nogate"];
-    expect(lane.state).toBe("done");
+    const lane = readJson(`${state}/ledger.json`)["empty-nogate"];
+    expect(lane.work.state).toBe("done");
     expect(lane.diffEmpty).toBe(true);
     expect(readFileSync(`${state}/reports/empty-nogate-r1.md`, "utf8")).toContain("\n\n## Harness note\n\nThis round changed no files.\n");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("diff=empty");
@@ -1293,8 +1331,8 @@ describe("cdx execution engines", () => {
     const env = baseEnv(state, bin);
     const result = runCli(["spawn", "changed-tree", "--engine", "gpt", "--cd", root, "--gate", `touch ${gateMarker}`, "WRITE_WORK_FILE"], env);
     expect(result.exitCode).toBe(0);
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["changed-tree"];
-    expect(lane.state).toBe("done");
+    const lane = readJson(`${state}/ledger.json`)["changed-tree"];
+    expect(lane.work.state).toBe("done");
     expect(lane.diffEmpty).toBeUndefined();
     expect(existsSync(gateMarker)).toBe(true);
     expect(readFileSync(`${state}/reports/changed-tree-r1.md`, "utf8")).not.toContain("## Harness note");
@@ -1346,9 +1384,8 @@ describe("cdx execution engines", () => {
     const result = runCli(["spawn", "gemini-work", "--engine", "gemini", "--effort", "low", "--cd", root, "BUILD_SMALL_THING"], env);
 
     expect(result.exitCode).toBe(0);
-    expect(result.stderr).toContain("--effort ignored for gemini; gemini lanes always run gemini-3.8-flash-high");
     expect(readFileSync(`${state}/reports/gemini-work-r1.md`, "utf8")).toContain("gemini report:");
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-work"];
+    const lane = readJson(`${state}/ledger.json`)["gemini-work"];
     expect(lane.engine).toBe("gemini");
     expect(lane.effort).toBe("high");
     expect(lane.sessionId).toBe("33333333-3333-4333-8333-333333333333");
@@ -1401,7 +1438,7 @@ describe("cdx execution engines", () => {
     const trace = `${root}/agy.trace`;
     const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
     expect(runCli(["spawn", "gemini-follow-up", "--engine", "gemini", "--cd", root, "--bg", "WAIT_FOR_FOLLOW_UP LONG_SLEEP"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["gemini-follow-up"]?.codexPid);
     expect(runCli(["send", "gemini-follow-up", "inspect the tests"], env).exitCode).toBe(0);
 
     // With hooks missing, the send is written immediately to stdin
@@ -1413,12 +1450,12 @@ describe("cdx execution engines", () => {
         .map((r) => r.stdinUser);
     };
     await waitFor(() => getStdinUsers().some((u: string) => u.includes("inspect the tests")));
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.state).toBe("running");
+    expect(readJson(`${state}/ledger.json`)["gemini-follow-up"]?.work?.state).toBe("running");
 
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"]?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`)["gemini-follow-up"]?.work?.state === "done");
     expect(readFileSync(`${state}/reports/gemini-follow-up-r1.md`, "utf8").trim()).toContain("follow-up result: inspect the tests");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("mode=follow-up-turn");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-follow-up"].steers).toBe(1);
+    expect(readJson(`${state}/ledger.json`)["gemini-follow-up"].steers).toBe(1);
     expect(readFileSync(`${state}/control/gemini-follow-up-r1.delivered`, "utf8").trim()).toBe("1");
 
     writeFileSync(trace, "");
@@ -1441,7 +1478,7 @@ describe("cdx execution engines", () => {
     await waitFor(() => existsSync(`${state}/questions/gemini-ask-r1-1.json`));
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("QUESTION #1: Which file should I inspect?");
     expect(runCli(["reply", "gemini-ask", "src/engine.ts"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-ask"]?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`)["gemini-ask"]?.work?.state === "done");
     expect(readFileSync(`${state}/reports/gemini-ask-r1.md`, "utf8").trim()).toBe("owner answered: src/engine.ts");
     const answer = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((record) => record.answer)?.answer;
     expect(answer).toBe("src/engine.ts");
@@ -1491,10 +1528,10 @@ describe("cdx execution engines", () => {
     const state = `${root}/state`;
     const started = Date.now();
     const result = runCli(["spawn", "gemini-runtime", "--engine", "gemini", "--cd", root, "--max-runtime", "0.005", "HANG_AGY"], baseEnv(state, installFakeAgy(root)));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-runtime"];
+    const lane = readJson(`${state}/ledger.json`)["gemini-runtime"];
     expect(result.exitCode).not.toBe(0);
     expect(Date.now() - started).toBeLessThan(5000);
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("max runtime");
   }, 6000);
 
@@ -1502,9 +1539,9 @@ describe("cdx execution engines", () => {
     const root = tempPath("gemini-error");
     const state = `${root}/state`;
     const result = runCli(["spawn", "gemini-error", "--engine", "gemini", "--cd", root, "AGY_ERROR"], baseEnv(state, installFakeAgy(root)));
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-error"];
+    const lane = readJson(`${state}/ledger.json`)["gemini-error"];
     expect(result.exitCode).toBe(1);
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("scripted agy failure");
     expect(readFileSync(`${state}/reports/gemini-error-r1.partial.md`, "utf8")).toContain("scripted agy failure");
   });
@@ -1517,8 +1554,8 @@ describe("cdx execution engines", () => {
     const result = runCli(["spawn", "gemini-continue", "--engine", "gemini", "--cd", root, "STREAM_INTERRUPT"], env);
     expect(result.exitCode).toBe(0);
 
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-continue"];
-    expect(lane.state).toBe("done");
+    const lane = readJson(`${state}/ledger.json`)["gemini-continue"];
+    expect(lane.work.state).toBe("done");
     expect(lane.continuations).toBe(1);
 
     const report = readFileSync(`${state}/reports/gemini-continue-r1.md`, "utf8").trim();
@@ -1543,8 +1580,8 @@ describe("cdx execution engines", () => {
     const result = runCli(["spawn", "gemini-fail-3x", "--engine", "gemini", "--cd", root, "FAIL_3X"], env);
     expect(result.exitCode).toBe(1);
 
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-fail-3x"];
-    expect(lane.state).toBe("failed");
+    const lane = readJson(`${state}/ledger.json`)["gemini-fail-3x"];
+    expect(lane.work.state).toBe("failed");
     expect(lane.continuations).toBe(2);
     expect(lane.work.note).toMatch(/^turn failed after 2 auto-continues/);
 
@@ -1560,8 +1597,8 @@ describe("cdx execution engines", () => {
     const result = runCli(["spawn", "gemini-non-transport", "--engine", "gemini", "--cd", root, "NON_TRANSPORT_ERROR"], env);
     expect(result.exitCode).toBe(1);
 
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-non-transport"];
-    expect(lane.state).toBe("failed");
+    const lane = readJson(`${state}/ledger.json`)["gemini-non-transport"];
+    expect(lane.work.state).toBe("failed");
     expect(lane.continuations ?? 0).toBe(0);
     expect(lane.work.note).not.toContain("auto-continue");
     expect(lane.work.note).toContain("non-transport fatal error");
@@ -1583,8 +1620,8 @@ describe("cdx execution engines", () => {
     const partialReport = readFileSync(`${state}/reports/gemini-partial-r1.partial.md`, "utf8").trim();
     expect(partialReport).toBe("progress text");
 
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-partial"];
-    expect(lane.state).toBe("failed");
+    const lane = readJson(`${state}/ledger.json`)["gemini-partial"];
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.report).toBe(`${state}/reports/gemini-partial-r1.md`);
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
@@ -1601,7 +1638,7 @@ describe("cdx execution engines", () => {
 
     const clean = runCli(["review", "gemini-review-clean", "--engine", "gemini", "--cd", root, "REVIEW_CLEAN"], env);
     expect(clean.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-review-clean"].review.state).toBe("done");
+    expect(readJson(`${state}/ledger.json`)["gemini-review-clean"].review.state).toBe("done");
 
     writeFileSync(trace, "");
     const native = runCli(["review", "gemini-review-native", "--engine", "gemini", "--cd", root, "--uncommitted"], env);
@@ -1620,31 +1657,21 @@ describe("cdx execution engines", () => {
     writeFileSync(`${root}/fake-review-change.txt`, "original dirty content\n");
     const dirty = runCli(["review", "gemini-review-dirty", "--engine", "gemini", "--cd", root, "REVIEW_WRITE"], env);
     expect(dirty.exitCode).toBe(1);
-    const dirtyLane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["gemini-review-dirty"];
+    const dirtyLane = readJson(`${state}/ledger.json`)["gemini-review-dirty"];
     expect(dirtyLane.review.state).toBe("failed");
     expect(dirtyLane.review.note).toContain("review modified the tree: fake-review-change.txt");
     expect(existsSync(`${state}/reports/gemini-review-dirty-r1.md`)).toBe(true);
   }, 15000);
 
-  test("treats legacy lane entries without engine as gpt", () => {
-    const root = tempPath("legacy-engine");
-    const state = `${root}/state`;
-    const trace = `${root}/codex.trace`;
-    const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_TRACE: trace };
-    expect(runCli(["spawn", "legacy-engine", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
-    delete ledger["legacy-engine"].engine;
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
-    const specPath = `${state}/specs/legacy-engine-r1.json`;
-    const spec = JSON.parse(readFileSync(specPath, "utf8"));
-    delete spec.engine;
-    writeFileSync(specPath, JSON.stringify(spec));
-
-    expect(runCli(["status"], env).stdout).toContain("gpt");
-    expect(JSON.parse(runCli(["status", "--json"], env).stdout)["legacy-engine"].engine).toBe("gpt");
-    expect(JSON.parse(runCli(["wait", "legacy-engine", "--json"], env).stdout).engine).toBe("gpt");
-    expect(runCli(["resume", "legacy-engine", "REPORT_ONLY"], env).exitCode).toBe(0);
-    expect(readFileSync(trace, "utf8")).toContain('"method":"thread/resume"');
+  test("refuses missing engines in a version 5 ledger", () => {
+    const state = tempPath("missing-engine");
+    mkdirSync(state, { recursive: true });
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({ version: 5, lanes: {
+      broken: { work: { state: "done", cwd: state }, kind: "work" },
+    } }));
+    const result = runCli(["status", "--json"], baseEnv(state));
+    expect(result.exitCode).toBe(1);
+    expect(result.stderr).toContain("requires an engine and work/review records");
   });
 
   test("parses gemini usage into its own snapshot", () => {
@@ -1805,7 +1832,7 @@ describe("cdx execution engines", () => {
     const spawn = runCli(["spawn", "transcript-lane", "--engine", "gemini", "--cd", root, "BUILD_SMALL_THING"], env);
     expect(spawn.exitCode).toBe(0);
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     const lane = ledger["transcript-lane"];
     expect(lane.transcriptPath).toBe(`${agyStateHome}/brain/${lane.sessionId}/.system_generated/logs/transcript_full.jsonl`);
 
@@ -1841,7 +1868,7 @@ describe("cdx execution engines", () => {
     // openRound resets transcriptPath to undefined before init
     const resume = runCli(["resume", "transcript-lane", "--bg", "WAIT_FOR_FOLLOW_UP"], env);
     expect(resume.exitCode).toBe(0);
-    const ledgerRound2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledgerRound2 = readJson(`${state}/ledger.json`);
     expect(ledgerRound2["transcript-lane"].transcriptPath).toBeUndefined();
   });
 
@@ -1953,37 +1980,36 @@ describe("cdx execution engines", () => {
     };
     fixtureCodexHome(`${env.HOME}/.codex`);
 
-    // Initially secondary AGENTS differs from primary; MCP allows extra server beta; hooks valid.
+    // Initially secondary AGENTS differs from primary; secondary config has extra server beta; hooks match.
     const check1 = runCli(["doctor"], env);
     expect(check1.exitCode).toBe(1);
     expect(check1.stdout).toContain("FAIL secondary AGENTS.md: differs from primary");
-    expect(check1.stdout).toContain("secondary MCP: matches 1 primary server definitions");
-    expect(check1.stdout).toContain(`secondary hooks: valid ${homeSecondary}/hooks.json`);
+    expect(check1.stdout).toContain("FAIL secondary config: shared settings differ from primary");
+    expect(check1.stdout).toContain("secondary hooks.json: matches primary");
 
-    // doctor --fix repairs secondary AGENTS.md from primary
+    // doctor --fix repairs secondary AGENTS.md and synchronizes shared settings in config.toml
     const fix1 = runCli(["doctor", "--fix"], env);
     expect(fix1.exitCode).toBe(0);
-    expect(fix1.stdout).toContain(`secondary AGENTS.md: repaired from ${homePrimary}/AGENTS.md`);
+    expect(fix1.stdout).toContain("secondary AGENTS.md: repaired from primary");
+    expect(fix1.stdout).toContain("secondary config: synchronized primary shared settings");
     expect(readFileSync(`${homeSecondary}/AGENTS.md`, "utf8")).toBe("# Codex Directives\n");
     const checkClean = runCli(["doctor"], env);
     expect(checkClean.exitCode).toBe(0);
     expect(checkClean.stdout).toContain("secondary AGENTS.md: matches primary");
+    expect(checkClean.stdout).toContain("secondary config: matches primary shared settings");
 
-    // Differing primary server in secondary config.toml fails and --fix does not touch config
-    writeFileSync(`${homeSecondary}/config.toml`, '[mcp_servers.alpha]\ncommand = "alpha-other"\nargs = []\n');
+    // Malformed secondary TOML fails and --fix does not overwrite it
+    writeFileSync(`${homeSecondary}/config.toml`, "not valid toml [[[[");
     const fix2 = runCli(["doctor", "--fix"], env);
     expect(fix2.exitCode).toBe(1);
-    expect(fix2.stdout).toContain("FAIL secondary MCP: missing or different servers: alpha");
-    expect(fix2.stdout).toContain("doctor --fix does not copy config");
-    expect(readFileSync(`${homeSecondary}/config.toml`, "utf8")).toContain("alpha-other");
+    expect(fix2.stdout).toContain("FAIL secondary config: cannot read or repair config.toml; no malformed TOML is overwritten");
 
-    // Invalid hooks.json fails and --fix does not install hooks
+    // Invalid secondary hooks are replaced with the primary hooks.
     writeFileSync(`${homeSecondary}/config.toml`, '[mcp_servers.alpha]\ncommand = "alpha"\nargs = ["1"]\n');
     writeFileSync(`${homeSecondary}/hooks.json`, "{}");
     const fix3 = runCli(["doctor", "--fix"], env);
-    expect(fix3.exitCode).toBe(1);
-    expect(fix3.stdout).toContain("FAIL secondary hooks: hooks.json missing, unreadable, or invalid");
-    expect(fix3.stdout).toContain("doctor --fix does not install Codex hooks");
+    expect(fix3.exitCode).toBe(0);
+    expect(readFileSync(`${homeSecondary}/hooks.json`, "utf8")).toBe(readFileSync(`${homePrimary}/hooks.json`, "utf8"));
   });
 
   test("gemini report captures only the final agent message from multi-message turn", () => {
@@ -2030,14 +2056,12 @@ describe("agy lifecycle hooks", () => {
 
     // Setup review lane and work lane in ledger
     const now = new Date().toISOString();
-    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+    writeLedger(state, {
       "review-lane": {
         engine: "gemini",
-        cwd: "/tmp",
+        work: { state: "running", cwd: "/tmp" },
         effort: "high",
-        state: "running",
-        reviewState: "running",
-        reviewRound: 1,
+        review: { state: "running", cwd: "/tmp", round: 1 },
         kind: "review",
         rounds: 1,
         reports: [],
@@ -2046,17 +2070,15 @@ describe("agy lifecycle hooks", () => {
       },
       "work-lane": {
         engine: "gemini",
-        cwd: "/tmp",
+        work: { state: "running", cwd: "/tmp" },
         effort: "high",
-        state: "running",
-        workState: "running",
         kind: "work",
         rounds: 1,
         reports: [],
         createdAt: now,
         updatedAt: now,
       },
-    }));
+    });
 
     const reviewEnv = { ...env, CDX_LANE: "review-lane", CDX_ROUND: "1" };
 
@@ -2108,13 +2130,11 @@ describe("agy lifecycle hooks", () => {
     mkdirSync(`${state}/control`, { recursive: true });
 
     const now = new Date().toISOString();
-    writeFileSync(`${state}/ledger.json`, JSON.stringify({
+    writeLedger(state, {
       "steer-lane": {
         engine: "gemini",
-        cwd: "/tmp",
+        work: { state: "running", cwd: "/tmp" },
         effort: "high",
-        state: "running",
-        workState: "running",
         kind: "work",
         rounds: 1,
         reports: [],
@@ -2123,7 +2143,7 @@ describe("agy lifecycle hooks", () => {
         steers: 0,
         ownerSession: "12345678-session",
       },
-    }));
+    });
 
     const sentAt1 = "2026-09-03T10:00:00.000Z";
     const sentAt2 = "2026-09-03T10:01:00.000Z";
@@ -2150,7 +2170,7 @@ describe("agy lifecycle hooks", () => {
     });
 
     expect(readFileSync(`${state}/control/steer-lane-r1.delivered`, "utf8").trim()).toBe("2");
-    const ledger1 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"];
+    const ledger1 = readJson(`${state}/ledger.json`)["steer-lane"];
     expect(ledger1.steers).toBe(2);
 
     const feedLines = readFileSync(`${state}/feed.log`, "utf8").trim().split("\n");
@@ -2168,7 +2188,7 @@ describe("agy lifecycle hooks", () => {
     expect(JSON.parse(res2.stdout.toString())).toEqual({});
 
     expect(readFileSync(`${state}/control/steer-lane-r1.delivered`, "utf8").trim()).toBe("2");
-    const ledger2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["steer-lane"];
+    const ledger2 = readJson(`${state}/ledger.json`)["steer-lane"];
     expect(ledger2.steers).toBe(2);
     const feedLines2 = readFileSync(`${state}/feed.log`, "utf8").trim().split("\n");
     expect(feedLines2).toHaveLength(2);
@@ -2195,7 +2215,7 @@ describe("agy lifecycle hooks", () => {
     };
 
     expect(runCli(["spawn", "hooks-lane", "--engine", "gemini", "--cd", root, "--bg", "WAIT_FOR_FOLLOW_UP LONG_SLEEP"], env).exitCode).toBe(0);
-    await waitFor(() => existsSync(`${state}/ledger.json`) && JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.codexPid);
+    await waitFor(() => existsSync(`${state}/ledger.json`) && readJson(`${state}/ledger.json`)["hooks-lane"]?.codexPid);
 
     // Send while first turn is active
     expect(runCli(["send", "hooks-lane", "steer while active"], env).exitCode).toBe(0);
@@ -2212,17 +2232,17 @@ describe("agy lifecycle hooks", () => {
     await Bun.sleep(300);
     const immediateUsers = getStdinUsers();
     expect(immediateUsers.some((u: string) => u.includes("steer while active"))).toBe(false);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.state).toBe("running");
+    expect(readJson(`${state}/ledger.json`)["hooks-lane"]?.work?.state).toBe("running");
 
     // Wait for the lane to complete
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"]?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`)["hooks-lane"]?.work?.state === "done");
 
     // After result arrived, it was delivered as follow-up turn once
     const finalUsers = getStdinUsers();
     expect(finalUsers.filter((u: string) => u.includes("steer while active"))).toHaveLength(1);
     expect(readFileSync(`${state}/reports/hooks-lane-r1.md`, "utf8").trim()).toContain("follow-up result: steer while active");
     expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("mode=follow-up-turn");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["hooks-lane"].steers).toBe(1);
+    expect(readJson(`${state}/ledger.json`)["hooks-lane"].steers).toBe(1);
     expect(readFileSync(`${state}/control/hooks-lane-r1.delivered`, "utf8").trim()).toBe("1");
   }, 15_000);
 
@@ -2490,9 +2510,9 @@ describe("gemini quota handling", () => {
     expect(resetTime).toBeGreaterThanOrEqual(before + expectedDelay);
     expect(resetTime).toBeLessThanOrEqual(after + expectedDelay + 2000);
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     const lane = ledger["quota-lane"];
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toBe(`turn failed: gemini five-hour quota exhausted; resets at ${quota.blockedUntil}; resume this lane after the reset`);
     expect(lane.work.note).not.toContain("Individual quota reached");
     expect(lane.work.note).not.toContain("trailing chatter");
@@ -2739,7 +2759,7 @@ describe("gemini quota handling", () => {
 
     const result = runCli(["adopt", "adopted-lane", "4a5e2f7b-1111-2222-3333-444455556666", "--engine", "gemini"], env);
     expect(result.exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     expect(ledger["adopted-lane"]?.engine).toBe("gemini");
     expect(ledger["adopted-lane"]?.sessionId).toBe("4a5e2f7b-1111-2222-3333-444455556666");
   });
@@ -2807,9 +2827,9 @@ describe("gemini quota handling", () => {
     expect(r1Spawn.exitCode).toBe(1);
     expect(existsSync(`${state}/gemini-quota.json`)).toBe(true);
 
-    const ledgerR1 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledgerR1 = readJson(`${state}/ledger.json`);
     const laneR1 = ledgerR1["replay-lane"];
-    expect(laneR1.state).toBe("failed");
+    expect(laneR1.work.state).toBe("failed");
     const expectedError = "ERROR: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 27m19s.";
     expect(laneR1.lastResultError).toBe(expectedError);
 
@@ -2819,9 +2839,9 @@ describe("gemini quota handling", () => {
     const r2Resume = runCli(["resume", "replay-lane", "REPLAYED_ERROR_WITH_REPORT"], env);
     expect(r2Resume.exitCode).toBe(0);
 
-    const ledgerR2 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledgerR2 = readJson(`${state}/ledger.json`);
     const laneR2 = ledgerR2["replay-lane"];
-    expect(laneR2.state).toBe("done");
+    expect(laneR2.work.state).toBe("done");
     // Ruling (1): lastResultError is RETAINED on replayed success
     expect(laneR2.lastResultError).toBe(expectedError);
 
@@ -2841,9 +2861,9 @@ describe("gemini quota handling", () => {
     const r3Resume = runCli(["resume", "replay-lane", "REPLAYED_ERROR_WITH_REPORT"], env);
     expect(r3Resume.exitCode).toBe(0);
 
-    const ledgerR3 = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledgerR3 = readJson(`${state}/ledger.json`);
     const laneR3 = ledgerR3["replay-lane"];
-    expect(laneR3.state).toBe("done");
+    expect(laneR3.work.state).toBe("done");
     expect(laneR3.lastResultError).toBe(expectedError);
     expect(existsSync(`${state}/reports/replay-lane-r3.md`)).toBe(true);
 
@@ -2856,8 +2876,8 @@ describe("gemini quota handling", () => {
 
     const diffResume = runCli(["resume", "diff-lane", "DIFF_ERROR_NO_REPORT"], env);
     expect(diffResume.exitCode).toBe(1);
-    const ledgerDiff = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
-    expect(ledgerDiff["diff-lane"].state).toBe("failed");
+    const ledgerDiff = readJson(`${state}/ledger.json`);
+    expect(ledgerDiff["diff-lane"].work.state).toBe("failed");
     expect(ledgerDiff["diff-lane"].lastResultError).toBe("ERROR: A completely different error occurred.");
 
     // 4. A replayed error with no agent_response text still fails
@@ -2869,8 +2889,8 @@ describe("gemini quota handling", () => {
 
     const noReportResume = runCli(["resume", "no-report-lane", "REPLAYED_ERROR_NO_REPORT"], env);
     expect(noReportResume.exitCode).toBe(1);
-    const ledgerNoReport = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
-    expect(ledgerNoReport["no-report-lane"].state).toBe("failed");
+    const ledgerNoReport = readJson(`${state}/ledger.json`);
+    expect(ledgerNoReport["no-report-lane"].work.state).toBe("failed");
   });
 
   test("transport errors are excluded from replay detection: stream-interrupted error with response text auto-continues, does not finalize done", { timeout: 25_000 }, () => {
@@ -2884,9 +2904,9 @@ describe("gemini quota handling", () => {
     const spawnResult = runCli(["spawn", "transport-lane", "--engine", "gemini", "--cd", root, "STREAM_INTERRUPT_WITH_REPORT"], env);
     expect(spawnResult.exitCode).toBe(0);
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     const lane = ledger["transport-lane"];
-    expect(lane.state).toBe("done");
+    expect(lane.work.state).toBe("done");
     expect(lane.continuations).toBe(1);
 
     const feed = readFileSync(`${state}/feed.log`, "utf8");
@@ -2919,7 +2939,7 @@ describe("gemini quota handling", () => {
     expect(existsSync(reportPath)).toBe(true);
     expect(readFileSync(reportPath, "utf8")).toContain("# Review Replayed");
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     expect(ledger["rev-lane"].review.state).toBe("done");
   });
 
@@ -2960,9 +2980,9 @@ describe("gemini quota handling", () => {
     // Block must NOT be written because usage was 91% (>= 5%)
     expect(existsSync(`${state}/gemini-quota.json`)).toBe(false);
 
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     const lane = ledger["healthy-lane"];
-    expect(lane.state).toBe("failed");
+    expect(lane.work.state).toBe("failed");
     expect(lane.work.note).toContain("agy reported quota exhausted but usage shows 91% five-hour remaining; no block written");
     expect(lane.lastResultError).toContain("Individual quota reached");
   });
@@ -2985,7 +3005,7 @@ describe("cdx models and supervisors", () => {
     let requests = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
     expect(requests.find((request) => request.method === "thread/start").params.model).toBe("gpt-6-pro");
     expect(requests.find((request) => request.method === "turn/start").params.effort).toBe("xhigh");
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     expect(ledger["m-astra"].model).toBe("gpt-6-pro");
     expect(ledger["m-astra"].effort).toBe("xhigh");
     expect(runCli(["status"], env).stdout).toContain("model=gpt-6-pro");
@@ -3011,7 +3031,7 @@ describe("cdx models and supervisors", () => {
     expect(forkFlag.exitCode).toBe(1);
     expect(forkFlag.stderr).toContain("fork inherits the source lane's model (gpt-6-pro)");
     expect(runCli(["fork", "m-fork", "m-astra", "REPORT_ONLY"], env).exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["m-fork"].model).toBe("gpt-6-pro");
+    expect(readJson(`${state}/ledger.json`)["m-fork"].model).toBe("gpt-6-pro");
 
     expect(runCli(["help"], env).stdout).toContain("model gpt-5.6-sol (aliases astra=gpt-6-astra, pro=gpt-6-pro)");
   }, 30_000);
@@ -3052,7 +3072,7 @@ describe("cdx models and supervisors", () => {
     expect(spawned.stdout).toContain("engine=gpt model=gpt-6-astra supervisor mode=spawn");
     await waitFor(() => existsSync(supervisorTrace) && readFileSync(supervisorTrace, "utf8").trim() === "sup");
     expect(readFileSync(`${state}/briefs/sup-r1.md`, "utf8")).toContain("You are the owner's driver.");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBe(true);
+    expect(readJson(`${state}/ledger.json`).sup.supervisor).toBe(true);
     expect(runCli(["status"], env).stdout).toContain("engine=gpt  model=gpt-6-astra  supervisor");
 
     // A plain gpt worker gets no supervisor variable.
@@ -3066,7 +3086,7 @@ describe("cdx models and supervisors", () => {
     const child = runCli(["spawn", "child", "--gate", gateCmd, "--cd", root, "BUILD_SMALL_THING"], inside);
     expect(child.exitCode).toBe(0);
     expect(existsSync(gateMarker)).toBe(true);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     expect(ledger.child.parent).toBe("sup");
     expect(ledger.child.parentRound).toBe(1);
     expect(ledger.child.engine).toBe("gemini");
@@ -3088,27 +3108,27 @@ describe("cdx models and supervisors", () => {
     const respawnChild = runCli(["spawn", "child", "--cd", root, "BUILD_SMALL_THING"], inside);
     expect(respawnChild.exitCode).toBe(0);
     expect(existsSync(gateMarker)).toBe(true);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).child.gate).toBe(gateCmd);
+    expect(readJson(`${state}/ledger.json`).child.gate).toBe(gateCmd);
     expect(JSON.parse(readFileSync(`${state}/specs/child-r2.json`, "utf8")).gate).toBe(gateCmd);
     expect(runCli(["gate", "child", "exit 2"], env).exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).child.gate).toBe("exit 2");
+    expect(readJson(`${state}/ledger.json`).child.gate).toBe("exit 2");
     expect(runCli(["gate", "child", "exit 0"], env).exitCode).toBe(0);
 
     // Supervisor can spawn GPT children, consult, and GPT reviews
     const gptChild = runCli(["spawn", "child-gpt", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], inside);
     expect(gptChild.exitCode).toBe(0);
-    const ledgerGpt = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["child-gpt"];
+    const ledgerGpt = readJson(`${state}/ledger.json`)["child-gpt"];
     expect(ledgerGpt.parent).toBe("sup");
     expect(ledgerGpt.parentRound).toBe(1);
     expect(ledgerGpt.engine).toBe("gpt");
 
     const childConsult = runCli(["consult", "child-consult", "--cd", root, "Should we refactor?"], inside);
     expect(childConsult.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["child-consult"].parent).toBe("sup");
+    expect(readJson(`${state}/ledger.json`)["child-consult"].parent).toBe("sup");
 
     const gptReview = runCli(["review", "child", "--engine", "gpt", "look again"], inside);
     expect(gptReview.exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).child.reviewEngine).toBe("gpt");
+    expect(readJson(`${state}/ledger.json`).child.reviewEngine).toBe("gpt");
 
     const nested = runCli(["spawn", "child-sup", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], inside);
     expect(nested.exitCode).toBe(1);
@@ -3154,12 +3174,12 @@ describe("cdx models and supervisors", () => {
     // Once the supervisor round is over its identity is dead, and a plain
     // respawn of the same name is a plain lane again.
     expect(runCli(["kill", "sup"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.state === "failed");
+    await waitFor(() => readJson(`${state}/ledger.json`).sup.work.state === "failed");
     const finished = runCli(["spawn", "child-late", "--cd", root, "BUILD_SMALL_THING"], inside);
     expect(finished.exitCode).toBe(1);
     expect(finished.stderr).toContain("does not match a running supervisor round");
     expect(runCli(["spawn", "sup", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).sup.supervisor).toBeUndefined();
+    expect(readJson(`${state}/ledger.json`).sup.supervisor).toBeUndefined();
   }, 40_000);
 
   test("consult runs a read-only gpt lane with the advisor frame and resumes read-only", () => {
@@ -3180,7 +3200,7 @@ describe("cdx models and supervisors", () => {
     expect(args).toContain("read-only");
     expect(args).toContain("gpt-6-astra");
     expect(readFileSync(`${state}/reports/advisor-r1.md`, "utf8")).toContain("fake exec report");
-    const lane = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).advisor;
+    const lane = readJson(`${state}/ledger.json`).advisor;
     expect(lane.kind).toBe("review");
     expect(lane.consult).toBe(true);
     expect(lane.model).toBe("gpt-6-astra");
@@ -3213,12 +3233,12 @@ describe("cdx models and supervisors", () => {
     expect(runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
     const inside = { ...env, CDX_LANE: "sup", CDX_SUPERVISOR: "sup", CDX_ROUND: "1", CDX_OWNER: "terminal" };
     expect(runCli(["spawn", "child", "--cd", root, "--bg", "HANG_AGY"], inside).exitCode).toBe(0);
-    const read = () => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const read = () => readJson(`${state}/ledger.json`);
     await waitFor(() => read().sup?.codexPid && read().child?.codexPid);
 
     const killed = runCli(["kill", "sup", "stop everything"], env);
     expect(killed.exitCode).toBe(0);
-    await waitFor(() => read().sup.state === "failed" && read().child.state === "failed");
+    await waitFor(() => read().sup.work.state === "failed" && read().child.work.state === "failed");
     // The supervisor's runner settles its children as part of its own
     // finalization; the CLI cascade is the fallback for a dead runner.
     expect(read().sup.work.note).toContain("stop everything");
@@ -3233,14 +3253,14 @@ describe("cdx models and supervisors", () => {
     const env = { ...baseEnv(state), PATH: `${binCodex}:${binAgy}:${process.env.PATH ?? ""}` };
     expect(runCli(["spawn", "sup", "--engine", "gpt", "--supervisor", "--cd", root, "--bg", "WAIT_FOR_STEER"], env).exitCode).toBe(0);
     const inside = { ...env, CDX_LANE: "sup", CDX_SUPERVISOR: "sup", CDX_ROUND: "1", CDX_OWNER: "terminal" };
-    const read = () => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const read = () => readJson(`${state}/ledger.json`);
     await waitFor(() => Boolean(read().sup?.codexPid));
     expect(runCli(["spawn", "child", "--cd", root, "--bg", "HANG_AGY"], inside).exitCode).toBe(0);
     await waitFor(() => Boolean(read().child?.codexPid));
 
     // The steer completes the supervisor's turn while the child still hangs.
     expect(runCli(["send", "sup", "finish now"], env).exitCode).toBe(0);
-    await waitFor(() => read().sup.state === "failed" && read().child.state === "failed", 15_000);
+    await waitFor(() => read().sup.work.state === "failed" && read().child.work.state === "failed", 15_000);
     expect(read().sup.work.note).toBe("supervisor ended with running children: child (stopped)");
     expect(read().child.work.note).toContain("supervisor sup round 1 ended");
   }, 30_000);
@@ -3271,7 +3291,7 @@ describe("cdx models and supervisors", () => {
     writeFileSync(`${state}/config.json`, JSON.stringify({ gemini: { model: "gemini-custom-pro", agent: "house-lane", reviewAgent: "house-review" } }));
     const env = { ...baseEnv(state, installFakeAgy(root)), FAKE_AGY_TRACE: trace };
     expect(runCli(["spawn", "pinned", "--engine", "gemini", "--cd", root, "--bg", "DONE"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`).pinned?.work?.state === "done");
     const spec = JSON.parse(readFileSync(`${state}/specs/pinned-r1.json`, "utf8"));
     expect(spec.model).toBe("gemini-custom-pro");
     expect(spec.agent).toBe("house-lane");
@@ -3279,7 +3299,7 @@ describe("cdx models and supervisors", () => {
     expect(work.args).toContain("gemini-custom-pro");
     expect(work.args).toContain("house-lane");
     expect(runCli(["review", "pinned", "--bg", "attack the change"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned?.review.state !== "running");
+    await waitFor(() => readJson(`${state}/ledger.json`).pinned?.review.state !== "running");
     const review = JSON.parse(readFileSync(`${state}/specs/pinned-r2.json`, "utf8"));
     expect(review.agent).toBe("house-review");
   }, 20_000);
@@ -3314,22 +3334,22 @@ describe("cdx view", () => {
     const startedAt = new Date(Date.now() - 120_000).toISOString();
     const later = new Date(Date.parse(startedAt) + 60_000).toISOString();
     const quietAt = new Date(Date.now() - 600_000).toISOString();
-    const lane = { engine: 'gpt', model: 'gpt-6-astra', kind: 'work', state: 'running', rounds: 1, reports: [], cwd: state, effort: 'medium', createdAt: startedAt, updatedAt: startedAt, roundStartedAt: startedAt, ownerSession: 'fixture-owner', tokens: { input: 1200, cached: 200, output: 300 } };
+    const lane = { engine: 'gpt', model: 'gpt-6-astra', kind: 'work', work: { state: 'running', cwd: state }, rounds: 1, reports: [], effort: 'medium', createdAt: startedAt, updatedAt: startedAt, roundStartedAt: startedAt, ownerSession: 'fixture-owner', tokens: { input: 1200, cached: 200, output: 300 } };
     const report = `${state}/reports/done-r1.md`;
     writeFileSync(report, 'Finished. --api-key fixture-secret');
     const ledger = {
       lead: { ...lane, supervisor: true, lastAction: 'Tracing the dispatcher and checking contracts' },
       child: { ...lane, engine: 'gemini', model: 'gemini-3.8-flash-high', parent: 'lead', parentRound: 1, lastEventAt: later, lastAction: 'Reading changed files for the next patch' },
-      done: { ...lane, state: 'done', updatedAt: later, reports: [report] },
-      failed: { ...lane, state: 'failed', updatedAt: later, lastAction: 'Check failed. Review the round report.' },
-      gate: { ...lane, state: 'gate-invalid' },
-      closed: { ...lane, state: 'closed' },
-      adopted: { ...lane, state: 'adopted' },
-      consult: { ...lane, state: 'done', consult: true },
-      review: { ...lane, kind: 'review', state: 'done', reviewState: 'running', reviewEngine: 'gemini', reviewUpdatedAt: later },
-      legacy: { ...lane, engine: undefined, roundStartedAt: undefined, createdAt: quietAt },
+      done: { ...lane, work: { ...lane.work, state: 'done' }, updatedAt: later, reports: [report] },
+      failed: { ...lane, work: { ...lane.work, state: 'failed' }, updatedAt: later, lastAction: 'Check failed. Review the round report.' },
+      gate: { ...lane, work: { ...lane.work, state: 'gate-invalid' } },
+      closed: { ...lane, work: { ...lane.work, state: 'closed' } },
+      adopted: { ...lane, work: { ...lane.work, state: 'adopted' } },
+      consult: { ...lane, work: { ...lane.work, state: 'done' }, consult: true },
+      review: { ...lane, kind: 'review', work: { ...lane.work, state: 'done' }, review: { state: 'running', cwd: state, updatedAt: later }, reviewEngine: 'gemini' },
+      legacy: { ...lane, roundStartedAt: undefined, createdAt: quietAt },
     };
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
     const finishedAt = new Date(Date.parse(startedAt) + 2_000).toISOString();
     const job = { state: 'done', startedAt, finishedAt, exitCode: 0, cwd: state, cmd: 'bun run check', log: `${state}/logs/job-check.log` };
     writeFileSync(`${state}/jobs.json`, JSON.stringify({ check: job, build: { ...job, state: 'running', finishedAt: undefined, exitCode: undefined, log: `${state}/logs/job-build.log` }, failed: { ...job, state: 'failed', exitCode: 1, log: `${state}/logs/missing.log` } }));
@@ -3469,11 +3489,12 @@ describe("cdx view", () => {
     expect(events).toContain('secret: [redacted]');
     expect(events).not.toContain('z'.repeat(40));
     writeFileSync(`${state}/logs/lead-r2.log`, 'New round output\n');
-    writeFileSync(`${state}/ledger.json`, JSON.stringify({ ...ledger, lead: { ...ledger.lead, rounds: 2 } }));
+    writeLedger(state, { ...ledger, lead: { ...ledger.lead, rounds: 2 } });
     await until('New round output');
     expect(events).toContain('"round":2,"lines":["New round output"]');
     expect(events).toContain('"reset":true');
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
+    const stored = readFileSync(`${state}/ledger.json`, 'utf8');
     controller.abort();
     await reader.cancel().catch(() => {});
     const curl = Bun.spawnSync(['curl', '--silent', '--show-error', `${url}/api/state`], { env });
@@ -3483,7 +3504,7 @@ describe("cdx view", () => {
     }
     proc.kill('SIGINT');
     expect(await proc.exited).toBe(0);
-    expect(readFileSync(`${state}/ledger.json`, 'utf8')).toBe(JSON.stringify(ledger));
+    expect(readFileSync(`${state}/ledger.json`, 'utf8')).toBe(stored);
   }, process.env.CDX_VIEW_SCREENSHOTS ? 120_000 : 15000);
 
   test('rejects non-loopback bind flags and does not create an empty home', async () => {
@@ -3546,9 +3567,9 @@ describe("cdx effort caps", () => {
   // A gemini review round stores "high" on the lane; the ledger patch below
   // reproduces that state without a gemini run.
   const recordEffort = (state: string, lane: string, effort: string) => {
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     ledger[lane].effort = effort;
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
   };
 
   test("a lane recorded above the cap resumes and forks clamped to the cap, and the clamp reaches codex", () => {
@@ -3566,25 +3587,23 @@ describe("cdx effort caps", () => {
     for (const lane of ["legacy-high", "legacy-fork-source", "legacy-consult"]) recordEffort(state, lane, "high");
     {
       // The fake exec prints no session id; a resumable consult needs one.
-      const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+      const ledger = readJson(`${state}/ledger.json`);
       ledger["legacy-consult"].sessionId = "22222222-2222-4222-8222-222222222222";
-      writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+      writeLedger(state, ledger);
     }
 
     writeFileSync(trace, "");
     const resumed = runCli(["resume", "legacy-high", "REPORT_ONLY"], env);
     expect(resumed.exitCode).toBe(0);
-    expect(resumed.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
     const turn = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((request) => request.method === "turn/start");
     expect(turn.params.effort).toBe("medium");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["legacy-high"].effort).toBe("medium");
+    expect(readJson(`${state}/ledger.json`)["legacy-high"].effort).toBe("medium");
 
     // Fork straight from a source still recorded at high.
     writeFileSync(trace, "");
     const forked = runCli(["fork", "legacy-fork", "legacy-fork-source", "REPORT_ONLY"], env);
     expect(forked.exitCode).toBe(0);
-    expect(forked.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["legacy-fork"].effort).toBe("medium");
+    expect(readJson(`${state}/ledger.json`)["legacy-fork"].effort).toBe("medium");
     const forkTurn = readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((request) => request.method === "turn/start");
     expect(forkTurn.params.effort).toBe("medium");
 
@@ -3592,7 +3611,6 @@ describe("cdx effort caps", () => {
     // session's stored effort unless the override travels with the turn.
     writeFileSync(argsTrace, "");
     const consult = runCli(["resume", "legacy-consult", "follow up"], env);
-    expect(consult.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
     const execArgs = readFileSync(argsTrace, "utf8").trim().split("\n").find((line) => line.startsWith("exec resume"));
     expect(execArgs).toContain("model_reasoning_effort=medium");
   }, 30000);
@@ -3608,19 +3626,17 @@ describe("cdx effort caps", () => {
     // defaultEffort above the cap clamps with a note instead of failing.
     const spawned = runCli(["spawn", "default-high", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
     expect(spawned.exitCode).toBe(0);
-    expect(spawned.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
     expect(readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).find((request) => request.method === "turn/start").params.effort).toBe("medium");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"))["default-high"].effort).toBe("medium");
+    expect(readJson(`${state}/ledger.json`)["default-high"].effort).toBe("medium");
     const review = runCli(["review", "default-review", "--engine", "gpt", "--cd", root, "review this"], env);
     expect(review.exitCode).toBe(0);
-    expect(review.stderr).toContain("running at medium");
 
     // A respawn without --model keeps the lane's model, so a sol lane at high
     // is not judged as astra.
     expect(runCli(["spawn", "sol-lane", "--engine", "gpt", "--model", "gpt-5.6-sol", "--effort", "high", "--cd", root, "REPORT_ONLY"], env).exitCode).toBe(0);
     const respawn = runCli(["spawn", "sol-lane", "--engine", "gpt", "--effort", "high", "--cd", root, "REPORT_ONLY"], env);
     expect(respawn.exitCode).toBe(0);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     expect(ledger["sol-lane"].model).toBe("gpt-5.6-sol");
     expect(ledger["sol-lane"].effort).toBe("high");
   }, 30000);
@@ -3649,13 +3665,8 @@ describe("cdx effort caps", () => {
 });
 
 describe("cdx account advisor", () => {
-  const DAY = 86_400;
-  const WEEK_MINS = 10_080;
-  const window = (usedPercent: number, resetsAt: number, windowDurationMins = WEEK_MINS) => ({ usedPercent, windowDurationMins, resetsAt });
-  const snapshot = (usedPercent: number, resetsAt: number, extra: Record<string, unknown> = {}) => ({
-    checkedAt: new Date().toISOString(), usedPercent, windowDurationMins: WEEK_MINS, resetsAt, planType: "pro",
-    resetCreditsAvailable: 0, reached: usedPercent >= 99, windows: [window(usedPercent, resetsAt)], ...extra,
-  });
+  const window = fixtureWindow;
+  const snapshot = fixtureUsageSnapshot;
 
   function setup(label: string, usage: Record<string, unknown>) {
     const root = tempPath(label);
@@ -3690,84 +3701,85 @@ describe("cdx account advisor", () => {
     expect(spawned.stdout).toContain("cdx: account=codex-3 for work lane: 100% left");
     expect(spawned.stderr).toContain("account codex-1 consumed");
     expect(readFileSync(envTrace, "utf8").trim()).toBe(homes["codex-3"]);
-    expect(JSON.parse(readFileSync(`${env.CDX_HOME}/ledger.json`, "utf8")).edf.account).toBe("codex-3");
+    expect(readJson(`${env.CDX_HOME}/ledger.json`).edf.account).toBe("codex-3");
   }, 15000);
 
-  test("headroom admission enforces thresholds for work and supervisor, warns light lanes, ranks unknown, and allows --account force", () => {
-    const now = Math.floor(Date.now() / 1000);
+  test("one eligibility rule applies thresholds, unknown fallback, and exhaustion to every demand", () => {
+    const reset = Math.floor(Date.now() / 1000) + DAY;
+    const account = (name: string, remaining?: number) => standingOf({ name, home: `/tmp/${name}` }, remaining === undefined ? undefined : snapshot(100 - remaining, reset));
+    const near = account("near", 14.6), far = account("far", 80), unknown = account("unknown"), empty = account("empty", 0);
+    expect(decideAccount([near, far, unknown], "work")?.choice.name).toBe("far");
+    expect(decideAccount([near, unknown], "supervisor")?.choice.name).toBe("unknown");
+    expect(decideAccount([account("tiny", 2), empty], "light")?.choice.name).toBe("tiny");
+    for (const demand of ["light", "work", "supervisor"] as const) expect(decideAccount([empty], demand)).toBeUndefined();
+    const tight = setup("forced-exhausted", { only: snapshot(100, reset) });
+    const refused = runCli(["review", "forced", "--engine", "gpt", "--account", "only", "--cd", tight.root, "look"], tight.env);
+    expect(refused.exitCode).toBe(1);
+    expect(refused.stderr).toContain("exhausted");
+  });
 
-    // Multi-account setup: near has 14.6% left (below 15% work threshold), far has 80% left, mystery has unknown usage
-    const { root, homes, env, envTrace } = setup("advisor-admission", {
-      "near": snapshot(85.4, now + 1 * DAY),
-      "far": snapshot(20, now + 6 * DAY),
-      "mystery": { checkedAt: new Date(0).toISOString(), usedPercent: 0, windowDurationMins: 0, resetsAt: 0, planType: "unknown", resetCreditsAvailable: 0, reached: false, probeFailedAt: new Date().toISOString() },
-    });
+  test("holds use the active round demand and survive a runner exit while its engine lives", () => {
+    const choice = { name: "one", home: "/tmp/one" };
+    const standing = standingOf(choice, snapshot(20, Math.floor(Date.now() / 1000) + DAY));
+    const round = (extra: Record<string, unknown>) => ({ engine: "gpt", work: { state: "running", cwd: "/tmp" }, kind: "work", rounds: 1, reports: [], effort: "medium", roundAccount: { ...choice, demand: "work" }, ...extra }) as any;
+    const ledger = {
+      review: round({ kind: "review", work: { state: "done", cwd: "/tmp" }, review: { state: "running", cwd: "/tmp" }, supervisor: true, pid: process.pid, roundAccount: { ...choice, demand: "light" } }),
+      engine: round({ codexPid: process.pid }),
+      dead: round({}),
+      done: round({ pid: process.pid, work: { state: "done", cwd: "/tmp" } }),
+    };
+    expect(withAccountHolds([standing], ledger)[0]).toMatchObject({ heldPercent: 20, remainingPercent: 60 });
+    const full = withAccountHolds([{ ...standing, remainingPercent: 20 }], ledger);
+    expect(decideAccount(full, "light")).toBeUndefined();
+  });
 
-    // Light lane (5% threshold) fits in near (14.6% left)
-    const review = runCli(["review", "light", "--engine", "gpt", "--cd", root, "review this"], env);
-    expect(review.exitCode).toBe(0);
-    expect(review.stdout).toContain("cdx: account=near for consult/review lane: 15% left");
+  test("concurrent launches cannot spend the same remaining headroom", async () => {
+    const reset = Math.floor(Date.now() / 1000) + DAY;
+    const { root, state, env } = setup("concurrent-admission", { first: snapshot(80, reset), next: snapshot(80, reset + DAY) });
+    const names = ["left", "right"];
+    try {
+      const launches = names.map((name) => Bun.spawn([process.execPath, CLI, "spawn", name, "--engine", "gpt", "--cd", root, "--bg", "WAIT_FOR_STEER"], { env, stdout: "pipe", stderr: "pipe" }));
+      const results = await Promise.all(launches.map(async (proc) => {
+        const [, stderr, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+        return { code, stderr };
+      }));
+      for (const result of results) expect(result.code, result.stderr).toBe(0);
+      await waitFor(() => names.every((name) => readJson(`${state}/ledger.json`)[name]?.codexPid));
+      const ledger = readJson(`${state}/ledger.json`);
+      expect(new Set(names.map((name) => ledger[name].roundAccount.home)).size).toBe(2);
+    } finally {
+      for (const name of names) runCli(["kill", name], env);
+    }
+  }, 15000);
 
-    // Work lane (15% threshold) skips near (14.6% < 15%) and unknown, selecting far (80% left)
-    writeFileSync(envTrace, "");
-    const work = runCli(["spawn", "work-lane", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
-    expect(work.exitCode).toBe(0);
-    expect(work.stdout).toContain("cdx: account=far for work lane: 80% left");
-    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes.far);
+  test.each(["spawn", "review", "consult"])("%s recovers quota failures on a fresh home and invalidates completion evidence", (command) => {
+    const reset = Math.floor(Date.now() / 1000) + DAY;
+    const { root, state, homes, env } = setup(`failover-${command}`, { first: snapshot(0, reset), next: snapshot(0, reset + DAY) });
+    const args = [command, "switch", ...(command === "consult" ? [] : ["--engine", "gpt"]), "--cd", root, "QUOTA_ERROR"];
+    const result = runCli(args, env);
+    expect(result.exitCode).toBe(0);
+    const lane = readJson(`${state}/ledger.json`).switch;
+    expect(lane.rounds).toBe(2);
+    expect(lane.roundAccount.home).toBe(homes.next);
+    expect((lane.kind === "review" ? lane.review : lane.work).state).toBe("done");
+    const spec = readJson(`${state}/specs/switch-r2.json`);
+    expect(spec.prompt).toContain("QUOTA_ERROR");
+    expect(spec.prompt).toContain("round 1: account=first");
+    expect(spec.sourceThreadId).toBeUndefined();
+    if (command !== "spawn") expect(spec.codexArgs).toContain("read-only");
+    const usage = readJson(`${state}/usage.json`).accounts;
+    expect(usage.first.exhaustedUntil).toBeGreaterThan(Date.now() / 1000);
+    expect(usage.first.usedPercent).toBe(100);
+    expect(usage.first.reached).toBe(true);
+    expect(usage.next.invalidatedAt).toBeDefined();
+    expect(readFileSync(`${state}/feed.log`, "utf8")).toContain("auto-switch from=first to=next");
+  }, 15000);
 
-    // Supervisor lane (25% threshold) selects far (80% left)
-    const supervisor = runCli(["spawn", "boss", "--engine", "gpt", "--supervisor", "--cd", root, "REPORT_ONLY"], env);
-    expect(supervisor.exitCode).toBe(0);
-    expect(supervisor.stdout).toContain("cdx: account=far for supervisor lane");
-
-    // Forced with --account overrides threshold and unknown ranking
-    writeFileSync(envTrace, "");
-    const forcedNear = runCli(["spawn", "forced-near", "--engine", "gpt", "--account", "near", "--cd", root, "REPORT_ONLY"], env);
-    expect(forcedNear.exitCode).toBe(0);
-    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes.near);
-
-    writeFileSync(envTrace, "");
-    const forcedMystery = runCli(["spawn", "forced-unknown", "--engine", "gpt", "--account", "mystery", "--cd", root, "REPORT_ONLY"], env);
-    expect(forcedMystery.exitCode).toBe(0);
-    expect(readFileSync(envTrace, "utf8").trim()).toBe(homes.mystery);
-
-    // Fallback: short has 8% left (<15% work threshold), mystery has unknown usage
-    const fallback = setup("advisor-fallback", {
-      "short": snapshot(92, now + 1 * DAY),
-      "mystery": { checkedAt: new Date(0).toISOString(), usedPercent: 0, windowDurationMins: 0, resetsAt: 0, planType: "unknown", resetCreditsAvailable: 0, reached: false, probeFailedAt: new Date().toISOString() },
-    });
-    // Light lane takes known capacity short (8% >= 5%)
-    const lightFallback = runCli(["review", "light-fallback", "--engine", "gpt", "--cd", fallback.root, "look"], fallback.env);
-    expect(lightFallback.exitCode).toBe(0);
-    expect(lightFallback.stdout).toContain("cdx: account=short for consult/review lane: 8% left");
-    // Work lane falls back to unknown account mystery when known account is below 15% threshold
-    writeFileSync(fallback.envTrace, "");
-    const workFallback = runCli(["spawn", "work-fallback", "--engine", "gpt", "--cd", fallback.root, "REPORT_ONLY"], fallback.env);
-    expect(workFallback.exitCode).toBe(0);
-    expect(workFallback.stdout).toContain("cdx: account=mystery for work lane");
-    expect(workFallback.stderr).toContain("WARNING: mystery usage unknown");
-    expect(readFileSync(fallback.envTrace, "utf8").trim()).toBe(fallback.homes.mystery);
-
-    // Tight accounts setup: a has 8% left, b has 10% left, no unknown account
-    const tight = setup("advisor-tight", {
-      "a": snapshot(92, now + 1 * DAY),
-      "b": snapshot(90, now + 6 * DAY),
-    });
-    // Work lane refused when no account has 15% remaining headroom
-    const tightWork = runCli(["spawn", "tight-work", "--engine", "gpt", "--cd", tight.root, "REPORT_ONLY"], tight.env);
-    expect(tightWork.exitCode).toBe(1);
-    expect(tightWork.stderr).toContain("no account has 15% remaining headroom for a work lane (b: 10% left");
-
-    // Single account with 2% left: supervisor (needs 25%) refused, light (needs 5%) warns and starts
-    const single = setup("advisor-single", { "only": snapshot(98, now + 2 * DAY) });
-    const bossFail = runCli(["spawn", "boss-fail", "--engine", "gpt", "--supervisor", "--cd", single.root, "REPORT_ONLY"], single.env);
-    expect(bossFail.exitCode).toBe(1);
-    expect(bossFail.stderr).toContain("no account has 25% remaining headroom for a supervisor lane (only: 2% left");
-
-    const peek = runCli(["consult", "peek", "--cd", single.root, "look"], single.env);
-    expect(peek.exitCode).toBe(0);
-    expect(peek.stderr).toContain("WARNING: no account has 5% remaining headroom for a consult/review lane; only has 2%");
-  }, 30000);
+  test("quota failure without an eligible alternate reports resets", () => {
+    const { root, state, env } = setup("failover-empty", { only: snapshot(0, Math.floor(Date.now() / 1000) + DAY) });
+    expect(runCli(["spawn", "blocked", "--engine", "gpt", "--cd", root, "QUOTA_ERROR"], env).exitCode).toBe(1);
+    expect(readJson(`${state}/ledger.json`).blocked.work.note).toContain("resets");
+  });
 
   test("usage prints the spend order, picks per headroom, and the pace to empty; --json carries the same advice", () => {
     const now = Math.floor(Date.now() / 1000);
@@ -3811,9 +3823,9 @@ describe("cdx account advisor", () => {
     const stored = JSON.parse(readFileSync(`${env.CDX_HOME}/usage.json`, "utf8")).accounts;
     for (const name of ["legacy", "reset", "old"]) expect(stored[name].probeFailedAt).toBeDefined();
     const usage = runCli(["usage"], env).stdout;
-    expect(usage).toContain("then legacy (usage unknown: snapshot predates 3.10");
-    expect(usage).toContain("then reset (usage unknown: window reset 5m ago");
-    expect(usage).toContain("then old (usage unknown: probe failed; last reading 40m ago said 90% left");
+    expect(usage).toContain("legacy (usage unknown: snapshot has no quota windows");
+    expect(usage).toContain("reset (usage unknown: window reset 5m ago");
+    expect(usage).toContain("old (usage unknown: probe failed; last reading 40m ago said 90% left");
   }, 30000);
 });
 
@@ -3868,54 +3880,52 @@ describe("4.0 runner and ledger", () => {
 
     const waited = runCli(["wait", "legacy", "--json", "--report"], env);
     expect(waited.exitCode).toBe(1);
-    expect(JSON.parse(waited.stdout)).toMatchObject({ state: "done", roundState: "failed", report, exitCode: 7 });
+    expect(JSON.parse(waited.stdout)).toMatchObject({ work: { state: "done" }, roundState: "failed", report, exitCode: 7 });
 
     // A fresh work round clears the seeded work.report while active and after failure
     const resumed = runCli(["resume", "v3", "--bg", "WAIT_FOR_STEER"], env);
     expect(resumed.exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).v3?.codexPid);
-    const v3Active = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).v3;
+    await waitFor(() => readJson(`${state}/ledger.json`).v3?.codexPid);
+    const v3Active = readJson(`${state}/ledger.json`).v3;
     expect(v3Active.work.state).toBe("running");
     expect(v3Active.work.report).toBeUndefined();
     expect(runCli(["kill", "v3"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).v3?.work?.state === "failed");
-    const v3Killed = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).v3;
+    await waitFor(() => readJson(`${state}/ledger.json`).v3?.work?.state === "failed");
+    const v3Killed = readJson(`${state}/ledger.json`).v3;
     expect(v3Killed.work.state).toBe("failed");
     expect(v3Killed.work.report).toBeUndefined();
 
     expect(runCli(["close", "legacy"], env).exitCode).toBe(0);
-    const written = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).legacy;
+    const written = readJson(`${state}/ledger.json`).legacy;
     expect(written.work.state).toBe("closed");
     expect(written.review).toEqual(lane.legacy.review);
     expect(written.workState).toBeUndefined();
     expect(written.reviewState).toBeUndefined();
     expect(JSON.parse(runCli(["status", "--json"], env).stdout).legacy.work).toEqual(written.work);
+    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).version).toBe(5);
+    expect(readFileSync(`${state}/.ledger-version`, "utf8").trim()).toBe("5");
+    writeFileSync(`${state}/ledger.json`, JSON.stringify({ legacy: written }));
+    expect(runCli(["status"], env).stderr).toContain("unsupported ledger shape after migration");
+    writeFileSync(`${state}/ledger.json`, "{}");
+    expect(runCli(["status"], env).exitCode).toBe(0);
   }, 15000);
 
-  test.each([false, true])("pins effort across a ledger edit and follow-up turn, legacy spec=%s", async (legacy) => {
+  test("pins effort across a ledger edit and follow-up turn", async () => {
     const root = tempPath("pinned-effort");
     const state = `${root}/state`;
     const trace = `${root}/trace`;
     const env = { ...baseEnv(state, installFakeCodex(root)), FAKE_REJECT_STEER: "1", FAKE_TRACE: trace };
-    if (legacy) {
-      for (const dir of ["reports", "logs", "specs"]) mkdirSync(`${state}/${dir}`, { recursive: true });
-      const now = new Date().toISOString();
-      writeFileSync(`${state}/ledger.json`, JSON.stringify({ pinned: { state: "running", cwd: root, kind: "work", rounds: 1, reports: [], effort: "low", engine: "gpt", createdAt: now, updatedAt: now } }));
-      writeFileSync(`${state}/specs/pinned-r1.json`, JSON.stringify({ mode: "spawn", lane: "pinned", round: 1, cwd: root, engine: "gpt", prompt: "STEER_REJECTED_AFTER_COMPLETION" }));
-      runners.push(Bun.spawn([process.execPath, CLI, "_run", "pinned", "1"], { env: { ...env, CDX_STATE_HOME: state }, stdout: "pipe", stderr: "pipe" }));
-    } else {
-      expect(runCli(["spawn", "pinned", "--engine", "gpt", "--effort", "low", "--cd", root, "--bg", "STEER_REJECTED_AFTER_COMPLETION"], env).exitCode).toBe(0);
-    }
+    expect(runCli(["spawn", "pinned", "--engine", "gpt", "--effort", "low", "--cd", root, "--bg", "STEER_REJECTED_AFTER_COMPLETION"], env).exitCode).toBe(0);
     const starts = () => existsSync(trace) ? readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line)).filter((item) => item.method === "turn/start") : [];
     await waitFor(() => starts().length === 1);
-    const ledger = JSON.parse(readFileSync(`${state}/ledger.json`, "utf8"));
+    const ledger = readJson(`${state}/ledger.json`);
     ledger.pinned.effort = "high";
-    writeFileSync(`${state}/ledger.json`, JSON.stringify(ledger));
+    writeLedger(state, ledger);
     expect(runCli(["send", "pinned", "finish"], env).exitCode).toBe(0);
-    await waitFor(() => JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned.state === "done");
+    await waitFor(() => readJson(`${state}/ledger.json`).pinned.work.state === "done");
     expect(starts().map((item) => item.params.effort)).toEqual(["low", "low"]);
-    expect(JSON.parse(readFileSync(`${state}/specs/pinned-r1.json`, "utf8")).effort).toBe(legacy ? undefined : "low");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).pinned.review).toBeUndefined();
+    expect(JSON.parse(readFileSync(`${state}/specs/pinned-r1.json`, "utf8")).effort).toBe("low");
+    expect(readJson(`${state}/ledger.json`).pinned.review).toBeUndefined();
   }, 12000);
 
   test("resolves an unterminated app-server response before closing pending requests", () => {
@@ -3925,7 +3935,7 @@ describe("4.0 runner and ledger", () => {
     const result = runCli(["spawn", "trailing", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
     expect(result.exitCode).toBe(0);
     expect(readFileSync(`${state}/feed.log`, "utf8")).not.toContain("cleanup warning");
-    expect(JSON.parse(readFileSync(`${state}/ledger.json`, "utf8")).trailing.work.note).toBeUndefined();
+    expect(readJson(`${state}/ledger.json`).trailing.work.note).toBeUndefined();
   });
 
   test("preserves both account snapshots under concurrent writers", async () => {
@@ -3951,4 +3961,43 @@ describe("4.0 runner and ledger", () => {
       for (const proc of writers) { try { proc.kill(); } catch {} }
     }
   });
+});
+
+
+describe("5.0 estate and baseline contracts", () => {
+  test("sync replaces shared values exactly and preserves account-local files", () => {
+    const root = tempPath("account-sync");
+    const primary = `${root}/primary`, secondary = `${root}/secondary`;
+    fixtureCodexHome(primary, { configToml: 'model = "gpt-6-astra"\n[agents]\ninterrupt_message = true\n[mcp_servers.off]\nenabled = false\ncommand = "off"\n' });
+    fixtureCodexHome(secondary, { configToml: 'personality = "old"\nlocal_setting = "keep"\n[mcp_servers.extra]\ncommand = "extra"\n' });
+    writeFileSync(`${secondary}/auth.json`, "fixture-auth");
+    mkdirSync(`${secondary}/sessions`);
+    writeFileSync(`${secondary}/sessions/keep`, "fixture-session");
+    const errors: string[] = [];
+    syncAccountHomes({ primary, secondary }, true, () => {}, (...parts) => errors.push(parts.join(" ")));
+    expect(errors).toEqual([]);
+    const config = Bun.TOML.parse(readFileSync(`${secondary}/config.toml`, "utf8")) as any;
+    expect(config).toEqual({ model: "gpt-6-astra", local_setting: "keep", agents: { interrupt_message: true }, mcp_servers: { off: { enabled: false, command: "off" } } });
+    expect(readFileSync(`${secondary}/auth.json`, "utf8")).toBe("fixture-auth");
+    expect(readFileSync(`${secondary}/sessions/keep`, "utf8")).toBe("fixture-session");
+    const before = readFileSync(`${secondary}/config.toml`, "utf8");
+    writeFileSync(`${primary}/config.toml`, '[mcp_servers.secret.http_headers]\nAuthorization = "Bearer fixture-secret"\n[mcp_servers.secret.env_http_headers]\nX-Key = "ghp_fixturetoken"\n');
+    syncAccountHomes({ primary, secondary }, true, () => {}, (...parts) => errors.push(parts.join(" ")));
+    expect(errors.join(" ")).toContain("literal credentials");
+    expect(errors.join(" ")).not.toContain("fixture-secret");
+    expect(errors.join(" ")).not.toContain("fixturetoken");
+    expect(readFileSync(`${secondary}/config.toml`, "utf8")).toBe(before);
+  });
+
+  test.each([false, true])("worktree baseline runs only when opted in: %s", (baseline) => {
+    const root = tempPath("baseline-opt-in"), state = tempPath("baseline-state");
+    mkdirSync(root, { recursive: true });
+    expect(Bun.spawnSync({ cmd: ["git", "init", "-q"], cwd: root }).exitCode).toBe(0);
+    expect(Bun.spawnSync({ cmd: ["git", "-c", "user.name=CDX Test", "-c", "user.email=cdx@example.test", "commit", "--allow-empty", "-qm", "baseline"], cwd: root }).exitCode).toBe(0);
+    const result = runCli(["spawn", "baseline", "--engine", "gpt", "--cd", root, "--worktree", `${root}/tree`, "--gate", "exit 3", ...(baseline ? ["--gate-baseline-check"] : []), "REPORT_ONLY"], baseEnv(state, installFakeCodex(root)));
+    expect(result.exitCode).toBe(1);
+    const lane = readJson(`${state}/ledger.json`).baseline;
+    expect(lane.work.state).toBe(baseline ? "gate-invalid" : "failed");
+    expect(lane.gateBaseline?.exitCode).toBe(baseline ? 3 : undefined);
+  }, 15000);
 });
