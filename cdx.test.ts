@@ -2,7 +2,12 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, statSync, symlinkSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { readJsonLines, qualifyGeminiReport, redactViewText, houseRules, isAgyCancellationTemplate, REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, geminiQuotaState } from "./cdx.ts";
+import {
+  readJsonLines, qualifyGeminiReport, redactViewText, houseRules, isAgyCancellationTemplate,
+  REVIEW_FINDINGS_SCHEMA, GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso,
+  geminiQuotaState, rankAccounts, standingOf, withReservations, laneDemand, cappedEffort,
+  snapshotExpired, config,
+} from "./cdx.ts";
 
 const CLI = join(import.meta.dir, "cdx.ts");
 const runners: Bun.Subprocess[] = [];
@@ -1277,7 +1282,7 @@ describe("cdx execution engines", () => {
     expect(geminiRules).toContain("do not spawn subagents");
     expect(geminiRules).not.toContain("search_web");
     expect(geminiRules).toContain("remove the temporary diagnostics you added while debugging");
-    expect(geminiRules).toContain("The report lists exactly which files changed, the commands you ran with their exit codes, and an Assumptions heading (write 'none' if empty).");
+    expect(geminiRules).toContain("End with an Assumptions heading (write 'none' if empty).");
     expect(geminiRules).toContain("You are one lane of cdx");
 
     const gptRules = houseRules("/tmp", false, "gpt");
@@ -3912,5 +3917,270 @@ describe("4.0 runner and ledger", () => {
     const usage = JSON.parse(readFileSync(`${state}/usage.json`, "utf8"));
     expect(usage.accounts.one.usedPercent).toBe(39);
     expect(usage.accounts.two.usedPercent).toBe(39);
+  });
+});
+
+describe("pure policy functions in memory", () => {
+  test("plain import is inert, touching no user state and providing defaults", () => {
+    expect(config.model).toBe("gpt-6-astra");
+    expect(config.defaultEffort).toBe("medium");
+    expect(config.efforts).toEqual(["low", "medium", "high"]);
+    expect(config.effortCaps["gpt-6-astra"]).toBe("medium");
+  });
+
+  test("EDF ordering with headroom tiers ranks tier 0, 1, 2, 3 and orders by earliest deadline", () => {
+    const now = Math.floor(Date.now() / 1000);
+
+    const makeStanding = (
+      name: string,
+      resetsAt: number,
+      freePercent: number,
+      opts: { reached?: boolean; noSnapshot?: boolean } = {}
+    ) => {
+      const choice = { name, home: `/tmp/${name}` };
+      if (opts.noSnapshot) {
+        return {
+          choice,
+          remainingPercent: 0,
+          reservedPercent: 0,
+          reservedLanes: 0,
+          freePercent: 0,
+          reached: false,
+          reason: "usage unknown",
+        };
+      }
+      const window = {
+        usedPercent: 100 - freePercent,
+        windowDurationMins: 10080,
+        resetsAt,
+      };
+      const snapshot = {
+        checkedAt: new Date(now * 1000).toISOString(),
+        usedPercent: 100 - freePercent,
+        windowDurationMins: 10080,
+        resetsAt,
+        planType: "pro",
+        resetCreditsAvailable: 0,
+        reached: Boolean(opts.reached),
+        windows: [window],
+      };
+      return {
+        choice,
+        snapshot,
+        weekly: window,
+        remainingPercent: freePercent,
+        reservedPercent: 0,
+        reservedLanes: 0,
+        freePercent,
+        reached: Boolean(opts.reached),
+        reason: "ok",
+      };
+    };
+
+    const t0Soon = makeStanding("t0Soon", now + 1000, 40);
+    const t0TiedFuller = makeStanding("t0TiedFuller", now + 1000, 60);
+    const t0Later = makeStanding("t0Later", now + 2000, 80);
+
+    const t1Full = makeStanding("t1Full", now + 500, 10);
+    const t1Low = makeStanding("t1Low", now + 500, 2);
+
+    const t2Unknown = makeStanding("t2Unknown", 0, 0, { noSnapshot: true });
+
+    const t3Soon = makeStanding("t3Soon", now + 100, 0, { reached: true });
+    const t3Later = makeStanding("t3Later", now + 300, 0, { reached: true });
+
+    const scrambled = [t3Later, t1Low, t2Unknown, t0Later, t0Soon, t3Soon, t1Full, t0TiedFuller];
+    const ranked = rankAccounts(scrambled as any, "work");
+
+    expect(ranked.map((s) => s.choice.name)).toEqual([
+      "t0TiedFuller",
+      "t0Soon",
+      "t0Later",
+      "t1Full",
+      "t1Low",
+      "t2Unknown",
+      "t3Soon",
+      "t3Later",
+    ]);
+  });
+
+  test("reservation moves lane to next account when headroom drops below tier 0", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const choiceA = { name: "account-a", home: "/tmp/a" };
+    const choiceB = { name: "account-b", home: "/tmp/b" };
+
+    const winA = { usedPercent: 80, windowDurationMins: 10080, resetsAt: now + 1000 };
+    const winB = { usedPercent: 82, windowDurationMins: 10080, resetsAt: now + 2000 };
+
+    const standingA = {
+      choice: choiceA,
+      snapshot: {
+        checkedAt: new Date(now * 1000).toISOString(),
+        usedPercent: 80,
+        windowDurationMins: 10080,
+        resetsAt: now + 1000,
+        planType: "pro",
+        resetCreditsAvailable: 0,
+        reached: false,
+        windows: [winA],
+      },
+      weekly: winA,
+      remainingPercent: 20,
+      reservedPercent: 0,
+      reservedLanes: 0,
+      freePercent: 20,
+      reached: false,
+      reason: "20% left",
+    };
+
+    const standingB = {
+      choice: choiceB,
+      snapshot: {
+        checkedAt: new Date(now * 1000).toISOString(),
+        usedPercent: 82,
+        windowDurationMins: 10080,
+        resetsAt: now + 2000,
+        planType: "pro",
+        resetCreditsAvailable: 0,
+        reached: false,
+        windows: [winB],
+      },
+      weekly: winB,
+      remainingPercent: 18,
+      reservedPercent: 0,
+      reservedLanes: 0,
+      freePercent: 18,
+      reached: false,
+      reason: "18% left",
+    };
+
+    const unreservedRank = rankAccounts([standingA, standingB] as any, "work");
+    expect(unreservedRank[0].choice.name).toBe("account-a");
+
+    const ledger = {
+      "work-lane": {
+        work: { state: "running", cwd: "/tmp" },
+        kind: "work",
+        account: "account-a",
+        engine: "gpt",
+      },
+    };
+
+    const withRes = withReservations([standingA, standingB] as any, ledger as any);
+    const resA = withRes.find((s) => s.choice.name === "account-a")!;
+    const resB = withRes.find((s) => s.choice.name === "account-b")!;
+
+    expect(resA.reservedPercent).toBe(15);
+    expect(resA.reservedLanes).toBe(1);
+    expect(resA.freePercent).toBe(5);
+    expect(resA.reason).toContain("15% held by 1 running lane");
+
+    expect(resB.reservedPercent).toBe(0);
+    expect(resB.freePercent).toBe(18);
+
+    const reservedRank = rankAccounts(withRes, "work");
+    expect(reservedRank[0].choice.name).toBe("account-b");
+    expect(reservedRank[1].choice.name).toBe("account-a");
+  });
+
+  test("standingOf produces unknown evidence when snapshot lacks windows", () => {
+    const choice = { name: "legacy", home: "/tmp/legacy" };
+    const now = Math.floor(Date.now() / 1000);
+    const legacySnapshot = {
+      checkedAt: new Date(now * 1000).toISOString(),
+      usedPercent: 20,
+      windowDurationMins: 300,
+      resetsAt: now + 3600,
+      planType: "pro",
+      resetCreditsAvailable: 0,
+      reached: false,
+    };
+
+    const standing = standingOf(choice, legacySnapshot as any);
+    expect(standing.snapshot).toBeUndefined();
+    expect(standing.remainingPercent).toBe(0);
+    expect(standing.freePercent).toBe(0);
+    expect(standing.reached).toBe(false);
+    expect(standing.reason).toBe("usage unknown: snapshot predates 3.10; run cdx usage");
+  });
+
+  test("snapshotExpired detects expired window and standingOf treats it as unknown evidence", () => {
+    const now = Math.floor(Date.now() / 1000);
+    const choice = { name: "expired", home: "/tmp/expired" };
+
+    const liveWindow = { usedPercent: 40, windowDurationMins: 10080, resetsAt: now + 3600 };
+    const expiredWindow = { usedPercent: 40, windowDurationMins: 10080, resetsAt: now - 100 };
+
+    const liveSnapshot = {
+      checkedAt: new Date(now * 1000).toISOString(),
+      usedPercent: 40,
+      windowDurationMins: 10080,
+      resetsAt: now + 3600,
+      planType: "pro",
+      resetCreditsAvailable: 0,
+      reached: false,
+      windows: [liveWindow],
+    };
+
+    const expiredSnapshot = {
+      checkedAt: new Date((now - 200) * 1000).toISOString(),
+      usedPercent: 40,
+      windowDurationMins: 10080,
+      resetsAt: now - 100,
+      planType: "pro",
+      resetCreditsAvailable: 0,
+      reached: false,
+      windows: [expiredWindow],
+    };
+
+    expect(snapshotExpired(liveSnapshot as any)).toBe(false);
+    expect(snapshotExpired(expiredSnapshot as any)).toBe(true);
+
+    const standing = standingOf(choice, expiredSnapshot as any);
+    expect(standing.snapshot).toBeUndefined();
+    expect(standing.remainingPercent).toBe(0);
+    expect(standing.freePercent).toBe(0);
+    expect(standing.reason).toMatch(/usage unknown: window reset .* ago, probe failed/);
+  });
+
+  test("Astra cap clamps inherited effort with a warning and refuses explicit effort", () => {
+    const origErr = console.error;
+    let loggedWarn = "";
+    console.error = (msg: any) => { loggedWarn += String(msg); };
+    try {
+      const clamped = cappedEffort("gpt-6-astra", "high" as any, false);
+      expect(clamped).toBe("medium");
+      expect(loggedWarn).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
+    } finally {
+      console.error = origErr;
+    }
+
+    const origExit = process.exit;
+    let exitCode: number | undefined;
+    let loggedErr = "";
+    console.error = (msg: any) => { loggedErr += String(msg); };
+    process.exit = ((code?: number) => {
+      exitCode = code;
+      throw new Error("process.exit called");
+    }) as any;
+    try {
+      expect(() => cappedEffort("gpt-6-astra", "high" as any, true)).toThrow("process.exit called");
+      expect(exitCode).toBe(1);
+      expect(loggedErr).toContain("effort high exceeds the cap for gpt-6-astra (max medium)");
+    } finally {
+      process.exit = origExit;
+      console.error = origErr;
+    }
+
+    expect(cappedEffort("gpt-6-astra", "medium" as any, true)).toBe("medium");
+    expect(cappedEffort("gpt-6-astra", "low" as any, true)).toBe("low");
+  });
+
+  test("laneDemand returns supervisor for supervisor, light for consult/review, work for work", () => {
+    expect(laneDemand({ supervisor: true, kind: "work" } as any)).toBe("supervisor");
+    expect(laneDemand({ supervisor: true, kind: "review" } as any)).toBe("supervisor");
+    expect(laneDemand({ kind: "review" } as any)).toBe("light");
+    expect(laneDemand({ kind: "work", consult: true } as any)).toBe("light");
+    expect(laneDemand({ kind: "work" } as any)).toBe("work");
   });
 });
