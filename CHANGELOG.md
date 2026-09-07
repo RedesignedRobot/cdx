@@ -3,11 +3,11 @@
 cdx routes native Claude Code events to the owning session before delivery.
 
 - Breaking change: `feed.log` contains structured JSON records. Old free-text lines are ignored and removed by cleanup. One renderer serves the monitor, diagnostics, and dashboard.
-- Breaking change: full session ids replace prefix addresses. Foreign lane mutations require explicit `cdx takeover <lane|full-session-id>`. Session-owned takeover moves the owner's group through a persisted binding; terminal lane takeover claims only the named lane and its supervisor children. `adopt` behavior stays unchanged.
-- The automatic plugin monitor runs `cdx watch` using `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`. A process lease prevents duplicate delivery after reload. Wake and quiet delivery have separate durable cursors.
+- Breaking change: full session ids replace prefix addresses. Foreign lane mutations require explicit `cdx takeover <lane|full-session-id>`. A session target moves the owner's group through a persisted binding; a lane target claims only the named lane and its supervisor children, whoever owned them. Takeover replays nothing and prints the owned summary. `adopt` over an existing lane checks ownership.
+- The automatic plugin monitor runs `cdx watch` using `CLAUDE_CODE_SESSION_ID` and `CLAUDE_PID`. A process lease prevents duplicate delivery after reload; a second watcher stands by until the holder exits. Wake and quiet delivery have separate durable cursors.
 - SessionStart restores owned state, completed lanes awaiting attention, and open questions, including after compact. PostToolBatch and UserPromptSubmit inject quiet events. Native subagent hook calls are skipped; missing identity is rejected.
 - The watcher wakes for questions, stalls, final work or review results, job exits, and peer messages. Final events include gate failures. Successful failover and partial report paths remain quiet. Synchronous spawn and reply output is not copied into the feed.
-- Scoped brief, questions, feed, inbox, and running-job summaries replace broadcast recovery. The dashboard retains shared diagnostic access and renders structured events under the journal lock.
+- Scoped brief, questions, feed, inbox, and running-job summaries replace broadcast recovery. `cdx clean` prunes closed lanes regardless of owner. The dashboard retains shared diagnostic access and renders structured events under the journal lock.
 - Doctor checks the personal `cdx@skills-dir` plugin path, installed hooks, current session hook receipts, and watcher lease. Hook and monitor changes need `/reload-plugins` or restart; skill edits are live.
 - Stop older writers and cancel old global-tail monitors or restart their sessions before rollout. The ledger format remains version 5.
 

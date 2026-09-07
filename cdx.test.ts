@@ -4056,8 +4056,12 @@ describe("native session integration", () => {
     expect(runCli(["takeover", "terminal"], head).exitCode).toBe(0);
     expect(runCli(["brief"], head).stdout).toContain("lane=terminal-child");
     expect(runCli(["brief"], head).stdout).not.toContain("lane=unrelated");
+    const second = { ...env, CLAUDE_CODE_SESSION_ID: "second-claiming-head-session" };
+    expect(runCli(["takeover", "terminal"], second).exitCode).toBe(0);
+    expect(readJson(`${state}/sessions.json`).bindings).toEqual({});
     expect(runCli(["close", "terminal-child"], env).exitCode).toBe(1);
-    expect(runCli(["close", "terminal-child"], head).exitCode).toBe(0);
+    expect(runCli(["close", "terminal-child"], head).exitCode).toBe(1);
+    expect(runCli(["close", "terminal-child"], second).exitCode).toBe(0);
   });
 
   test("explicit takeover redirects a live producer and refuses foreign mutations", async () => {
@@ -4068,7 +4072,8 @@ describe("native session integration", () => {
     const next = { ...old, CLAUDE_CODE_SESSION_ID: "replacement-head-session" };
     writeLedger(state, { work: fixtureLane(root, old.CLAUDE_CODE_SESSION_ID), live: fixtureLane(root, old.CLAUDE_CODE_SESSION_ID, { work: { state: "running", cwd: root }, pid: process.pid }) });
     const mutations = [["resume", "work", "continue"], ["send", "work", "stop"], ["reply", "work", "answer"], ["gate", "work", "true"],
-      ["close", "work"], ["kill", "work"], ["review", "work", "--engine", "gpt", "inspect"], ["spawn", "work", "--engine", "gpt", "again"]];
+      ["close", "work"], ["kill", "work"], ["review", "work", "--engine", "gpt", "inspect"], ["spawn", "work", "--engine", "gpt", "again"],
+      ["adopt", "work", "11111111-1111-4111-8111-111111111111", "--engine", "gpt"]];
     for (const args of mutations) {
       const result = runCli(args, next);
       expect(result.exitCode).toBe(1);
@@ -4091,6 +4096,9 @@ describe("native session integration", () => {
     const timed = runCli(["ask", "--timeout", "0.001", "After takeover?"], { ...old, CDX_LANE: "live", CDX_ROUND: "1", CDX_OWNER: old.CLAUDE_CODE_SESSION_ID });
     expect(timed.exitCode).toBe(0);
     expect(runCli(["feed"], next).stdout).toContain("After takeover?");
+    // The lane claim left the other lane with its head; a session claim moves the rest.
+    expect(runCli(["close", "work"], next).exitCode).toBe(1);
+    expect(runCli(["takeover", old.CLAUDE_CODE_SESSION_ID], next).exitCode).toBe(0);
     expect(runCli(["close", "work"], next).exitCode).toBe(0);
     expect(readJson(`${state}/ledger.json`).live.ownerSession).toBe(old.CLAUDE_CODE_SESSION_ID);
   });

@@ -94,9 +94,10 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   refused so its resume stays read-only.
 - Events reach only their owning full session id. Another head must run
   `cdx takeover <lane|full-session-id>` before mutating that owner's work.
-  Session-owned takeover transfers the owner's group. Terminal-owned takeover
-  claims the named lane and its supervisor children. `adopt` imports an engine
-  session and keeps its existing behavior.
+  A lane target claims that lane and its supervisor children, whoever owned
+  them. A session target moves that head's whole group: lanes, jobs, and
+  messages. Takeover replays nothing; it prints the owned summary. `adopt`
+  over an existing lane needs ownership like any other mutation.
 - SessionStart restores owned running and completed work and open questions,
   including after compaction. Close completed lanes when handled. Hooks supply
   quiet updates; the plugin watcher wakes the head for questions and completions.
