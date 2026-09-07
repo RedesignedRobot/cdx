@@ -993,7 +993,8 @@ function cappedEffort(model: string | undefined, effort: Effort, explicit = true
     return cap;
   }
   const allowed = EFFORT_ORDER.slice(0, capIndex + 1).filter((candidate) => config.efforts.includes(candidate));
-  fail(`effort ${effort} exceeds the cap for ${model} (max ${cap}); allowed: ${allowed.join(", ")}. Set effortCaps in ${CONFIG_PATH} to change it`);
+  const remedy = allowed.length > 0 ? `allowed: ${allowed.join(", ")}` : `no configured effort is at or below ${cap}; edit efforts in ${CONFIG_PATH}`;
+  fail(`effort ${effort} exceeds the cap for ${model} (max ${cap}); ${remedy}`);
 }
 
 function requireEngineBinary(engine: Engine): void {
@@ -3780,6 +3781,8 @@ interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; 
 // changes account, so it must start with room to finish.
 type Demand = "light" | "work" | "supervisor";
 const HEADROOM_PERCENT: Record<Demand, number> = { light: 5, work: 15, supervisor: 25 };
+// A usage reading serves this long before the next launch probes again.
+const USAGE_CACHE_MS = 30 * 60 * 1000;
 const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "work", supervisor: "supervisor" };
 
 interface AccountStanding {
@@ -3826,11 +3829,18 @@ function unknownStanding(choice: AccountChoice, reason: string): AccountStanding
 }
 
 function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
+  const now = Date.now();
   if (!snapshot || snapshot.planType === "unknown") return unknownStanding(choice, "probe failed; codex login?");
   const weekly = weeklyWindow(snapshot);
   if (!weekly) return unknownStanding(choice, "snapshot predates 3.10; run cdx usage");
-  if (weekly.resetsAt * 1000 <= Date.now()) return unknownStanding(choice, `window reset ${fmtAge(new Date(weekly.resetsAt * 1000).toISOString())} ago, probe failed`);
-  const now = Date.now();
+  if (weekly.resetsAt * 1000 <= now) return unknownStanding(choice, `window reset ${fmtAge(new Date(weekly.resetsAt * 1000).toISOString())} ago, probe failed`);
+  // A reading older than the cache window that the last probe could not
+  // confirm is history, not headroom. A fresh reading survives a failed
+  // probe: it would not have been probed at all.
+  const probeFailedAt = snapshot.probeFailedAt ? Date.parse(snapshot.probeFailedAt) : Number.NaN;
+  if (probeFailedAt > Date.parse(snapshot.checkedAt) && !snapshotFresh(snapshot, USAGE_CACHE_MS)) {
+    return unknownStanding(choice, `probe failed; last reading ${fmtAge(snapshot.checkedAt)} ago said ${Math.round(100 - weekly.usedPercent)}% left`);
+  }
   const live = snapshot.windows!.filter((window) => window.resetsAt * 1000 > now);
   const reached = snapshotReached(snapshot) || live.some((window) => window.usedPercent >= 99);
   // Exact share for decisions; the text rounds.
@@ -3878,10 +3888,12 @@ function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStan
 // on disk and standingOf decides how much of it to trust.
 async function accountSnapshot(choice: AccountChoice): Promise<UsageSnapshot | undefined> {
   const cached = readUsageSnapshot(choice);
-  const usable = snapshotFresh(cached, 30 * 60 * 1000) && cached.windows !== undefined && !snapshotExpired(cached);
+  const usable = snapshotFresh(cached, USAGE_CACHE_MS) && cached.windows !== undefined && !snapshotExpired(cached);
   if (usable || probeFailedRecently(cached)) return cached;
   const refreshed = await refreshUsageSnapshot({ account: choice });
-  return refreshed?.snapshot ?? cached;
+  // A failed refresh writes its marker beside the old reading; read it back
+  // so the standing sees the failure.
+  return refreshed?.snapshot ?? readUsageSnapshot(choice);
 }
 
 async function accountStandings(): Promise<AccountStanding[]> {
@@ -3996,7 +4008,9 @@ function announceAccountSelection(lane: string, selection: AccountSelection, own
     // The reason line explains a choice; one account is no choice. The
     // headroom warning stands on its own.
     if (Object.keys(config.accounts ?? {}).length > 1) console.log(`cdx: account=${color.bold(pick.choice.name)} for ${DEMAND_LABEL[demand]} lane: ${pick.reason}`);
-    if (pick.snapshot && pick.remainingPercent < HEADROOM_PERCENT[demand]) {
+    if (!pick.snapshot) {
+      console.error(color.yellow(`cdx: WARNING: ${pick.choice.name} ${pick.reason}; ${lane} starts on it unverified`));
+    } else if (pick.remainingPercent < HEADROOM_PERCENT[demand]) {
       console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.remainingPercent)}% and ${lane} may hit the limit mid-run`));
     }
   }

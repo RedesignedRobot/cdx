@@ -3536,7 +3536,6 @@ describe("cdx effort caps", () => {
     writeFileSync(argsTrace, "");
     const consult = runCli(["resume", "legacy-consult", "follow up"], env);
     expect(consult.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
-    expect(consult.stderr).toContain("effort high exceeds the cap for gpt-6-astra; running at medium");
     const execArgs = readFileSync(argsTrace, "utf8").trim().split("\n").find((line) => line.startsWith("exec resume"));
     expect(execArgs).toContain("model_reasoning_effort=medium");
   }, 30000);
@@ -3711,6 +3710,9 @@ describe("cdx account advisor", () => {
       // Fully consumed, but the window reset five minutes ago: neither
       // exhausted nor empty, just unknown until a probe answers.
       "reset": snapshot(100, now - 300),
+      // A good reading from 40 minutes ago that the next probe cannot
+      // confirm; it would win on fullness if the stale number counted.
+      "old": snapshot(10, now + 2 * DAY, { checkedAt: new Date(Date.now() - 40 * 60_000).toISOString() }),
       "known": snapshot(50, now + 3 * DAY),
     });
     const spawned = runCli(["spawn", "stale-pick", "--engine", "gpt", "--cd", root, "REPORT_ONLY"], env);
@@ -3718,12 +3720,20 @@ describe("cdx account advisor", () => {
     expect(spawned.stdout).toContain("cdx: account=known for work lane: 50% left");
     expect(spawned.stderr).not.toContain("consumed");
     const stored = JSON.parse(readFileSync(`${env.CDX_HOME}/usage.json`, "utf8")).accounts;
-    expect(stored.legacy.probeFailedAt).toBeDefined();
-    expect(stored.reset.probeFailedAt).toBeDefined();
+    for (const name of ["legacy", "reset", "old"]) expect(stored[name].probeFailedAt).toBeDefined();
     const usage = runCli(["usage"], env).stdout;
     expect(usage).toContain("then legacy (usage unknown: snapshot predates 3.10");
     expect(usage).toContain("then reset (usage unknown: window reset 5m ago");
-  }, 20000);
+    expect(usage).toContain("then old (usage unknown: probe failed; last reading 40m ago said 90% left");
+
+    // One account and no evidence: the lane still starts, but says so.
+    const single = setup("advisor-single-unknown", {
+      "only": { checkedAt: new Date(0).toISOString(), usedPercent: 0, windowDurationMins: 0, resetsAt: 0, planType: "unknown", resetCreditsAvailable: 0, reached: false, probeFailedAt: new Date().toISOString() },
+    });
+    const blind = runCli(["spawn", "blind", "--engine", "gpt", "--cd", single.root, "REPORT_ONLY"], single.env);
+    expect(blind.exitCode).toBe(0);
+    expect(blind.stderr).toContain("WARNING: only usage unknown: probe failed; codex login?; blind starts on it unverified");
+  }, 30000);
 
   test("headroom compares exact shares and warns for a single short account", () => {
     const now = Math.floor(Date.now() / 1000);
