@@ -1,3 +1,10 @@
+## 4.0.0
+
+A major release: the account advisor admits and reserves, the runner and ledger are restructured, and the policy functions are testable in memory. State files stay backward compatible; a ledger written by 3.x loads unchanged.
+
+- Admission control. A work or supervisor lane is refused when no account has its headroom free (15% and 25% of the weekly window), with each account's standing in the message; `--account NAME` overrides, a consult or review lane still starts with a warning, and an unprobed account admits with a warning when it is the best on offer. Account selection runs before the worktree is created, so a refused spawn strands nothing.
+- Reservations. A running gpt lane holds its demand on its account until it finishes, derived from the ledger at ranking time. Free headroom is what remains after those holds, so two work lanes started together land on two accounts. `cdx usage` shows the held share per account and `usage --json` carries `reservedPercent` and `freePercent`.
+
 ## 3.10.1
 
 Fixes from the 3.10.0 reviews (Astra consult, Gemini hostile review).
