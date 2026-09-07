@@ -6,86 +6,33 @@ allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 
 # cdx
 
-You are the head. cdx is how you delegate: each lane is one engine process with
-a brief, a ledger row, a captured report, and the policy from `config.json`.
+You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
+a brief, a ledger row, a captured report, and policy from `config.json`.
 This file is the operating guide. Mechanics, flags, state files, and edge
 cases are in `README.md` next to it; read that when a command surprises you.
 
 ## The execution loop
 
-Authority runs one way: the owner talks to you; you consult Astra or hand it a
-whole change; Astra delegates bounded parts to Gemini children through cdx and
-verifies them; you review and merge. Nothing lands without your review.
+Owner ruling, 2026-09-07: Astra drives execution and technical design. You brief outcomes, answer questions, arrange independent review, and merge. Challenge decisions with evidence; do not prescribe the implementation.
 
-1. Decide whether the design is settled. If it is not, consult:
-   `cdx consult <lane> --model astra "<question>"` runs Astra read-only with
-   an advisor frame and ends with "Decisions for the head". Follow up with
-   `cdx resume <lane> "<question>"`. A consult is a full Astra pass, so skip
-   it when you already know the answer.
-2. Hand a multi-part change to one supervisor:
-   `cdx spawn <lane> --engine gpt --model astra --supervisor --bg "<brief>"`.
-   Astra plans, briefs Gemini children with gates, waits, verifies each report
-   against its gate, and reports once. Its `cdx ask` questions reach you on the
-   feed; `cdx wait <lane>` exits 2 the moment one is open. Answer with
-   `cdx reply`.
-3. Send bounded work straight to Gemini when you know exactly what to do:
-   `cdx spawn <lane> --bg --gate "<cmd>" "<brief>"`. One outcome per lane,
-   named files, a gate. No Astra in the loop.
-4. Read the reports, run the wall, run one hostile review (`cdx review <lane>
-   "<attack items>"` on Gemini, or Astra for a design-heavy change), merge.
+1. Hand a whole change to one supervisor with an acceptance gate:
+   `cdx spawn <lane> --engine gpt --model gpt-6-astra --supervisor --bg --gate "<cmd>" "<brief>"`.
+   Astra owns the design and delegates bounded execution to Gemini. It can use GPT children, read-only consults, or native subagents when useful.
+2. Wait for its report with `cdx wait <lane> --report`. Exit 2 means a question is open; answer with `cdx reply`. Use `cdx send` for corrections without dropping the task.
+3. Read the report, run required checks, arrange one independent review, and merge. Lanes must not commit, push, or deploy.
 
-Astra runs at `low` or `medium` only; cdx refuses `high` and above (the
-`effortCaps` config). The default is medium. Gemini is the workhorse: a
-precise brief finishes in about nine minutes against forty to fifty for a gpt
-lane. Several Codex accounts share the load: cdx starts each new gpt lane on
-the account whose weekly window resets soonest and still has free headroom for
-the lane's size, counting what running lanes already hold. A work or supervisor
-lane with no room anywhere is refused (`--account NAME` overrides); run it on
-gemini or wait for a reset. `cdx usage` prints the same advice with the pace
-per day that would empty each window before its reset.
-
-## Astra is a peer, Gemini is a worker
-
-Owner ruling, 2026-09-05: Astra is the smarter model and the head's copilot.
-The head is the CEO with the overall view, and it defers to Astra on the hard
-calls the way a CEO defers to the CTO. So bring Astra your doubts, your plans,
-and your finished work, and expect to be challenged: on the premise, the
-scope, deletion versus building deeper. Never box it in with format rules or
-step lists; the frames give it freedom and the harness enforces only what it
-must (read-only for consults, ownership and gates for supervisors). Take its
-pushback seriously, argue back with evidence when you disagree, and put the
-disagreement in front of the owner when it changes the outcome. Every Astra
-frame carries the owner's bar: world class as Apple, OpenAI, Anthropic,
-Vercel, and Cloudflare build, with licence to tear down legacy, bloat, and
-slop wherever it finds them. Gemini is the opposite: a precise box, one
-outcome, a gate.
-
-## Which engine
-
-- `gemini` (default): bounded briefs with named files and an acceptance
-  command. Investigate, search, audit, review, tests, small builds. Weak
-  self-doubt, so the brief carries the judgment and the gate carries the proof.
-- `gpt` (explicit, `--model astra`): design-heavy lanes, supervisors, consults.
-  Slow and scarce. One big brief, not many small ones.
-- Gemini always runs `gemini-3.8-flash-high` at high effort; `--effort` is for
-  gpt only. Gemini has no fork; resume it.
+For an already-defined small task, use Gemini directly with named files and a gate. The CLI defaults to Gemini. Astra requires `--engine gpt`; its effort cap stays at `medium`. Gemini always uses `gemini-3.8-flash-high`. A standalone `cdx consult <lane> --model gpt-6-astra "<question>"` gives read-only advice; follow up with `cdx resume`.
 
 ## Briefing
 
-The brief is the whole handoff; the worker cannot see this conversation. Every
-brief states the outcome, the files the worker owns and the ones it must not
-touch, the acceptance command (pass the same one as `--gate`), the facts the
-worker would otherwise rediscover, and what to do when it is unsure (ask). Under
-a page for Gemini. Never ask a worker to delete a failing assertion; say what
-the test must prove instead. Long briefs go through stdin:
-`cdx spawn big --bg - < /tmp/brief.md`.
+State the outcome, constraints, acceptance command, and facts the lane would otherwise rediscover. Give Gemini exclusive files and a brief under a page. Let Astra choose the design and division of work. Long briefs can use stdin:
+`cdx spawn big --engine gpt --supervisor --bg --gate "<cmd>" - < /tmp/brief.md`.
 
-cdx prepends built-in rules to every brief: what cdx is, no commits or deploys,
-the report contract, `cdx ask` for open points, engine-specific delegation
-rules, and for supervisors the operating contract (delegate only independent
-parts with named files and a gate, fresh child names, answer questions, never
-weaken a gate, verify the combined change, never report while a child runs).
-Then `config.json` rules, then the repository's `.cdx-rules.md`.
+The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
+
+Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Run the acceptance gate and targeted regressions; repeat only after edits, failures, or unresolved concerns.
+
+cdx injects these rules before `config.json` rules and the repository's `.cdx-rules.md`. Gemini children and native subagents must not delegate further. Supervisors must join native subagents before reporting; cdx only tracks cdx children. See [README.md](README.md#two-engines) for the enforced limits and their reasons.
 
 ## Commands
 
@@ -118,11 +65,14 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 ## Operating rules
 
 - One lane: run `cdx spawn` in the foreground from a background Bash call.
-  Independent lanes: `--bg` each, then one `cdx wait a b c`. Long head
-  commands (a wall, a deploy chain): `cdx job`, never a sleep loop.
-- `wait` exit 2 means a lane is blocked on a question. Answer it and wait
-  again; an unanswered question times out after 30 minutes and the worker
-  guesses.
+  Independent lanes: `--bg` each, then one `cdx wait a b c`. Long liaison
+  commands can use `cdx job`; supervisors cannot start jobs, fork, adopt, or clean.
+- `wait` exit 2 means a lane is blocked on a question. Answer it promptly with
+  `cdx reply`. An unanswered question times out after 30 minutes. Timeout is
+  not approval; the worker reports the unresolved dependency and stops only
+  dependent work without guessing, continuing independent authorized work.
+- Calling `cdx resume` on an active running lane is refused by the harness;
+  wait for the active round to settle before resuming.
 - The gate is the verdict. An unchanged tree does not fail a gated round; the
   gate runs and the feed line says `diff=empty` so you can judge. A worktree
   spawn runs the gate once on the untouched tree first; a red baseline stops
@@ -130,18 +80,19 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - Lanes touching the same repository get `--worktree`, or disjoint files in
   one tree with no other writer. Never run a Gemini review against a tree
   another lane is editing; its write protection is detection after the fact.
-- Supervisors own only the children they spawned, cannot change a gate, and
-  cannot stop your jobs. When a supervisor's round ends, its running children
-  are stopped; a supervisor that reported while a child ran shows
-  `supervisor ended with running children`. `cdx kill <supervisor>` stops the
-  tree.
+- Supervisors own only the children they spawned, cannot change a child gate
+  through `cdx gate`, `resume --gate`, or respawn (omitting `--gate` on
+  supervised respawn preserves the existing gate), and cannot stop your jobs.
+  When a supervisor's round ends, its running children are stopped; a supervisor
+  that reported while a child ran shows `supervisor ended with running children`.
+  `cdx kill <supervisor>` stops the tree.
 - A consult lane keeps its name for consults only; spawning work under it is
   refused so its resume stays read-only.
 - Feed lines end in `owner=`. A different owner is another Claude session's
   lane: information only, never resume or close it unasked. After a
   compaction, `cdx feed -n 30` replays what the monitor delivered.
-- `cdx usage` answers capacity questions. A `[cdx] WARNING: OpenAI Codex
-  usage` feed line means tell the owner plainly, with the reset time.
+- With configured accounts, `cdx usage` and launch share a decision. Work needs 15% weekly capacity and supervisors 25%. Known sufficient accounts come first, then unknown accounts with a warning, otherwise refusal. Light turns prefer 5% but may launch on an exhausted account. `--account` overrides selection; existing GPT affinity remains pinned. There are no reservations in 4.0, so concurrent launches may pick the same account.
+- `doctor` compares every Codex home with the primary for directives and MCP definitions, and validates its hooks file. For Codex homes, `--fix` copies `AGENTS.md` only and reports manual config or hook repairs.
 - Close finished lanes with an outcome note. `close --remove-worktree` deletes
   a merged, clean worktree and its branch; otherwise it prints the commands.
 - Gemini's five-hour window drains under heavy fan-out; cdx refuses Gemini
