@@ -67,7 +67,7 @@ const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "3.10.1";
+const VERSION = "4.0.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -326,12 +326,11 @@ function readConfig(skipFile = false): Config {
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
   };
-  const configPath = process.env.CDX_HOME ? `${process.env.CDX_HOME}/config.json` : CONFIG_PATH;
-  if (skipFile || !existsSync(configPath)) return defaults;
+  if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
 
   let text: string;
   try {
-    text = readFileSync(configPath, "utf8");
+    text = readFileSync(CONFIG_PATH, "utf8");
   } catch (error) {
     configError(`cannot read config: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -469,43 +468,11 @@ function geminiConfig(): GeminiConfig {
   };
 }
 
-let _cachedConfig: Config | undefined;
-let _cachedConfigHome: string | undefined;
-
-function loadConfig(): Config {
-  if (import.meta.main) {
-    if (!_cachedConfig) {
-      const isHook = process.argv[2] === "hook";
-      const skip = process.argv[2] === "_run" || process.argv[2] === "view" || isHook;
-      _cachedConfig = readConfig(skip);
-    }
-    return _cachedConfig;
-  }
-  const currentHome = process.env.CDX_HOME;
-  if (_cachedConfig && _cachedConfigHome === currentHome) {
-    return _cachedConfig;
-  }
-  const userHome = `${process.env.HOME || HOME}/.cdx`;
-  const skip = !currentHome || currentHome === userHome;
-  _cachedConfig = readConfig(skip);
-  _cachedConfigHome = currentHome;
-  return _cachedConfig;
-}
-
-const config: Config = new Proxy({} as Config, {
-  get(_target, prop, receiver) {
-    return Reflect.get(loadConfig(), prop, receiver);
-  },
-  has(_target, prop) {
-    return Reflect.has(loadConfig(), prop);
-  },
-  ownKeys(_target) {
-    return Reflect.ownKeys(loadConfig());
-  },
-  getOwnPropertyDescriptor(_target, prop) {
-    return Reflect.getOwnPropertyDescriptor(loadConfig(), prop);
-  },
-});
+// A plain import (the tests) sees defaults and touches no user state; the
+// CLI reads the config file except on the paths that pin what they need.
+const config: Config = import.meta.main
+  ? readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || process.argv[2] === "hook")
+  : readConfig(true);
 
 if (import.meta.main) {
   const isHookInvocation = process.argv[2] === "hook";
