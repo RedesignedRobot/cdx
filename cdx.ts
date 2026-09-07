@@ -53,6 +53,7 @@ import {
 } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { isatty } from "node:tty";
 import { join, relative } from "node:path";
 
@@ -222,7 +223,7 @@ interface Lane {
   engine?: Engine;
   // Codex model id of the work thread; absent on gemini lanes.
   model?: string;
-  // A supervisor lane drives gemini child lanes through cdx.
+  // A supervisor lane owns its child lanes through cdx.
   supervisor?: true;
   // Name and round of the supervisor lane that spawned this one.
   parent?: string;
@@ -540,11 +541,11 @@ function feedOwned(line: string, ownerSession?: string): boolean {
 
 function normalizeLane(entry: any): void {
   entry.work ??= {
-    state: entry.workState ?? (entry.kind === "review" && entry.state === "running" ? entry.workSessionId ? "done" : "adopted" : entry.state),
+    state: entry.workState ?? (entry.kind === "review" ? entry.workSessionId ? "done" : "adopted" : entry.state),
     round: entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined),
     cwd: entry.workCwd ?? entry.worktreePath ?? entry.cwd,
-    exitCode: entry.exitCode,
-    note: entry.note,
+    exitCode: entry.kind === "review" && !entry.workState ? undefined : entry.exitCode,
+    note: entry.kind === "review" && !entry.workState ? undefined : entry.note,
     report: entry.workReport,
     updatedAt: entry.workUpdatedAt,
   };
@@ -553,8 +554,8 @@ function normalizeLane(entry: any): void {
       state: entry.reviewState ?? entry.state,
       round: entry.reviewRound ?? (entry.kind === "review" ? entry.rounds : undefined),
       cwd: entry.reviewCwd ?? entry.work.cwd,
-      exitCode: entry.reviewExitCode,
-      note: entry.reviewNote,
+      exitCode: entry.reviewExitCode ?? (entry.kind === "review" && !entry.workState ? entry.exitCode : undefined),
+      note: entry.reviewNote ?? (entry.kind === "review" && !entry.workState ? entry.note : undefined),
       report: entry.reviewReport,
       updatedAt: entry.reviewUpdatedAt,
     };
@@ -792,52 +793,39 @@ function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): stri
 // gets rationalized away the first time it is inconvenient.
 // ---------------------------------------------------------------------------
 
-const LANE_ROLE = "You are one lane of cdx, a harness the head (a Claude session answering to the owner) uses to delegate bounded work. The head sees nothing you do until your final message, so that message is the whole handoff.";
+const LANE_ROLE = "The Claude session is the owner's liaison. It briefs outcomes, answers questions, reviews, and merges. Your final report is its handoff.";
+const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what tests start. The liaison integrates after independent review.";
+const READ_ONLY = "READ-ONLY: change nothing in the tree; write only your report. The runtime sandbox or before-and-after tree check enforces this.";
+const WORK_REPORT = "A final report is required. Lead with the outcome, then changed files, verification commands and exit codes, and remaining risks. Include child outcomes and report paths. Use plain prose and short lists. No em dashes, filler, or praise.";
+const REVIEW_REPORT = "A final report is required. State the conclusion and evidence in plain prose and short lists. No em dashes or filler.";
+const ASK_RULE = 'Use `cdx ask "<question>"` only for a missing answer that changes the outcome or authorization. Read available evidence first. A timeout is not approval: continue independent authorized work, stop dependent work, and report the unanswered question.';
+const WORKER_BAN = "This worker cannot drive other cdx lanes or jobs. Use cdx ask for dependencies that need the supervisor or liaison.";
+const STANDARD_RULE = "Read the source, fix causes, and choose the simplest design that meets the outcome. Delete unnecessary code and tests.";
+const CHALLENGE_RULE = "You own technical judgment. If the brief solves the wrong problem, explain the evidence through cdx ask before changing scope. Report unresolved disagreement.";
 
-const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what the tests start themselves. The head integrates your work; a commit from a lane would land unreviewed.";
-
-const READ_ONLY = "READ-ONLY: change nothing in the tree; write only your report. The sandbox and the harness's before-and-after tree check enforce this; a changed path fails the round.";
-
-const WORK_REPORT = "Your final message is the lane report, and the harness fails the round without one. Open with the outcome in one sentence. Then list the files you changed, the commands you ran with their exit codes, and the risks or follow-ups the head must know before merging. Write plain prose and short lists; tables only for measured numbers.";
-
-const REVIEW_REPORT = "Your final message is the report, and the harness fails the round without one. Write plain prose and short lists; tables only for measured numbers.";
-
-const ASK_RULE = 'When the brief leaves open something that changes the architecture or the file set, run `cdx ask "<question>"` and wait for the answer instead of guessing. Ask once per open point, small and specific; never ask what the brief or the code already answers. The head answers through the feed. An unanswered question times out after 30 minutes; then take the narrowest reading, record it under an Assumptions heading in the report, and stop there.';
-
-const WORKER_BAN = "Never run cdx spawn, resume, fork, review, adopt, kill, or close from inside a lane; the harness refuses them. cdx ask is the only harness command you need.";
-
-const STANDARD_RULE = "The bar is world class: how Apple, OpenAI, Anthropic, Vercel, and Cloudflare build software, and that standard applies to the thinking as much as the code. When anything you meet in the tree, the brief, or the discussion falls short of it, say so and push for the fix: tear down legacy patterns and old thinking, delete test bloat, code bloat, and AI slop, and never add more of any of them.";
-
-const CHALLENGE_RULE = "The brief is the head's best current understanding, not an order. When it is wrong, solves the wrong problem, or misses a simpler or deeper path, say so through cdx ask before building, and put any disagreement you still hold in the report. The owner wants you to challenge the head, not to work around it.";
-
-const GPT_WORKER_RULES = [
-  WORKER_BAN,
+const ASTRA_RULES = [
   CHALLENGE_RULE,
   STANDARD_RULE,
+  "Finish the authorized outcome. Resolve routine choices and make reasonable assumptions for reversible work. Prepare a concrete result before asking for a decision. Incorporate steering and answer side questions without dropping the task.",
+  "The brief and liaison replies outrank project and skill guidance within runtime constraints. If an instruction file blocks work, name its path, quote the instruction, and explain the conflict. Do not invent approval requirements.",
+  "Delegate bounded work or exploration when it saves time or improves quality. Give writers exclusive files and join subagents before reporting. Native subagents and cdx child lanes must not delegate further.",
+  "Run the acceptance gate and tests for changed behavior. Keep one test per real rule; remove fixture restatements and implementation mirrors. Repeat checks only after edits, failures, or unresolved concerns.",
   ASK_RULE,
-  "Delegate to your own subagents only when the task splits into independent parts on disjoint files that each take more than a few minutes. A subagent costs a full context load, so exploration, review of your own work, and small serial edits stay with you. Subagents never spawn subagents.",
 ];
-
+const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
 const GEMINI_WORKER_RULES = [
   WORKER_BAN,
-  "Execute the task as written. Do not redesign, expand scope, or resolve open design questions yourself; the head owns the design and you own the delivery.",
+  "Execute the assigned outcome within your files. The parent owns design and scope. Do not spawn subagents.",
   ASK_RULE,
-  "Do the work in this conversation and do not spawn subagents. The harness tracks one worker per lane; a subagent's edits and mistakes would be invisible to it.",
-  "Before reporting, remove the temporary diagnostics you added while debugging (a print, a log line, a fixture) and re-run every test you cite. Logging the task asked for stays.",
-  "End with an Assumptions heading (write 'none' if empty).",
+  "Remove temporary diagnostics and run the acceptance gate before reporting. Cite only checks you ran. End with Assumptions, or 'none'.",
 ];
-
 const SUPERVISOR_RULES = [
-  "You supervise this lane for the head, who reviews and merges but does not second-guess how you get there. You hold the design and the judgment; gemini child lanes do the bounded execution. Delegate a part when it is independent, has named files, and can be checked by a command. Keep the parts that need the whole picture, cross-cutting decisions, and anything a child would have to ask about. A child costs a fresh context load plus your verification, so never delegate what you can finish faster than you can brief.",
-  CHALLENGE_RULE,
-  STANDARD_RULE,
-  'Commands: `cdx spawn <child> --bg --gate "<cmd>" [--cd <dir>] "<brief>"` starts a gemini child; `cdx wait <child>... --report` blocks until the named children finish and returns exit 2 the moment one of them asks a question; `cdx questions` lists open questions and `cdx reply <child> "<answer>"` answers one; `cdx review <child> "<attack items>"` runs a read-only gemini review; `cdx send`, `cdx resume`, and `cdx kill` steer, retry, and stop a child. Children are gemini only and cannot delegate further; never pass --engine gpt or --supervisor. Use fresh child names: the harness refuses lanes you did not spawn.',
-  "Brief each child under a page: the outcome, the files it owns, what it must not touch, the acceptance command (the same one you pass as --gate), and the facts it would otherwise have to rediscover. Two children never own the same file. Start only independent children together; a child that depends on another's output starts after you have verified that output.",
-  "Answer questions promptly: an unanswered child idles for up to 30 minutes and then guesses. Never weaken or clear a child's gate; if the gate is wrong, ask the head with cdx ask.",
-  "Children spawned with --worktree branch from committed HEAD and cannot commit, so their work exists only in that worktree. When children must build on each other, run them in one tree on disjoint files instead.",
-  "After the children finish, verify the combined change yourself: read each report, rerun each gate and the tests it cites, and fix or redo what is wrong. Your report lists each child with its outcome and report path, what you verified and how, and what you did yourself. Never report while a child is still running; the harness stops the child and fails your round.",
-  ASK_RULE,
-  "Do not spawn your own native subagents. Children are the delegation path; the harness cannot see anything else.",
+  "You are the owner's driver. Own design and cross-cutting decisions; delegate bounded execution to Gemini children. Use GPT children, consults, or native subagents when useful. Keep delegation one level deep.",
+  ...ASTRA_RULES,
+  'Start children with `cdx spawn <child> --bg --gate "<cmd>" "<brief>"`; Gemini is default, `--engine gpt` selects GPT. `cdx consult <child> --bg "<question>"` starts a read-only advisor. `cdx wait <child>... --report` returns exit 2 for questions; answer with `cdx reply`.',
+  "Each child needs an outcome, exclusive files, gate, and relevant facts. Start independent children together. Separate worktrees start from committed HEAD; use disjoint files in one tree when children need your edits.",
+  "Drive only your own children. Answer questions promptly. Never change a child's gate; ask the liaison if it is wrong. Jobs, fork, adopt, and clean belong to the liaison because they can outlive this lane or affect unrelated history.",
+  "Read child reports and verify the combined change. Join native subagents before reporting. Ending this round stops running cdx children; reporting with a running child fails the round.",
 ];
 
 function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
@@ -878,15 +866,15 @@ const REVIEW_FINDINGS_SCHEMA = {
   },
 };
 
-const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Your job is to find what is wrong before it lands; a clean verdict you cannot back with what you checked is a failed review. Hunt real defects: correctness bugs, races, authorization holes, contract breaks, data loss, and tests that pass without proving the change. For each finding give the severity (P1 breaks users or data, P2 wrong under realistic conditions, P3 hygiene), the file and line, a concrete failure scenario (the input or state, and the wrong result), and CONFIRMED if you traced the code path or PLAUSIBLE if you could not. Rank findings by severity and stop there: no style remarks, no restating the diff, no praise. If clean, say clean and list exactly what you checked and how.";
-const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} ${STANDARD_RULE} A finding under that bar is P3 unless it also breaks behaviour, but name it. End the report with a fenced json code block: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
+const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Find defects in behavior, contracts, data handling, or verification. For each finding give severity, file and line, and the input or state that produces the wrong result. P1 breaks users or data; P2 fails under realistic conditions; P3 is a smaller defect. Mark traced paths CONFIRMED and unverified paths PLAUSIBLE. Rank findings by severity. If clean, list what you checked and how. Omit praise and style remarks.";
+const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End with fenced JSON: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
 const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 
 function reviewFrame(engine: Engine): string {
   return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
 }
 
-const CONSULT_FRAME = `CONSULT. You are the senior advisor to the head, a Claude session that answers to the owner. The head brings you this because it wants to be challenged, not confirmed, and the owner's standing instruction is that you have full freedom here: question the premise, widen or narrow the scope, name the problem the head should be solving instead, and argue for deletion, for building deeper, or for stopping when the evidence points there. ${STANDARD_RULE} Read the tree before you answer and ground every claim in file paths, symbols, mechanisms, and numbers where they exist; keep what you verified apart from what you infer. Rank what you recommend and say what you rejected and why. Read-only: change nothing. End with a short list titled Decisions for the head: the choices only the head or the owner can make.`;
+const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. Read-only: change nothing. End with Decisions for the caller, limited to choices that need the caller or owner.`;
 
 // ---------------------------------------------------------------------------
 // Flag parsing
@@ -933,17 +921,12 @@ function effortOf(parsed: Parsed): Effort {
   return configuredEffort(parsed.flags.effort ?? config.defaultEffort);
 }
 
-const ENGINE_PICKER = `gemini is the default; pass --engine gpt for design-heavy or judgment work
-gpt:
-+ strongest code and judgment on hard multi-file work, design-heavy lanes
-- slow (20-30 min lanes), scarce weekly budget, burns fast
-gemini:
-+ near-unlimited quota, fast, good on bounded briefs (investigate, read, search, audit, review, test, small scoped builds)
-- weaker adversarial self-doubt, needs a precise brief with named files and acceptance checks
-gemini is the default engine for execution. Tell it exactly what to do and a lane finishes in about nine minutes, against forty to fifty for gpt. Judgment calls, discovery, design analysis, and open questions stay with gpt or the head.
-gemini: one outcome per lane, brief under a page, fan out many lanes in parallel.
-gpt: one big brief for sweeping multi-file work; --model picks the Codex model (alias or id).
-gpt --supervisor: one lane that plans, spawns gemini children through cdx, verifies, and reports.`;
+const ENGINE_PICKER = `gemini is the default; pass --engine gpt for design and judgment work.
+For a whole change, use --engine gpt --model gpt-6-astra --supervisor.
+The Astra supervisor owns the design, delegates bounded work, verifies, and reports.
+Gemini children need one outcome, named files, and an acceptance gate.
+Supervisors may also use GPT children and read-only consults, one level deep.
+--model picks a Codex model alias or id; Astra effort stays at medium or below.`;
 
 function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
   const value = parsed.flags.engine;
@@ -1354,7 +1337,7 @@ function openRound(lane: string, kind: "work" | "review", cwd: string, effort: E
       effort,
       state: workState,
       work: kind === "work"
-        ? { state: workState, round: rounds, cwd: workCwd, updatedAt: now, report: existing?.work.report }
+        ? { state: workState, round: rounds, cwd: workCwd, updatedAt: now }
         : existing?.work ?? { state: workState, cwd: workCwd },
       review: kind === "review" ? { state: "running", cwd, round: rounds, updatedAt: now } : existing?.review,
       roundStartedAt: now,
@@ -1795,7 +1778,10 @@ async function* readJsonLines(stream: ReadableStream<Uint8Array>, options: { onC
   const decoder = new TextDecoder();
   let buffer = "";
   const parse = (line: string) => {
-    try { return JSON.parse(line); } catch (error) { if (!options.ignoreMalformed) throw error; }
+    try {
+      const value = JSON.parse(line);
+      return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+    } catch (error) { if (!options.ignoreMalformed) throw error; }
   };
   for await (const chunk of stream) {
     options.onChunk?.(chunk);
@@ -2748,7 +2734,7 @@ async function askCommand(argv: string[]): Promise<void> {
     console.log(outcome.answer ?? "");
     return;
   }
-  console.log("cdx ask timed out. Take the conservative reading, record the deviation in the lane report, and continue.");
+  console.log("cdx ask timed out. No approval was received. Continue independent authorized work and report the unresolved dependency; do not guess a required answer.");
 }
 
 function replyCommand(argv: string[]): void {
@@ -2865,7 +2851,6 @@ async function spawnCommand(argv: string[]) {
   const parent = supervisorLane();
   if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and delegates to gemini children");
   if (supervisor && parent) fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
-  if (parent && engine !== "gemini") fail(`supervisor ${parent} may only spawn gemini children; drop --engine gpt`);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
   // probes; openRound re-checks under the ledger lock.
   const existingLane = readLedger()[lane];
@@ -2887,10 +2872,14 @@ async function spawnCommand(argv: string[]) {
   if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
   if (existingLane) {
     requireOwnChild(lane, existingLane);
+    if (parent && parsed.flags.gate !== undefined && parsed.flags.gate !== existingLane.gate) {
+      fail(`supervisor ${parent} may not change a child's gate; ask the liaison if it is wrong`);
+    }
     if (existingLane.consult) fail(`lane "${lane}" is a consult lane; spawn work under a new name so its resume stays read-only`);
     rejectEngineMismatch(lane, existingLane, engine);
     if (engine === "gpt") rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   }
+  const gate = parent && existingLane ? existingLane.gate : parsed.flags.gate;
   const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
     if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
     return realpathSync(dir);
@@ -2924,23 +2913,23 @@ async function spawnCommand(argv: string[]) {
     }
   }
   const { round } = openRound(lane, "work", cwd, effort, {
-    engine, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate: parsed.flags.gate,
+    engine, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate,
     ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
   if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
-  const gateBaselineChecked = Boolean(parsed.flags.gate && (worktree || parsed.bools.has("gate-baseline-check")));
+  const gateBaselineChecked = Boolean(gate && (worktree || parsed.bools.has("gate-baseline-check")));
   if (gateBaselineChecked) {
     const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
-    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${parsed.flags.gate}`);
-    const result = executeGate(parsed.flags.gate!, cwd, baselineLog);
+    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${gate}`);
+    const result = executeGate(gate!, cwd, baselineLog);
     const checkedAt = new Date().toISOString();
     withLedger((ledger) => {
-      ledger[lane]!.gateBaseline = { round, command: parsed.flags.gate!, cwd, exitCode: result.exitCode, checkedAt };
+      ledger[lane]!.gateBaseline = { round, command: gate!, cwd, exitCode: result.exitCode, checkedAt };
     });
     if (result.exitCode !== 0) {
       writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, fullBrief);
-      finishInvalidBaseline(lane, round, parsed.flags.gate!, cwd, result);
+      finishInvalidBaseline(lane, round, gate!, cwd, result);
       process.exitCode = 1;
       return;
     }
@@ -2952,7 +2941,7 @@ async function spawnCommand(argv: string[]) {
     ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(images.length ? { images } : {}),
     ...(outputSchema !== undefined ? { outputSchema } : {}),
-    ...(parsed.flags.gate ? { gate: parsed.flags.gate } : {}),
+    ...(gate ? { gate } : {}),
     ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account, fallbackHome), ...ownershipSpec(owner),
@@ -2967,6 +2956,9 @@ async function resumeCommand(argv: string[]) {
   const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
   requireOwnChild(lane, before);
+  if (supervisorLane() && parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate) {
+    fail(`supervisor ${supervisorLane()} may not change a child's gate; ask the liaison if it is wrong`);
+  }
   const engine = laneEngine(before);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
@@ -3083,7 +3075,6 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
   const parent = supervisorLane();
-  if (parent && engine !== "gemini") fail(`supervisor ${parent} may only run gemini reviews; drop --engine gpt`);
   if (parent) requireOwnChild(lane, existing);
   if (existing && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
   // A consult lane must never acquire a work thread: resume would then pick
@@ -3103,13 +3094,13 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
   if (targets.length === 1 && intent) fail("native review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
   if (targets.length === 1 && parsed.flags.scope) fail("--scope only applies to exec review (native review always covers the whole target diff)");
   if (targets.length === 0 && !intent) fail("exec review needs an intent (or pass a native target flag)");
-  if (existing && engine === "gpt") rejectPinnedAccountFlag(lane, existing, parsed.flags.account);
-
-  const selection = engine === "gpt" ? existing ? undefined : await selectAccount(parsed.flags.account, "light") : undefined;
-  const account = engine === "gpt" ? existing ? laneAccount(existing) : selection!.choice : undefined;
-  const fallbackHome = engine === "gpt" && existing ? legacyAccountFallback(lane, existing, existing.ownerSession) : undefined;
-  if (engine === "gpt" && (existing || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
-  const roundAccount = engine === "gpt" ? existing ? { preserveAccount: true as const } : { account } : {};
+  const preserveAccount = Boolean(existing && (laneEngine(existing) === "gpt" || existing.account || existing.codexHome));
+  if (preserveAccount && engine === "gpt") rejectPinnedAccountFlag(lane, existing!, parsed.flags.account);
+  const selection = engine === "gpt" && !preserveAccount ? await selectAccount(parsed.flags.account, "light") : undefined;
+  const account = engine === "gpt" ? preserveAccount ? laneAccount(existing!) : selection!.choice : undefined;
+  const fallbackHome = engine === "gpt" && preserveAccount ? legacyAccountFallback(lane, existing!, existing!.ownerSession) : undefined;
+  if (engine === "gpt" && (preserveAccount || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
+  const roundAccount = engine === "gpt" && !preserveAccount ? { account } : existing ? { preserveAccount: true as const } : {};
 
   if (targets.length === 1) {
     const owner = callerOwnership();
@@ -3127,7 +3118,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
     }
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
-    const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel });
+    const { round } = openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
     if (selection) announceAccountSelection(lane, selection, owner.ownerSession);
     const codexArgs = [
       "review", "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
@@ -3630,54 +3621,39 @@ function isUsageSnapshot(value: unknown): value is UsageSnapshot {
     && (snapshot.windows === undefined || (Array.isArray(snapshot.windows) && snapshot.windows.every(isRateLimitWindow)));
 }
 
-function readUsageSnapshot(account?: AccountChoice): UsageSnapshot | undefined {
+type UsageState = Record<string, any>;
+
+function readUsageState(): UsageState {
   try {
-    const value = JSON.parse(readFileSync(USAGE_PATH, "utf8")) as unknown;
-    if (!account) return isUsageSnapshot(value) ? value : undefined;
-    if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-    const accounts = (value as { accounts?: unknown }).accounts;
-    if (!accounts || typeof accounts !== "object" || Array.isArray(accounts)) return undefined;
-    const snapshot = (accounts as Record<string, unknown>)[account.name];
-    return isUsageSnapshot(snapshot) ? snapshot : undefined;
-  } catch {
-    return undefined;
-  }
+    const value = JSON.parse(readFileSync(USAGE_PATH, "utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch { return {}; }
+}
+
+function usageSnapshotFrom(state: UsageState, account?: AccountChoice): UsageSnapshot | undefined {
+  const snapshot = account ? state.accounts?.[account.name] : state;
+  return isUsageSnapshot(snapshot) ? snapshot : undefined;
+}
+
+function readUsageSnapshot(account?: AccountChoice): UsageSnapshot | undefined {
+  return usageSnapshotFrom(readUsageState(), account);
+}
+
+function storeUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, account?: AccountChoice): void {
+  const accounts = account && state.accounts && typeof state.accounts === "object" && !Array.isArray(state.accounts)
+    ? Object.fromEntries(Object.entries(state.accounts).filter((entry) => isUsageSnapshot(entry[1]))) : {};
+  for (const key of Object.keys(state)) delete state[key];
+  Object.assign(state, account ? { accounts: { ...accounts, [account.name]: snapshot } } : snapshot);
+}
+
+// Every usage mutation reads and merges under this lock, including warning
+// deduplication and failed probes. No nested or separate writer lock.
+function withUsageState<T>(mutate: (state: UsageState) => T): T {
+  return withLockedJson(USAGE_PATH, `${ROOT}/.usage.lock`, readUsageState, mutate);
 }
 
 function writeUsageSnapshot(snapshot: UsageSnapshot, account?: AccountChoice) {
-  withLockedJson<Record<string, any>, void>(USAGE_PATH, `${ROOT}/.usage-write.lock`, () => {
-    try {
-      const value = JSON.parse(readFileSync(USAGE_PATH, "utf8"));
-      return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-    } catch { return {}; }
-  }, (value) => {
-    const accounts = account && value.accounts && typeof value.accounts === "object" && !Array.isArray(value.accounts)
-      ? Object.fromEntries(Object.entries(value.accounts).filter((entry) => isUsageSnapshot(entry[1]))) : {};
-    for (const key of Object.keys(value)) delete value[key];
-    Object.assign(value, account ? { accounts: { ...accounts, [account.name]: snapshot } } : snapshot);
-  });
-}
-
-function withUsageLock<T>(action: () => T): T | undefined {
-  const lock = `${ROOT}/.usage.lock`;
-  const deadline = Date.now() + 1000;
-  for (;;) {
-    try {
-      mkdirSync(lock);
-      break;
-    } catch {
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
-      } catch { /* raced */ }
-      if (Date.now() > deadline) return undefined;
-      Bun.sleepSync(25);
-    }
-  }
-  try {
-    return action();
-  } finally {
-    try { rmdirSync(lock); } catch { /* raced */ }
-  }
+  withUsageState((state) => storeUsageSnapshot(state, snapshot, account));
 }
 
 function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
@@ -3711,9 +3687,9 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
     // Negative-cache the failure so a hung app-server does not cost every
     // subsequent launch a fresh probe timeout (selectAccount honors this
     // marker for 5 minutes).
-    withUsageLock(() => {
-      const previous = readUsageSnapshot(options.account);
-      writeUsageSnapshot({
+    withUsageState((state) => {
+      const previous = usageSnapshotFrom(state, options.account);
+      storeUsageSnapshot(state, {
         checkedAt: new Date(0).toISOString(),
         usedPercent: 0,
         windowDurationMins: 0,
@@ -3728,8 +3704,8 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
     return undefined;
   }
   const fresh = snapshotFromAccountUsage(usage);
-  const stored = withUsageLock(() => {
-    const previous = readUsageSnapshot(options.account);
+  const stored = withUsageState((state) => {
+    const previous = usageSnapshotFrom(state, options.account);
     const previousIsNewer = previous && Date.parse(previous.checkedAt) > Date.parse(fresh.checkedAt);
     let snapshot = previousIsNewer ? previous : {
       ...fresh,
@@ -3740,16 +3716,16 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
       if (!Number.isFinite(warnedAt) || Date.now() - warnedAt >= 3_600_000) {
         const beforeWarning = snapshot;
         const warned = { ...snapshot, warnedAt: new Date().toISOString() };
-        writeUsageSnapshot(warned, options.account);
+        storeUsageSnapshot(state, warned, options.account);
         if (feed(usageFeedWarning(warned, options.account, options.ownerSession))) return warned;
-        writeUsageSnapshot(beforeWarning, options.account);
+        storeUsageSnapshot(state, beforeWarning, options.account);
         return beforeWarning;
       }
     }
-    writeUsageSnapshot(snapshot, options.account);
+    storeUsageSnapshot(state, snapshot, options.account);
     return snapshot;
   });
-  return { usage, snapshot: stored ?? fresh };
+  return { usage, snapshot: stored };
 }
 
 function warnCachedUsageBeforeLaunch(account?: AccountChoice) {
@@ -3765,10 +3741,8 @@ function warnCachedUsageBeforeLaunch(account?: AccountChoice) {
 interface ReachedAccount { choice: AccountChoice; snapshot: UsageSnapshot }
 interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; allReached: boolean; pick?: AccountStanding; demand?: Demand }
 
-// What a new lane asks of an account, as weekly-window headroom in percent.
-// A consult or review is one read-only turn; a work lane runs an hour or
-// more; a supervisor runs its own turns plus every child report. A lane never
-// changes account, so it must start with room to finish.
+// Snapshot thresholds guide placement, not completion budgets. Concurrent
+// launches can choose the same account; 4.0 does not reserve capacity.
 type Demand = "light" | "work" | "supervisor";
 const HEADROOM_PERCENT: Record<Demand, number> = { light: 5, work: 15, supervisor: 25 };
 // A usage reading serves this long before the next launch probes again.
@@ -3782,49 +3756,11 @@ interface AccountStanding {
   // is the deadline: whatever is unspent then is lost.
   weekly?: RateLimitWindow;
   remainingPercent: number;
-  // Headroom running gpt lanes on this account still hold (their demand,
-  // until they finish), and what is left for a new lane after it.
-  reservedPercent: number;
-  reservedLanes: number;
-  freePercent: number;
   // Percent of the weekly window per day that spends the remainder exactly at
   // reset; a pace far above real burn means the window will expire unused.
   paceToEmpty?: number;
   reached: boolean;
   reason: string;
-}
-
-// The headroom a lane asked for at launch, from its ledger row.
-function laneDemand(entry: Pick<Lane, "supervisor" | "consult" | "kind">): Demand {
-  if (entry.supervisor) return "supervisor";
-  return entry.consult || entry.kind === "review" ? "light" : "work";
-}
-
-// Two launches that read the same snapshot would otherwise both claim the
-// same share. A running gpt lane holds its demand on its account until it
-// finishes; nothing is stored, the ledger is the reservation.
-function reservedHeadroom(ledger: Ledger): Record<string, { percent: number; lanes: number }> {
-  const held: Record<string, { percent: number; lanes: number }> = {};
-  for (const entry of Object.values(ledger)) {
-    if (!entry.account || laneEngine(entry) !== "gpt" || !laneRunning(entry)) continue;
-    const slot = held[entry.account] ?? { percent: 0, lanes: 0 };
-    slot.percent += HEADROOM_PERCENT[laneDemand(entry)];
-    slot.lanes += 1;
-    held[entry.account] = slot;
-  }
-  return held;
-}
-
-function withReservations(standings: AccountStanding[], ledger: Ledger): AccountStanding[] {
-  const held = reservedHeadroom(ledger);
-  return standings.map((standing) => {
-    const slot = held[standing.choice.name];
-    if (!slot || !standing.snapshot) return standing;
-    const freePercent = Math.max(0, standing.remainingPercent - slot.percent);
-    const reason = standing.reached ? standing.reason
-      : `${standing.reason}, ${slot.percent}% held by ${slot.lanes} running lane${slot.lanes === 1 ? "" : "s"}`;
-    return { ...standing, reservedPercent: slot.percent, reservedLanes: slot.lanes, freePercent, reason };
-  });
 }
 
 function fmtUntil(unixSeconds: number): string {
@@ -3853,7 +3789,7 @@ function snapshotExpired(snapshot: UsageSnapshot): boolean {
 }
 
 function unknownStanding(choice: AccountChoice, reason: string): AccountStanding {
-  return { choice, remainingPercent: 0, reservedPercent: 0, reservedLanes: 0, freePercent: 0, reached: false, reason: `usage unknown: ${reason}` };
+  return { choice, remainingPercent: 0, reached: false, reason: `usage unknown: ${reason}` };
 }
 
 function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
@@ -3875,7 +3811,7 @@ function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined):
   const remainingPercent = Math.max(0, 100 - weekly.usedPercent);
   const daysToReset = (weekly.resetsAt * 1000 - now) / 86_400_000;
   const paceToEmpty = Math.round(remainingPercent / daysToReset);
-  const base = { choice, snapshot, weekly, remainingPercent, reservedPercent: 0, reservedLanes: 0, freePercent: remainingPercent, paceToEmpty, reached };
+  const base = { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached };
   if (reached) {
     const blocking = live.filter((window) => window.usedPercent >= 99).sort((a, b) => a.resetsAt - b.resetsAt)[0] ?? snapshot;
     return { ...base, reason: `${rateLimitWindowName(blocking.windowDurationMins)} window exhausted, back ${fmtUntil(blocking.resetsAt)}` };
@@ -3891,7 +3827,7 @@ function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined):
 function standingTier(standing: AccountStanding, demand: Demand): number {
   if (standing.reached) return 3;
   if (!standing.snapshot) return 2;
-  return standing.freePercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
+  return standing.remainingPercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
 }
 
 function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStanding[] {
@@ -3902,12 +3838,21 @@ function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStan
     if (tier === 0) {
       const deadline = a.standing.weekly!.resetsAt - b.standing.weekly!.resetsAt;
       if (deadline !== 0) return deadline;
-      return b.standing.freePercent - a.standing.freePercent;
+      return b.standing.remainingPercent - a.standing.remainingPercent;
     }
-    if (tier === 1) return b.standing.freePercent - a.standing.freePercent;
+    if (tier === 1) return b.standing.remainingPercent - a.standing.remainingPercent;
     if (tier === 3) return a.standing.snapshot!.resetsAt - b.standing.snapshot!.resetsAt;
     return a.index - b.index;
   }).map(({ standing }) => standing);
+}
+
+// Eligibility is shared by launch and usage advice. Unknown evidence is a
+// fallback after sufficient known capacity; light turns admit with warnings.
+function decideAccount(standings: AccountStanding[], demand: Demand): AccountStanding | undefined {
+  const ranked = rankAccounts(standings, demand);
+  if (demand === "light") return ranked[0];
+  return ranked.find((standing) => standingTier(standing, demand) === 0)
+    ?? ranked.find((standing) => !standing.snapshot && !standing.reached);
 }
 
 // A cached snapshot serves for 30 minutes unless a window has reset or it
@@ -3928,36 +3873,31 @@ async function accountStandings(): Promise<AccountStanding[]> {
     const choice = { name, home };
     return standingOf(choice, await accountSnapshot(choice));
   }));
-  return withReservations(standings, readLedger());
+  return standings;
 }
 
 function cachedAccountStandings(): AccountStanding[] {
-  return withReservations(Object.entries(config.accounts ?? {}).map(([name, home]) => {
+  return Object.entries(config.accounts ?? {}).map(([name, home]) => {
     const choice = { name, home };
     return standingOf(choice, readUsageSnapshot(choice));
-  }), readLedger());
+  });
 }
 
 interface AccountAdvice {
   order: string[];
   picks: Record<Demand, string | null>;
-  accounts: Array<{ account: string; remainingPercent: number; reservedPercent: number; freePercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
+  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
 }
 
 function accountAdvice(standings: AccountStanding[]): AccountAdvice {
   const ranked = rankAccounts(standings, "light");
-  const pickFor = (demand: Demand) => {
-    const first = rankAccounts(standings, demand)[0];
-    return first && !first.reached ? first.choice.name : null;
-  };
+  const pickFor = (demand: Demand) => decideAccount(standings, demand)?.choice.name ?? null;
   return {
     order: ranked.map((standing) => standing.choice.name),
     picks: { light: pickFor("light"), work: pickFor("work"), supervisor: pickFor("supervisor") },
     accounts: ranked.map((standing) => ({
       account: standing.choice.name,
       remainingPercent: standing.remainingPercent,
-      reservedPercent: standing.reservedPercent,
-      freePercent: standing.freePercent,
       reached: standing.reached,
       ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt } : {}),
       ...(standing.paceToEmpty !== undefined ? { paceToEmpty: standing.paceToEmpty } : {}),
@@ -3967,7 +3907,7 @@ function accountAdvice(standings: AccountStanding[]): AccountAdvice {
 }
 
 function adviceLines(standings: AccountStanding[]): string[] {
-  if (standings.length < 2) return [];
+  if (standings.length === 0) return [];
   const ranked = rankAccounts(standings, "light");
   const advice = accountAdvice(standings);
   const spend = ranked.filter((standing) => !standing.reached).map((standing) => `${standing.choice.name} (${standing.reason})`);
@@ -4007,13 +3947,10 @@ async function selectAccount(forced: string | undefined, demand: Demand): Promis
   if (forced !== undefined) return { choice: configuredAccount(forced), skipped: [], allReached: false };
 
   const standings = await accountStandings();
-  const pick = rankAccounts(standings, demand)[0]!;
-  // Admission: a work or supervisor lane never changes account, so it does
-  // not start where the evidence says it cannot finish. Unknown evidence
-  // admits with a warning; a light lane only warns; --account forces.
-  if (demand !== "light" && pick.snapshot && standingTier(pick, demand) !== 0) {
+  const pick = decideAccount(standings, demand);
+  if (!pick) {
     const detail = rankAccounts(standings, demand).map((standing) => `${standing.choice.name}: ${standing.reason}`).join("; ");
-    fail(`no account has ${HEADROOM_PERCENT[demand]}% free headroom for a ${DEMAND_LABEL[demand]} lane (${detail}). Wait for a reset, run it on gemini, or force one with --account NAME`);
+    fail(`no account has ${HEADROOM_PERCENT[demand]}% remaining headroom for a ${DEMAND_LABEL[demand]} lane (${detail}). Wait for a reset, run it on gemini, or force one with --account NAME`);
   }
   const skipped = standings
     .filter((standing) => standing.reached && standing.snapshot)
@@ -4024,16 +3961,16 @@ async function selectAccount(forced: string | undefined, demand: Demand): Promis
 // Feed lines are broadcast to every open Claude session, so exhaustion
 // notices share the hourly warnedAt dedupe; the per-spawn console line stays.
 function feedExhaustionOnce(accounts: AccountChoice[], message: string, ownerSession?: string) {
-  withUsageLock(() => {
+  withUsageState((state) => {
     const due = accounts.some((choice) => {
-      const warnedAt = readUsageSnapshot(choice)?.warnedAt;
+      const warnedAt = usageSnapshotFrom(state, choice)?.warnedAt;
       const parsed = warnedAt ? Date.parse(warnedAt) : Number.NaN;
       return !Number.isFinite(parsed) || Date.now() - parsed >= 3_600_000;
     });
     if (!due || !feedOwned(message, ownerSession)) return;
     for (const choice of accounts) {
-      const current = readUsageSnapshot(choice);
-      if (current) writeUsageSnapshot({ ...current, warnedAt: new Date().toISOString() }, choice);
+      const current = usageSnapshotFrom(state, choice);
+      if (current) storeUsageSnapshot(state, { ...current, warnedAt: new Date().toISOString() }, choice);
     }
   });
 }
@@ -4047,8 +3984,8 @@ function announceAccountSelection(lane: string, selection: AccountSelection, own
     if (Object.keys(config.accounts ?? {}).length > 1) console.log(`cdx: account=${color.bold(pick.choice.name)} for ${DEMAND_LABEL[demand]} lane: ${pick.reason}`);
     if (!pick.snapshot) {
       console.error(color.yellow(`cdx: WARNING: ${pick.choice.name} ${pick.reason}; ${lane} starts on it unverified`));
-    } else if (pick.freePercent < HEADROOM_PERCENT[demand]) {
-      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% free headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.freePercent)}% and ${lane} may hit the limit mid-run`));
+    } else if (pick.remainingPercent < HEADROOM_PERCENT[demand]) {
+      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% remaining headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.remainingPercent)}% and ${lane} may hit the limit mid-run`));
     }
   }
   if (selection.skipped.length === 0) return;
@@ -4743,6 +4680,59 @@ async function checkDoctorAgyHooks(
   }
 }
 
+// Account homes share directives and tools, not credentials. Report config
+// differences without printing values that might contain server credentials.
+function checkDoctorAccountHomes(fix: boolean, good: (message: string) => void, bad: (label: string, detail: string, remedy: string) => void): void {
+  const homes = Object.entries(config.accounts ?? { default: defaultCodexHome() });
+  const primaryHome = homes[0]![1];
+  let primaryAgents: string | undefined;
+  try { primaryAgents = readFileSync(`${primaryHome}/AGENTS.md`, "utf8"); } catch { /* reported per home */ }
+  let primaryServers: Record<string, unknown> | undefined;
+  const object = (value: unknown): value is Record<string, any> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+  for (const [name, home] of homes) {
+    const agentsPath = `${home}/AGENTS.md`;
+    try {
+      let agents: string | undefined;
+      try { agents = readFileSync(agentsPath, "utf8"); } catch { /* may be repairable */ }
+      if (fix && primaryAgents?.trim() && agents !== primaryAgents) {
+        mkdirSync(home, { recursive: true });
+        writeFileSync(agentsPath, primaryAgents);
+        agents = readFileSync(agentsPath, "utf8");
+        good(`${name} AGENTS.md: repaired from ${primaryHome}/AGENTS.md`);
+      }
+      if (!agents?.trim()) bad(`${name} AGENTS.md`, "missing or empty", primaryAgents?.trim() ? "run cdx doctor --fix to copy primary directives" : `restore ${agentsPath}; no primary directives can be inferred`);
+      else if (primaryAgents === undefined || !primaryAgents.trim()) bad(`${name} AGENTS.md`, "primary directives unavailable for comparison", `restore ${primaryHome}/AGENTS.md, then run cdx doctor --fix`);
+      else if (agents !== primaryAgents) bad(`${name} AGENTS.md`, "differs from primary", "run cdx doctor --fix to copy primary directives");
+      else good(`${name} AGENTS.md: matches primary`);
+    } catch {
+      bad(`${name} AGENTS.md`, "cannot read or repair directives", `check permissions on ${agentsPath}`);
+    }
+    const configPath = `${home}/config.toml`;
+    try {
+      const parsed = Bun.TOML.parse(readFileSync(configPath, "utf8"));
+      const servers = parsed.mcp_servers ?? {};
+      if (!object(servers)) throw new Error("invalid MCP table");
+      if (home === primaryHome) primaryServers = servers;
+      if (!primaryServers) bad(`${name} MCP`, "primary config unavailable for comparison", `repair ${primaryHome}/config.toml by hand`);
+      else {
+        const different = Object.keys(primaryServers).filter((server) => !isDeepStrictEqual(servers[server], primaryServers![server]));
+        if (different.length) bad(`${name} MCP`, `missing or different servers: ${different.join(", ")}`, `update ${configPath} by hand to match primary MCP definitions; doctor --fix does not copy config`);
+        else good(`${name} MCP: matches ${Object.keys(primaryServers).length} primary server definitions`);
+      }
+    } catch {
+      bad(`${name} MCP`, "config.toml missing, unreadable, or invalid", `repair ${configPath} by hand; doctor --fix does not copy config`);
+    }
+    const hooksPath = `${home}/hooks.json`;
+    try {
+      const hooks = JSON.parse(readFileSync(hooksPath, "utf8"));
+      if (!object(hooks) || !object(hooks.hooks)) throw new Error("invalid hooks object");
+      good(`${name} hooks: valid ${hooksPath}`);
+    } catch {
+      bad(`${name} hooks`, "hooks.json missing, unreadable, or invalid", `restore ${hooksPath} by hand; doctor --fix does not install Codex hooks`);
+    }
+  }
+}
+
 async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -4832,6 +4822,8 @@ async function doctorCommand(argv: string[]) {
     }
   }
 
+  checkDoctorAccountHomes(parsed.bools.has("fix"), good, bad);
+
   let loggedIn = false;
   if (config.accounts) {
     const entries = Object.entries(config.accounts);
@@ -4895,7 +4887,7 @@ async function doctorCommand(argv: string[]) {
     }
   }
 
-  const primaryHome = (config.accounts && Object.values(config.accounts)[0]) ?? `${HOME}/.codex`;
+  const primaryHome = primaryAccount()?.home ?? defaultCodexHome();
   const configPath = `${primaryHome}/config.toml`;
   if (existsSync(configPath)) {
     const configModel = readFileSync(configPath, "utf8").match(/^model\s*=\s*"([^"]+)"/m)?.[1];
@@ -5516,8 +5508,8 @@ ${ENGINE_PICKER}
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
-  --supervisor (gpt only) lets the lane spawn, review, resume, kill, and close gemini
-  children through cdx, one level deep; killing the supervisor kills its children.
+  --supervisor (gpt only) lets the lane drive GPT or Gemini children and consults
+  through cdx, one level deep; killing the supervisor kills its children.
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
   ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
@@ -5550,9 +5542,8 @@ const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "fork", "review", "consult", "adopt",
   "kill", "close", "clean", "gate", "reply", "job",
 ]);
-// A supervisor drives its gemini children with these; the commands themselves
-// enforce gemini-only children and the parent relation.
-const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "kill", "close", "gate", "reply"]);
+// A supervisor drives its children with these; each mutation checks ownership.
+const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "kill", "close", "gate", "reply"]);
 
 if (import.meta.main) {
   const [command, ...argv] = process.argv.slice(2);
@@ -5575,7 +5566,7 @@ export {
   readJsonLines, qualifyGeminiReport, writeUsageSnapshot,
   isAgyCancellationTemplate, houseRules, hookInstallState, installHooks, REVIEW_FINDINGS_SCHEMA,
   GEMINI_TRANSPORT_ERRORS, parseQuotaResetDelayMs, parseQuotaResetIso, requireGeminiQuota, geminiQuotaState,
-  rankAccounts, standingOf, withReservations, laneDemand, cappedEffort, snapshotExpired, config,
+  rankAccounts, standingOf, decideAccount, cappedEffort, snapshotExpired, config,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
