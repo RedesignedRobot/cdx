@@ -34,7 +34,7 @@ cdx doctor --probe
 
 `doctor` checks engine binaries, login and usage, configuration, plugin hooks, the monitor, and stale ledger entries. For Antigravity it also checks agent files, loaded hooks, and model availability. `--fix` installs the shipped Antigravity agents and hooks and repairs stale rounds. `--probe` runs a short request through each installed engine. Missing `agy` is a warning unless the config enables Gemini.
 
-Every configured Codex home must have the primary home's `AGENTS.md` and MCP server definitions, plus a valid `hooks.json` with a `hooks` object. Extra MCP servers are allowed. The first configured account is primary; without an accounts map, doctor uses `CODEX_HOME` or `~/.codex`. For Codex homes, `--fix` copies directives only. It reports config and hook repairs for manual action without printing their values. It does not execute or verify individual Codex hook commands.
+Every configured Codex home must have the primary home's `AGENTS.md` and enabled MCP server definitions, plus a valid `hooks.json` with a `hooks` object. Extra MCP servers are allowed. The first configured account is primary; without an accounts map, doctor uses `CODEX_HOME` or `~/.codex`. For Codex homes, `--fix` copies directives only. It reports config and hook repairs for manual action without printing their values. It does not execute or verify individual Codex hook commands.
 
 Use `CDX_AGY_CONFIG_HOME` and `CDX_AGY_STATE_HOME` to override Antigravity paths in tests. Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code session. The symlink also makes cdx available as a terminal command.
 

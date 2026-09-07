@@ -2849,7 +2849,7 @@ async function spawnCommand(argv: string[]) {
   validLane(lane);
   const supervisor = parsed.bools.has("supervisor");
   const parent = supervisorLane();
-  if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and delegates to gemini children");
+  if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and drives its children through cdx");
   if (supervisor && parent) fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
   // probes; openRound re-checks under the ledger lock.
@@ -4712,7 +4712,9 @@ function checkDoctorAccountHomes(fix: boolean, good: (message: string) => void, 
       const parsed = Bun.TOML.parse(readFileSync(configPath, "utf8"));
       const servers = parsed.mcp_servers ?? {};
       if (!object(servers)) throw new Error("invalid MCP table");
-      if (home === primaryHome) primaryServers = servers;
+      // Disabled servers (the desktop app injects a few) do not run, so a
+      // secondary home need not carry them.
+      if (home === primaryHome) primaryServers = Object.fromEntries(Object.entries(servers).filter(([, server]) => !(object(server) && server.enabled === false)));
       if (!primaryServers) bad(`${name} MCP`, "primary config unavailable for comparison", `repair ${primaryHome}/config.toml by hand`);
       else {
         const different = Object.keys(primaryServers).filter((server) => !isDeepStrictEqual(servers[server], primaryServers![server]));
