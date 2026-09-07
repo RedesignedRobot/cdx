@@ -38,9 +38,11 @@ Astra runs at `low` or `medium` only; cdx refuses `high` and above (the
 `effortCaps` config). The default is medium. Gemini is the workhorse: a
 precise brief finishes in about nine minutes against forty to fifty for a gpt
 lane. Several Codex accounts share the load: cdx starts each new gpt lane on
-the account whose weekly window resets soonest and still has headroom for the
-lane's size, and `cdx usage` prints the same advice with the pace per day that
-would empty each window before its reset.
+the account whose weekly window resets soonest and still has free headroom for
+the lane's size, counting what running lanes already hold. A work or supervisor
+lane with no room anywhere is refused (`--account NAME` overrides); run it on
+gemini or wait for a reset. `cdx usage` prints the same advice with the pace
+per day that would empty each window before its reset.
 
 ## Astra is a peer, Gemini is a worker
 
