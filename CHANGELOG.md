@@ -1,3 +1,12 @@
+## 6.1.1
+
+- Gemini transport interruptions get five continuation retries with waits of 1, 2, 3, 4, and 5 seconds. Stops and runtime limits prevent another continuation after the wait.
+- Failed rounds expose partial report paths in the ledger and terminal feed. Resume includes the previous failed round's partial report for either engine and tells it to continue without redoing completed work.
+- Gemini failure notes contain the error reason and partial report path, without report markdown. Transport errors no longer overwrite captured partial work.
+- Every injected brief tells the engine to save tool payloads larger than one screen outside the repository and print only the path and a one-line digest.
+- Consult status uses its review state, timing, and report on the main consult line instead of showing adopted work.
+- Multi-target wait prints the target list and completion lines, then a summary and requested report bodies. JSON output stays unchanged.
+
 ## 6.1.0
 
 - Removed the 135 end-to-end tests because a 226-second run delayed every cdx gate. Only pure ownership routing and feed parsing tests survive, with no spawned processes, sleeps, fake engines, or temporary homes. `bun run check` still builds the CLI before those tests.

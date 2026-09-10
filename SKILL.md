@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx 6.1.0
+# cdx 6.1.1
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -30,7 +30,7 @@ State the outcome, constraints, acceptance command, and facts the lane would oth
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
 
-Reuse verified evidence and use targeted reads with compact output. Skip status checks that change nothing. Keep child updates to one sentence and reports short; end supervisor reports with duplicated investigation or rework observed.
+Reuse verified evidence and use targeted reads with compact output. Every injected brief tells both engines to write tool payloads larger than one screen to a file outside the repository and print only the path and a one-line digest. Skip status checks that change nothing. Keep child updates to one sentence and reports short; end supervisor reports with duplicated investigation or rework observed.
 
 Keep the system lean. Prefer deletion and one test per observable rule. Do not add tests that restate fixtures, prompt wording, or implementation. Owner ruling, 2026-09-07: the suite runs once per batch, as the lane gate after the report. Workers and reviewers never run it, and you merge on the gate result instead of running your own wall.
 
@@ -72,12 +72,20 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - One lane: run `cdx spawn` in the foreground from a background Bash call.
   Independent lanes: `--bg` each, then one `cdx wait a b c`. Long liaison
   commands can use `cdx job`; supervisors cannot start jobs, fork, adopt, or clean.
+- Multi-target `wait` prints the target list, then each completion and report
+  path as the five-second poll observes it. It ends with a summary and, with
+  `--report`, report bodies. JSON output stays unchanged. Consult lanes show
+  `consult` and their review state on the main status line.
 - `wait` exit 2 means a lane is blocked on a question. Answer it promptly with
   `cdx reply`. An unanswered question times out after 30 minutes. Timeout is
   not approval; the worker reports the unresolved dependency and stops only
   dependent work without guessing, continuing independent authorized work.
 - Calling `cdx resume` on an active running lane is refused by the harness;
-  wait for the active round to settle before resuming.
+  wait for the active round to settle before resuming. Failed rounds expose a
+  partial report path when no full report exists. `resume` feeds that partial
+  back to either engine with an instruction to continue without redoing work.
+  Gemini transport errors get five retries with waits of 1 through 5 seconds;
+  other errors get no transport retries. Failure notes keep markdown in the file.
 - The gate is the verdict. An unchanged tree does not fail a gated round; the
   gate runs and the feed line says `diff=empty` so you can judge. Only
   `--gate-baseline-check` runs the gate on the untouched baseline tree before
