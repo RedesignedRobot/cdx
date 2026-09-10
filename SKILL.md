@@ -15,6 +15,8 @@ cases are in `README.md` next to it; read that when a command surprises you.
 
 Owner ruling, 2026-09-07: Astra drives execution and technical design. You brief outcomes, answer questions, arrange independent review, and merge. Challenge decisions with evidence; do not prescribe the implementation.
 
+Owner ruling, 2026-09-10: one Astra lane per backlog, never one per finding. Astra holds twenty or more problems in one design, so give it the whole open set at once (every finding with full detail, every audit report, every sweep, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Gemini lanes from that split, one worktree each off the integration branch. Per-finding Astra lanes repeat investigation, fragment fixes and drain the weekly window. When no account has supervisor headroom, a work-tier Astra lane still writes the plan and the head spawns the Geminis.
+
 1. Hand a whole change to one supervisor with an acceptance gate:
    `cdx spawn <lane> --engine gpt --model gpt-6-astra --supervisor --bg --gate "<cmd>" "<brief>"`.
    Astra owns the design and delegates bounded execution to Gemini. It can use GPT children, read-only consults, or native subagents when useful.
