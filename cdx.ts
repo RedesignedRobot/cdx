@@ -65,10 +65,11 @@ const CONFIG_PATH = `${ROOT}/config.json`;
 const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
 const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
+const GEMINI_TRANSPORT_RETRIES = 5;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.1.0";
+const VERSION = "6.1.1";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -670,7 +671,7 @@ function sessionSummary(session: string): string {
   const ledger = readLedger();
   const lines = Object.entries(ledger).filter(([lane, entry]) => owned(entry.ownerSession, lane, session, state)
     && entry.work.state !== "closed").sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt))
-    .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${roundStateOf(entry)} report=${entry.reports.at(-1) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
+    .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${roundStateOf(entry)} report=${roundReportOf(entry) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
   for (const { record } of questionFiles()) {
     const entry = ledger[record.lane];
     if (entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state)) {
@@ -886,6 +887,11 @@ function validLane(lane: string): string {
 
 const reportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.md`;
 const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.partial.md`;
+
+function availableReportPath(lane: string, round: number): string | undefined {
+  return [reportPathOf(lane, round), partialReportPathOf(lane, round)]
+    .find((path) => existsSync(path) && readFileSync(path, "utf8").trim().length > 0);
+}
 const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;
 const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
 const controlPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.jsonl`;
@@ -1062,6 +1068,7 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", op
     if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
+  builtIns.push("Write tool payloads larger than one screen to a file outside the repository and print only the path and a one-line digest.");
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
   const projectRules = `${cwd}/.cdx-rules.md`;
@@ -1808,11 +1815,15 @@ function failActiveRound(lane: string, item: Lane, note: string): void {
   if (roundEngine(item) === "gpt") invalidateAccountUsage(item.roundAccount);
   item.switchingAccount = undefined;
   const now = new Date().toISOString();
+  const report = availableReportPath(lane, item.rounds);
+  if (report?.endsWith(".partial.md")) note = `${singleLine(note)}; partial report=${report}`;
   if (item.kind === "review") {
+    item.review!.report = report;
     item.review!.state = "failed";
     item.review!.note = note;
     item.review!.updatedAt = now;
   } else {
+    item.work.report = report;
     item.work.state = "failed";
     item.work.note = note;
     item.work.updatedAt = now;
@@ -1980,7 +1991,7 @@ async function runRound(lane: string, round: number): Promise<number> {
       try { await refreshGeminiUsage(); } catch { /* best-effort */ }
     }
     if (spec.engine !== "gpt" || !entry.quotaFailure || code === 0) {
-      if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${entry.reports.at(-1) ?? "-"}`, entry.ownerSession, { lane, round });
+      if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${roundReportOf(entry) ?? "-"}`, entry.ownerSession, { lane, round });
       if (code !== 0 && entry.supervisor) await killChildren(lane, `supervisor ${lane} failed`);
       return code;
     }
@@ -2088,18 +2099,19 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
         }
       } else {
         touchLedger((item) => { item.lastResultError = recordedError; }, true);
-        if (isTransportError && childRunning && geminiContinuations < 2) {
+        if (isTransportError && childRunning && geminiContinuations < GEMINI_TRANSPORT_RETRIES) {
           geminiContinuations += 1;
           touchLedger((item) => {
             item.continuations = geminiContinuations;
             item.lastEventAt = now;
           }, true);
           const reason = singleLine(effectiveError).slice(0, 80);
-          feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/2 reason=${reason}`, ownerSession, { lane, round });
+          feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${GEMINI_TRANSPORT_RETRIES} wait=${geminiContinuations}s reason=${reason}`, ownerSession, { lane, round });
           continueTurn = true;
         } else {
-          const detail = [result.status, result.error?.message ?? result.error, result.response].filter(Boolean).join(": ");
-          turnFailureReason ??= detail || "gemini result status ERROR";
+          turnFailureReason ??= isTransportError ? "gemini transport interrupted"
+            : errorText.trim() ? singleLine(errorText).slice(0, 200)
+            : `gemini result status ${result.status ?? "ERROR"}`;
         }
       }
     }
@@ -2121,8 +2133,12 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
     }
     turnFailureReason = qualified.failureReason ?? turnFailureReason;
   } else {
-    if (typeof result.response === "string" && result.response.trim()) {
-      writeFileSync(partialReportPathOf(lane, round), `${result.response.trim()}\n`);
+    const response = typeof result.response === "string" ? result.response.trim() : "";
+    const transportMessage = (text: string) => GEMINI_TRANSPORT_ERRORS.some((pattern) => pattern.test(text.split("\n", 1)[0] ?? ""));
+    const partial = finalAgentResponse && !transportMessage(finalAgentResponse) ? finalAgentResponse
+      : response && !transportMessage(response) ? response : "";
+    if (partial) {
+      writeFileSync(partialReportPathOf(lane, round), `${partial}\n`);
       feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, ownerSession, { lane, round });
     }
   }
@@ -2393,7 +2409,14 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       });
       turnFailureReason = qualified.turnFailureReason;
       geminiContinuations = qualified.geminiContinuations;
-      if (qualified.continueTurn) writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+      if (qualified.continueTurn) {
+        await Bun.sleep(geminiContinuations * 1000);
+        if (!receivedSignal && !maxRuntimeHit && proc.exitCode === null) {
+          writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+        } else if (!receivedSignal && !maxRuntimeHit) {
+          turnFailureReason = "agy exited during transport retry wait";
+        }
+      }
       geminiTurnsCompleted += 1;
       const wake = geminiTurnWake;
       geminiTurnWake = undefined;
@@ -2911,6 +2934,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
   expireRoundQuestions(lane, round);
+  const capturedReport = availableReportPath(lane, round);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
     if (!gemini) invalidateAccountUsage(item.roundAccount);
@@ -2946,18 +2970,21 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       const errTail = stderrText.trim().split("\n").at(-1);
       if (errTail) roundNote = `stderr: ${errTail.slice(0, 200)}`;
     }
+    if (roundState === "failed" && capturedReport?.endsWith(".partial.md")) {
+      roundNote = `${singleLine(roundNote ?? "round failed")}; partial report=${capturedReport}`;
+    }
     if (unchangedWork) item.diffEmpty = true;
     if (item.kind === "review") {
       item.review!.state = roundState;
       item.review!.exitCode = exitCode;
       item.review!.note = roundNote;
-      item.review!.report = existsSync(reportPath) ? reportPath : undefined;
+      item.review!.report = capturedReport;
       item.review!.updatedAt = new Date().toISOString();
     } else {
       item.work.state = roundState;
       item.work.exitCode = exitCode;
       item.work.note = roundNote;
-      item.work.report = existsSync(reportPath) ? reportPath : undefined;
+      item.work.report = capturedReport;
       item.work.updatedAt = new Date().toISOString();
     }
     item.pid = undefined;
@@ -2986,8 +3013,8 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const finalRoundState = roundStateOf(entry);
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${reportOk ? reportPath : "-"}`, entry.ownerSession, { lane, round });
-  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${reportPath}`);
+  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${capturedReport ?? "-"}`, entry.ownerSession, { lane, round });
+  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${capturedReport ?? "-"}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
     console.log("--- report ---");
@@ -3376,6 +3403,8 @@ async function resumeCommand(argv: string[]) {
   const account = engine === "gpt" ? reviewResume ? before.roundAccount ?? laneAccount(before) : laneAccount(before) : undefined;
   if (engine === "gpt") warnCachedUsageBeforeLaunch(account);
   const cwd = workCwdOf(before);
+  const partialPath = partialReportPathOf(lane, before.rounds);
+  const partial = roundStateOf(before) === "failed" && existsSync(partialPath) ? readFileSync(partialPath, "utf8").trim() : "";
   const { round, sessionId, selection } = await openRound(lane, reviewResume ? "review" : "work", cwd, effort, {
     engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", preserveOwner: true,
     preserveGate: parsed.flags.gate === undefined,
@@ -3387,7 +3416,8 @@ async function resumeCommand(argv: string[]) {
   const structuredInstruction = reviewResume && engine === "gemini"
     ? "\n\nYour final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
     : "";
-  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}\n\nTask:\n${followUp}${structuredInstruction}`;
+  const previousRound = partial ? `\n\nYour previous round ended with this partial report at ${partialPath}; continue from it, do not redo completed work:\n${partial}` : "";
+  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}${previousRound}\n\nTask:\n${followUp}${structuredInstruction}`;
   // The resolved effort always travels with the turn: a resumed session would
   // otherwise keep the effort it was created with, cap or no cap.
   const codexArgs = reviewResume && engine === "gpt"
@@ -3573,9 +3603,10 @@ function fmtCreated(iso: string): string {
 function renderLaneBlock(lane: string, entry: Lane): string {
   const active = laneRunning(entry);
   const stale = active && !pidAlive(entry.pid);
-  const workState = workStateOf(entry);
-  const state = entry.kind === "work" && stale ? "running(dead?)" : workState;
-  const workRound = entry.work.round ?? (entry.kind === "work" ? entry.rounds : undefined);
+  const record = entry.consult ? entry.review! : entry.work;
+  const workState = record.state;
+  const state = (entry.consult || entry.kind === "work") && stale ? "running(dead?)" : workState;
+  const workRound = record.round ?? (entry.kind === "work" ? entry.rounds : undefined);
   const engine = laneEngine(entry);
   const steerMode = entry.kind === "work" && active && engine === "gemini"
     ? `  steer=${entry.hooksActive ? "in-turn" : "follow-up"}`
@@ -3584,7 +3615,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
   const modelDetail = engine === "gpt" && entry.model ? `  model=${entry.model}` : "";
   const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
-  const first = `${color.magenta(lane)}  ${coloredState(state)}  work${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
+  const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.consult ? "consult" : "work"}${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
   let owner = "-";
   if (entry.ownerCwd || entry.ownerSession || readSessions().lanes[lane]) {
@@ -3597,20 +3628,20 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   }
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
-    : `finished ${fmtAge(entry.work.updatedAt ?? entry.updatedAt)} ago`;
+    : `finished ${fmtAge(record.updatedAt ?? entry.updatedAt)} ago`;
   const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
   const tokenLabel = active && entry.roundTokens
     ? `${fmtTokens(entry.roundTokens)} round / ${fmtTokens(entry.tokens)} total`
     : fmtTokens(entry.tokens);
   const tokenDetail = `${tokenLabel} · ${engine === "gemini" ? "gemini conversation" : "codex session"} ${(entry.workSessionId ?? entry.sessionId)?.slice(0, 8) ?? "-"}`;
-  const report = entry.work.report ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
-  const lastParts = [entry.diffEmpty ? "no tree change" : undefined, entry.work.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
-  const last = entry.kind === "work" && active ? entry.lastAction ?? "-"
+  const report = record.report ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
+  const lastParts = [entry.diffEmpty ? "no tree change" : undefined, record.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
+  const last = (entry.consult || entry.kind === "work") && active ? entry.lastAction ?? "-"
     : lastParts.join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
   const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
   if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
-  if (entry.review?.state) {
+  if (entry.review?.state && !entry.consult) {
     const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.review?.state;
     const reviewTiming = entry.review?.state === "running"
       ? `running ${fmtAge(entry.roundStartedAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt)}`
@@ -3658,6 +3689,8 @@ async function waitCommand(argv: string[]) {
   const json = parsed.bools.has("json");
   const showReport = parsed.bools.has("report");
   const names = parsed.rest;
+  const multiple = new Set(names).size > 1;
+  const completedReports: { lane: string; entry: Lane }[] = [];
   if (names.length === 0) fail("usage: cdx wait <lane|job>... [--timeout <sec>] [--json] [--report]");
   const knownLanes = readLedger();
   const knownJobs = readJobs();
@@ -3681,6 +3714,7 @@ async function waitCommand(argv: string[]) {
     ...(error ? { error } : {}),
   }));
   let failed = false;
+  if (!json && multiple) console.log(`cdx: waiting for ${[...new Set(names)].join(", ")}`);
   while (pending.size > 0 || pendingJobs.size > 0) {
     const ledger = readLedger();
     // A waited lane that asks a question is blocked, not busy: return at
@@ -3698,13 +3732,14 @@ async function waitCommand(argv: string[]) {
       if (laneRunning(entry) && pidAlive(entry.pid)) continue;
       if (laneRunning(entry)) {
         if (json) emitJson(lane, entry, "runner died without finalizing");
-        else console.log(`cdx: lane=${color.magenta(lane)} ${color.red("runner died without finalizing")} (see cdx doctor)`);
+        else console.log(`cdx: lane=${color.magenta(lane)} state=failed report=${availableReportPath(lane, entry.rounds) ?? "-"} ${color.red("runner died without finalizing")} (see cdx doctor)`);
         failed = true;
       } else {
         if (json) emitJson(lane, entry);
         else {
           console.log(`cdx: lane=${color.magenta(lane)} engine=${roundEngine(entry)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${roundReportOf(entry) ?? "-"}`);
-          if (showReport) {
+          if (showReport && multiple) completedReports.push({ lane, entry });
+          if (showReport && !multiple) {
             const text = reportTextOf(entry);
             if (text) {
               console.log(`--- report ${color.magenta(lane)} ---`);
@@ -3722,7 +3757,7 @@ async function waitCommand(argv: string[]) {
         const job = settledJob(name);
         if (!job) continue;
         if (json) console.log(JSON.stringify({ job: name, state: job.state, exitCode: job.exitCode ?? null, log: job.log, note: job.note ?? null, cwd: job.cwd, cmd: job.cmd }));
-        else console.log(`cdx: ${renderJobLine(name, job)}`);
+        else console.log(`cdx: ${renderJobLine(name, job)}${multiple ? ` report=${job.log}` : ""}`);
         if (job.state === "failed") failed = true;
         pendingJobs.delete(name);
       }
@@ -3730,6 +3765,13 @@ async function waitCommand(argv: string[]) {
     if (pending.size === 0 && pendingJobs.size === 0) break;
     if (Date.now() > deadline) fail(`timeout waiting for: ${[...pending, ...pendingJobs].join(", ")}`);
     await Bun.sleep(5000);
+  }
+  if (!json && multiple) {
+    console.log(`cdx: waited for ${new Set(names).size} targets; state=${failed ? "failed" : "done"}`);
+    for (const { lane, entry } of completedReports) {
+      const text = reportTextOf(entry);
+      if (text) console.log(`--- report ${color.magenta(lane)} ---\n${text.trimEnd()}\n--- end ${color.magenta(lane)} ---`);
+    }
   }
   process.exit(failed ? 1 : 0);
 }
