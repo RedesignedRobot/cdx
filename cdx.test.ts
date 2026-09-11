@@ -73,6 +73,16 @@ test("config parsing reads gemini.maxRounds and defaults to 2", () => {
   expect(partial.gemini?.model).toBe("custom-gemini");
 });
 
+test("config parsing reads gemini.maxRuntimeMins and defaults to 90", () => {
+  const empty = parseConfig("{}");
+  expect(empty.gemini?.maxRuntimeMins).toBe(90);
+  const custom = parseConfig(JSON.stringify({ gemini: { maxRuntimeMins: 30 } }));
+  expect(custom.gemini?.maxRuntimeMins).toBe(30);
+  for (const bad of [0, -5, "90", null]) {
+    expect(() => parseConfig(JSON.stringify({ gemini: { maxRuntimeMins: bad } }))).toThrow("gemini.maxRuntimeMins must be a positive number of minutes");
+  }
+});
+
 test("config parsing rejects invalid gemini.maxRounds values", () => {
   for (const bad of [0, -1, 1.5, "2", null, []]) {
     expect(() => parseConfig(JSON.stringify({ gemini: { maxRounds: bad } }))).toThrow("gemini.maxRounds must be a positive integer");

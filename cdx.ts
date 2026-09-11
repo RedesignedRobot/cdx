@@ -176,6 +176,7 @@ interface GeminiConfig {
   agent: string;
   reviewAgent: string;
   maxRounds: number;
+  maxRuntimeMins: number;
 }
 
 interface Config {
@@ -443,7 +444,7 @@ function parseConfig(text: string): Config {
       configError("gemini must be an object");
     }
     const geminiInput = value as Record<string, unknown>;
-    const geminiAllowed = new Set(["model", "agent", "reviewAgent", "maxRounds"]);
+    const geminiAllowed = new Set(["model", "agent", "reviewAgent", "maxRounds", "maxRuntimeMins"]);
     const unknownGemini = Object.keys(geminiInput).filter((key) => !geminiAllowed.has(key));
     if (unknownGemini.length > 0) {
       configError(`unknown gemini key${unknownGemini.length === 1 ? "" : "s"}: ${unknownGemini.join(", ")}`);
@@ -454,6 +455,7 @@ function parseConfig(text: string): Config {
       agent: Object.hasOwn(geminiInput, "agent") ? geminiInput.agent : defaults.agent,
       reviewAgent: Object.hasOwn(geminiInput, "reviewAgent") ? geminiInput.reviewAgent : defaults.reviewAgent,
       maxRounds: Object.hasOwn(geminiInput, "maxRounds") ? geminiInput.maxRounds : defaults.maxRounds,
+      maxRuntimeMins: Object.hasOwn(geminiInput, "maxRuntimeMins") ? geminiInput.maxRuntimeMins : defaults.maxRuntimeMins,
     };
     for (const key of ["model", "agent", "reviewAgent"] as const) {
       const field = values[key];
@@ -461,6 +463,9 @@ function parseConfig(text: string): Config {
     }
     if (!Number.isInteger(values.maxRounds) || (values.maxRounds as number) < 1) {
       configError("gemini.maxRounds must be a positive integer");
+    }
+    if (typeof values.maxRuntimeMins !== "number" || !Number.isFinite(values.maxRuntimeMins) || values.maxRuntimeMins <= 0) {
+      configError("gemini.maxRuntimeMins must be a positive number of minutes");
     }
     gemini = values as GeminiConfig;
   }
@@ -497,6 +502,7 @@ function geminiConfig(): GeminiConfig {
     agent: "cdx-lane",
     reviewAgent: "cdx-review",
     maxRounds: 2,
+    maxRuntimeMins: 90,
   };
 }
 
@@ -1383,6 +1389,14 @@ function maxRuntimeOf(parsed: Parsed): number | undefined {
   const minutes = Number(raw);
   if (!Number.isFinite(minutes) || minutes <= 0) fail("--max-runtime must be a positive number of minutes");
   return minutes;
+}
+
+// A Gemini lane that hangs on its own script (a Playwright run on a remote
+// client went 40 minutes silent on 2026-09-11) otherwise runs to the 12-hour
+// print timeout. Codex lanes keep no default: --max-runtime stays explicit.
+function defaultMaxRuntime(engine: Engine): number | undefined {
+  if (engine !== "gemini") return undefined;
+  return (config.gemini ?? geminiConfig()).maxRuntimeMins;
 }
 
 interface AccountChoice { name: string; home: string }
@@ -3351,7 +3365,7 @@ async function spawnCommand(argv: string[]) {
   let cwd = parsed.flags.cd ?? (existingLane ? workCwdOf(existingLane) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = resolveEffort(engine, model, parsed.flags.effort);
-  const maxRuntime = maxRuntimeOf(parsed);
+  const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
   if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
@@ -3448,13 +3462,13 @@ async function resumeCommand(argv: string[]) {
   const [lane, followUpArg] = parsed.rest;
   const followUp = await resolveBrief(followUpArg);
   if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"');
-  const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
   requireOwnChild(lane, before);
   if (supervisorLane() && parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate) {
     fail(`supervisor ${supervisorLane()} may not change a child's gate; ask the liaison if it is wrong`);
   }
   const engine = laneEngine(before);
+  const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
