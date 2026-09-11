@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx 6.1.1
+# cdx 6.2.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -43,8 +43,8 @@ cdx injects these rules before `config.json` rules and the repository's `.cdx-ru
 ## Commands
 
 ```bash
-cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] "<brief>"
-cdx resume  <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime MIN] "<follow-up>"
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] "<brief>"
+cdx resume  <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] "<follow-up>"
 cdx consult <lane> [--model M] [--effort E] [--cd D] [--bg] [--account NAME] "<question>"
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
 cdx fork    <new> <lane|sessionId> [--model M] [--effort E] [--bg] [--account NAME] "<brief>"
@@ -83,16 +83,27 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   not approval; the worker reports the unresolved dependency and stops only
   dependent work without guessing, continuing independent authorized work.
 - Calling `cdx resume` on an active running lane is refused by the harness;
-  wait for the active round to settle before resuming. Failed rounds expose a
-  partial report path when no full report exists. `resume` feeds that partial
-  back to either engine with an instruction to continue without redoing work.
-  Gemini transport errors get five retries with waits of 1 through 5 seconds;
-  other errors get no transport retries. Failure notes keep markdown in the file.
+  wait for the active round to settle before resuming. `gemini.maxRounds`
+  (default 2) sets the round cap on Gemini lanes. `cdx resume` on a Gemini lane
+  whose work rounds already equal the cap fails with:
+  `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`.
+  Review rounds do not count toward the cap.
+  Astra and GPT lanes are not capped. Failed rounds expose a partial report
+  path when no full report exists. `resume` feeds that partial back to either
+  engine with an instruction to continue without redoing work. Gemini transport
+  errors get five retries with waits of 1 through 5 seconds; other errors get no
+  transport retries. Failure notes keep markdown in the file.
 - The gate is the verdict. An unchanged tree does not fail a gated round; the
   gate runs and the feed line says `diff=empty` so you can judge. Only
   `--gate-baseline-check` runs the gate on the untouched baseline tree before
   worker startup, including worktrees. A baseline failure stops the round as
   `gate-invalid`.
+- `--pre "<cmd>"` on spawn and resume runs `<cmd>` in the lane's cwd before
+  opening the round. A nonzero exit refuses the launch, prints the last 20
+  lines of output, and records nothing in the ledger. The pre-check persists on
+  the lane like the gate so resume reuses it unless a new `--pre` is given.
+  Intended use: `--pre "bun qa.ts readiness-check --release <sha>"` before any
+  register cell lane.
 - Lanes touching the same repository get `--worktree`, or disjoint files in
   one tree with no other writer. Never run a Gemini review against a tree
   another lane is editing; its write protection is detection after the fact.

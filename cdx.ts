@@ -69,7 +69,7 @@ const GEMINI_TRANSPORT_RETRIES = 5;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.1.1";
+const VERSION = "6.2.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -175,6 +175,7 @@ interface GeminiConfig {
   model: string;
   agent: string;
   reviewAgent: string;
+  maxRounds: number;
 }
 
 interface Config {
@@ -248,6 +249,7 @@ interface Lane {
   switchingAccount?: true;
   kind: "work" | "review";
   rounds: number;
+  workRounds?: number;
   reports: string[];
   tokens?: Tokens;
   roundTokens?: Tokens;
@@ -258,6 +260,8 @@ interface Lane {
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
+  // Pre-check command; runs in cwd before opening the round.
+  pre?: string;
   pid?: number;
   codexPid?: number;
   lastAction?: string;
@@ -324,26 +328,10 @@ function configError(message: string): never {
 
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]*$/;
 
-function readConfig(skipFile = false): Config {
-  const defaults: Config = {
-    model: "gpt-6-astra",
-    efforts: ["low", "medium", "high"],
-    defaultEffort: "medium",
-    rules: [],
-    effortCaps: DEFAULT_EFFORT_CAPS,
-  };
-  if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
-
-  let text: string;
-  try {
-    text = readFileSync(CONFIG_PATH, "utf8");
-  } catch (error) {
-    configError(`cannot read config: ${error instanceof Error ? error.message : String(error)}`);
-  }
-
+function parseConfig(text: string): Config {
   let value: unknown;
   try {
-    value = JSON.parse(text!);
+    value = JSON.parse(text);
   } catch (error) {
     configError(`invalid JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -355,6 +343,15 @@ function readConfig(skipFile = false): Config {
   const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
+
+  const defaults: Config = {
+    model: "gpt-6-astra",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "medium",
+    rules: [],
+    effortCaps: DEFAULT_EFFORT_CAPS,
+    gemini: geminiConfig(),
+  };
 
   const model = Object.hasOwn(input, "model") ? input.model : defaults.model;
   if (typeof model !== "string" || model.trim().length === 0) configError("model must be a nonempty string");
@@ -446,27 +443,52 @@ function readConfig(skipFile = false): Config {
       configError("gemini must be an object");
     }
     const geminiInput = value as Record<string, unknown>;
-    const geminiAllowed = new Set(["model", "agent", "reviewAgent"]);
+    const geminiAllowed = new Set(["model", "agent", "reviewAgent", "maxRounds"]);
     const unknownGemini = Object.keys(geminiInput).filter((key) => !geminiAllowed.has(key));
     if (unknownGemini.length > 0) {
       configError(`unknown gemini key${unknownGemini.length === 1 ? "" : "s"}: ${unknownGemini.join(", ")}`);
     }
     const defaults = geminiConfig();
     const values = {
-      model: geminiInput.model ?? defaults.model,
-      agent: geminiInput.agent ?? defaults.agent,
-      reviewAgent: geminiInput.reviewAgent ?? defaults.reviewAgent,
+      model: Object.hasOwn(geminiInput, "model") ? geminiInput.model : defaults.model,
+      agent: Object.hasOwn(geminiInput, "agent") ? geminiInput.agent : defaults.agent,
+      reviewAgent: Object.hasOwn(geminiInput, "reviewAgent") ? geminiInput.reviewAgent : defaults.reviewAgent,
+      maxRounds: Object.hasOwn(geminiInput, "maxRounds") ? geminiInput.maxRounds : defaults.maxRounds,
     };
-    for (const [key, field] of Object.entries(values)) {
+    for (const key of ["model", "agent", "reviewAgent"] as const) {
+      const field = values[key];
       if (typeof field !== "string" || field.trim().length === 0) configError(`gemini.${key} must be a nonempty string`);
+    }
+    if (!Number.isInteger(values.maxRounds) || (values.maxRounds as number) < 1) {
+      configError("gemini.maxRounds must be a positive integer");
     }
     gemini = values as GeminiConfig;
   }
 
   return {
     model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
-    ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), ...(gemini ? { gemini } : {}),
+    ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };
+}
+
+function readConfig(skipFile = false): Config {
+  const defaults: Config = {
+    model: "gpt-6-astra",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "medium",
+    rules: [],
+    effortCaps: DEFAULT_EFFORT_CAPS,
+    gemini: geminiConfig(),
+  };
+  if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
+
+  let text: string;
+  try {
+    text = readFileSync(CONFIG_PATH, "utf8");
+  } catch (error) {
+    configError(`cannot read config: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseConfig(text!);
 }
 
 function geminiConfig(): GeminiConfig {
@@ -474,6 +496,7 @@ function geminiConfig(): GeminiConfig {
     model: "gemini-3.8-flash-high",
     agent: "cdx-lane",
     reviewAgent: "cdx-review",
+    maxRounds: 2,
   };
 }
 
@@ -1115,7 +1138,7 @@ const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. 
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open"]);
 
@@ -1507,7 +1530,7 @@ function removeWorktree(entry: Lane) {
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 // ---------------------------------------------------------------------------
 
-async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
+async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
   for (;;) {
     if (engine === "gpt" && config.accounts) {
@@ -1528,6 +1551,8 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       }
       if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
       const rounds = (existing?.rounds ?? 0) + 1;
+      const existingWorkRounds = existing?.workRounds ?? existing?.rounds ?? 0;
+      const workRounds = kind === "work" ? existingWorkRounds + 1 : existingWorkRounds;
       const preferred = opts?.account ?? (opts?.preserveAccount ? existing && laneAccount(existing) : undefined);
       const demand: Demand = kind === "review" ? "light" : (opts?.lineage?.supervisor ?? existing?.supervisor) ? "supervisor" : "work";
       const selection = engine === "gpt" ? chooseAccount(cachedAccountStandings(ledger).map((standing) => opts?.excludedHomes?.has(standing.choice.home) ? { ...standing, reached: true, reason: `already exhausted in this run; ${standing.reason}` } : standing), demand, opts?.forcedAccount, preferred) : undefined;
@@ -1570,6 +1595,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
           ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
           : existing?.workSessionId,
         gate: opts?.preserveGate ? existing?.gate : opts?.gate,
+        pre: opts?.preservePre ? existing?.pre : opts?.pre,
         effort,
         work: kind === "work"
           ? { state: workState, round: rounds, cwd: workCwd, updatedAt: now }
@@ -1581,6 +1607,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         pid: process.pid,
         kind,
         rounds,
+        workRounds,
         reports: existing?.reports ?? [],
         tokens: existing?.tokens ?? { input: 0, cached: 0, output: 0 },
         roundTokens: { input: 0, cached: 0, output: 0 },
@@ -1678,6 +1705,42 @@ function executeGate(command: string, cwd: string, logPath: string): GateResult 
 function gateOutputForReport(output: string): string {
   const trimmed = output.trim();
   return trimmed.length > 4000 ? `...${trimmed.slice(-4000)}` : trimmed;
+}
+
+function roundCapRefusal(lane: string, cap: number): string {
+  return `round cap ${cap} reached for ${lane}: close it and spawn a new lane with the failure attached`;
+}
+
+function checkRoundCap(lane: string, engine: Engine, workRounds: number, cap = (config.gemini ?? geminiConfig()).maxRounds): void {
+  if (engine === "gemini" && workRounds >= cap) fail(roundCapRefusal(lane, cap));
+}
+
+function tailOutput(text: string, count = 20): string {
+  const lines = text.replace(/\r\n/g, "\n").trimEnd().split("\n");
+  if (lines.length === 1 && lines[0] === "") return "";
+  return lines.slice(-count).join("\n");
+}
+
+function executePreCheck(command: string, cwd: string): { exitCode: number; output: string } {
+  const proc = Bun.spawnSync({
+    cmd: ["/bin/sh", "-lc", command],
+    cwd,
+    env: uncoloredChildEnv(),
+  });
+  const exitCode = proc.exitCode ?? 1;
+  const output = `${proc.stdout.toString()}${proc.stderr.toString()}`;
+  return { exitCode, output };
+}
+
+function runPreCheck(command: string, cwd: string): void {
+  const result = executePreCheck(command, cwd);
+  if (result.exitCode !== 0) {
+    const tail = tailOutput(result.output, 20);
+    if (tail.length > 0) {
+      console.error(tail);
+    }
+    fail(`pre-check failed (exit ${result.exitCode}): ${command}`);
+  }
 }
 
 interface ReviewTreeSnapshot {
@@ -3262,7 +3325,7 @@ function gateCommand(argv: string[]): void {
 }
 
 async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "model", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "model", "supervisor", "pre"]);
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
   const brief = await resolveBrief(briefArg);
@@ -3290,6 +3353,7 @@ async function spawnCommand(argv: string[]) {
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const maxRuntime = maxRuntimeOf(parsed);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
+  if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
   if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
   if (existingLane) {
     requireOwnChild(lane, existingLane);
@@ -3302,6 +3366,7 @@ async function spawnCommand(argv: string[]) {
   }
   // A respawn keeps the stored gate and cwd unless the caller passes new ones.
   const gate = parsed.flags.gate ?? existingLane?.gate;
+  const pre = parsed.flags.pre ?? existingLane?.pre;
   const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
     if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
     return realpathSync(dir);
@@ -3327,8 +3392,9 @@ async function spawnCommand(argv: string[]) {
       console.error(warning);
     }
   }
+  if (pre) runPreCheck(pre, cwd);
   const { round, selection } = await openRound(lane, "work", cwd, effort, {
-    engine, forcedAccount: parsed.flags.account, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate,
+    engine, forcedAccount: parsed.flags.account, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate, pre,
     ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
   if (parsed.flags.worktree) {
@@ -3378,10 +3444,10 @@ async function spawnCommand(argv: string[]) {
 }
 
 async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account"]);
+  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre"]);
   const [lane, followUpArg] = parsed.rest;
   const followUp = await resolveBrief(followUpArg);
-  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] "<follow-up>"');
+  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"');
   const maxRuntime = maxRuntimeOf(parsed);
   const before = readLane(lane);
   requireOwnChild(lane, before);
@@ -3394,6 +3460,9 @@ async function resumeCommand(argv: string[]) {
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gpt") rejectPinnedAccountFlag(lane, before, parsed.flags.account);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
+  if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
+  const workRounds = before.workRounds ?? before.rounds;
+  checkRoundCap(lane, engine, workRounds);
   const owner = storedOwnership(before);
   const effort = resolveEffort(engine, laneModel(before), parsed.flags.effort, before.effort);
   // Resume targets the lane's work thread even when the latest round was a
@@ -3403,12 +3472,16 @@ async function resumeCommand(argv: string[]) {
   const account = engine === "gpt" ? reviewResume ? before.roundAccount ?? laneAccount(before) : laneAccount(before) : undefined;
   if (engine === "gpt") warnCachedUsageBeforeLaunch(account);
   const cwd = workCwdOf(before);
+  const pre = parsed.flags.pre ?? before.pre;
+  if (pre) runPreCheck(pre, cwd);
   const partialPath = partialReportPathOf(lane, before.rounds);
   const partial = roundStateOf(before) === "failed" && existsSync(partialPath) ? readFileSync(partialPath, "utf8").trim() : "";
   const { round, sessionId, selection } = await openRound(lane, reviewResume ? "review" : "work", cwd, effort, {
     engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", preserveOwner: true,
     preserveGate: parsed.flags.gate === undefined,
     ...(parsed.flags.gate !== undefined ? { gate: parsed.flags.gate } : {}),
+    preservePre: parsed.flags.pre === undefined,
+    ...(parsed.flags.pre !== undefined ? { pre: parsed.flags.pre } : {}),
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
   if (selection) announceAccountSelection(lane, selection);
@@ -5982,7 +6055,7 @@ if (import.meta.main) {
   }
 }
 
-export { parseFeedEvent, recipientOf, owned, eventOwned };
+export { parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput };
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
@@ -6033,7 +6106,7 @@ switch (command) {
         ...(account ? { account: account.name, codexHome: account.home } : {}),
         ...owner,
         sessionId, workSessionId: sessionId, work: { state: "adopted", cwd: parsed.flags.cd ?? process.cwd(), updatedAt: now }, effort: resolveEffort(engine, model),
-        kind: "work", rounds: ledger[lane]?.rounds ?? 0,
+        kind: "work", rounds: ledger[lane]?.rounds ?? 0, workRounds: ledger[lane]?.workRounds ?? ledger[lane]?.rounds ?? 0,
         reports: ledger[lane]?.reports ?? [], createdAt: ledger[lane]?.createdAt ?? now, updatedAt: now,
       };
     });

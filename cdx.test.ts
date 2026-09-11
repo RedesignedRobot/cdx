@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { eventOwned, owned, parseFeedEvent, recipientOf } from "./cdx.ts";
+import { checkRoundCap, eventOwned, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal } from "./cdx.ts";
 
 // Keep only ownership and feed rules. Pass state explicitly so these tests
 // never read user files, spawn engines, or wait on timers.
@@ -59,4 +59,69 @@ test("a peer message reaches its recipient rather than its sender or message tex
   expect(eventOwned(event, "current-head", state)).toBe(true);
   expect(eventOwned(event, "sender", state)).toBe(false);
   expect(eventOwned(event, "someone-else", state)).toBe(false);
+});
+
+test("config parsing reads gemini.maxRounds and defaults to 2", () => {
+  const empty = parseConfig("{}");
+  expect(empty.gemini?.maxRounds).toBe(2);
+
+  const custom = parseConfig(JSON.stringify({ gemini: { maxRounds: 4 } }));
+  expect(custom.gemini?.maxRounds).toBe(4);
+
+  const partial = parseConfig(JSON.stringify({ gemini: { model: "custom-gemini" } }));
+  expect(partial.gemini?.maxRounds).toBe(2);
+  expect(partial.gemini?.model).toBe("custom-gemini");
+});
+
+test("config parsing rejects invalid gemini.maxRounds values", () => {
+  for (const bad of [0, -1, 1.5, "2", null, []]) {
+    expect(() => parseConfig(JSON.stringify({ gemini: { maxRounds: bad } }))).toThrow("gemini.maxRounds must be a positive integer");
+  }
+});
+
+test("round cap refusal formats exact refusal message", () => {
+  expect(roundCapRefusal("worker-lane", 2)).toBe(
+    "round cap 2 reached for worker-lane: close it and spawn a new lane with the failure attached"
+  );
+  expect(roundCapRefusal("hs-cell-9", 5)).toBe(
+    "round cap 5 reached for hs-cell-9: close it and spawn a new lane with the failure attached"
+  );
+});
+
+test("checkRoundCap refuses gemini lanes at or above the round cap", () => {
+  expect(() => checkRoundCap("gemini-lane", "gemini", 2, 2)).toThrow(
+    "round cap 2 reached for gemini-lane: close it and spawn a new lane with the failure attached"
+  );
+  expect(() => checkRoundCap("gemini-lane", "gemini", 3, 2)).toThrow(
+    "round cap 2 reached for gemini-lane: close it and spawn a new lane with the failure attached"
+  );
+  // Work rounds only: a lane at rounds 2 with one review round has workRounds 1.
+  expect(() => checkRoundCap("gemini-lane", "gemini", 1, 2)).not.toThrow();
+});
+
+test("checkRoundCap does not cap Astra or GPT lanes", () => {
+  expect(() => checkRoundCap("gpt-lane", "gpt", 2, 2)).not.toThrow();
+  expect(() => checkRoundCap("gpt-lane", "gpt", 5, 2)).not.toThrow();
+  expect(() => checkRoundCap("gpt-lane", "gpt", 100, 2)).not.toThrow();
+});
+
+test("parseArgs parses --pre flag for spawn and resume", () => {
+  const spawnArgs = parseArgs(
+    ["lane-1", "--pre", "bun qa.ts readiness-check --release abc", "task brief"],
+    ["pre"]
+  );
+  expect(spawnArgs.flags.pre).toBe("bun qa.ts readiness-check --release abc");
+  expect(spawnArgs.rest).toEqual(["lane-1", "task brief"]);
+
+  const resumeArgs = parseArgs(
+    ["lane-1", "--pre", "make test", "follow up"],
+    ["pre"]
+  );
+  expect(resumeArgs.flags.pre).toBe("make test");
+  expect(resumeArgs.rest).toEqual(["lane-1", "follow up"]);
+});
+
+test("parseArgs rejects --pre without a value or when disallowed", () => {
+  expect(() => parseArgs(["lane-1", "--pre"], ["pre"])).toThrow("--pre needs a value");
+  expect(() => parseArgs(["lane-1", "--pre", "cmd"], [])).toThrow("--pre is not valid for this command");
 });

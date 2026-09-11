@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 6.1.1
+# cdx 6.2.0
 
 **Codex and Antigravity execution lanes for Claude Code.**
 
@@ -159,8 +159,8 @@ flowchart LR
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
-cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--max-runtime MIN] "<follow-up>"
+cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] "<brief>"
+cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] "<follow-up>"
 cdx gate   <lane> ("<cmd>" | --clear)
 cdx fork   <new> <lane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
 cdx send   <lane> "<text>"
@@ -212,7 +212,9 @@ Only `--gate-baseline-check` runs the gate on the untouched baseline tree before
 
 `cdx gate <lane> "<cmd>"` sets or replaces the stored gate. `cdx gate <lane> --clear` removes it. Both forms print the old and new value and refuse to change an active lane. A supervisor cannot change a child's gate through `cdx gate`, `resume --gate`, or `spawn`; the gate is the liaison's acceptance check. Omitting `--gate` on a supervised respawn preserves the existing gate. `resume --gate "<cmd>"` replaces the stored gate before that work round and keeps it for later resumes.
 
-`resume` inherits the lane engine and rejects `--engine`. It reattaches to the recorded work session even after a review. Calling `cdx resume` on an active running lane is refused by the harness; wait for the active round to settle before resuming. A GPT lane prefers its recorded account while eligible. If admission selects another home, cdx starts a fresh session with the task and prior evidence. A Gemini lane resumes with `agy --conversation <sessionId>`. When the previous round failed and has a nonempty partial report, `resume` includes its contents and path before the follow-up, with an instruction to continue without redoing completed work. This applies to both engines and still requires a recorded session. One-time migration assigns GPT to older rows with no engine.
+`spawn --pre "<cmd>"` and `resume --pre "<cmd>"` run the command in the lane's cwd before opening the round. A nonzero exit refuses the launch, prints the last 20 lines of its output, and records nothing in the ledger. The pre-check is stored on the lane like the gate so resume reuses it unless a new `--pre` is given. Intended use: `--pre "bun qa.ts readiness-check --release <sha>"` before any register cell lane.
+
+`resume` inherits the lane engine and rejects `--engine`. It reattaches to the recorded work session even after a review. Calling `cdx resume` on an active running lane is refused by the harness; wait for the active round to settle before resuming. Resume on a Gemini lane whose work rounds already equal the `gemini.maxRounds` cap (default 2) fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped. A GPT lane prefers its recorded account while eligible. If admission selects another home, cdx starts a fresh session with the task and prior evidence. A Gemini lane resumes with `agy --conversation <sessionId>`. When the previous round failed and has a nonempty partial report, `resume` includes its contents and path before the follow-up, with an instruction to continue without redoing completed work. This applies to both engines and still requires a recorded session. One-time migration assigns GPT to older rows with no engine.
 
 `fork` inherits the source lane engine and model. GPT can fork a lane or a raw Codex session ID; a raw-session fork takes `--model` and applies it to the forked thread's turns. Gemini has no headless fork, so `cdx fork` refuses a Gemini lane and directs the caller to `cdx resume`.
 
@@ -248,7 +250,7 @@ For multiple targets, text-mode `wait` names the targets at the start and prints
 
 ## Claude Code integration
 
-cdx 6.1.1 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
+cdx 6.2.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
 
 The plugin monitor runs `cdx watch` with no argument. The monitor's own `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's, so the watcher ignores it. It reads `CLAUDE_PID` and looks up the head's session id in the receipt the session hook wrote for that process; `/clear` writes a new receipt and the watcher follows it. It refuses to run without `CLAUDE_PID` and stands by until the receipt exists. No head setup call is needed. A persisted lease allows one live watcher per full session id, tied to that Claude process. A watcher that finds a live lease stands by and takes over when the holder exits, so a reload that starts the new monitor before the old one stops still ends with one watcher resuming the saved wake cursor.
 
@@ -294,7 +296,8 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
   "gemini": {
     "model": "gemini-3.8-flash-high",
     "agent": "cdx-lane",
-    "reviewAgent": "cdx-review"
+    "reviewAgent": "cdx-review",
+    "maxRounds": 2
   }
 }
 ```
@@ -303,7 +306,7 @@ That is a working example, not the built-in defaults. Without a config file cdx 
 
 - Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
 - `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, fork, review, consult, and the doctor probe after alias resolution. The built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only; an explicit `--effort high` or `xhigh` fails with the allowed list. Any other source above the cap (the config `defaultEffort`, a lane recorded before the cap, a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note, and the clamped value travels with every turn, including `codex exec resume` of a review-only session. Config may add caps for other models or lower a built-in cap; raising `gpt-6-astra` above `medium` is a config error. `efforts` must stay within `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `gemini` is optional. Its shown values are the defaults. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
+- `gemini` is optional. Its shown values are the defaults. `gemini.maxRounds` sets the round cap for Gemini lanes, default 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
 

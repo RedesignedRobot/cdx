@@ -1,3 +1,8 @@
+## 6.2.0
+
+- Round cap: new config key `gemini.maxRounds` defaults to 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped.
+- Pre-check: new flag `--pre "<cmd>"` on spawn and resume runs the command in the lane's cwd before opening the round. A nonzero exit refuses the launch, prints the last 20 lines of output, and records nothing in the ledger. The pre-check persists on the lane like the gate so resume reuses it unless a new `--pre` is given. Intended use: `--pre "bun qa.ts readiness-check --release <sha>"` before any register cell lane.
+
 ## 6.1.1
 
 - Gemini transport interruptions get five continuation retries with waits of 1, 2, 3, 4, and 5 seconds. Stops and runtime limits prevent another continuation after the wait.
