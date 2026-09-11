@@ -4270,9 +4270,9 @@ interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; 
 
 // Fixed allowances guide placement; they are not completion budgets.
 type Demand = "light" | "work" | "supervisor";
-// Owner ruling 2026-09-11: an Astra design lane costs a few percent, so the
-// allowances are small placement hints and never a refusal on their own.
-const HEADROOM_PERCENT: Record<Demand, number> = { light: 2, work: 3, supervisor: 5 };
+// Owner ruling 2026-09-11: the risk line is 3% remaining, for every lane kind;
+// the allowance is a placement hint and never a refusal on its own.
+const HEADROOM_PERCENT: Record<Demand, number> = { light: 3, work: 3, supervisor: 3 };
 // A usage reading serves this long before the next launch probes again.
 const USAGE_CACHE_MS = 30 * 60 * 1000;
 const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "work", supervisor: "supervisor" };
