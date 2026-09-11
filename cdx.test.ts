@@ -1,7 +1,9 @@
+import "./visibility.test.ts";
+import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
 import { checkRoundCap, eventOwned, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal } from "./cdx.ts";
 
-// Keep only ownership and feed rules. Pass state explicitly so these tests
+// Keep tests pure. Pass state explicitly so these tests
 // never read user files, spawn engines, or wait on timers.
 const state = {
   sequence: 0,
