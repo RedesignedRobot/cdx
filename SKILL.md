@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
 ---
 
-# cdx 6.2.0
+# cdx 6.4.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -54,7 +54,7 @@ cdx ask     [--timeout MIN] "<question>"   # inside a lane only
 cdx reply   <lane> [--id SEQ] "<answer>"
 cdx questions [lane]
 cdx wait    <lane|job>... [--timeout SEC] [--json] [--report]   # exit 1 on failure, 2 on an open question
-cdx status  [--all] [--json]
+cdx status  [--all] [--json | --brief | --watch [--interval S]]
 cdx tail    <lane> [-n N] | cdx tail -f [lane]
 cdx report  <lane> [round]
 cdx log     <lane> [round] [--transcript]
@@ -78,6 +78,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   path as the five-second poll observes it. It ends with a summary and, with
   `--report`, report bodies. JSON output stays unchanged. Consult lanes show
   `consult` and their review state on the main status line.
+- Normal `cdx status` reports round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age. Running jobs show their latest log line capped at 80 characters, skipping blank tail lines. `status --brief` prints only running lanes and caller-owned jobs, one line each under 100 characters. `status --watch` with optional `--interval S` defaulting to 2 seconds re-renders the brief view in place read-only until stopped with Ctrl-C.
 - `wait` exit 2 means a lane is blocked on a question. Answer it promptly with
   `cdx reply`. An unanswered question times out after 30 minutes. Timeout is
   not approval; the worker reports the unresolved dependency and stops only
@@ -122,8 +123,22 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   messages. Takeover replays nothing; it prints the owned summary. `adopt`
   over an existing lane needs ownership like any other mutation.
 - SessionStart restores owned running and completed work and open questions,
-  including after compaction. Close completed lanes when handled. Hooks supply
-  quiet updates; the plugin watcher wakes the head for questions and completions.
+  including after compaction. Finished jobs are capped at 10 while running jobs
+  remain visible. Close completed lanes when handled. Hooks supply quiet
+  updates; the plugin watcher wakes the head for questions, stalls, thrash alerts,
+  and completions.
+- The session-wide plugin watcher emits a quiet progress digest every
+  visibility.heartbeatMinutes defaulting to 10 while owned work runs, showing
+  step and file deltas, stage transitions, and current action. The monitor reads
+  heartbeat configuration at startup, so a changed cadence requires a monitor restart.
+  Stage events gate-started, gate-finished with exit code, and report-written stay quiet.
+- The thrash detector wakes once per round if the same command fails
+  visibility.failureRepeats consecutive times defaulting to 5, or if the same file
+  is edited more than visibility.fileEdits times in a round defaulting to 20.
+  The detector recognizes only explicit structured failures and nonzero exit codes;
+  it never guesses from free text. Shell script edits without structured file events
+  are not counted by file thrash. Round specs pin visibility settings at launch.
+  Repeat state tracks in runner memory.
 - With configured accounts, `cdx usage` and launch admission share one decision. Work needs 15% weekly capacity, supervisors 25%, and light turns prefer 5% but can use less; every tier refuses exhausted accounts. Active rounds hold fixed demand against the account during execution: light holds 5%, work holds 15%, and supervisors hold 25%. Admission subtracts active holds from remaining headroom before account selection. Dead runners release their hold during admission while preserving live child holds. Consuming round completion invalidates the account snapshot to force fresh usage probes. Thresholds guide placement; they do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish. `--account` obeys exhaustion eligibility instead of forcing a depleted account. A GPT quota exhaustion failure triggers automatic account failover: cdx starts a fresh round on an available account carrying the brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
 - `doctor` compares secondary Codex homes against the primary home. Running `cdx doctor --fix` synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` across configured homes while preserving credentials, auth sessions, and account-specific settings.
 - Close finished lanes with an outcome note. `close --remove-worktree` deletes
@@ -142,7 +157,7 @@ run. No setup call is needed. One persisted lease prevents duplicate watchers.
 `hooks/guard-raw-codex.ts` keeps the raw-work guard. SessionStart,
 PostToolBatch, and UserPromptSubmit run `_session`; native subagent calls
 are skipped. Run `cdx doctor` to check this session's hook receipt and lease.
-Hook and monitor changes need `/reload-plugins` or a restart. Skill edits are live.
+Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart running monitors, so changes to monitors or watcher code require a session restart. Skill edits are live.
 Cancel old global-tail monitors or restart their sessions before upgrading.
 Version 6 ignores old free-text feed lines; cleanup removes them.
 

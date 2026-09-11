@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 6.2.0
+# cdx 6.4.0
 
 **Codex and Antigravity execution lanes for Claude Code.**
 
@@ -143,7 +143,7 @@ flowchart LR
 | `cdx msg <target> "<text>"` | Send a feed message to a full session id or a lane's owning session |
 | `cdx inbox` | Print messages addressed to the calling Claude session |
 | `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
-| `cdx status` | Show lane state, timing, tokens, steer count, open question, and last activity |
+| `cdx status` | Show lane state, tool steps, dirty file count, stage, timing, and last action |
 | `cdx usage` | Codex account limits, which account to spend next and why, Gemini limits, and all-time ledger totals |
 | `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
 | `cdx job <name> "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
@@ -175,7 +175,7 @@ cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E
 cdx consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 cdx view [--port N] [--open]
-cdx status [--all] [--json]
+cdx status [--all] [--json | --brief | --watch [--interval S]]
 cdx usage  [--json]
 cdx wait   <lane>... [--timeout S] [--json] [--report]
 cdx tail   <lane> [-n N]
@@ -218,7 +218,7 @@ Only `--gate-baseline-check` runs the gate on the untouched baseline tree before
 
 `fork` inherits the source lane engine and model. GPT can fork a lane or a raw Codex session ID; a raw-session fork takes `--model` and applies it to the forked thread's turns. Gemini has no headless fork, so `cdx fork` refuses a Gemini lane and directs the caller to `cdx resume`.
 
-`status` reports the lane outcome and directory from its work record. A review does not replace work outcome. When a lane has review history, `status` prints the review outcome on a separate review line. Consult lanes use their review record for the main state, timing, and report, with `consult` as the role. `status --json` emits a name-to-record map.
+`status` reports lane progress, outcome, and directory from its work record. Active lanes show round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age. Running jobs display their final non-empty log line capped at 80 characters, skipping blank tail lines. A review does not replace work outcome. When a lane has review history, `status` prints the review outcome on a separate review line. Consult lanes use their review record for the main state, timing, and report, with `consult` as the role. `status --brief` prints only running lanes and caller-owned jobs, formatted as one line each under 100 characters. `status --watch [--interval S]` re-renders the brief view in place read-only until stopped with Ctrl-C, using a default interval of 2 seconds. `--json` cannot combine with `--brief` or `--watch`. `status --json` emits a name-to-record map.
 
 `kill` sends SIGTERM to the runner, which reaps its engine child and finalizes the round with a signal note. A runner still silent after 10 seconds gets SIGKILL, and cdx finalizes the ledger with note `killed`. `--max-runtime MIN` uses the same signal sequence on either engine child.
 
@@ -250,13 +250,13 @@ For multiple targets, text-mode `wait` names the targets at the start and prints
 
 ## Claude Code integration
 
-cdx 6.2.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
+cdx 6.4.0 loads as `cdx@skills-dir` in personal scope. In the owner's installation, `~/.claude/skills/cdx` points to `/Users/mas/code/cdx`. No marketplace or extra installation is needed. Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart a running monitor and Claude Code does not respawn one that exited, so a change to `monitors/monitors.json` or to the watcher code needs a session restart. `SKILL.md` changes are live.
 
 The plugin monitor runs `cdx watch` with no argument. The monitor's own `CLAUDE_CODE_SESSION_ID` is a child session id, not the head's, so the watcher ignores it. It reads `CLAUDE_PID` and looks up the head's session id in the receipt the session hook wrote for that process; `/clear` writes a new receipt and the watcher follows it. It refuses to run without `CLAUDE_PID` and stands by until the receipt exists. No head setup call is needed. A persisted lease allows one live watcher per full session id, tied to that Claude process. A watcher that finds a live lease stands by and takes over when the holder exits, so a reload that starts the new monitor before the old one stops still ends with one watcher resuming the saved wake cursor.
 
-The watcher delivers owned questions, stalls, final work or review results, job exits, and peer messages. A stall produces one event per quiet episode. Gate failure is part of the final lane event. GPT quota failover emits a quiet account update on success and one terminal failure when no alternate remains. Spawn results stay in command output; supervisor child starts and partial report paths arrive through quiet hooks. Partial reports produce at most one event per round.
+The watcher delivers owned questions, stalls, thrash alerts, final work or review results, job exits, and peer messages. A stall produces one event per quiet episode. When owned work runs, the watcher emits a quiet progress digest every visibility.heartbeatMinutes defaulting to 10 with step and dirty file deltas, stage transitions, and current actions. The monitor reads heartbeat configuration at startup, so a changed cadence requires a monitor restart. Stage events gate-started, gate-finished with exit code, and report-written arrive through quiet hooks. The thrash detector wakes once per round if the same command fails visibility.failureRepeats consecutive times defaulting to 5, or if the same file is edited more than visibility.fileEdits times in a round defaulting to 20. The detector recognizes only explicit structured tool failures and nonzero exit codes; it never guesses from free text. Shell script edits without structured file events are not counted by file thrash. Round specs pin visibility settings at launch. Repeat state tracks in runner memory. Gate failure is part of the final lane event. GPT quota failover emits a quiet account update on success and one terminal failure when no alternate remains. Spawn results stay in command output; supervisor child starts and partial report paths arrive through quiet hooks. Partial reports produce at most one event per round.
 
-`SessionStart`, including compact and resume, restores owned lanes, completed work awaiting attention, open questions, and jobs. Completed lanes remain in recovery until closed. `PostToolBatch` and `UserPromptSubmit` deliver quiet events through `hookSpecificOutput.additionalContext`. Hook calls with `agent_id` do nothing. Missing `session_id` is an error. Wake and quiet cursors are separate, so a hook cannot consume a pending monitor notification. The raw Codex guard stays on `PreToolUse`. There is no Stop hook.
+`SessionStart`, including compact and resume, restores owned lanes, completed work awaiting attention, open questions, and jobs. Finished jobs are capped at 10 while running jobs remain visible. Completed lanes remain in recovery until closed. `PostToolBatch` and `UserPromptSubmit` deliver quiet events through `hookSpecificOutput.additionalContext`. Hook calls with `agent_id` do nothing. Missing `session_id` is an error. Wake and quiet cursors are separate, so a hook cannot consume a pending monitor notification. The raw Codex guard stays on `PreToolUse`. There is no Stop hook.
 
 `cdx doctor` checks the `cdx@skills-dir` personal path, installed hook set, hooks observed in the current session, and that session's watcher lease. An installed file alone is not proof of a loaded hook. Doctor reports a missing or stale receipt and asks for a reload or restart. Claude runtime delivery still needs an interactive check.
 
@@ -298,15 +298,21 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
     "agent": "cdx-lane",
     "reviewAgent": "cdx-review",
     "maxRounds": 2
+  },
+  "visibility": {
+    "heartbeatMinutes": 10,
+    "failureRepeats": 5,
+    "fileEdits": 20
   }
 }
 ```
 
-That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the Astra cap below, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini values shown.
+That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the Astra cap below, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini and visibility values shown.
 
 - Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
 - `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, fork, review, consult, and the doctor probe after alias resolution. The built-in value caps `gpt-6-astra` at `medium`, so Astra runs `low` or `medium` only; an explicit `--effort high` or `xhigh` fails with the allowed list. Any other source above the cap (the config `defaultEffort`, a lane recorded before the cap, a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note, and the clamped value travels with every turn, including `codex exec resume` of a review-only session. Config may add caps for other models or lower a built-in cap; raising `gpt-6-astra` above `medium` is a config error. `efforts` must stay within `minimal`, `low`, `medium`, `high`, `xhigh`.
 - `gemini` is optional. Its shown values are the defaults. `gemini.maxRounds` sets the round cap for Gemini lanes, default 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
+- `visibility` is optional. Its shown values are the defaults. `heartbeatMinutes` must be a positive finite number defaulting to 10; it sets the interval for quiet watcher progress digests when owned work runs. `failureRepeats` must be a positive integer defaulting to 5; it sets consecutive identical command failures before a thrash wake. `fileEdits` must be a positive integer defaulting to 20; it sets the maximum edits to the same file in a round before a thrash wake.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
 
@@ -372,7 +378,7 @@ Each engine handles its own context. cdx does not set a fixed context size.
 
 ```
 $CDX_HOME/
-  ledger.json    version 5 envelope with lanes, work/review records, sessions, tokens, and account holds
+  ledger.json    version 5 envelope with lanes, work/review records, sessions, tokens, and account holds; lanes track roundSteps, stage, stageStartedAt, and lastActionAt
   .ledger-version rejects older writers after the first migration
   logs/          raw engine events and stderr for each round
   reports/       final report per round

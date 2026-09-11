@@ -1,3 +1,20 @@
+## 6.4.0
+
+- Normal cdx status displays round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age.
+- Running jobs display their latest non-empty log line capped at 80 characters, skipping blank tail lines.
+- cdx status --brief prints only running lanes and caller-owned jobs, one line each under 100 characters.
+- cdx status --watch with optional --interval S defaulting to 2 seconds re-renders the brief view in place read-only until stopped with Ctrl-C.
+- Session-wide plugin watch emits one quiet progress digest every visibility.heartbeatMinutes defaulting to 10 while owned work runs. Each line reports step and dirty file deltas, stage transitions, and current action.
+- The monitor reads heartbeat configuration at startup, so changed cadence needs a monitor restart.
+- Stage transitions gate-started, gate-finished with exit code, and report-written emit quiet events.
+- Thrash detector wakes the liaison once per round if the same command fails visibility.failureRepeats consecutive times defaulting to 5, or if the same file is edited more than visibility.fileEdits times in a round defaulting to 20. The detector recognizes only explicit structured failures and nonzero exit codes; it never guesses from free text. Shell script edits without structured file events are not counted by file thrash.
+- Round specs pin visibility settings at launch. Runner memory tracks tool observations and repetition state per round.
+- Lane ledger records add fields roundSteps, stage, stageStartedAt, and lastActionAt.
+- SessionStart caps finished jobs at 10 while including running jobs, nonclosed lanes awaiting attention, and open questions.
+- New visibility configuration object supports heartbeatMinutes as a positive finite number, failureRepeats as a positive integer, and fileEdits as a positive integer.
+- Version alignment: cdx.ts runtime VERSION, package.json, and plugin.json align to 6.4.0.
+- Zero new runtime dependencies. Updating watcher code requires restarting the Claude Code session.
+
 ## 6.2.0
 
 - Round cap: new config key `gemini.maxRounds` defaults to 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped.

@@ -12,7 +12,7 @@
 //   cdx questions [lane]
 //   cdx msg    <target> "<text>"
 //   cdx inbox  [-n <lines>]
-//   cdx status [--all] [--json]
+//   cdx status [--all] [--json] [--brief] [--watch [--interval S]]
 //   cdx usage  [--json]
 //   cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
 //   cdx tail   <lane> [-n <lines>]
@@ -53,6 +53,7 @@ import {
 } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { VISIBILITY_DEFAULTS, roundProgress, toolObservation, digestLines, heartbeatDue, type VisibilityConfig, type ProgressSample } from "./visibility.ts";
 import { syncAccountHomes } from "./account-sync.ts";
 import { isatty } from "node:tty";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -69,7 +70,7 @@ const GEMINI_TRANSPORT_RETRIES = 5;
 const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.2.0";
+const VERSION = "6.4.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -180,6 +181,7 @@ interface GeminiConfig {
 }
 
 interface Config {
+  visibility?: VisibilityConfig;
   model: string;
   models?: Record<string, string>;
   efforts: string[];
@@ -254,6 +256,10 @@ interface Lane {
   reports: string[];
   tokens?: Tokens;
   roundTokens?: Tokens;
+  roundSteps?: number;
+  stage?: "working" | "gate" | "reporting";
+  stageStartedAt?: string;
+  lastActionAt?: string;
   steers?: number;
   steerOpen?: boolean;
   continuations?: number;
@@ -278,6 +284,7 @@ interface Lane {
 }
 
 interface Spec {
+  visibility?: VisibilityConfig;
   effort: Effort;
   engine: Engine;
   mode: Mode;
@@ -341,7 +348,7 @@ function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini"]);
+  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -470,7 +477,20 @@ function parseConfig(text: string): Config {
     gemini = values as GeminiConfig;
   }
 
+  const visibility = { ...VISIBILITY_DEFAULTS };
+  if (Object.hasOwn(input, "visibility")) {
+    const values = input.visibility;
+    if (!values || typeof values !== "object" || Array.isArray(values)) configError("visibility must be an object");
+    for (const [key, value] of Object.entries(values)) {
+      if (!Object.hasOwn(visibility, key)) configError(`unknown visibility key: ${key}`);
+      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0
+        || (key !== "heartbeatMinutes" && !Number.isSafeInteger(value))) configError(`visibility.${key} must be a positive ${key === "heartbeatMinutes" ? "number" : "integer"}`);
+      visibility[key as keyof VisibilityConfig] = value as number;
+    }
+  }
+
   return {
+    visibility,
     model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };
@@ -509,12 +529,24 @@ function geminiConfig(): GeminiConfig {
 // Pure tests import defaults without reading or writing user state. The
 // CLI reads the config file except on the paths that pin what they need.
 const config: Config = import.meta.main
-  ? readConfig(process.argv[2] === "_run" || process.argv[2] === "view" || process.argv[2] === "hook" || process.argv[2] === "watch" || process.argv[2] === "_session")
+  ? readConfigForCommand(process.argv[2])
   : readConfig(true);
+
+// The plugin monitor must keep delivering wake events when config.json is
+// broken, so `watch` falls back to the defaults and says so once on stderr.
+function readConfigForCommand(command: string | undefined): Config {
+  const pinned = command === "_run" || command === "view" || command === "hook" || command === "_session";
+  if (command !== "watch") return readConfig(pinned);
+  try { return readConfig(false); }
+  catch (error) {
+    process.stderr.write(`cdx watch: ${error instanceof Error ? error.message : String(error)}; using default visibility settings\n`);
+    return readConfig(true);
+  }
+}
 
 if (import.meta.main) {
   const isHookInvocation = process.argv[2] === "hook";
-  if (!isHookInvocation && process.argv[2] !== "view") {
+  if (!isHookInvocation && process.argv[2] !== "view" && process.argv[2] !== "status") {
     for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
       try {
         mkdirSync(`${ROOT}/${dir}`, { recursive: true });
@@ -554,7 +586,7 @@ function readTailLines(path: string, limit: number, accept: (line: string) => bo
   }
 }
 
-type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message";
+type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "gate-started" | "gate-finished" | "report-written";
 interface FeedEvent {
   id: number;
   timestamp: string;
@@ -581,7 +613,7 @@ interface SessionState {
   heads: Record<string, string>;
 }
 const SESSION_STATE = `${ROOT}/sessions.json`;
-const WAKE_EVENTS = new Set<EventKind>(["question", "stalled", "terminal", "job-exit", "message"]);
+const WAKE_EVENTS = new Set<EventKind>(["question", "stalled", "terminal", "job-exit", "message", "thrash"]);
 function readSessions(): SessionState {
   return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, heads: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
 }
@@ -608,7 +640,7 @@ function parseFeedEvent(line: string): FeedEvent | undefined {
     const event = JSON.parse(line);
     if (Number.isSafeInteger(event.id) && event.id > 0 && typeof event.timestamp === "string"
       && typeof event.owner === "string" && typeof event.message === "string"
-      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message"].includes(event.kind)) return event;
+      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
   } catch { /* Version 5 free-text records are deliberately ignored. */ }
 }
 function readEvents(): FeedEvent[] {
@@ -632,7 +664,7 @@ function feedEvent(kind: EventKind, message: string, owner?: string, identity: {
     state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
     if (kind === "terminal" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
-    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity, message: singleLine(message) };
+    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity, message: kind === "progress" ? message.split("\n").map(singleLine).join("\n") : singleLine(message) };
     appendFileSync(`${ROOT}/feed.log`, `${JSON.stringify(event)}\n`);
   });
 }
@@ -662,6 +694,9 @@ async function watchCommand(argv: string[]): Promise<void> {
   // the session hook receipt keyed by the Claude process; /clear changes it.
   const headSession = () => readSessions().heads[String(claudePid)];
   let held: string | undefined;
+  let digestSession: string | undefined;
+  let lastDigest = Date.now();
+  let previousProgress: ProgressSample[] = [];
   const release = () => withEvents((state) => {
     if (held && state.sessions[held]?.lease?.pid === process.pid) delete state.sessions[held]!.lease;
     held = undefined;
@@ -685,6 +720,18 @@ async function watchCommand(argv: string[]): Promise<void> {
       if (held && session !== held) release();
       if (session && acquire(session)) {
         held = session;
+        const now = Date.now();
+        if (digestSession !== session) {
+          digestSession = session;
+          lastDigest = now;
+          previousProgress = [];
+        }
+        if (heartbeatDue(now, lastDigest, (config.visibility ?? VISIBILITY_DEFAULTS).heartbeatMinutes)) {
+          const samples = sessionProgress(session, now);
+          if (samples.length) feedEvent("progress", `[cdx] progress\n${digestLines(samples, previousProgress).join("\n")}`, session);
+          previousProgress = samples;
+          lastDigest = now;
+        }
         deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
       }
       await Bun.sleep(500);
@@ -695,6 +742,32 @@ async function watchCommand(argv: string[]): Promise<void> {
     process.removeListener("SIGINT", stop);
   }
 }
+function sessionProgress(session: string, now: number): ProgressSample[] {
+  const state = readSessions();
+  const samples: ProgressSample[] = [];
+  const files = new Map<string, number | undefined>();
+  for (const [name, entry] of Object.entries(readLedger())) {
+    if (!laneRunning(entry) || !owned(entry.ownerSession, name, session, state)) continue;
+    const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
+    if (!files.has(cwd)) files.set(cwd, changedFileCount(cwd));
+    const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
+    const gateAge = stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)} ` : "";
+    samples.push({ key: `lane=${name}`, round: entry.rounds, steps: entry.roundSteps ?? 0, files: files.get(cwd), stage,
+      action: `${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
+  }
+  for (const [name, job] of Object.entries(readJobs())) {
+    if (jobRunning(job) && owned(job.ownerSession, undefined, session, state)) {
+      samples.push({ key: `job=${name}`, stage: "running", action: jobPhase(job.log) || "-" });
+    }
+  }
+  return samples;
+}
+
+function summaryJobs(jobs: Jobs): [string, Job][] {
+  const entries = Object.entries(jobs).sort((a, b) => b[1].startedAt.localeCompare(a[1].startedAt));
+  return [...entries.filter(([, job]) => jobRunning(job)), ...entries.filter(([, job]) => !jobRunning(job)).slice(0, FINISHED_SHOWN)];
+}
+
 function sessionSummary(session: string): string {
   const state = readSessions();
   const ledger = readLedger();
@@ -707,9 +780,8 @@ function sessionSummary(session: string): string {
       lines.push(`lane=${record.lane} r${record.round} QUESTION #${record.seq}: ${record.question}; cdx reply ${record.lane} --id ${record.seq} "<answer>"`);
     }
   }
-  for (const [name, job] of Object.entries(readJobs())) {
-    if (owned(job.ownerSession, undefined, session, state)) lines.push(renderJobLine(name, job));
-  }
+  const jobs = Object.fromEntries(Object.entries(readJobs()).filter(([, job]) => owned(job.ownerSession, undefined, session, state)));
+  for (const [name, job] of summaryJobs(jobs)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
 }
 async function sessionCommand(): Promise<void> {
@@ -1144,9 +1216,9 @@ const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. 
 // Flag parsing
 // ---------------------------------------------------------------------------
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -1625,6 +1697,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         reports: existing?.reports ?? [],
         tokens: existing?.tokens ?? { input: 0, cached: 0, output: 0 },
         roundTokens: { input: 0, cached: 0, output: 0 },
+        roundSteps: 0, stage: "working", stageStartedAt: now, lastActionAt: undefined,
         steers: 0,
         steerOpen: kind === "work",
         continuations: 0,
@@ -1645,6 +1718,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
   spec.accountHomes = config.accounts;
+  spec.visibility = config.visibility ?? VISIBILITY_DEFAULTS;
   spec.taskPrompt ??= spec.prompt;
   const entry = readLane(spec.lane);
   if (spec.engine === "gpt") {
@@ -2413,9 +2487,27 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     return details.length ? details.join(": ") : lastProtocolError;
   };
 
+  const trackProgress = roundProgress(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS);
+  // Review lanes refuse `cdx send`, so the alert points at the transcript instead.
+  const thrashAdvice = (name: string): string => startingLane?.kind === "work"
+    ? `cdx send ${name} "Stop repeating this attempt; inspect the cause and change approach."`
+    : `cdx tail ${name}`;
+  const observeTool = (event: any, now: string) => {
+    const observation = toolObservation(event);
+    if (!observation) return;
+    const progress = trackProgress(observation);
+    touchLedger((item) => {
+      item.roundSteps = progress.steps;
+      item.lastActionAt = now;
+      item.lastEventAt = now;
+      if (event.params?.item ?? event.item) item.lastAction = excerpt(event.params?.item ?? event.item);
+    }, Boolean(progress.thrash));
+    if (progress.thrash) feedEvent("thrash", `[cdx] lane=${lane} round=${round} ${progress.thrash}; ${thrashAdvice(lane)}`, spec.ownerSession, { lane, round });
+  };
   const handleGeminiEvent = async (event: any) => {
     noteActivity();
     const now = new Date().toISOString();
+    observeTool(event, now);
     if (event.event === "init" && event.conversation_id) {
       touchLedger((item) => {
         item.sessionId = event.conversation_id;
@@ -2448,7 +2540,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         const tool = update.tool_name ?? update.tool_info?.name ?? "tool";
         const params = update.tool_info?.parameters;
         const detail = params === undefined ? "" : ` ${singleLine(typeof params === "string" ? params : JSON.stringify(params)).slice(0, 120)}`;
-        touchLedger((item) => { item.lastAction = `${tool}${detail}`; item.lastEventAt = now; });
+        touchLedger((item) => { item.lastAction = `${tool}${detail}`.slice(0, 160); item.lastEventAt = now; item.lastActionAt = now; });
       } else if (update.step_type === "agent_response") {
         const stepIdx = String(update.step_index ?? "");
         if (stepIdx) {
@@ -2463,7 +2555,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
           turnAgentResponses.set(stepIdx, existing);
         }
         if (typeof update.text_delta === "string") {
-          touchLedger((item) => { item.lastAction = singleLine(update.text_delta).slice(0, 160); item.lastEventAt = now; });
+          touchLedger((item) => { item.lastAction = singleLine(update.text_delta).slice(0, 160); item.lastEventAt = now; item.lastActionAt = now; });
         }
       }
     } else if (event.event === "result" && event.result) {
@@ -2504,6 +2596,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const handleCodexEvent = async (event: any) => {
     noteActivity();
     const now = new Date().toISOString();
+    observeTool(event, now);
     if (event.method === "item/agentMessage/delta" && typeof event.params?.delta === "string") {
       appendFileSync(partialReportPathOf(lane, round), event.params.delta);
       announcePartial();
@@ -2565,7 +2658,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     } else if (event.method === "item/completed" && event.params?.item) {
       const item = event.params.item as Record<string, unknown>;
       rememberAgentMessage(item, event.params.turnId ?? activeTurnId);
-      touchLedger((entry) => { entry.lastAction = excerpt(item); entry.lastEventAt = now; });
+      touchLedger((entry) => { entry.lastAction = excerpt(item); entry.lastEventAt = now; entry.lastActionAt = now; });
     } else if (event.type === "turn.failed" || event.type === "error") {
       const evidence = JSON.stringify(event.error ?? event.message ?? "");
       turnFailureReason = evidence;
@@ -2584,7 +2677,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         item.lastEventAt = now;
       }, true);
     } else if (event.type === "item.completed" && event.item) {
-      touchLedger((item) => { item.lastAction = excerpt(event.item); item.lastEventAt = now; });
+      touchLedger((item) => { item.lastAction = excerpt(event.item); item.lastEventAt = now; item.lastActionAt = now; });
     }
   };
 
@@ -2966,6 +3059,11 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   // Success needs all three gates: exit 0, a nonempty report, and (implicitly)
   // the drained event log. The report is the lane's contract with its caller;
   // a clean exit without one is still a failure.
+  const setStage = (stage: "gate" | "reporting") => withLedger((ledger) => {
+    const item = ledger[lane];
+    if (item?.rounds === round) { item.stage = stage; item.stageStartedAt = new Date().toISOString(); }
+  });
+  setStage("reporting");
   const reportOk = existsSync(reportPath) && readFileSync(reportPath, "utf8").trim().length > 0;
   const stderrText = (() => {
     try { return readFileSync(`${ROOT}/logs/${lane}-r${round}.stderr.log`, "utf8"); } catch { return ""; }
@@ -2994,14 +3092,19 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   let gateExit: number | undefined;
   let gateTimedOut = false;
   if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason) {
+    setStage("gate");
+    feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
     const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
+    setStage("reporting");
+    feedEvent("gate-finished", `[cdx] lane=${lane} round=${round} gate finished exit=${gateExit}`, spec.ownerSession, { lane, round });
     writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
   }
   if (unchangedWork && existsSync(reportPath)) {
     appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
   }
+  if (reportOk) feedEvent("report-written", `[cdx] lane=${lane} round=${round} report written`, spec.ownerSession, { lane, round });
   const gateFailed = gateExit !== undefined && gateExit !== 0;
   // A supervisor's round ends with its children. Whatever the outcome, any
   // child still running is stopped so nothing keeps editing after the
@@ -3687,6 +3790,42 @@ function fmtCreated(iso: string): string {
   return `${date.getDate()} ${months[date.getMonth()]} ${hour}:${minute}`;
 }
 
+function statusText(text: string, limit: number): string {
+  const clean = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
+  return clean.length <= limit ? clean : `${clean.slice(0, Math.max(0, limit - 3))}...`;
+}
+
+function porcelainFileCount(output: string): number {
+  const records = output.split("\0");
+  let count = 0;
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]!;
+    if (!record) continue;
+    count += 1;
+    if (/[RC]/.test(record.slice(0, 2))) index += 1;
+  }
+  return count;
+}
+
+function changedFileCount(cwd: string): number | undefined {
+  try {
+    const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stderr: "ignore", timeout: 1000, killSignal: "SIGKILL", maxBuffer: 1_048_576 });
+    return result.success ? porcelainFileCount(result.stdout.toString()) : undefined;
+  } catch { return undefined; }
+}
+
+function statusAge(iso: string | undefined, now: number): string {
+  if (!iso || !Number.isFinite(Date.parse(iso))) return "-";
+  const seconds = Math.max(0, Math.round((now - Date.parse(iso)) / 1000));
+  return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.round(seconds / 60)}m` : `${(seconds / 3600).toFixed(1)}h`;
+}
+
+function laneProgress(entry: Lane, files: number | undefined, now = Date.now()): string {
+  const stage = entry.stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)}` : entry.stage ?? "working";
+  return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
+}
+
 function renderLaneBlock(lane: string, entry: Lane): string {
   const active = laneRunning(entry);
   const stale = active && !pidAlive(entry.pid);
@@ -3726,6 +3865,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const last = (entry.consult || entry.kind === "work") && active ? entry.lastAction ?? "-"
     : lastParts.join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
+  if (active) lines.push(line("progress", laneProgress(entry, changedFileCount(entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd))));
   const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
   if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
   if (entry.review?.state && !entry.consult) {
@@ -3744,8 +3884,61 @@ function renderLaneBlock(lane: string, entry: Lane): string {
 
 const FINISHED_SHOWN = 10;
 
-function statusCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["json", "all"]);
+function jobPhaseText(tail: string): string {
+  return statusText(tail.split("\n").filter((line) => line.trim()).at(-1) ?? "", 80);
+}
+
+function jobPhase(log: string): string {
+  try { return jobPhaseText(readTailLines(log, 1, (line) => line.trim().length > 0).join("\n")); }
+  catch { return ""; }
+}
+
+function statusBrief(ledger: Ledger, jobs: Jobs, io: {
+  files: (cwd: string) => number | undefined;
+  phase: (log: string) => string;
+  ownsJob: (job: Job) => boolean;
+  now: number;
+}): string {
+  const lines: string[] = [];
+  for (const [name, entry] of Object.entries(ledger)) {
+    if (!laneRunning(entry)) continue;
+    const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
+    lines.push(statusText(`${statusText(name, 24)} ${laneProgress(entry, io.files(cwd), io.now)}`, 99));
+  }
+  for (const [name, job] of Object.entries(jobs)) {
+    if (!jobRunning(job) || !io.ownsJob(job)) continue;
+    lines.push(statusText(`job ${statusText(name, 24)} ${statusAge(job.startedAt, io.now)} ${io.phase(job.log) || "-"}`, 99));
+  }
+  return lines.join("\n");
+}
+
+export { changedFileCount, jobPhase, jobPhaseText, laneProgress, porcelainFileCount, statusBrief, statusText };
+
+async function statusCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["json", "all", "brief", "watch", "interval"]);
+  if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --watch [--interval S]]");
+  const watch = parsed.bools.has("watch");
+  const interval = Number(parsed.flags.interval ?? 2);
+  if (!Number.isFinite(interval) || interval <= 0 || interval > 2_147_483) fail("--interval must be positive seconds below 2147483");
+  if (parsed.flags.interval !== undefined && !watch) fail("--interval requires --watch");
+  if (parsed.bools.has("json") && (watch || parsed.bools.has("brief"))) fail("--json cannot be combined with --brief or --watch");
+  if (parsed.bools.has("all") && (watch || parsed.bools.has("brief"))) fail("--all lists finished jobs; --brief and --watch show only running work");
+  if (watch || parsed.bools.has("brief")) {
+    const render = () => statusBrief(readLedger(), readJobs(), { files: changedFileCount, phase: jobPhase, ownsJob: (job) => owned(job.ownerSession), now: Date.now() });
+    if (!watch) { const text = render(); if (text) console.log(text); return; }
+    process.stdout.write(`\x1b[H\x1b[2J${render()}\n`);
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => { clearInterval(timer); process.removeListener("SIGINT", stop); process.removeListener("SIGTERM", stop); };
+      const stop = () => { cleanup(); resolve(); };
+      const timer = setInterval(() => {
+        try { process.stdout.write(`\x1b[H\x1b[2J${render()}\n`); }
+        catch (error) { cleanup(); reject(error); }
+      }, interval * 1000);
+      process.on("SIGINT", stop);
+      process.on("SIGTERM", stop);
+    });
+    return;
+  }
   const ledger = readLedger();
   const all = Object.entries(ledger);
   if (parsed.bools.has("json")) {
@@ -5663,7 +5856,8 @@ function renderJobLine(name: string, job: Job): string {
   const state = jobRunning(job) && !pidAlive(job.pid) ? "running(dead?)" : job.state;
   const exit = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
   const note = job.note ? ` note=${job.note}` : "";
-  return `job=${color.magenta(name)} state=${coloredState(state)}${exit} ${jobDuration(job)} log=${job.log}${note}`;
+  const phase = jobRunning(job) ? jobPhase(job.log) : "";
+  return `job=${color.magenta(name)} state=${coloredState(state)}${exit} ${jobDuration(job)}${phase ? ` phase=${phase}` : ""} log=${job.log}${note}`;
 }
 
 // A running job whose runner died never finalized itself; record that here so
@@ -6032,7 +6226,8 @@ ${ENGINE_PICKER}
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   takeover <lane|full-session-id> # explicitly connect ownership to this head
   watch                    # plugin monitor; finds its head through CLAUDE_PID
-  status [--json]         wait <lane>... [--timeout S] [--json] [--report]
+  status [--all | --json | --brief | --watch [--interval S]]
+  wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   view   [--port N] [--open] # local browser view; Ctrl-C stops it
@@ -6079,7 +6274,7 @@ if (import.meta.main) {
   }
 }
 
-export { parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput };
+export { summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput };
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
@@ -6138,7 +6333,7 @@ switch (command) {
     break;
   }
   case "view": viewCommand(argv); break;
-  case "status": statusCommand(argv); break;
+  case "status": await statusCommand(argv); break;
   case "job": await jobCommand(argv); break;
   case "_job": {
     if (!argv[0]) fail("internal: _job <name>");
