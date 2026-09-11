@@ -4270,7 +4270,9 @@ interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; 
 
 // Fixed allowances guide placement; they are not completion budgets.
 type Demand = "light" | "work" | "supervisor";
-const HEADROOM_PERCENT: Record<Demand, number> = { light: 5, work: 15, supervisor: 25 };
+// Owner ruling 2026-09-11: an Astra design lane costs a few percent, so the
+// allowances are small placement hints and never a refusal on their own.
+const HEADROOM_PERCENT: Record<Demand, number> = { light: 2, work: 3, supervisor: 5 };
 // A usage reading serves this long before the next launch probes again.
 const USAGE_CACHE_MS = 30 * 60 * 1000;
 const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "work", supervisor: "supervisor" };
@@ -4385,6 +4387,12 @@ function decideAccount(standings: AccountStanding[], demand: Demand): AccountSta
   return rankAccounts(standings.filter((standing) => accountEligible(standing, demand)), demand)[0];
 }
 
+function fullestOpenAccount(standings: AccountStanding[]): AccountStanding | undefined {
+  return standings
+    .filter((standing) => !standing.reached && (!standing.snapshot || standing.remainingPercent > 0))
+    .sort((a, b) => b.remainingPercent - a.remainingPercent)[0];
+}
+
 // A cached snapshot serves for 30 minutes unless a window has reset or it
 // predates per-window storage; after a failed refresh the stale copy stays
 // on disk and standingOf decides how much of it to trust.
@@ -4476,10 +4484,12 @@ function chooseAccount(standings: AccountStanding[], demand: Demand, forced?: st
   }
   if (forced !== undefined) configuredAccount(forced);
   const pinned = standings.find((standing) => standing.choice.name === (forced ?? preferred?.name) && accountEligible(standing, demand));
-  const pick = pinned ?? (forced === undefined ? decideAccount(standings, demand) : undefined);
+  // Below the allowance, the fullest account that has not hit its limit still
+  // runs the lane (announceAccountSelection warns); only exhaustion refuses.
+  const pick = pinned ?? (forced === undefined ? (decideAccount(standings, demand) ?? fullestOpenAccount(standings)) : undefined);
   if (!pick) {
     const detail = standings.map((standing) => `${standing.choice.name}: ${standing.reason}`).join("; ");
-    throw new CmdError(`no account has ${HEADROOM_PERCENT[demand]}% remaining headroom for a ${DEMAND_LABEL[demand]} lane (${detail}); wait for a reset or use gemini`);
+    throw new CmdError(`every account has reached its limit for a ${DEMAND_LABEL[demand]} lane (${detail}); wait for a reset or use gemini`);
   }
   return { choice: pick.choice, skipped: standings.filter((s) => s.reached && s.snapshot).map((s) => ({ choice: s.choice, snapshot: s.snapshot! })), pick, demand };
 }
