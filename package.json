@@ -9,6 +9,10 @@
   "repository": "github:RedesignedRobot/cdx",
   "description": "OpenAI Codex and Google Antigravity execution lanes for Claude Code.",
   "scripts": {
-    "check": "bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts"
+    "check": "tsc --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.2",
+    "typescript": "^7.0.2"
   }
 }

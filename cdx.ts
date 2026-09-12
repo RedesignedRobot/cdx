@@ -66,8 +66,12 @@ const CONFIG_PATH = `${ROOT}/config.json`;
 const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
 const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
-const GEMINI_TRANSPORT_RETRIES = 5;
-const GEMINI_TRANSPORT_ERRORS = [/stream was interrupted/i, /timeout waiting for response/i];
+const GEMINI_TRANSPORT_RETRIES = 1;
+const CODEX_DISABLE_NATIVE_SUBAGENTS = [
+  "-c", "agents.enabled=false",
+  "--disable", "multi_agent",
+  "--disable", "multi_agent_v2",
+];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
 const VERSION = "6.4.0";
@@ -89,8 +93,8 @@ const color = {
   cyan: style(36),
 };
 
-function uncoloredChildEnv(codexHome?: string, stateHome?: string) {
-  const env = { ...process.env, NO_COLOR: "1" };
+function uncoloredChildEnv(codexHome?: string, stateHome?: string): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1" };
   delete env.FORCE_COLOR;
   if (codexHome !== undefined) env.CODEX_HOME = codexHome;
   if (stateHome !== undefined) env.CDX_STATE_HOME = stateHome;
@@ -143,8 +147,11 @@ function supervisorLane(): string | undefined {
   if (!lane || supervisor !== lane) return undefined;
   const entry = readLedger()[lane];
   const round = Number(process.env.CDX_ROUND);
-  if (!entry?.supervisor || entry.kind !== "work" || !laneRunning(entry) || entry.rounds !== round) {
+  if (!entry?.supervisor || (entry.kind !== "work" && !entry.consult) || !laneRunning(entry) || entry.rounds !== round) {
     fail(`supervisor identity "${lane}" round ${process.env.CDX_ROUND ?? "?"} does not match a running supervisor round in the ledger; this shell belongs to an earlier or unknown round`);
+  }
+  if (entry.parent) {
+    fail(`child lane "${lane}" cannot be a supervisor; delegation is one level deep`);
   }
   return supervisor;
 }
@@ -165,6 +172,9 @@ interface Lineage { supervisor: boolean; parent?: string; parentRound?: number }
 function callerLineage(supervisor: boolean): Lineage {
   const parent = supervisorLane();
   const parentRound = Number(process.env.CDX_ROUND);
+  if (parent && supervisor) {
+    fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
+  }
   return { supervisor, ...(parent ? { parent, parentRound } : {}) };
 }
 
@@ -221,6 +231,8 @@ interface RoundRecord<S extends WorkState = WorkState> {
   cwd: string;
   report?: string;
   updatedAt?: string;
+  startedAt?: string;
+  tokensIncomplete?: boolean;
 }
 
 interface Lane {
@@ -256,6 +268,7 @@ interface Lane {
   reports: string[];
   tokens?: Tokens;
   roundTokens?: Tokens;
+  tokensIncomplete?: boolean;
   roundSteps?: number;
   stage?: "working" | "gate" | "reporting";
   stageStartedAt?: string;
@@ -305,6 +318,7 @@ interface Spec {
   taskPrompt?: string;
   ownerSession?: string;
   ownerCwd?: string;
+  sessionId?: string;
   gate?: string;
   gateBaselineChecked?: true;
   reviewDir?: string;
@@ -312,6 +326,7 @@ interface Spec {
   supervisor?: true;
   // agy agent name, pinned at launch so the detached runner cannot drift.
   agent?: string;
+  startedAt?: string;
 }
 
 type Ledger = Record<string, Lane>;
@@ -590,7 +605,7 @@ type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "ac
 interface FeedEvent {
   id: number;
   timestamp: string;
-  kind: EventKind;
+  kind: EventKind | string;
   owner: string;
   recipient?: string;
   from?: string;
@@ -613,7 +628,7 @@ interface SessionState {
   heads: Record<string, string>;
 }
 const SESSION_STATE = `${ROOT}/sessions.json`;
-const WAKE_EVENTS = new Set<EventKind>(["question", "stalled", "terminal", "job-exit", "message", "thrash"]);
+const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash"]);
 function readSessions(): SessionState {
   return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, heads: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
 }
@@ -1294,6 +1309,10 @@ function modelAliases(): string {
   return entries.map(([alias, id]) => `${alias}=${id}`).join(", ");
 }
 
+const DEFAULT_MODEL_ALIASES: Record<string, string> = {
+  astra: "gpt-6-astra",
+};
+
 // --model takes an alias from config.models or a raw Codex model id. Gemini
 // lanes have one model and refuse the flag.
 function modelOf(parsed: Parsed, engine: Engine): string | undefined {
@@ -1303,7 +1322,7 @@ function modelOf(parsed: Parsed, engine: Engine): string | undefined {
     return undefined;
   }
   if (value === undefined) return config.model;
-  const resolved = config.models?.[value];
+  const resolved = config.models?.[value] ?? DEFAULT_MODEL_ALIASES[value];
   if (resolved) return resolved;
   if (!MODEL_ID.test(value)) {
     const aliases = modelAliases();
@@ -1314,6 +1333,25 @@ function modelOf(parsed: Parsed, engine: Engine): string | undefined {
 
 function laneModel(lane: Pick<Lane, "model"> | undefined): string {
   return lane?.model ?? config.model;
+}
+
+function resolveCodexModel(model?: string, cfg?: { model?: string; models?: Record<string, string> }): string {
+  const activeConfig = cfg ?? config;
+  const raw = model ?? activeConfig.model ?? "";
+  return activeConfig.models?.[raw] ?? DEFAULT_MODEL_ALIASES[raw] ?? raw;
+}
+
+function checkChildAstraRefusal(
+  isChild: boolean,
+  engine: Engine,
+  model: string | undefined,
+  cfg?: { model: string; models?: Record<string, string> },
+): void {
+  if (!isChild || engine !== "gpt") return;
+  const resolved = resolveCodexModel(model, cfg);
+  if (resolved === "gpt-6-astra") {
+    fail("child lane cannot run gpt-6-astra; gpt-6-astra is reserved for head-launched lanes");
+  }
 }
 
 function resolveEffort(engine: Engine, model: string | undefined, explicit?: string, inherited?: string): Effort {
@@ -1328,8 +1366,11 @@ function resolveEffort(engine: Engine, model: string | undefined, explicit?: str
 // Astra above medium by accident and nothing blocks a resume over bookkeeping.
 // Every caller must send the returned effort to Codex; a session's stored
 // effort is never trusted.
-function cappedEffort(model: string | undefined, effort: Effort, explicit = true): Effort {
-  const cap = model ? config.effortCaps[model] : undefined;
+function cappedEffort(model: string | undefined, effort: Effort, explicit = true, cfg?: { model?: string; models?: Record<string, string>; effortCaps?: Record<string, string>; efforts?: string[] }): Effort {
+  const activeEffortCaps = cfg?.effortCaps ?? config.effortCaps;
+  const activeEfforts = cfg?.efforts ?? config.efforts;
+  const resolvedModel = model ? resolveCodexModel(model, cfg) : undefined;
+  const cap = resolvedModel ? activeEffortCaps[resolvedModel] : undefined;
   if (!cap) return effort;
   const capIndex = EFFORT_ORDER.indexOf(cap);
   const effortIndex = EFFORT_ORDER.indexOf(effort);
@@ -1337,7 +1378,7 @@ function cappedEffort(model: string | undefined, effort: Effort, explicit = true
   if (!explicit) {
     return cap;
   }
-  const allowed = EFFORT_ORDER.slice(0, capIndex + 1).filter((candidate) => config.efforts.includes(candidate));
+  const allowed = EFFORT_ORDER.slice(0, capIndex + 1).filter((candidate) => activeEfforts.includes(candidate));
   const remedy = allowed.length > 0 ? `allowed: ${allowed.join(", ")}` : `no configured effort is at or below ${cap}; edit efforts in ${CONFIG_PATH}`;
   fail(`effort ${effort} exceeds the cap for ${model} (max ${cap}); ${remedy}`);
 }
@@ -1618,6 +1659,14 @@ function removeWorktree(entry: Lane) {
 
 async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
+  const existingBefore = readLedger()[lane];
+  const isChildPre = Boolean(opts?.lineage?.parent ?? existingBefore?.parent ?? supervisorLane());
+  const roundEnginePre = opts?.preserveEngine || (kind === "review" && existingBefore && hasWorkThread(existingBefore))
+    ? laneEngine(existingBefore)
+    : opts?.engine ?? (existingBefore ? laneEngine(existingBefore) : engine);
+  const resolvedModelCandidate = roundEnginePre === "gpt" ? opts?.model ?? existingBefore?.model : undefined;
+  checkChildAstraRefusal(isChildPre, roundEnginePre, resolvedModelCandidate);
+
   for (;;) {
     if (engine === "gpt" && config.accounts) {
       withLedger(reconcileAccountHolds);
@@ -1654,6 +1703,9 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       if (kind === "work" && roundEngineType === "gemini" && !hooksActive) {
         console.error("cdx: agy hooks not installed; steering falls back to follow-up turns (cdx doctor --fix)");
       }
+      const isChildCommitted = Boolean(opts?.lineage?.parent ?? existing?.parent ?? supervisorLane());
+      const roundModelCommitted = roundEngineType === "gpt" ? opts?.model ?? existing?.model : undefined;
+      checkChildAstraRefusal(isChildCommitted, roundEngineType, roundModelCommitted);
       ledger[lane] = {
         ...(existing ?? {}),
         // The work engine belongs to the work thread. A review round on an
@@ -1684,9 +1736,9 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         pre: opts?.preservePre ? existing?.pre : opts?.pre,
         effort,
         work: kind === "work"
-          ? { state: workState, round: rounds, cwd: workCwd, updatedAt: now }
-          : existing?.work ?? { state: workState, cwd: workCwd },
-        review: kind === "review" ? { state: "running", cwd, round: rounds, updatedAt: now } : existing?.review,
+          ? { state: workState, round: rounds, cwd: workCwd, startedAt: now, updatedAt: now }
+          : existing?.work ?? { state: workState, cwd: workCwd, startedAt: now },
+        review: kind === "review" ? { state: "running", cwd, round: rounds, startedAt: now, updatedAt: now } : existing?.review,
         roundStartedAt: now,
         // Reserve the lane with the parent's pid so a concurrent launch is
         // rejected before the runner records its own pid.
@@ -1695,8 +1747,8 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         rounds,
         workRounds,
         reports: existing?.reports ?? [],
-        tokens: existing?.tokens ?? { input: 0, cached: 0, output: 0 },
-        roundTokens: { input: 0, cached: 0, output: 0 },
+        tokens: existing?.tokens,
+        roundTokens: undefined,
         roundSteps: 0, stage: "working", stageStartedAt: now, lastActionAt: undefined,
         steers: 0,
         steerOpen: kind === "work",
@@ -1740,9 +1792,10 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.model ??= policy.model;
     spec.agent ??= readLedger()[spec.lane]?.kind === "review" ? policy.reviewAgent : policy.agent;
   }
+  spec.startedAt ??= entry.roundStartedAt ?? new Date().toISOString();
   writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
-  if (supervisorLane()) feedEvent("started", `[cdx] lane=${spec.lane} round=${spec.round} started report=${reportPathOf(spec.lane, spec.round)}`, spec.ownerSession, { lane: spec.lane, round: spec.round });
+  feedEvent("started", `[cdx] lane=${spec.lane} round=${spec.round} started report=${reportPathOf(spec.lane, spec.round)}`, spec.ownerSession, { lane: spec.lane, round: spec.round });
   const jsonMode = spec.engine === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
@@ -1774,12 +1827,32 @@ function excerpt(item: Record<string, unknown>): string {
   return label.length > 160 ? `${label.slice(0, 157)}...` : label;
 }
 
+function gateEnv(cwd: string): Record<string, string | undefined> {
+  const env = uncoloredChildEnv();
+  const localBin = join(cwd, "node_modules", ".bin");
+  const currentPath = env.PATH ?? process.env.PATH ?? "";
+  env.PATH = currentPath ? `${localBin}:${currentPath}` : localBin;
+  return env;
+}
+
+function classifyGateFailure(exitCode: number, output: string): "setup" | "assertion" {
+  if (exitCode === 126 || exitCode === 127) {
+    if (/(?:command not found|Permission denied|No such file or directory|cannot execute|:\s*not found)/i.test(output)) return "setup";
+    return "assertion";
+  }
+  if (exitCode !== 0) {
+    if (/command not found/i.test(output) || /\bENOENT\b/i.test(output)) return "setup";
+    if (/(?:^|\n)\s*(?:(?:\S+: )?(?:line \d+: )?)?No such file or directory/i.test(output)) return "setup";
+  }
+  return "assertion";
+}
+
 interface GateResult { exitCode: number; output: string; timedOut: boolean }
 
 function executeGate(command: string, cwd: string, logPath: string): GateResult {
   const started = Date.now();
   const gate = Bun.spawnSync({
-    cmd: ["/bin/sh", "-lc", command], cwd, env: uncoloredChildEnv(),
+    cmd: ["/bin/sh", "-lc", command], cwd, env: gateEnv(cwd),
     timeout: 60 * 60 * 1000, killSignal: "SIGKILL",
   });
   const timedOut = gate.signalCode === "SIGKILL" && Date.now() - started >= 60 * 60 * 1000 - 1000;
@@ -1813,7 +1886,7 @@ function executePreCheck(command: string, cwd: string): { exitCode: number; outp
   const proc = Bun.spawnSync({
     cmd: ["/bin/sh", "-lc", command],
     cwd,
-    env: uncoloredChildEnv(),
+    env: gateEnv(cwd),
   });
   const exitCode = proc.exitCode ?? 1;
   const output = `${proc.stdout.toString()}${proc.stderr.toString()}`;
@@ -1827,7 +1900,7 @@ function runPreCheck(command: string, cwd: string): void {
     if (tail.length > 0) {
       console.error(tail);
     }
-    fail(`pre-check failed (exit ${result.exitCode}): ${command}`);
+    fail(`pre-check failed (exit ${result.exitCode}) in ${cwd}: ${command}`);
   }
 }
 
@@ -1938,9 +2011,11 @@ function changedReviewPath(before: ReviewTreeSnapshot, after: ReviewTreeSnapshot
 function finishInvalidBaseline(lane: string, round: number, command: string, cwd: string, result: GateResult): void {
   const checkedAt = new Date().toISOString();
   const reportPath = reportPathOf(lane, round);
+  const failureKind = classifyGateFailure(result.exitCode, result.output);
+  const kindLabel = failureKind === "setup" ? "gate setup failed on baseline" : "gate assertion failed on baseline";
   const note = result.timedOut
     ? `gate invalid on baseline: timed out after 60 minutes: ${command}`
-    : `gate invalid on baseline (exit ${result.exitCode}): ${command}`;
+    : `${kindLabel} (exit ${result.exitCode}): ${command} (cwd=${cwd}, log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log)`;
   writeFileSync(reportPath, `# Gate baseline\n\n\`${command}\` exited ${result.exitCode} in ${cwd} before worker startup.\n\n\`\`\`\n${gateOutputForReport(result.output)}\n\`\`\`\n`);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
@@ -2013,7 +2088,10 @@ function inputText(text: string): AppInput {
 }
 
 function appThreadParams(spec: Spec): Record<string, unknown> {
-  const configOverrides: Record<string, unknown> = {};
+  const configOverrides: Record<string, unknown> = {
+    agents: { enabled: false },
+    features: { multi_agent: false, multi_agent_v2: false },
+  };
   if (spec.additionalDirectories?.length) {
     configOverrides.sandbox_workspace_write = { writable_roots: spec.additionalDirectories };
   }
@@ -2022,7 +2100,7 @@ function appThreadParams(spec: Spec): Record<string, unknown> {
     cwd: spec.cwd,
     approvalPolicy: "never",
     sandbox: "danger-full-access",
-    ...(Object.keys(configOverrides).length ? { config: configOverrides } : {}),
+    config: configOverrides,
   };
 }
 
@@ -2044,10 +2122,14 @@ function recordCodexExhaustion(spec: Spec, evidence: string): void {
       : blocking?.length ? Math.max(...blocking.map((window) => window.resetsAt))
       : previous?.resetsAt && previous.resetsAt * 1000 > now ? previous.resetsAt
       : (now + 30 * 60_000) / 1000;
+    const windowDurationMins = blocking?.[0]?.windowDurationMins ?? previous?.windowDurationMins;
     storeUsageSnapshot(state, {
       windowDurationMins: 0, planType: "unknown", resetCreditsAvailable: 0, ...previous,
       checkedAt: new Date(now).toISOString(), usedPercent: 100, resetsAt: reset, reached: true,
       exhaustedUntil: Math.max(reset, previous?.exhaustedUntil ?? 0),
+      exhaustedRecordedAt: new Date(now).toISOString(),
+      exhaustedWindowDurationMins: windowDurationMins,
+      exhaustedReason: evidence.slice(0, 200),
     }, account);
   });
   withLedger((ledger) => {
@@ -2099,7 +2181,7 @@ function freshAccountSpec(spec: Spec, entry: Lane, prompt: string): void {
   if (readOnly) {
     spec.reviewDir = spec.cwd;
     spec.gate = undefined;
-    spec.codexArgs = ["exec", "--json", "-m", spec.model ?? config.model,
+    spec.codexArgs = ["exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", spec.model ?? config.model,
       "-c", `model_reasoning_effort=${spec.effort}`, "-s", "read-only",
       "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", spec.cwd,
       "--output-last-message", reportPathOf(spec.lane, spec.round), prompt];
@@ -2124,6 +2206,8 @@ async function runRound(lane: string, round: number): Promise<number> {
       code = await runRoundInner(lane, round);
     } catch (error) {
       if (spec && spec.engine === "gpt" && isCodexQuotaFailure(String(error))) recordCodexExhaustion(spec, String(error));
+      const startingItem = readLedger()[lane];
+      if (startingItem?.supervisor) await killChildren(lane, `supervisor ${lane} failed with runner error`);
       withLedger((ledger) => {
         const item = ledger[lane];
         if (item?.rounds === round) {
@@ -2143,7 +2227,6 @@ async function runRound(lane: string, round: number): Promise<number> {
     }
     if (spec.engine !== "gpt" || !entry.quotaFailure || code === 0) {
       if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${roundReportOf(entry) ?? "-"}`, entry.ownerSession, { lane, round });
-      if (code !== 0 && entry.supervisor) await killChildren(lane, `supervisor ${lane} failed`);
       return code;
     }
     try {
@@ -2159,7 +2242,7 @@ async function runRound(lane: string, round: number): Promise<number> {
       const next = readLane(lane);
       const account = next.roundAccount;
       const previousAccount = spec.account ?? "default";
-      spec = { ...spec, round: opened.round, account: account?.name, codexHome: account?.home };
+      spec = { ...spec, round: opened.round, account: account?.name, codexHome: account?.home, startedAt: next.roundStartedAt ?? new Date().toISOString() };
       freshAccountSpec(spec, next, prompt);
       writeFileSync(specPathOf(lane, spec.round), JSON.stringify(spec, null, 2));
       writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, spec.prompt);
@@ -2179,7 +2262,8 @@ async function runRound(lane: string, round: number): Promise<number> {
 // The stock message opens with one of these sentences on its own line; a
 // real report opens with its own heading, so only the first line decides,
 // and it must be the sentence, not a heading that quotes it.
-function isAgyCancellationTemplate(text: string): boolean {
+function isAgyCancellationTemplate(text: string | undefined): boolean {
+  if (!text || typeof text !== "string") return false;
   const firstLine = (text.trim().split("\n", 1)[0] ?? "").trim().replace(/\.$/, "");
   return firstLine === "User initiated cancellation"
     || firstLine === "Execution stopped per your cancellation request"
@@ -2198,23 +2282,67 @@ function extractFinalAgentResponse(responses: Map<string, { stepIndex: string; n
   return undefined;
 }
 
-async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAgentResponse, isReview, childRunning, geminiContinuations, turnFailureReason, touchLedger, now, reportPath }: {
+type GeminiErrorKind = "transport" | "503" | "quota" | "malformed" | "cancellation" | "other";
+
+function classifyGeminiError(text: string | undefined): GeminiErrorKind {
+  if (!text || typeof text !== "string") return "other";
+  const trimmed = text.trim();
+  if (trimmed === "transport" || trimmed === "503" || trimmed === "quota" || trimmed === "malformed" || trimmed === "cancellation" || trimmed === "other") {
+    return trimmed as GeminiErrorKind;
+  }
+  if (isAgyCancellationTemplate(trimmed) || /user initiated cancellation|cancelled by user/i.test(trimmed)) {
+    return "cancellation";
+  }
+  if (/Individual quota reached/i.test(trimmed) || /quota[ _-]?(?:exceeded|exhausted)|rate[ _-]?limit|\b429\b/i.test(trimmed)) {
+    return "quota";
+  }
+  if (/malformed (?:function|tool)[ _]?call|invalid (?:function|tool)[ _]?call|schema violation/i.test(trimmed)) {
+    return "malformed";
+  }
+  if (/\b503\b|service unavailable/i.test(trimmed)) {
+    return "503";
+  }
+  if (
+    /stream was interrupted|interrupted stream/i.test(trimmed)
+    || /timeout waiting for response|ETIMEDOUT|timed? ?out/i.test(trimmed)
+    || /broken pipe|EPIPE/i.test(trimmed)
+    || /ECONNRESET|fetch failed|network error|socket hang up/i.test(trimmed)
+  ) {
+    return "transport";
+  }
+  return "other";
+}
+
+function shouldRetryGeminiTransport(
+  options: { errorText: string; continuations: number; currentSteps: number; stepsAtLastContinuation?: number },
+): { retry: boolean; backoffMs: number } {
+  const error = options.errorText ?? "";
+  const kind = classifyGeminiError(error);
+  if (kind !== "transport" && kind !== "503") {
+    return { retry: false, backoffMs: 0 };
+  }
+  const hasProgress = options.stepsAtLastContinuation !== undefined && options.currentSteps > options.stepsAtLastContinuation;
+  const effectiveContinuations = hasProgress ? 0 : options.continuations;
+  if (effectiveContinuations >= GEMINI_TRANSPORT_RETRIES) {
+    return { retry: false, backoffMs: 0 };
+  }
+  const backoffMs = kind === "503" ? 5000 : 0;
+  return { retry: true, backoffMs };
+}
+
+async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAgentResponse, isReview, turnFailureReason, touchLedger, reportPath }: {
   lane: string; round: number; ownerSession?: string; result: any; finalAgentResponse?: string; isReview: boolean;
-  childRunning: boolean; geminiContinuations: number; turnFailureReason?: string;
+  turnFailureReason?: string;
   touchLedger: (patch: (item: Lane) => void, force?: boolean) => void;
-  now: string; reportPath: string;
-}): Promise<{ turnFailureReason?: string; geminiContinuations: number; continueTurn: boolean }> {
-  let continueTurn = false;
+  reportPath: string;
+}): Promise<{ turnFailureReason?: string }> {
   const rawError = result.error?.message ?? result.error;
   const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
-  const errorCandidates = [
-    errorText,
-    typeof result.response === "string" ? result.response : "",
-  ].filter((s) => s.trim().length > 0);
-  const effectiveError = (errorText.trim() || (typeof result.response === "string" ? result.response : "")).trim();
+  const effectiveError = errorText.trim();
   const recordedError = effectiveError.slice(0, 300);
 
-  const isTransportError = GEMINI_TRANSPORT_ERRORS.some((pattern) => errorCandidates.some((c) => pattern.test(c)));
+  const errorKind = classifyGeminiError(effectiveError);
+  const isTransportError = errorKind === "transport" || errorKind === "503";
   const previousResultError = readLedger()[lane]?.lastResultError;
   const isVerbatimReplay = Boolean(!isTransportError && previousResultError && effectiveError === previousResultError);
 
@@ -2226,7 +2354,7 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
       treatedAsReplay = true;
       success = true;
     } else {
-      const quotaCandidate = errorCandidates.find((c) => /Individual quota reached/i.test(c));
+      const quotaCandidate = /Individual quota reached/i.test(effectiveError) ? effectiveError : undefined;
       if (quotaCandidate) {
         let usageSnapshot: GeminiUsageSnapshot | undefined;
         try { usageSnapshot = await refreshGeminiUsage(); } catch {}
@@ -2250,20 +2378,9 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
         }
       } else {
         touchLedger((item) => { item.lastResultError = recordedError; }, true);
-        if (isTransportError && childRunning && geminiContinuations < GEMINI_TRANSPORT_RETRIES) {
-          geminiContinuations += 1;
-          touchLedger((item) => {
-            item.continuations = geminiContinuations;
-            item.lastEventAt = now;
-          }, true);
-          const reason = singleLine(effectiveError).slice(0, 80);
-          feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${GEMINI_TRANSPORT_RETRIES} wait=${geminiContinuations}s reason=${reason}`, ownerSession, { lane, round });
-          continueTurn = true;
-        } else {
-          turnFailureReason ??= isTransportError ? "gemini transport interrupted"
-            : errorText.trim() ? singleLine(errorText).slice(0, 200)
-            : `gemini result status ${result.status ?? "ERROR"}`;
-        }
+        turnFailureReason ??= isTransportError ? (errorKind === "503" ? "gemini service unavailable (503)" : "gemini transport interrupted")
+          : errorText.trim() ? singleLine(errorText).slice(0, 200)
+          : `gemini result status ${result.status ?? "ERROR"}`;
       }
     }
   }
@@ -2285,15 +2402,13 @@ async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAge
     turnFailureReason = qualified.failureReason ?? turnFailureReason;
   } else {
     const response = typeof result.response === "string" ? result.response.trim() : "";
-    const transportMessage = (text: string) => GEMINI_TRANSPORT_ERRORS.some((pattern) => pattern.test(text.split("\n", 1)[0] ?? ""));
-    const partial = finalAgentResponse && !transportMessage(finalAgentResponse) ? finalAgentResponse
-      : response && !transportMessage(response) ? response : "";
+    const partial = finalAgentResponse || response;
     if (partial) {
       writeFileSync(partialReportPathOf(lane, round), `${partial}\n`);
       feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, ownerSession, { lane, round });
     }
   }
-  return { turnFailureReason, geminiContinuations, continueTurn };
+  return { turnFailureReason };
 }
 
 function qualifyGeminiReport(result: { structured_output?: any; response?: unknown }, finalAgentResponse: string | undefined, isReview: boolean): { report?: string; findings?: unknown[]; failureReason?: string } {
@@ -2328,6 +2443,57 @@ async function* readJsonLines(stream: ReadableStream<Uint8Array>, options: { onC
   }
   buffer += decoder.decode();
   if (buffer.trim()) { const value = parse(buffer); if (value !== undefined) yield value; }
+}
+
+interface CodexThreadUsage {
+  baseline?: Tokens;
+  previous: Tokens;
+}
+
+const isFiniteCount = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n);
+
+function recordCodexTokenDelta(
+  threads: Map<string, CodexThreadUsage>,
+  threadId: string,
+  tokenUsage?: { last?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | null; total?: { inputTokens?: number; cachedInputTokens?: number; outputTokens?: number } | null } | null,
+): Tokens | null {
+  if (!tokenUsage || !tokenUsage.last || !tokenUsage.total) return null;
+  const { last, total } = tokenUsage;
+  const totalInput = total.inputTokens;
+  const totalCached = total.cachedInputTokens;
+  const totalOutput = total.outputTokens;
+  const lastInput = last.inputTokens;
+  const lastCached = last.cachedInputTokens;
+  const lastOutput = last.outputTokens;
+  if (
+    !isFiniteCount(totalInput) || !isFiniteCount(totalCached) || !isFiniteCount(totalOutput) ||
+    !isFiniteCount(lastInput) || !isFiniteCount(lastCached) || !isFiniteCount(lastOutput)
+  ) {
+    return null;
+  }
+  let usage = threads.get(threadId);
+  if (!usage) {
+    const baseline: Tokens = {
+      input: Math.max(0, totalInput - lastInput),
+      cached: Math.max(0, totalCached - lastCached),
+      output: Math.max(0, totalOutput - lastOutput),
+    };
+    usage = { baseline, previous: { input: 0, cached: 0, output: 0 } };
+    threads.set(threadId, usage);
+  }
+  const baseline = usage.baseline ?? { input: 0, cached: 0, output: 0 };
+  const current: Tokens = {
+    input: Math.max(0, totalInput - baseline.input),
+    cached: Math.max(0, totalCached - baseline.cached),
+    output: Math.max(0, totalOutput - baseline.output),
+  };
+  const delta: Tokens = {
+    input: Math.max(0, current.input - usage.previous.input),
+    cached: Math.max(0, current.cached - usage.previous.cached),
+    output: Math.max(0, current.output - usage.previous.output),
+  };
+  usage.previous = { ...current };
+  return delta;
 }
 
 async function runRoundInner(lane: string, round: number): Promise<number> {
@@ -2370,7 +2536,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     "--print-timeout", spec.maxRuntimeMins ? `${spec.maxRuntimeMins}m` : "12h",
   ];
   const proc = Bun.spawn({
-    cmd: gemini ? geminiArgs : appServer ? ["codex", "app-server", "--listen", "stdio://"] : ["codex", ...(spec.codexArgs ?? [])],
+    cmd: gemini ? geminiArgs : appServer ? ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"] : ["codex", ...(spec.codexArgs ?? [])],
     cwd: spec.cwd,
     env: laneChildEnv(spec.codexHome, { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
     stdin: appServer || gemini ? "pipe" : "ignore",
@@ -2450,15 +2616,16 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   let turnFailureReason: string | undefined;
   let lastProtocolError: string | undefined;
   let activeTurnId: string | undefined;
-  let codexUsageBaseline: Tokens | undefined;
-  let codexRoundUsage: Tokens = { input: 0, cached: 0, output: 0 };
+  const codexThreadUsages = new Map<string, CodexThreadUsage>();
   let geminiTurnsSent = 0;
   let geminiTurnsCompleted = 0;
   let geminiTurnWake: (() => void) | undefined;
   let geminiContinuations = 0;
+  let stepsAtLastContinuation: number | undefined;
   const turnAgentResponses = new Map<string, { stepIndex: string; num: number; text: string }>();
   const writeUserTurn = (text: string) => {
     turnAgentResponses.clear();
+    if (!proc.stdin) throw new Error("process stdin is not available");
     proc.stdin.write(`${JSON.stringify({ event: "user", message: { content: text } })}\n`);
     proc.stdin.flush();
     geminiTurnsSent += 1;
@@ -2518,22 +2685,34 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const update = event.step_update;
       const stepUsage = update.usage;
       if (stepUsage && typeof stepUsage === "object") {
-        const delta: Tokens = {
-          input: stepUsage.input_tokens ?? 0,
-          cached: stepUsage.cache_read_tokens ?? 0,
-          output: stepUsage.output_tokens ?? 0,
-        };
-        if (delta.input || delta.cached || delta.output) {
+        if (![stepUsage.input_tokens, stepUsage.cache_read_tokens, stepUsage.output_tokens].every(isFiniteCount)) {
           touchLedger((item) => {
-            const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
-            const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
-            for (const tokens of [cumulative, roundTokens]) {
-              tokens.input += delta.input;
-              tokens.cached += delta.cached;
-              tokens.output += delta.output;
+            item.tokensIncomplete = true;
+            if (item.kind === "review") {
+              if (item.review) item.review.tokensIncomplete = true;
+            } else {
+              item.work.tokensIncomplete = true;
             }
             item.lastEventAt = now;
           }, true);
+        } else {
+          const delta: Tokens = {
+            input: stepUsage.input_tokens,
+            cached: stepUsage.cache_read_tokens,
+            output: stepUsage.output_tokens,
+          };
+          if (delta.input || delta.cached || delta.output) {
+            touchLedger((item) => {
+              const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+              const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+              for (const tokens of [cumulative, roundTokens]) {
+                tokens.input = (tokens.input ?? 0) + delta.input;
+                tokens.cached = (tokens.cached ?? 0) + delta.cached;
+                tokens.output = (tokens.output ?? 0) + delta.output;
+              }
+              item.lastEventAt = now;
+            }, true);
+          }
         }
       }
       if (update.step_type === "tool") {
@@ -2569,21 +2748,80 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
           item.lastEventAt = now;
         }, true);
       }
+      const rawError = result.error?.message ?? result.error;
+      const errorText = typeof rawError === "string" ? rawError : typeof rawError === "object" && rawError ? JSON.stringify(rawError) : "";
+      const isSuccess = result.status === "SUCCESS";
       const isReview = startingLane?.kind === "review";
       const finalAgentResponse = extractFinalAgentResponse(turnAgentResponses);
 
-      const qualified = await qualifyGeminiResult({
-        lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
-        childRunning: proc.exitCode === null, geminiContinuations, turnFailureReason, touchLedger, now, reportPath,
-      });
-      turnFailureReason = qualified.turnFailureReason;
-      geminiContinuations = qualified.geminiContinuations;
-      if (qualified.continueTurn) {
-        await Bun.sleep(geminiContinuations * 1000);
-        if (!receivedSignal && !maxRuntimeHit && proc.exitCode === null) {
-          writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
-        } else if (!receivedSignal && !maxRuntimeHit) {
-          turnFailureReason = "agy exited during transport retry wait";
+      if (isSuccess) {
+        const qualified = await qualifyGeminiResult({
+          lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+          turnFailureReason, touchLedger, reportPath,
+        });
+        turnFailureReason = qualified.turnFailureReason;
+      } else {
+        const currentSteps = readLedger()[lane]?.roundSteps ?? 0;
+        const hasProgress = stepsAtLastContinuation !== undefined && currentSteps > stepsAtLastContinuation;
+        const kind = classifyGeminiError(errorText);
+        const isTransport = kind === "transport" || kind === "503";
+
+        if (isTransport && proc.exitCode !== null) {
+          turnFailureReason = "transport death; cdx resume continues from the partial";
+          const qualified = await qualifyGeminiResult({
+            lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+            turnFailureReason, touchLedger, reportPath,
+          });
+          turnFailureReason = qualified.turnFailureReason ?? turnFailureReason;
+        } else if (isTransport) {
+          const retryDecision = shouldRetryGeminiTransport({
+            errorText,
+            continuations: geminiContinuations,
+            currentSteps,
+            stepsAtLastContinuation,
+          });
+
+          if (retryDecision.retry) {
+            geminiContinuations = (hasProgress ? 0 : geminiContinuations) + 1;
+            stepsAtLastContinuation = currentSteps;
+            touchLedger((item) => {
+              item.continuations = geminiContinuations;
+              item.lastEventAt = now;
+            }, true);
+            const reason = singleLine(errorText).slice(0, 80);
+            const waitNotice = retryDecision.backoffMs > 0 ? ` wait=${retryDecision.backoffMs / 1000}s` : "";
+            feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${GEMINI_TRANSPORT_RETRIES}${waitNotice} reason=${reason}`, spec.ownerSession, { lane, round });
+            const response = typeof result.response === "string" ? result.response.trim() : "";
+            const partial = finalAgentResponse || response;
+            if (partial) {
+              writeFileSync(partialReportPathOf(lane, round), `${partial}\n`);
+              announcePartial();
+            }
+            if (retryDecision.backoffMs > 0) {
+              await Bun.sleep(retryDecision.backoffMs);
+            }
+            if (proc.exitCode !== null) {
+              turnFailureReason = "transport death; cdx resume continues from the partial";
+            } else if (!receivedSignal && !maxRuntimeHit) {
+              try {
+                writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+              } catch {
+                turnFailureReason = "transport death; cdx resume continues from the partial";
+              }
+            }
+          } else {
+            const qualified = await qualifyGeminiResult({
+              lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+              turnFailureReason, touchLedger, reportPath,
+            });
+            turnFailureReason = qualified.turnFailureReason;
+          }
+        } else {
+          const qualified = await qualifyGeminiResult({
+            lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+            turnFailureReason, touchLedger, reportPath,
+          });
+          turnFailureReason = qualified.turnFailureReason;
         }
       }
       geminiTurnsCompleted += 1;
@@ -2607,40 +2845,31 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       lastProtocolError = [error.message, error.additionalDetails].filter(Boolean).join(": ") || "app-server turn error";
       if (isCodexQuotaFailure(lastProtocolError)) recordCodexExhaustion(spec, lastProtocolError);
       touchLedger((item) => { item.lastAction = `error: ${lastProtocolError}`; item.lastEventAt = now; }, true);
-    } else if (event.method === "thread/tokenUsage/updated" && event.params?.turnId && event.params?.tokenUsage?.last) {
-      const last = event.params.tokenUsage.last;
-      const total = event.params.tokenUsage.total ?? last;
-      const totalTokens: Tokens = {
-        input: total.inputTokens ?? 0,
-        cached: total.cachedInputTokens ?? 0,
-        output: total.outputTokens ?? 0,
-      };
-      codexUsageBaseline ??= {
-        input: totalTokens.input - (last.inputTokens ?? 0),
-        cached: totalTokens.cached - (last.cachedInputTokens ?? 0),
-        output: totalTokens.output - (last.outputTokens ?? 0),
-      };
-      const current: Tokens = {
-        input: Math.max(0, totalTokens.input - codexUsageBaseline.input),
-        cached: Math.max(0, totalTokens.cached - codexUsageBaseline.cached),
-        output: Math.max(0, totalTokens.output - codexUsageBaseline.output),
-      };
-      const delta: Tokens = {
-        input: Math.max(0, current.input - codexRoundUsage.input),
-        cached: Math.max(0, current.cached - codexRoundUsage.cached),
-        output: Math.max(0, current.output - codexRoundUsage.output),
-      };
-      codexRoundUsage = current;
-      touchLedger((item) => {
-        const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
-        const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
-        for (const tokens of [cumulative, roundTokens]) {
-          tokens.input += delta.input;
-          tokens.cached += delta.cached;
-          tokens.output += delta.output;
-        }
-        item.lastEventAt = now;
-      }, true);
+    } else if (event.method === "thread/tokenUsage/updated" && event.params?.turnId && event.params?.tokenUsage) {
+      const threadId = String(event.params?.threadId ?? event.params?.thread?.id ?? spec.sessionId ?? "default");
+      const delta = recordCodexTokenDelta(codexThreadUsages, threadId, event.params.tokenUsage);
+      if (delta === null) {
+        touchLedger((item) => {
+          item.tokensIncomplete = true;
+          if (item.kind === "review") {
+            if (item.review) item.review.tokensIncomplete = true;
+          } else {
+            item.work.tokensIncomplete = true;
+          }
+          item.lastEventAt = now;
+        }, true);
+      } else if (delta.input || delta.cached || delta.output) {
+        touchLedger((item) => {
+          const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+          const roundTokens = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+          for (const tokens of [cumulative, roundTokens]) {
+            tokens.input = (tokens.input ?? 0) + delta.input;
+            tokens.cached = (tokens.cached ?? 0) + delta.cached;
+            tokens.output = (tokens.output ?? 0) + delta.output;
+          }
+          item.lastEventAt = now;
+        }, true);
+      }
     } else if (event.method === "turn/completed" && event.params?.turn?.id) {
       const turn = event.params.turn as AppTurn;
       for (const item of turn.items ?? []) {
@@ -2666,16 +2895,28 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     } else if (event.type === "thread.started" && event.thread_id) {
       touchLedger((item) => { item.sessionId = event.thread_id; item.lastEventAt = now; }, true);
     } else if (event.type === "turn.completed" && event.usage) {
-      touchLedger((item) => {
-        const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
-        const round = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
-        for (const tokens of [cumulative, round]) {
-          tokens.input += event.usage.input_tokens ?? 0;
-          tokens.cached += event.usage.cached_input_tokens ?? 0;
-          tokens.output += event.usage.output_tokens ?? 0;
-        }
-        item.lastEventAt = now;
-      }, true);
+      if (![event.usage.input_tokens, event.usage.cached_input_tokens, event.usage.output_tokens].every(isFiniteCount)) {
+        touchLedger((item) => {
+          item.tokensIncomplete = true;
+          if (item.kind === "review") {
+            if (item.review) item.review.tokensIncomplete = true;
+          } else {
+            item.work.tokensIncomplete = true;
+          }
+          item.lastEventAt = now;
+        }, true);
+      } else {
+        touchLedger((item) => {
+          const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
+          const round = (item.roundTokens ??= { input: 0, cached: 0, output: 0 });
+          for (const tokens of [cumulative, round]) {
+            tokens.input = (tokens.input ?? 0) + event.usage.input_tokens;
+            tokens.cached = (tokens.cached ?? 0) + event.usage.cached_input_tokens;
+            tokens.output = (tokens.output ?? 0) + event.usage.output_tokens;
+          }
+          item.lastEventAt = now;
+        }, true);
+      }
     } else if (event.type === "item.completed" && event.item) {
       touchLedger((item) => { item.lastAction = excerpt(event.item); item.lastEventAt = now; item.lastActionAt = now; });
     }
@@ -2764,7 +3005,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     // A send that landed before steerOpen closed still gets its own turn.
     await queueControlDrain();
     await awaitTurns();
-    try { proc.stdin.end(); } catch { /* already closed */ }
+    try { proc.stdin?.end(); } catch { /* already closed */ }
     if (proc.exitCode === null) await Promise.race([proc.exited, Bun.sleep(10_000)]);
     if (proc.exitCode === null) {
       roundCleanupWarning = "agy did not exit within 10s after stdin closed";
@@ -2785,6 +3026,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     let rpcClosed = false;
     const pending = new Map<number, { resolve: (value: any) => void; reject: (error: Error) => void }>();
     const writeRpc = (message: Record<string, unknown>) => {
+      if (!proc.stdin) throw new Error("process stdin is not available");
       proc.stdin.write(`${JSON.stringify(message)}\n`);
       proc.stdin.flush();
     };
@@ -2975,7 +3217,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       } else if (proc.exitCode !== null && proc.exitCode !== 0) {
         roundCleanupWarning = `app-server exited ${proc.exitCode} after completed turn`;
       }
-      try { proc.stdin.end(); } catch { /* child already closed */ }
+      try { proc.stdin?.end(); } catch { /* child already closed */ }
       if (proc.exitCode === null) await Promise.race([proc.exited, Bun.sleep(3000)]);
       if (proc.exitCode !== null && proc.exitCode !== 0 && existsSync(reportPath) && !maxRuntimeHit) {
         roundCleanupWarning ??= `app-server exited ${proc.exitCode} after completed turn`;
@@ -2996,7 +3238,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       }
     } catch (error) {
       if (controlWatcher) clearInterval(controlWatcher);
-      try { proc.stdin.end(); } catch { /* child already closed */ }
+      try { proc.stdin?.end(); } catch { /* child already closed */ }
       try { proc.kill(); } catch { /* child already closed */ }
       await Promise.allSettled([stdoutPump, stderrPump, proc.exited]);
       if (receivedSignal) {
@@ -3109,7 +3351,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   // A supervisor's round ends with its children. Whatever the outcome, any
   // child still running is stopped so nothing keeps editing after the
   // report; a round that finished with children running cannot be done.
-  const orphanedChildren = beforeFinalize?.kind === "work" && beforeFinalize.supervisor && !retryQuota
+  const orphanedChildren = (beforeFinalize?.kind === "work" || beforeFinalize?.consult) && beforeFinalize.supervisor && !retryQuota
     ? await killChildren(lane, receivedSignal ? `supervisor ${lane} killed` : maxRuntimeHit ? `supervisor ${lane} hit max runtime` : `supervisor ${lane} round ${round} ended`)
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
@@ -3127,16 +3369,25 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     if (reviewModifiedPath) roundNote = `review modified the tree: ${reviewModifiedPath}`;
     else if (orphanedChildren.length > 0 && !receivedSignal && !maxRuntimeHit) roundNote = `supervisor ended with running children: ${orphanedChildren.join(", ")} (stopped)`;
     else if (gateFailed) {
+      const gateLogPath = `${ROOT}/logs/${lane}-r${round}.gate.log`;
+      let gateLogOutput = "";
+      try { gateLogOutput = readFileSync(gateLogPath, "utf8"); } catch {}
+      const failureKind = classifyGateFailure(gateExit ?? 1, gateLogOutput);
+      const kindLabel = failureKind === "setup" ? "gate setup failed" : "gate assertion failed";
       roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
-        ? `gate failed after work; baseline passed (exit ${gateExit}): ${spec.gate}`
-        : `gate failed (exit ${gateExit}): ${spec.gate}; baseline was not checked, use --gate-baseline-check on spawn`;
+        ? `${kindLabel} after work; baseline passed (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`
+        : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath}); baseline was not checked, use --gate-baseline-check on spawn`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (receivedSignal) roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
     else if (turnFailureReason) {
-      const continuePrefix = geminiContinuations > 0
-        ? `turn failed after ${geminiContinuations} auto-continue${geminiContinuations === 1 ? "" : "s"}`
-        : "turn failed";
-      roundNote = `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
+      if (turnFailureReason === "transport death; cdx resume continues from the partial") {
+        roundNote = turnFailureReason;
+      } else {
+        const continuePrefix = geminiContinuations > 0
+          ? `turn failed after ${geminiContinuations} auto-continue${geminiContinuations === 1 ? "" : "s"}`
+          : "turn failed";
+        roundNote = `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
+      }
     }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
     else if (roundCleanupWarning) roundNote = `cleanup warning: ${roundCleanupWarning.slice(0, 200)}`;
@@ -3150,8 +3401,17 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       const errTail = stderrText.trim().split("\n").at(-1);
       if (errTail) roundNote = `stderr: ${errTail.slice(0, 200)}`;
     }
-    if (roundState === "failed" && capturedReport?.endsWith(".partial.md")) {
-      roundNote = `${singleLine(roundNote ?? "round failed")}; partial report=${capturedReport}`;
+    if (roundState === "failed") {
+      const hasReport = reportOk ? `report=${reportPath}` : capturedReport ? `partial=${capturedReport}` : "no report";
+      const lastStep = item.roundSteps ? `lastStep=${item.roundSteps}` : "";
+      const gateInfo = spec.gate ? `gateRan=${gateExit !== undefined}` : "";
+      const summaryParts = [
+        roundNote ?? "round failed",
+        hasReport,
+        lastStep,
+        gateInfo,
+      ].filter(Boolean);
+      roundNote = summaryParts.join("; ");
     }
     if (unchangedWork) item.diffEmpty = true;
     if (item.kind === "review") {
@@ -3166,6 +3426,9 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       item.work.note = roundNote;
       item.work.report = capturedReport;
       item.work.updatedAt = new Date().toISOString();
+    }
+    if (item.kind === "review" ? item.review?.tokensIncomplete : item.work.tokensIncomplete) {
+      item.tokensIncomplete = true;
     }
     item.pid = undefined;
     item.codexPid = undefined;
@@ -3192,9 +3455,10 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   }
   const finalRoundState = roundStateOf(entry);
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
+  const roundIncomplete = entry.kind === "review" ? entry.review?.tokensIncomplete : entry.work.tokensIncomplete;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens)} report=${capturedReport ?? "-"}`, entry.ownerSession, { lane, round });
-  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens)} report=${capturedReport ?? "-"}`);
+  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"}`, entry.ownerSession, { lane, round });
+  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${capturedReport ?? "-"}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
     console.log("--- report ---");
@@ -3450,6 +3714,12 @@ async function spawnCommand(argv: string[]) {
   validLane(lane);
   const supervisor = parsed.bools.has("supervisor");
   const parent = supervisorLane();
+  if (parent) {
+    const parentEntry = readLedger()[parent];
+    if (parentEntry?.consult) {
+      fail("consult supervisor cannot spawn writable workers; use cdx consult --engine gemini for read-only helpers");
+    }
+  }
   if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and drives its children through cdx");
   if (supervisor && parent) fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
@@ -3461,6 +3731,7 @@ async function spawnCommand(argv: string[]) {
   // A respawn without --model keeps the lane's model; the config default is
   // for new lanes only.
   const model = existingLane && engine === "gpt" && parsed.flags.model === undefined ? laneModel(existingLane) : modelOf(parsed, engine);
+  checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
@@ -3567,10 +3838,12 @@ async function resumeCommand(argv: string[]) {
   if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"');
   const before = readLane(lane);
   requireOwnChild(lane, before);
-  if (supervisorLane() && parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate) {
-    fail(`supervisor ${supervisorLane()} may not change a child's gate; ask the liaison if it is wrong`);
+  const parent = supervisorLane();
+  if (parent && parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate) {
+    fail(`supervisor ${parent} may not change a child's gate; ask the liaison if it is wrong`);
   }
   const engine = laneEngine(before);
+  checkChildAstraRefusal(Boolean(parent || before.parent), engine, before.model);
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
@@ -3611,7 +3884,7 @@ async function resumeCommand(argv: string[]) {
   // The resolved effort always travels with the turn: a resumed session would
   // otherwise keep the effort it was created with, cap or no cap.
   const codexArgs = reviewResume && engine === "gpt"
-    ? ["exec", "resume", "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
+    ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : undefined;
   const gate = parsed.flags.gate ?? before.gate;
   return launch({
@@ -3636,6 +3909,8 @@ async function forkCommand(argv: string[]) {
   if (sourceLane && laneEngine(sourceLane) === "gemini") fail("gemini has no headless fork; use cdx resume");
   if (sourceLane && parsed.flags.model !== undefined) fail(`fork inherits the source lane's model (${laneModel(sourceLane)}); drop --model`);
   const model = sourceLane ? laneModel(sourceLane) : modelOf(parsed, "gpt")!;
+  const parent = supervisorLane();
+  checkChildAstraRefusal(Boolean(parent), "gpt", model);
   const sessionId = sourceLane
     ? sourceLane.workSessionId ?? sourceLane.sessionId ?? source
     : source;
@@ -3668,37 +3943,59 @@ async function forkCommand(argv: string[]) {
   return launch({ effort, engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, ...(sourceLane ? { sourceLane: source } : { model }), sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
-// consult: a read-only gpt lane framed as an advisor rather than a hostile
-// reviewer. It shares the exec review path (read-only sandbox, report as the
-// last message) and resumes read-only for follow-up questions.
+// consult: a read-only advisor lane. It runs as a read-only review, framed
+// as an advisor rather than a hostile reviewer, and resumes read-only.
+// A head consult may opt into --supervisor to spawn read-only Gemini helpers.
 async function consultCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["model", "effort", "cd", "bg", "account"]);
+  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
   const [lane, questionArg] = parsed.rest;
-  if (!lane || !questionArg) fail('usage: cdx consult <lane> [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"');
-  return reviewCommand(["--engine", "gpt", ...argv], { consult: true });
+  if (!lane || !questionArg) fail('usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"');
+  const parent = supervisorLane();
+  const parentEntry = parent ? readLedger()[parent] : undefined;
+  if (parentEntry?.consult && parsed.flags.engine && parsed.flags.engine !== "gemini") {
+    fail("consult supervisor may only spawn read-only gemini helpers; gpt helpers are refused");
+  }
+  const engine = parsed.flags.engine ?? (parentEntry?.consult ? "gemini" : "gpt");
+  return reviewCommand(["--engine", engine, ...argv], { consult: true, supervisor: parsed.bools.has("supervisor") });
 }
 
-async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model"]);
+async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const intent = await resolveBrief(intentArg);
   if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
   validLane(lane);
-  if (opts.consult && engine !== "gpt") fail("consult runs on gpt only");
+  if (opts.consult && engine !== "gpt" && engine !== "gemini") fail("consult runs on gpt or gemini only");
+  const parent = supervisorLane();
+  if (parent) {
+    const parentEntry = readLedger()[parent];
+    if (parentEntry?.consult) {
+      if (engine !== "gemini") {
+        fail("consult supervisor may only spawn read-only gemini helpers; gpt helpers are refused");
+      }
+      if (!opts.consult) {
+        fail("consult supervisor may only spawn read-only gemini helpers; reviews are refused");
+      }
+    }
+  }
+  const supervisor = opts.supervisor ?? parsed.bools.has("supervisor");
+  if (supervisor && parent) {
+    fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
+  }
   requireEngineBinary(engine);
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   const existing = readLedger()[lane];
-  const parent = supervisorLane();
   requireOwnChild(lane, existing);
   if (existing && laneEngine(existing) === "gpt" && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
   // A consult lane must never acquire a work thread: resume would then pick
   // the writable session over the read-only one. Fresh names only.
   if (opts.consult && existing && !existing.consult) fail(`lane "${lane}" has work history; consult needs a fresh name so its resume stays read-only`);
   const model = engine === "gpt" ? existing && laneEngine(existing) === "gpt" ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
-  const roundModel = model && !existing ? { model } : {};
-  const roundParent = !existing ? { lineage: callerLineage(false) } : {};
+  checkChildAstraRefusal(Boolean(parent || existing?.parent), engine, model);
+  const roundModel = model && (!existing || parsed.flags.model !== undefined || !existing.model) ? { model } : {};
+  const roundParent = !existing ? { lineage: callerLineage(supervisor) } : {};
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
     console.log(color.yellow("cdx: gemini reviewing a gemini lane; give the intent explicit attack items"));
   }
@@ -3726,23 +4023,23 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
       const task = target
         ? `Review the diff shown by \`git diff ${target}\` in this repository.`
         : `Review the diff shown by \`git show ${parsed.flags.commit}\` in this repository.`;
-      const fullBrief = [reviewFrame(engine), `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${task}`].join("\n\n");
+      const fullBrief = [reviewFrame(engine), `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${task}`].join("\n\n");
       const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundParent });
-      return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, outputSchema: REVIEW_FINDINGS_SCHEMA, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+      return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(supervisor ? { supervisor: true as const } : {}), outputSchema: REVIEW_FINDINGS_SCHEMA, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
     }
     // Native `codex review`: purpose-built diff review. It rejects a custom
     // prompt alongside a target, so the adversarial frame stays home.
     const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
     if (selection) announceAccountSelection(lane, selection);
     const codexArgs = [
-      "review", "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
+      "review", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
       "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
     ];
     if (parsed.bools.has("uncommitted")) codexArgs.push("--uncommitted");
     if (parsed.flags.base) codexArgs.push("--base", parsed.flags.base);
     if (parsed.flags.commit) codexArgs.push("--commit", parsed.flags.commit);
     const label = parsed.bools.has("uncommitted") ? "uncommitted changes" : parsed.flags.base ? `diff vs ${parsed.flags.base}` : `commit ${parsed.flags.commit}`;
-    return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
+    return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...(supervisor ? { supervisor: true as const } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
   }
 
   const owner = callerOwnership();
@@ -3752,20 +4049,21 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean } = {}) {
     ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
     : "";
   const frame = opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope;
-  const fullBrief = [frame, `Ground rules:\n${houseRules(cwd, true, engine)}`, `Task:\n${intent}`].join("\n\n");
+  const fullBrief = [frame, `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${intent}`].join("\n\n");
   // Reviews are read-only: enforce it with the sandbox, not just the prompt.
   const codexArgs = engine === "gpt" ? [
-    "exec", "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
+    "exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
     "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ] : undefined;
-  return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(engine === "gemini" ? { outputSchema: REVIEW_FINDINGS_SCHEMA } : {}), ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(supervisor ? { supervisor: true as const } : {}), ...(engine === "gemini" && !opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA } : {}), ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
-function fmtTokens(tokens?: Tokens): string {
-  if (!tokens || (tokens.input === 0 && tokens.output === 0)) return "-";
-  const k = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n));
-  return `${k(tokens.input)}in/${k(tokens.output)}out`;
+function fmtTokens(tokens?: Tokens, incomplete?: boolean): string {
+  if (!tokens || (!tokens.input && !tokens.output && !tokens.cached)) return incomplete ? "(incomplete)" : "-";
+  const k = (n?: number) => { const v = n ?? 0; return v >= 1000 ? `${(v / 1000).toFixed(v >= 100_000 ? 0 : 1)}k` : String(v); };
+  const base = `${k(tokens.input)}in/${k(tokens.output)}out`;
+  return incomplete ? `${base} (incomplete)` : base;
 }
 
 function fmtAge(iso?: string): string {
@@ -3857,8 +4155,8 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : `finished ${fmtAge(record.updatedAt ?? entry.updatedAt)} ago`;
   const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
   const tokenLabel = active && entry.roundTokens
-    ? `${fmtTokens(entry.roundTokens)} round / ${fmtTokens(entry.tokens)} total`
-    : fmtTokens(entry.tokens);
+    ? `${fmtTokens(entry.roundTokens, record.tokensIncomplete)} round / ${fmtTokens(entry.tokens, entry.tokensIncomplete)} total`
+    : fmtTokens(entry.tokens, entry.tokensIncomplete);
   const tokenDetail = `${tokenLabel} · ${engine === "gemini" ? "gemini conversation" : "codex session"} ${(entry.workSessionId ?? entry.sessionId)?.slice(0, 8) ?? "-"}`;
   const report = record.report ?? (entry.kind === "work" ? entry.reports.at(-1) : undefined);
   const lastParts = [entry.diffEmpty ? "no tree change" : undefined, record.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
@@ -4017,7 +4315,7 @@ async function waitCommand(argv: string[]) {
       } else {
         if (json) emitJson(lane, entry);
         else {
-          console.log(`cdx: lane=${color.magenta(lane)} engine=${roundEngine(entry)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens)} report=${roundReportOf(entry) ?? "-"}`);
+          console.log(`cdx: lane=${color.magenta(lane)} engine=${roundEngine(entry)} kind=${entry.kind} state=${coloredState(roundStateOf(entry))} exit=${roundExitCodeOf(entry) ?? "?"} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${roundReportOf(entry) ?? "-"}`);
           if (showReport && multiple) completedReports.push({ lane, entry });
           if (showReport && !multiple) {
             const text = reportTextOf(entry);
@@ -4240,6 +4538,9 @@ interface UsageSnapshot {
   probeFailedAt?: string;
   invalidatedAt?: string;
   exhaustedUntil?: number;
+  exhaustedRecordedAt?: string;
+  exhaustedWindowDurationMins?: number;
+  exhaustedReason?: string;
 }
 
 interface RefreshedUsage {
@@ -4278,7 +4579,7 @@ function parseAccountUsage(response: unknown): AccountUsage | undefined {
 }
 
 async function readAccountUsage(codexHome?: string): Promise<AccountUsage | undefined> {
-  let proc: ReturnType<typeof Bun.spawn> | undefined;
+  let proc: any;
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let stderrDrain: Promise<string> | undefined;
   const deadline = Date.now() + 10_000;
@@ -4394,6 +4695,112 @@ function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
   };
 }
 
+// The longest returned window supplies weekly headroom on subscription plans.
+function weeklyWindow(snapshot: UsageSnapshot): RateLimitWindow | undefined {
+  const windows = snapshot.windows ?? [];
+  if (windows.length === 0) return undefined;
+  return windows.reduce((longest, window) => window.windowDurationMins > longest.windowDurationMins ? window : longest);
+}
+
+function reconcileExhaustionWithSnapshot(
+  previous: UsageSnapshot | undefined,
+  fresh: UsageSnapshot,
+  probeStartedAt: number,
+): Partial<UsageSnapshot> {
+  if (!previous?.exhaustedUntil || previous.exhaustedUntil * 1000 <= Date.now()) {
+    return {};
+  }
+  const recordedAtMs = previous.exhaustedRecordedAt ? Date.parse(previous.exhaustedRecordedAt) : Number.NaN;
+  // A later refusal wins a racing earlier probe
+  if (Number.isFinite(recordedAtMs) && recordedAtMs >= probeStartedAt) {
+    return {
+      exhaustedUntil: previous.exhaustedUntil,
+      exhaustedRecordedAt: previous.exhaustedRecordedAt,
+      exhaustedWindowDurationMins: previous.exhaustedWindowDurationMins,
+      exhaustedReason: previous.exhaustedReason,
+    };
+  }
+  // Probe is newer than recorded refusal
+  const windows = fresh.windows ?? [];
+  const anyReached = fresh.reached || windows.some((w) => w.usedPercent >= 99);
+  if (previous.exhaustedWindowDurationMins !== undefined) {
+    const match = windows.find((w) => w.windowDurationMins === previous.exhaustedWindowDurationMins);
+    if (match) {
+      if (match.usedPercent >= 99) {
+        return {
+          exhaustedUntil: Math.max(previous.exhaustedUntil, match.resetsAt),
+          exhaustedRecordedAt: previous.exhaustedRecordedAt,
+          exhaustedWindowDurationMins: previous.exhaustedWindowDurationMins,
+          exhaustedReason: previous.exhaustedReason,
+        };
+      }
+      if (!anyReached) {
+        return {};
+      }
+      return {
+        exhaustedUntil: previous.exhaustedUntil,
+        exhaustedRecordedAt: previous.exhaustedRecordedAt,
+        exhaustedWindowDurationMins: previous.exhaustedWindowDurationMins,
+        exhaustedReason: previous.exhaustedReason,
+      };
+    }
+    // Window duration was not in fresh probe windows; preserve marker as a different active window
+    return {
+      exhaustedUntil: previous.exhaustedUntil,
+      exhaustedRecordedAt: previous.exhaustedRecordedAt,
+      exhaustedWindowDurationMins: previous.exhaustedWindowDurationMins,
+      exhaustedReason: previous.exhaustedReason,
+    };
+  }
+  // Legacy marker without exhaustedWindowDurationMins:
+  if (anyReached) {
+    return {
+      exhaustedUntil: previous.exhaustedUntil,
+      exhaustedRecordedAt: previous.exhaustedRecordedAt,
+      exhaustedReason: previous.exhaustedReason,
+    };
+  }
+  const weekly = weeklyWindow(fresh);
+  if (weekly && weekly.usedPercent < 99) {
+    return {};
+  }
+  return {
+    exhaustedUntil: previous.exhaustedUntil,
+    exhaustedRecordedAt: previous.exhaustedRecordedAt,
+    exhaustedReason: previous.exhaustedReason,
+  };
+}
+
+function isExhaustionObsolete(snapshot: UsageSnapshot, now = Date.now()): boolean {
+  if (!snapshot.exhaustedUntil || snapshot.exhaustedUntil * 1000 <= now) return false;
+  const checkedAtMs = Date.parse(snapshot.checkedAt);
+  if (!Number.isFinite(checkedAtMs) || checkedAtMs === 0) return false;
+
+  const windows = snapshot.windows ?? [];
+  const anyReached = snapshot.reached || windows.some((w) => w.usedPercent >= 99);
+  if (anyReached) return false;
+
+  if (snapshot.exhaustedRecordedAt) {
+    const recordedAtMs = Date.parse(snapshot.exhaustedRecordedAt);
+    if (Number.isFinite(recordedAtMs) && recordedAtMs >= checkedAtMs) {
+      return false;
+    }
+    if (snapshot.exhaustedWindowDurationMins !== undefined) {
+      const match = windows.find((w) => w.windowDurationMins === snapshot.exhaustedWindowDurationMins);
+      if (match) {
+        return match.usedPercent < 99;
+      }
+      return false;
+    }
+  }
+
+  const weekly = weeklyWindow(snapshot);
+  if (weekly && weekly.usedPercent < 99 && weekly.resetsAt * 1000 > now) {
+    return true;
+  }
+  return false;
+}
+
 function usageFeedWarning(snapshot: UsageSnapshot, account?: AccountChoice): string {
   const credit = snapshot.resetCreditsAvailable > 0 ? ", reset credit available" : "";
   const owner = account ? `usage for account ${account.name}` : "usage";
@@ -4428,9 +4835,10 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
   const stored = withUsageState((state) => {
     const previous = usageSnapshotFrom(state, options.account);
     const previousIsNewer = previous && (Date.parse(previous.checkedAt) > Date.parse(fresh.checkedAt) || Date.parse(previous.invalidatedAt ?? "") >= probeStartedAt);
+    const reconciled = reconcileExhaustionWithSnapshot(previous, fresh, probeStartedAt);
     let snapshot = previousIsNewer ? previous : {
       ...fresh,
-      ...(previous?.exhaustedUntil && previous.exhaustedUntil * 1000 > Date.now() ? { exhaustedUntil: previous.exhaustedUntil } : {}),
+      ...reconciled,
       ...(previous?.warnedAt ? { warnedAt: previous.warnedAt } : {}),
     };
     if (options.warnFeed && snapshotReached(snapshot)) {
@@ -4493,13 +4901,6 @@ function fmtUntil(unixSeconds: number): string {
   return `in ${(minutes / 1440).toFixed(1)}d`;
 }
 
-// The longest returned window supplies weekly headroom on subscription plans.
-function weeklyWindow(snapshot: UsageSnapshot): RateLimitWindow | undefined {
-  const windows = snapshot.windows ?? [];
-  if (windows.length === 0) return undefined;
-  return windows.reduce((longest, window) => window.windowDurationMins > longest.windowDurationMins ? window : longest);
-}
-
 // A snapshot stops being evidence once any of its windows has reset: the
 // percentages belong to the old window.
 function snapshotExpired(snapshot: UsageSnapshot): boolean {
@@ -4513,7 +4914,7 @@ function unknownStanding(choice: AccountChoice, reason: string): AccountStanding
 
 function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
   const now = Date.now();
-  if (snapshot?.exhaustedUntil && snapshot.exhaustedUntil * 1000 > now) return {
+  if (snapshot?.exhaustedUntil && snapshot.exhaustedUntil * 1000 > now && !isExhaustionObsolete(snapshot, now)) return {
     choice, snapshot, reached: true, remainingPercent: 0,
     reason: `quota exhausted; resets ${new Date(snapshot.exhaustedUntil * 1000).toISOString()}`,
   };
@@ -4591,8 +4992,8 @@ function fullestOpenAccount(standings: AccountStanding[]): AccountStanding | und
 // on disk and standingOf decides how much of it to trust.
 async function accountSnapshot(choice: AccountChoice): Promise<UsageSnapshot | undefined> {
   const cached = readUsageSnapshot(choice);
-  const usable = !cached?.invalidatedAt && snapshotFresh(cached, USAGE_CACHE_MS) && cached.windows !== undefined && !snapshotExpired(cached);
-  if (usable || (!cached?.invalidatedAt && probeFailedRecently(cached))) return cached;
+  const usable = Boolean(cached && !cached.invalidatedAt && snapshotFresh(cached, USAGE_CACHE_MS) && cached.windows !== undefined && !snapshotExpired(cached));
+  if (usable || (cached && !cached.invalidatedAt && probeFailedRecently(cached))) return cached;
   const refreshed = await refreshUsageSnapshot({ account: choice });
   // A failed refresh writes its marker beside the old reading; read it back
   // so the standing sees the failure.
@@ -4650,7 +5051,7 @@ function adviceLines(standings: AccountStanding[]): string[] {
   return lines;
 }
 
-function snapshotFresh(snapshot: UsageSnapshot | undefined, maxAgeMs: number): snapshot is UsageSnapshot {
+function snapshotFresh(snapshot: UsageSnapshot | undefined, maxAgeMs: number): boolean {
   if (!snapshot) return false;
   const checkedAt = Date.parse(snapshot.checkedAt);
   const age = Date.now() - checkedAt;
@@ -4759,9 +5160,10 @@ function formatAccountUsage(usage: AccountUsage): { detail: string; usedPercent:
   };
 }
 
-function fmtTokensFull(tokens: Tokens): string {
-  const k = (n: number) => n >= 1_000_000 ? `${(n / 1_000_000).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(n >= 100_000 ? 0 : 1)}k` : String(n);
-  return `${k(tokens.input)} in (${k(tokens.cached)} cached) / ${k(tokens.output)} out`;
+function fmtTokensFull(tokens: Tokens, incomplete?: boolean): string {
+  const k = (n?: number) => { const v = n ?? 0; return v >= 1_000_000 ? `${(v / 1_000_000).toFixed(1)}M` : v >= 1000 ? `${(v / 1000).toFixed(v >= 100_000 ? 0 : 1)}k` : String(v); };
+  const base = `${k(tokens.input)} in (${k(tokens.cached)} cached) / ${k(tokens.output)} out`;
+  return incomplete ? `${base} (incomplete)` : base;
 }
 
 interface GeminiUsageWindow {
@@ -4830,7 +5232,7 @@ function formatGeminiReset(iso: string): string {
   return Number.isFinite(date.getTime()) ? date.toISOString() : iso;
 }
 
-async function usageCommand(argv: string[]) {
+async function usageCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["json"]);
   const json = parsed.bools.has("json");
   const accounts: (AccountChoice | undefined)[] = config.accounts
@@ -4840,25 +5242,27 @@ async function usageCommand(argv: string[]) {
   // All-time lane and token totals from the ledger, grouped by account.
   // Tokens only accrue on JSONL rounds (spawn, exec review); text rounds
   // (resume, fork, native review) report none.
-  const totals = new Map<string, { lanes: number; tokens: Tokens }>();
-  const geminiTotals = { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } as Tokens };
+  const totals = new Map<string, { lanes: number; tokens: Tokens; incomplete: boolean }>();
+  const geminiTotals = { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } as Tokens, incomplete: false };
   for (const entry of Object.values(readLedger())) {
     if (laneEngine(entry) === "gemini") {
       geminiTotals.lanes += 1;
+      if (entry.tokensIncomplete) geminiTotals.incomplete = true;
       if (entry.tokens) {
-        geminiTotals.tokens.input += entry.tokens.input;
-        geminiTotals.tokens.cached += entry.tokens.cached;
-        geminiTotals.tokens.output += entry.tokens.output;
+        geminiTotals.tokens.input += entry.tokens.input ?? 0;
+        geminiTotals.tokens.cached += entry.tokens.cached ?? 0;
+        geminiTotals.tokens.output += entry.tokens.output ?? 0;
       }
       continue;
     }
     const key = entry.account ?? "default";
-    const bucket = totals.get(key) ?? { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } };
+    const bucket = totals.get(key) ?? { lanes: 0, tokens: { input: 0, cached: 0, output: 0 }, incomplete: false };
     bucket.lanes += 1;
+    if (entry.tokensIncomplete) bucket.incomplete = true;
     if (entry.tokens) {
-      bucket.tokens.input += entry.tokens.input;
-      bucket.tokens.cached += entry.tokens.cached;
-      bucket.tokens.output += entry.tokens.output;
+      bucket.tokens.input += entry.tokens.input ?? 0;
+      bucket.tokens.cached += entry.tokens.cached ?? 0;
+      bucket.tokens.output += entry.tokens.output ?? 0;
     }
     totals.set(key, bucket);
   }
@@ -4867,6 +5271,16 @@ async function usageCommand(argv: string[]) {
     Promise.all(accounts.map((account) => refreshUsageSnapshot({ account }))),
     refreshGeminiUsage(),
   ]);
+  const effectiveStandings = config.accounts
+    ? withAccountHolds(
+        accounts.map((account, index) => {
+          const choice = account!;
+          const snapshot = refreshed[index]?.snapshot ?? readUsageSnapshot(choice);
+          return standingOf(choice, snapshot);
+        }),
+        readLedger(),
+      )
+    : [];
   if (json) {
     const rows = accounts.map((account, index) => {
       const key = account?.name ?? "default";
@@ -4878,9 +5292,10 @@ async function usageCommand(argv: string[]) {
         checkedAt: refreshed[index]?.snapshot.checkedAt ?? null,
         lanes: ledgerTotals?.lanes ?? 0,
         ledgerTokens: ledgerTotals?.tokens ?? null,
+        incomplete: Boolean(ledgerTotals?.incomplete),
       };
     });
-    const advice = config.accounts ? accountAdvice(cachedAccountStandings()) : null;
+    const advice = config.accounts ? accountAdvice(effectiveStandings) : null;
     console.log(JSON.stringify({ codex: rows, advice, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
     return;
   }
@@ -4900,9 +5315,9 @@ async function usageCommand(argv: string[]) {
       console.log(`${label}: ${paint(formatted.detail)}`);
     }
     const ledgerTotals = totals.get(key);
-    if (ledgerTotals) console.log(color.dim(`  lanes ${ledgerTotals.lanes} · ledger tokens ${fmtTokensFull(ledgerTotals.tokens)}`));
+    if (ledgerTotals) console.log(color.dim(`  lanes ${ledgerTotals.lanes} · ledger tokens ${fmtTokensFull(ledgerTotals.tokens, ledgerTotals.incomplete)}`));
   }
-  for (const line of adviceLines(cachedAccountStandings())) console.log(color.cyan(line));
+  for (const line of adviceLines(effectiveStandings)) console.log(color.cyan(line));
   const gemini = geminiUsage ?? readGeminiUsageSnapshot();
   if (!gemini) {
     console.log(`${color.bold("gemini")}: ${color.yellow("usage probe failed (agy installed and signed in?)")}`);
@@ -4912,7 +5327,7 @@ async function usageCommand(argv: string[]) {
     const fiveHour = `${gemini.fiveHour.remainingPercent}% five-hour remaining, resets ${formatGeminiReset(gemini.fiveHour.resetsAt)}`;
     console.log(`${color.bold("gemini")}: ${paint(gemini.weekly.remainingPercent)(weekly)}, ${paint(gemini.fiveHour.remainingPercent)(fiveHour)}`);
   }
-  if (geminiTotals.lanes > 0) console.log(color.dim(`  lanes ${geminiTotals.lanes} · ledger tokens ${fmtTokensFull(geminiTotals.tokens)}`));
+  if (geminiTotals.lanes > 0) console.log(color.dim(`  lanes ${geminiTotals.lanes} · ledger tokens ${fmtTokensFull(geminiTotals.tokens, geminiTotals.incomplete)}`));
 }
 
 async function probeAppServer(account?: AccountChoice): Promise<{ reply: string; usage: string }> {
@@ -5192,13 +5607,13 @@ async function hookCommand(argv: string[]): Promise<void> {
     }
     const lane = process.env.CDX_LANE;
     if (!lane || typeof input !== "object" || input === null) {
-      passThrough();
+      return passThrough();
     }
 
     if (subcommand === "pre-tool") {
       const ledger = readLedger();
       const entry = ledger[lane];
-      if (!entry) passThrough();
+      if (!entry) return passThrough();
       const currentRound = process.env.CDX_ROUND;
       const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
       const toolName = input.toolCall?.name;
@@ -5216,7 +5631,7 @@ async function hookCommand(argv: string[]): Promise<void> {
     if (subcommand === "pre-invocation") {
       const ledger = readLedger();
       const entry = ledger[lane];
-      if (!entry) passThrough();
+      if (!entry) return passThrough();
       const currentRound = process.env.CDX_ROUND;
       const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
       if (isReview || entry.kind !== "work") {
@@ -5817,8 +6232,8 @@ async function killLane(lane: string, entry: Lane, note?: string) {
 
 type JobState = "running" | "done" | "failed";
 interface Job {
-  cmd: string;
-  cwd: string;
+  cmd?: string;
+  cwd?: string;
   exitCode?: number;
   finishedAt?: string;
   log: string;
@@ -6155,7 +6570,7 @@ function viewCommand(argv: string[]) {
             catch { client.send("notice", "State is temporarily unreadable. Retrying."); }
           },
           cancel() { client.close(); },
-        }, { highWaterMark: 1_048_576, size: (chunk) => chunk.byteLength });
+        }, { highWaterMark: 1_048_576, size: (chunk: any) => chunk?.byteLength ?? 0 });
         return new Response(stream, { headers: { ...headers, "Content-Type": "text/event-stream", "Connection": "keep-alive" } });
       } catch { return response({ error: "State is temporarily unreadable" }, 503); }
     },
@@ -6274,7 +6689,13 @@ if (import.meta.main) {
   }
 }
 
-export { summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput };
+export {
+  summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
+  recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
+  checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
+  classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
+  fmtTokens, fmtTokensFull, cappedEffort,
+};
 
 async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
