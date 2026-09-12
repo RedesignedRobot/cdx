@@ -1,0 +1,242 @@
+[
+  {
+    "lane": "r28-d",
+    "round": 1,
+    "retry_seconds": 63.88067899999987,
+    "retries_after_one_seconds": 52.02515900000003,
+    "retry_tokens": {
+      "input_tokens": 49141,
+      "output_tokens": 13332,
+      "cache_read_tokens": 1744629
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 42050,
+      "output_tokens": 10345,
+      "cache_read_tokens": 1317714
+    },
+    "result_lines": [
+      1258,
+      1484,
+      1720,
+      1862,
+      1985,
+      2016
+    ]
+  },
+  {
+    "lane": "hs-r27-money",
+    "round": 1,
+    "retry_seconds": 165.26110300000028,
+    "retries_after_one_seconds": 142.53542300000026,
+    "retry_tokens": {
+      "input_tokens": 133088,
+      "output_tokens": 20789,
+      "cache_read_tokens": 7698098
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 114272,
+      "output_tokens": 17905,
+      "cache_read_tokens": 6685952
+    },
+    "result_lines": [
+      1763,
+      1911,
+      2044,
+      2156,
+      2314,
+      2512
+    ]
+  },
+  {
+    "lane": "hs-r27-rentguard",
+    "round": 1,
+    "retry_seconds": 76.45912399999997,
+    "retries_after_one_seconds": 68.0029619999998,
+    "retry_tokens": {
+      "input_tokens": 49535,
+      "output_tokens": 15293,
+      "cache_read_tokens": 2379498
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 42708,
+      "output_tokens": 12871,
+      "cache_read_tokens": 2175891
+    },
+    "result_lines": [
+      1002,
+      1183,
+      1359,
+      1529,
+      1714,
+      1895
+    ]
+  },
+  {
+    "lane": "hs-r27-vehicle",
+    "round": 1,
+    "retry_seconds": 105.19138800000019,
+    "retries_after_one_seconds": 89.90095700000006,
+    "retry_tokens": {
+      "input_tokens": 103593,
+      "output_tokens": 20800,
+      "cache_read_tokens": 2323584
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 91988,
+      "output_tokens": 17295,
+      "cache_read_tokens": 2152119
+    },
+    "result_lines": [
+      1277,
+      1508,
+      1720,
+      1912,
+      2106,
+      2260
+    ]
+  },
+  {
+    "lane": "hs-r30-train",
+    "round": 1,
+    "retry_seconds": 60.17960900000003,
+    "retries_after_one_seconds": 49.696098000000006,
+    "retry_tokens": {
+      "input_tokens": 232589,
+      "output_tokens": 10198,
+      "cache_read_tokens": 1393644
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 223369,
+      "output_tokens": 8341,
+      "cache_read_tokens": 1006570
+    },
+    "result_lines": [
+      433,
+      574,
+      707,
+      840,
+      934,
+      1021
+    ]
+  },
+  {
+    "lane": "hs-r30-train",
+    "round": 2,
+    "retry_seconds": 179.386209,
+    "retries_after_one_seconds": 169.77396999999996,
+    "retry_tokens": {
+      "input_tokens": 353130,
+      "output_tokens": 9620,
+      "cache_read_tokens": 6741164
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 347179,
+      "output_tokens": 7918,
+      "cache_read_tokens": 6317277
+    },
+    "result_lines": [
+      56,
+      143,
+      187,
+      240,
+      272,
+      407
+    ]
+  },
+  {
+    "lane": "hs-r31-tags-a",
+    "round": 1,
+    "retry_seconds": 73.35214200000007,
+    "retries_after_one_seconds": 59.48826500000007,
+    "retry_tokens": {
+      "input_tokens": 56863,
+      "output_tokens": 8713,
+      "cache_read_tokens": 3016466
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 44144,
+      "output_tokens": 6959,
+      "cache_read_tokens": 2331756
+    },
+    "result_lines": [
+      508,
+      603,
+      694,
+      778,
+      864,
+      960
+    ]
+  },
+  {
+    "lane": "hs-r31-tags-b",
+    "round": 1,
+    "retry_seconds": 87.76001499999995,
+    "retries_after_one_seconds": 75.154945,
+    "retry_tokens": {
+      "input_tokens": 84793,
+      "output_tokens": 11898,
+      "cache_read_tokens": 596204
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 71636,
+      "output_tokens": 10193,
+      "cache_read_tokens": 522566
+    },
+    "result_lines": [
+      557,
+      640,
+      725,
+      821,
+      935,
+      1015
+    ]
+  },
+  {
+    "lane": "hs-r31-desk-spec2",
+    "round": 1,
+    "retry_seconds": 57.32517000000007,
+    "retries_after_one_seconds": 35.714640000000145,
+    "retry_tokens": {
+      "input_tokens": 29118,
+      "output_tokens": 4703,
+      "cache_read_tokens": 1954711
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 18153,
+      "output_tokens": 3568,
+      "cache_read_tokens": 1227241
+    },
+    "result_lines": [
+      1040,
+      1110,
+      1185,
+      1243,
+      1298,
+      1358
+    ]
+  },
+  {
+    "lane": "hs-r31-http",
+    "round": 1,
+    "retry_seconds": 66.32724899999994,
+    "retries_after_one_seconds": 50.14675699999998,
+    "retry_tokens": {
+      "input_tokens": 40667,
+      "output_tokens": 9676,
+      "cache_read_tokens": 1730893
+    },
+    "retries_after_one_tokens": {
+      "input_tokens": 28552,
+      "output_tokens": 7254,
+      "cache_read_tokens": 1164861
+    },
+    "result_lines": [
+      470,
+      613,
+      758,
+      901,
+      969,
+      1036
+    ]
+  }
+]
