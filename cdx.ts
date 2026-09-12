@@ -5701,7 +5701,7 @@ function cleanCommand(argv: string[]) {
       const pattern = new RegExp(`^${escaped}-r\\d+(?:\\.|-)`);
       for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
         for (const file of readdirSync(`${ROOT}/${dir}`)) {
-          if (pattern.test(file)) rmSync(`${ROOT}/${dir}/${file}`, { force: true });
+          if (pattern.test(file)) rmSync(`${ROOT}/${dir}/${file}`, { force: true, recursive: true });
         }
       }
       delete ledger[lane];
