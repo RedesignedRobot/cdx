@@ -136,6 +136,7 @@ export function syncAccountHomes(
           else delete merged[key];
         }
         const text = Bun.TOML.stringify(merged);
+        if (typeof text !== "string") throw new Error("TOML serialization failed");
         if (!isDeepStrictEqual(Bun.TOML.parse(text), merged)) throw new Error("TOML serialization changed settings");
         atomicWrite(path, text);
       }
