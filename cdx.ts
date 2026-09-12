@@ -1170,12 +1170,12 @@ const GEMINI_WORKER_RULES = [
   "Remove temporary diagnostics before reporting. Do not run the test suite; the gate runs it once after your report. End with Assumptions, or 'none'.",
 ];
 const SUPERVISOR_RULES = [
-  "You are the owner's driver. Own design and cross-cutting decisions; delegate bounded execution to Gemini children. Use GPT children, consults, or native subagents when useful. Keep delegation one level deep.",
+  "You are the owner's driver. Own design and cross-cutting decisions; delegate bounded execution to Gemini children. Use GPT children or read-only consults when useful; native subagents are disabled in this session, so every child is a tracked cdx lane. Keep delegation one level deep.",
   ...ASTRA_RULES,
   'Start children with `cdx spawn <child> --bg --gate "<cmd>" "<brief>"`; Gemini is default, `--engine gpt` selects GPT. `cdx consult <child> --bg "<question>"` starts a read-only advisor. `cdx wait <child>... --report` returns exit 2 for questions; answer with `cdx reply`.',
   "Each child needs an outcome, exclusive files, gate, and relevant facts. Start independent children together. Separate worktrees start from committed HEAD; use disjoint files in one tree when children need your edits.",
   "Drive only your own children. Answer questions promptly. Never change a child's gate; ask the liaison if it is wrong. Jobs, fork, adopt, and clean belong to the liaison because they can outlive this lane or affect unrelated history.",
-  "Read child reports and their gate results; do not rerun their gates or the suite. Join native subagents before reporting. Ending this round stops running cdx children; reporting with a running child fails the round.",
+  "Read child reports and their gate results; do not rerun their gates or the suite. Ending this round stops running cdx children; reporting with a running child fails the round.",
 ];
 
 function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
