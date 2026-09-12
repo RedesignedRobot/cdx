@@ -13,17 +13,19 @@ cases are in `README.md` next to it; read that when a command surprises you.
 
 ## The execution loop
 
-Owner ruling, 2026-09-07: Astra drives execution and technical design. You brief outcomes, answer questions, arrange independent review, and merge. Challenge decisions with evidence; do not prescribe the implementation.
+Owner rulings, 2026-09-07 to 2026-09-12: Astra thinks, Gemini works. The head briefs outcomes, answers questions, arranges independent review, and merges. It challenges decisions with evidence and does not prescribe the implementation.
 
-Owner ruling, 2026-09-10: one Astra lane per backlog, never one per finding. Astra holds twenty or more problems in one design, so give it the whole open set at once (every finding with full detail, every audit report, every sweep, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Gemini lanes from that split, one worktree each off the integration branch. Per-finding Astra lanes repeat investigation, fragment fixes and drain the weekly window. When no account has supervisor headroom, a work-tier Astra lane still writes the plan and the head spawns the Geminis.
+Delegation tree: the head creates Astra lanes; Astra may spawn Gemini helpers through its own cdx; Astra never spawns Astra, and Gemini children never delegate. Gemini lanes always run `--effort high` (spawn, resume, review). Astra runs at effort medium.
+
+One Astra lane per backlog, never one per finding. Give Astra the whole open set at once (every finding with full detail, every audit report, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Gemini lanes from that split, one worktree each off the integration branch. When the root cause is already known, skip Astra and brief Gemini directly with named files and a gate. When no account has supervisor headroom, a work-tier Astra lane still writes the plan and the head spawns the Geminis.
 
 1. Hand a whole change to one supervisor with an acceptance gate:
    `cdx spawn <lane> --engine gpt --model gpt-6-astra --supervisor --bg --gate "<cmd>" "<brief>"`.
-   Astra owns the design and delegates bounded execution to Gemini. It can use GPT children, read-only consults, or native subagents when useful.
+   Astra owns the design and delegates bounded execution to Gemini children, read-only consults, or native subagents.
 2. Wait for its report with `cdx wait <lane> --report`. Exit 2 means a question is open; answer with `cdx reply`. Use `cdx send` for corrections without dropping the task.
-3. Read the report and the gate result, arrange one read-only review, and merge. Lanes must not commit, push, or deploy.
+3. Read the report and the gate result, arrange one read-only Gemini review, and merge. Lanes must not commit, push, or deploy.
 
-For an already-defined small task, use Gemini directly with named files and a gate. The CLI defaults to Gemini. Astra requires `--engine gpt`; its effort cap stays at `medium`. Gemini always uses `gemini-3.8-flash-high`. A standalone `cdx consult <lane> --model gpt-6-astra "<question>"` gives read-only advice; follow up with `cdx resume`.
+The CLI defaults to Gemini (`gemini-3.8-flash-high`). Astra requires `--engine gpt --model gpt-6-astra`; its effort cap stays at `medium`. A standalone `cdx consult <lane> --model gpt-6-astra "<question>"` gives read-only advice; the consult sandbox cannot write files, so the head copies artifacts out of the report. Every Bash call from the head starts with an absolute `cd` and invokes `bun /Users/mas/code/cdx/cdx.ts`, because batched calls share one cwd.
 
 ## Briefing
 
