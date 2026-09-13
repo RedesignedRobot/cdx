@@ -1,3 +1,11 @@
+## 6.6.0
+
+- Gemini 503 handling: a 503 is a service outage, not a stream fault. The live agy process is kept and cdx retries up to six times with waits of 30 s, 1, 2, 4, 5 and 5 minutes; a completed step restarts the ladder. Other transport faults keep the single immediate retry from 6.5.0. The continue prompt tells the model the service recovered and not to redo finished work.
+- New wake event kind `outage`, emitted once per round at the first 503, so the head learns at once that the lane is waiting rather than dead. The plugin watcher needs a session restart to deliver the new kind; the quiet `auto-continue k/6 wait=Ns` lines still arrive through hooks meanwhile.
+- Supervisor notices: when a child lane hits a 503 outage, and when a child round ends failed or gate-invalid, cdx appends a `CDX NOTICE` control record to the supervisor's current round, delivered like a head steer, so the supervisor reacts inside its own turn instead of at its next cdx wait. Nothing is written once the parent round has ended or closed steering. Head steers are still delivered verbatim.
+- A round that outlasts the ladder fails with `gemini 503 outage outlasted 6 auto-retries (~18 min); when Gemini answers again run cdx resume <lane>, the partial report is kept`.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 6.6.0.
+
 ## 6.4.0
 
 - Normal cdx status displays round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age.

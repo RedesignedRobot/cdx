@@ -7,7 +7,7 @@ import {
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
-  fmtTokens, fmtTokensFull, cappedEffort,
+  fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
 } from "./cdx.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -398,22 +398,37 @@ test("Rank 5: classifyGeminiError distinguishes transport and 503 from malformed
 
 test("Rank 5: shouldRetryGeminiTransport allows 1 retry without progress, resets on progress, and refuses terminal errors", () => {
   // Transport error on attempt 1 without progress: allowed 1 retry
-  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 0, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs: 0 });
+  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 0, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs: 0, limit: 1 });
 
   // Transport error on attempt 2 without progress: stopped (no repeated failure without progress)
-  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 1, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: false, backoffMs: 0 });
-  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 2, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: false, backoffMs: 0 });
+  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 1, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 1 });
+  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 2, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 1 });
 
   // Progress made: counter resets, retry allowed
-  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 1, currentSteps: 6, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs: 0 });
-
-  // 503 error: applies 5000ms bounded backoff
-  expect(shouldRetryGeminiTransport({ errorText: "503", continuations: 0, currentSteps: 5 })).toEqual({ retry: true, backoffMs: 5000 });
+  expect(shouldRetryGeminiTransport({ errorText: "transport", continuations: 1, currentSteps: 6, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs: 0, limit: 1 });
 
   // Terminal errors are never transport-retried even on first attempt
-  expect(shouldRetryGeminiTransport({ errorText: "malformed", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0 });
-  expect(shouldRetryGeminiTransport({ errorText: "quota", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0 });
-  expect(shouldRetryGeminiTransport({ errorText: "cancellation", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0 });
+  expect(shouldRetryGeminiTransport({ errorText: "malformed", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 0 });
+  expect(shouldRetryGeminiTransport({ errorText: "quota", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 0 });
+  expect(shouldRetryGeminiTransport({ errorText: "cancellation", continuations: 0, currentSteps: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 0 });
+});
+
+test("6.6.0: a 503 outage climbs a waiting ladder of six retries, resets on progress, and stops after the sixth", () => {
+  const waits = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+  waits.forEach((backoffMs, continuations) => {
+    expect(shouldRetryGeminiTransport({ errorText: "HTTP 503: Service Unavailable", continuations, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs, limit: GEMINI_OUTAGE_RETRIES });
+  });
+  expect(shouldRetryGeminiTransport({ errorText: "503", continuations: 6, currentSteps: 5, stepsAtLastContinuation: 5 })).toEqual({ retry: false, backoffMs: 0, limit: 6 });
+  // A completed step since the last continuation restarts the ladder at the first wait.
+  expect(shouldRetryGeminiTransport({ errorText: "503", continuations: 4, currentSteps: 9, stepsAtLastContinuation: 5 })).toEqual({ retry: true, backoffMs: 30_000, limit: 6 });
+  expect(outageMinutes(6)).toBe(18);
+  expect(outageMinutes(1)).toBe(1);
+});
+
+test("6.6.0: a cdx-authored control record is announced as a notice, a head steer stays verbatim", () => {
+  expect(controlText({ text: "child lane x failed", sentAt: "2026-09-13T20:00:00Z", from: "cdx" })).toBe("CDX NOTICE (sent 2026-09-13T20:00:00Z): child lane x failed");
+  expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z", from: "head-session" })).toBe("stop and report");
+  expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z" })).toBe("stop and report");
 });
 
 test("Rank 2: gateEnv prepends local bin to PATH and classifyGateFailure distinguishes setup vs assertion failures", () => {
