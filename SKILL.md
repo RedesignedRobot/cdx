@@ -121,9 +121,13 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   path when no full report exists. `resume` feeds that partial back to either
   engine with an instruction to continue without redoing work. Gemini errors
   are classified from the result error only, never from the model's response text.
-  Transport failures (interrupted stream, broken pipe, timeout, transient network, 503)
+  Transport failures (interrupted stream, broken pipe, timeout, transient network)
   get one automatic retry when no new step completed since the last one; a completed
-  step resets that counter; a 503 waits 5 seconds first inside the live process.
+  step resets that counter. A 503 is a service outage: the live process is kept and
+  cdx retries up to six times with waits of 30 s, 1, 2, 4, 5 and 5 minutes. The first
+  503 wakes the head (event kind outage) and posts a CDX NOTICE into the supervising
+  lane; neither should resume or respawn a lane that is only waiting. Past the ladder
+  the round fails with a note that names cdx resume <lane> and keeps the partial.
   If the agy process dies, the round fails with the note "transport death; cdx resume continues from the partial"
   and the partial report is kept for cdx resume. Quota refusals, malformed tool calls,
   cancellations, and failed gates never retry. The round runtime cap always applies.

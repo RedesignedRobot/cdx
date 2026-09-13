@@ -67,6 +67,12 @@ const USAGE_PATH = `${ROOT}/usage.json`;
 const GEMINI_USAGE_PATH = `${ROOT}/usage-gemini.json`;
 const GEMINI_QUOTA_PATH = `${ROOT}/gemini-quota.json`;
 const GEMINI_TRANSPORT_RETRIES = 1;
+// A 503 is the service, not the stream: the agy process is alive and the
+// conversation intact, so waiting costs nothing while an immediate resend
+// burns a context load per attempt (study 2026-09-12, retry-metrics). The
+// ladder waits out an outage of about a quarter of an hour before giving up.
+const GEMINI_OUTAGE_RETRIES = 6;
+const GEMINI_OUTAGE_BACKOFF_MS = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
 const CODEX_DISABLE_NATIVE_SUBAGENTS = [
   "-c", "agents.enabled=false",
   "--disable", "multi_agent",
@@ -74,7 +80,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.5.0";
+const VERSION = "6.6.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -601,7 +607,7 @@ function readTailLines(path: string, limit: number, accept: (line: string) => bo
   }
 }
 
-type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "gate-started" | "gate-finished" | "report-written";
+type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "outage" | "gate-started" | "gate-finished" | "report-written";
 interface FeedEvent {
   id: number;
   timestamp: string;
@@ -628,7 +634,7 @@ interface SessionState {
   heads: Record<string, string>;
 }
 const SESSION_STATE = `${ROOT}/sessions.json`;
-const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash"]);
+const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash", "outage"]);
 function readSessions(): SessionState {
   return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, heads: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
 }
@@ -655,7 +661,7 @@ function parseFeedEvent(line: string): FeedEvent | undefined {
     const event = JSON.parse(line);
     if (Number.isSafeInteger(event.id) && event.id > 0 && typeof event.timestamp === "string"
       && typeof event.owner === "string" && typeof event.message === "string"
-      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
+      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "outage", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
   } catch { /* Version 5 free-text records are deliberately ignored. */ }
 }
 function readEvents(): FeedEvent[] {
@@ -1029,6 +1035,32 @@ function writeDeliveredCount(lane: string, round: number, count: number): void {
   const dir = join(path, "..");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(path, `${count}\n`);
+}
+
+function outageMinutes(retries: number): number {
+  return Math.round(GEMINI_OUTAGE_BACKOFF_MS.slice(0, retries).reduce((sum, ms) => sum + ms, 0) / 60_000);
+}
+
+// A record cdx wrote itself is announced as a notice, never as a head steer,
+// so a supervisor can tell harness facts from instructions.
+function controlText(record: ControlRecord): string {
+  return record.from === "cdx" ? `CDX NOTICE (sent ${record.sentAt}): ${record.text}` : record.text;
+}
+
+// A child's outage or failure reaches its supervisor through the control
+// file, the same path a head steer takes, so the supervisor hears it inside
+// its own turn instead of finding out at the next cdx wait. Nothing is
+// written when the parent round has ended or stopped taking steers.
+function notifyParent(lane: string, text: string): void {
+  const ledger = readLedger();
+  const entry = ledger[lane];
+  const parent = entry?.parent;
+  const parentRound = entry?.parentRound;
+  if (!parent || !parentRound) return;
+  const parentEntry = ledger[parent];
+  if (!parentEntry || !laneRunning(parentEntry) || parentEntry.rounds !== parentRound || parentEntry.steerOpen === false) return;
+  const record: ControlRecord = { text: singleLine(text), sentAt: new Date().toISOString(), from: "cdx" };
+  withLedger(() => { writeFileSync(controlPathOf(parent, parentRound), `${JSON.stringify(record)}\n`, { flag: "a" }); });
 }
 
 function geminiTranscriptPath(conversationId: string): string {
@@ -2315,19 +2347,20 @@ function classifyGeminiError(text: string | undefined): GeminiErrorKind {
 
 function shouldRetryGeminiTransport(
   options: { errorText: string; continuations: number; currentSteps: number; stepsAtLastContinuation?: number },
-): { retry: boolean; backoffMs: number } {
+): { retry: boolean; backoffMs: number; limit: number } {
   const error = options.errorText ?? "";
   const kind = classifyGeminiError(error);
   if (kind !== "transport" && kind !== "503") {
-    return { retry: false, backoffMs: 0 };
+    return { retry: false, backoffMs: 0, limit: 0 };
   }
   const hasProgress = options.stepsAtLastContinuation !== undefined && options.currentSteps > options.stepsAtLastContinuation;
   const effectiveContinuations = hasProgress ? 0 : options.continuations;
-  if (effectiveContinuations >= GEMINI_TRANSPORT_RETRIES) {
-    return { retry: false, backoffMs: 0 };
+  const limit = kind === "503" ? GEMINI_OUTAGE_RETRIES : GEMINI_TRANSPORT_RETRIES;
+  if (effectiveContinuations >= limit) {
+    return { retry: false, backoffMs: 0, limit };
   }
-  const backoffMs = kind === "503" ? 5000 : 0;
-  return { retry: true, backoffMs };
+  const backoffMs = kind === "503" ? GEMINI_OUTAGE_BACKOFF_MS[Math.min(effectiveContinuations, GEMINI_OUTAGE_BACKOFF_MS.length - 1)]! : 0;
+  return { retry: true, backoffMs, limit };
 }
 
 async function qualifyGeminiResult({ lane, round, ownerSession, result, finalAgentResponse, isReview, turnFailureReason, touchLedger, reportPath }: {
@@ -2790,7 +2823,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
             }, true);
             const reason = singleLine(errorText).slice(0, 80);
             const waitNotice = retryDecision.backoffMs > 0 ? ` wait=${retryDecision.backoffMs / 1000}s` : "";
-            feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${GEMINI_TRANSPORT_RETRIES}${waitNotice} reason=${reason}`, spec.ownerSession, { lane, round });
+            feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${retryDecision.limit}${waitNotice} reason=${reason}`, spec.ownerSession, { lane, round });
+            if (kind === "503" && geminiContinuations === 1) {
+              const notice = `[cdx] lane=${lane} round=${round} gemini 503 outage: the process is alive and cdx retries up to ${retryDecision.limit} times over ~${outageMinutes(retryDecision.limit)} min; do not resume or respawn it, a terminal event follows if the outage outlasts the ladder`;
+              feedEvent("outage", notice, spec.ownerSession, { lane, round });
+              notifyParent(lane, notice);
+            }
             const response = typeof result.response === "string" ? result.response.trim() : "";
             const partial = finalAgentResponse || response;
             if (partial) {
@@ -2804,7 +2842,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
               turnFailureReason = "transport death; cdx resume continues from the partial";
             } else if (!receivedSignal && !maxRuntimeHit) {
               try {
-                writeUserTurn("The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
+                writeUserTurn(kind === "503"
+                  ? "The previous turn failed because the model service was temporarily unavailable (503). The service has been given time to recover. Continue the task you were working on from where you left off, without redoing completed work. When the task is complete, print your final lane report."
+                  : "The previous turn was cut off by a transport error. Continue the task you were working on from where you left off. When the task is complete, print your final lane report.");
               } catch {
                 turnFailureReason = "transport death; cdx resume continues from the partial";
               }
@@ -2972,7 +3012,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         }
       });
       for (const record of toDeliver) {
-        writeUserTurn(record.text);
+        writeUserTurn(controlText(record));
         const flat = singleLine(record.text);
         feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession, { lane, round });
       }
@@ -3117,17 +3157,17 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const expectedTurnId = activeTurnId;
       try {
         if (expectedTurnId) {
-          await request("turn/steer", { threadId, expectedTurnId, input: [inputText(record.text)] });
+          await request("turn/steer", { threadId, expectedTurnId, input: [inputText(controlText(record))] });
           return "steered";
         } else {
-          await startTurn(threadId, record.text, false);
+          await startTurn(threadId, controlText(record), false);
           return "follow-up-turn";
         }
       } catch (steerError) {
         if (expectedTurnId) {
           try {
             await waitForTurn(expectedTurnId);
-            await startTurn(threadId, record.text, false);
+            await startTurn(threadId, controlText(record), false);
             return "follow-up-turn";
           } catch (followUpError) {
             steerError = followUpError;
@@ -3386,7 +3426,9 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
         const continuePrefix = geminiContinuations > 0
           ? `turn failed after ${geminiContinuations} auto-continue${geminiContinuations === 1 ? "" : "s"}`
           : "turn failed";
-        roundNote = `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
+        roundNote = turnFailureReason === "gemini service unavailable (503)" && geminiContinuations >= GEMINI_OUTAGE_RETRIES
+          ? `gemini 503 outage outlasted ${geminiContinuations} auto-retries (~${outageMinutes(geminiContinuations)} min); when Gemini answers again run cdx resume ${lane}, the partial report is kept`
+          : `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
       }
     }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
@@ -3458,6 +3500,9 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const roundIncomplete = entry.kind === "review" ? entry.review?.tokensIncomplete : entry.work.tokensIncomplete;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
   if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"}`, entry.ownerSession, { lane, round });
+  if (finalRoundState === "failed" || finalRoundState === "gate-invalid") {
+    notifyParent(lane, `[cdx] child lane=${lane} round=${round} state=${finalRoundState}${finalRoundNote ? ` note=${finalRoundNote}` : ""} report=${capturedReport ?? "-"}; read the report or partial before deciding between cdx resume ${lane} and a new lane`);
+  }
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${capturedReport ?? "-"}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
@@ -5665,7 +5710,7 @@ async function hookCommand(argv: string[]): Promise<void> {
           }
           if (typeof record.text !== "string" || !record.text.trim()) continue;
           injectSteps.push({
-            userMessage: `HEAD STEER (sent ${record.sentAt}): ${record.text}`,
+            userMessage: record.from === "cdx" ? controlText(record) : `HEAD STEER (sent ${record.sentAt}): ${record.text}`,
           });
           newlyDelivered += 1;
           const flat = singleLine(record.text);
@@ -6694,7 +6739,7 @@ export {
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
-  fmtTokens, fmtTokensFull, cappedEffort,
+  fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
