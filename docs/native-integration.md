@@ -77,7 +77,7 @@ Reference material outside the repo: `/tmp/cdx-mods-reference/mods` (Anthropic's
 
 ### Binding
 
-On `session.start`: `session = await $.session.id()`; `root = await $.plugin.root()`; `CDX = [\"bun\", \`${root}/cdx.ts\`]`. Register `/cdx` with `$.command.register({ name: "cdx", description: "cdx lanes: status, or any read-only cdx command" })`. Register every tool in the table. Start `$.clock.every(2000, poll)`. Run `cdx brief`; a non-empty result goes to `$.ui.log` (when `e.surface` is not null) and into the pending buffer as one quiet entry so the first prompt carries it. Then `next(e)`.
+On `session.start`: `session = await $.session.id()`; `root = await $.plugin.root()`; `CDX = [\"bun\", \`${root}/cdx.ts\`]`. Register every tool in the table, then `/lanes` with `$.command.register({ name: "lanes", ... })` inside a try/catch: Claude Code refuses the name `cdx` because `/cdx` is the user's skill, and a refused command must never stop the tools and the poll. Start `$.clock.every(2000, poll)`. Run `cdx brief`; a non-empty result goes to `$.ui.log` (when `e.surface` is not null) and into the pending buffer as one quiet entry so the first prompt carries it. Then `next(e)`.
 
 Every `$.process.run` on cdx passes `env: { CLAUDE_CODE_SESSION_ID: session }` and `cwd: root`.
 
@@ -99,9 +99,9 @@ The drain rules live in `hooks/delivery.ts` as pure functions over `{ pending, i
 
 `on("tool.call", { tool: "Bash" }, ...)`: `invokedRawEngine(e.command)` from `../guard.ts`; on a hit return `{ deny: rawEngineRefusal(engine) }`, else `next(e)`. Register it before the generic drain hook so the deny never carries context.
 
-### `/cdx`
+### `/lanes`
 
-`command.run` of `cdx`: no args runs `cdx status`; args are split on whitespace and passed through. Reply `{ text }` with stdout, or stderr on a non-zero exit. Never `next(e)`.
+`command.run` of `lanes` (the name `cdx` belongs to the user skill): no args runs `cdx status`; args are split on whitespace and passed through. Reply `{ text }` with stdout, or stderr on a non-zero exit. Never `next(e)`.
 
 ### Tools
 
