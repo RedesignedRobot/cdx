@@ -80,7 +80,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "6.6.0";
+const VERSION = "7.0.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -553,14 +553,14 @@ const config: Config = import.meta.main
   ? readConfigForCommand(process.argv[2])
   : readConfig(true);
 
-// The plugin monitor must keep delivering wake events when config.json is
-// broken, so `watch` falls back to the defaults and says so once on stderr.
+// The CLI must keep delivering events when config.json is broken, so `events`
+// falls back to the defaults and says so once on stderr.
 function readConfigForCommand(command: string | undefined): Config {
-  const pinned = command === "_run" || command === "view" || command === "hook" || command === "_session";
-  if (command !== "watch") return readConfig(pinned);
+  const pinned = command === "_run" || command === "view" || command === "hook";
+  if (command !== "events") return readConfig(pinned);
   try { return readConfig(false); }
   catch (error) {
-    process.stderr.write(`cdx watch: ${error instanceof Error ? error.message : String(error)}; using default visibility settings\n`);
+    process.stderr.write(`cdx events: ${error instanceof Error ? error.message : String(error)}; using default visibility settings\n`);
     return readConfig(true);
   }
 }
@@ -621,22 +621,21 @@ interface FeedEvent {
   message: string;
 }
 interface SessionDelivery {
-  wake: number;
-  quiet: number;
-  lease?: { pid: number; claudePid: number };
-  plugin?: { root: string; version: string; hooks: string; observed: string[] };
+  cursor: number;
+  polledAt?: string;
+  digestAt?: string;
+  progress?: ProgressSample[];
 }
 interface SessionState {
   sequence: number;
   bindings: Record<string, string>;
   lanes: Record<string, string>;
   sessions: Record<string, SessionDelivery>;
-  heads: Record<string, string>;
 }
 const SESSION_STATE = `${ROOT}/sessions.json`;
 const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash", "outage"]);
 function readSessions(): SessionState {
-  return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, heads: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
+  return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
 }
 function withEvents<T>(action: (state: SessionState) => T, persist = true): T {
   if (!persist && !existsSync(ROOT)) return action(readSessions());
@@ -694,73 +693,108 @@ function scopedEvents(limit: number, session = callerSession(), messagesOnly = f
     && (!messagesOnly || event.kind === "message")).slice(-limit).map(renderEvent), false);
 }
 function delivery(state: SessionState, session: string): SessionDelivery {
-  return state.sessions[session] ??= { wake: 0, quiet: 0 };
+  const entry = state.sessions[session] ??= { cursor: 0 };
+  if (typeof entry.cursor !== "number") entry.cursor = 0;
+  return entry;
 }
-function deliverEvents(session: string, channel: "wake" | "quiet", emit: (text: string) => void, leasePid?: number): void {
-  withEvents((state) => {
-    const cursor = delivery(state, session);
-    if (leasePid !== undefined && cursor.lease?.pid !== leasePid) fail("watcher lease was replaced");
-    const records = readEvents();
-    const events = records.filter((event) => event.id > cursor[channel] && eventOwned(event, session, state)
-      && WAKE_EVENTS.has(event.kind) === (channel === "wake"));
-    if (events.length) emit(events.map(renderEvent).join("\n"));
-    // Persist only after stdout succeeds. A crash may replay, never acknowledge early.
-    cursor[channel] = Math.max(cursor[channel], records.at(-1)?.id ?? 0);
-  });
+
+interface EventsRecord {
+  id: number;
+  kind: string;
+  wake: boolean;
+  text: string;
+  lane?: string;
+  round?: number;
+  job?: string;
+  from?: string;
+  recipient?: string;
 }
-async function watchCommand(argv: string[]): Promise<void> {
-  const claudePid = Number(process.env.CLAUDE_PID);
-  if (argv.length || !Number.isInteger(claudePid) || claudePid < 1) fail("cdx watch needs CLAUDE_PID from the plugin monitor, with no arguments");
-  // The monitor's own CLAUDE_CODE_SESSION_ID is a child id. The head's id is
-  // the session hook receipt keyed by the Claude process; /clear changes it.
-  const headSession = () => readSessions().heads[String(claudePid)];
-  let held: string | undefined;
-  let digestSession: string | undefined;
-  let lastDigest = Date.now();
-  let previousProgress: ProgressSample[] = [];
-  const release = () => withEvents((state) => {
-    if (held && state.sessions[held]?.lease?.pid === process.pid) delete state.sessions[held]!.lease;
-    held = undefined;
+
+interface SelectEventsOptions {
+  peek?: boolean;
+}
+
+function selectEvents(
+  records: FeedEvent[],
+  session: string,
+  state: SessionState,
+  options: SelectEventsOptions = {}
+): {
+  events: EventsRecord[];
+  cursor: number;
+} {
+  const current = delivery(state, session);
+  const currentCursor = current.cursor ?? 0;
+  const matching = records.filter((event) => event.id > currentCursor && eventOwned(event, session, state));
+  const lastRecordId = records.length > 0 ? records[records.length - 1]!.id : currentCursor;
+  const newCursor = options.peek ? currentCursor : Math.max(currentCursor, lastRecordId);
+  if (!options.peek) {
+    current.cursor = newCursor;
+  }
+  const events: EventsRecord[] = matching.map((event) => {
+    const e: EventsRecord = {
+      id: event.id,
+      kind: event.kind,
+      wake: WAKE_EVENTS.has(event.kind),
+      text: renderEvent(event),
+    };
+    if (event.lane !== undefined) e.lane = event.lane;
+    if (event.round !== undefined) e.round = event.round;
+    if (event.job !== undefined) e.job = event.job;
+    if (event.from !== undefined) e.from = event.from;
+    if (event.recipient !== undefined) e.recipient = event.recipient;
+    return e;
   });
-  // A live holder keeps the lease; this watcher stands by and takes over
-  // when the holder exits (a plugin reload starts the new monitor first).
-  const acquire = (session: string) => withEvents((state) => {
+  return { events, cursor: current.cursor };
+}
+
+async function eventsCommand(argv: string[]): Promise<void> {
+  const parsed = parseArgs(argv, ["json", "peek"]);
+  if (parsed.rest.length) fail("usage: cdx events [--json] [--peek]");
+  const session = callerSession();
+  if (!session || session === "terminal") fail("cdx events needs a Claude session");
+  const json = parsed.bools.has("json");
+  const peek = parsed.bools.has("peek");
+
+  const now = Date.now();
+  const visibilityCfg = config.visibility ?? VISIBILITY_DEFAULTS;
+
+  const { events } = withEvents((state) => {
     const current = delivery(state, session);
-    if (current.lease?.pid === process.pid) return true;
-    if (current.lease && pidAlive(current.lease.pid) && pidAlive(current.lease.claudePid)) return false;
-    current.lease = { pid: process.pid, claudePid };
-    return true;
-  });
-  let stopped = false;
-  const stop = () => { stopped = true; };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
-  try {
-    while (!stopped && pidAlive(claudePid)) {
-      const session = headSession();
-      if (held && session !== held) release();
-      if (session && acquire(session)) {
-        held = session;
-        const now = Date.now();
-        if (digestSession !== session) {
-          digestSession = session;
-          lastDigest = now;
-          previousProgress = [];
+    current.polledAt = new Date(now).toISOString();
+
+    if (!peek) {
+      if (!current.digestAt) {
+        current.digestAt = new Date(now).toISOString();
+        current.progress = [];
+      } else if (heartbeatDue(now, Date.parse(current.digestAt), visibilityCfg.heartbeatMinutes)) {
+        current.digestAt = new Date(now).toISOString();
+        const samples = sessionProgress(session, now);
+        if (samples.length) {
+          const records = readEvents();
+          state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
+          const message = `[cdx] progress\n${digestLines(samples, current.progress ?? []).join("\n")}`;
+          const progressEvent: FeedEvent = {
+            id: ++state.sequence,
+            timestamp: new Date().toISOString(),
+            kind: "progress",
+            owner: session,
+            message: message.split("\n").map(singleLine).join("\n"),
+          };
+          appendFileSync(`${ROOT}/feed.log`, `${JSON.stringify(progressEvent)}\n`);
+          current.progress = samples;
         }
-        if (heartbeatDue(now, lastDigest, (config.visibility ?? VISIBILITY_DEFAULTS).heartbeatMinutes)) {
-          const samples = sessionProgress(session, now);
-          if (samples.length) feedEvent("progress", `[cdx] progress\n${digestLines(samples, previousProgress).join("\n")}`, session);
-          previousProgress = samples;
-          lastDigest = now;
-        }
-        deliverEvents(session, "wake", (text) => writeFileSync(1, `${text}\n`), process.pid);
       }
-      await Bun.sleep(500);
     }
-  } finally {
-    release();
-    process.removeListener("SIGTERM", stop);
-    process.removeListener("SIGINT", stop);
+
+    const records = readEvents();
+    return selectEvents(records, session, state, { peek });
+  });
+
+  if (json) {
+    console.log(JSON.stringify({ session, events }));
+  } else if (events.length > 0) {
+    console.log(events.map((e) => e.text).join("\n"));
   }
 }
 function sessionProgress(session: string, now: number): ProgressSample[] {
@@ -805,31 +839,7 @@ function sessionSummary(session: string): string {
   for (const [name, job] of summaryJobs(jobs)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
 }
-async function sessionCommand(): Promise<void> {
-  const input = JSON.parse(await Bun.stdin.text());
-  if (typeof input.session_id !== "string" || !input.session_id.trim() || input.session_id === "terminal") fail("session hook needs session_id");
-  if (input.agent_id) return;
-  const event = input.hook_event_name;
-  if (!["SessionStart", "PostToolBatch", "UserPromptSubmit"].includes(event)) fail("unsupported session hook event");
-  const session = input.session_id.trim();
-  withEvents((state) => {
-    if (process.env.CLAUDE_PID) state.heads[process.env.CLAUDE_PID] = session;
-    const current = delivery(state, session);
-    const hooks = createHash("sha256").update(readFileSync(`${REPO_ROOT}/hooks/hooks.json`)).digest("hex");
-    const observed = current.plugin?.version === VERSION && current.plugin.hooks === hooks ? current.plugin.observed : [];
-    current.plugin = { root: realpathSync(REPO_ROOT), version: VERSION, hooks, observed: [...new Set([...observed, event])] };
-  });
-  const summary = event === "SessionStart" ? sessionSummary(session) : "";
-  let emitted = false;
-  deliverEvents(session, "quiet", (delta) => {
-    emitted = true;
-    const additionalContext = [summary, delta].filter(Boolean).join("\n");
-    writeFileSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext } }) + "\n");
-  });
-  if (summary && !emitted) {
-    writeFileSync(1, JSON.stringify({ hookSpecificOutput: { hookEventName: event, additionalContext: summary } }) + "\n");
-  }
-}
+
 function takeoverCommand(argv: string[]): void {
   const [target, extra] = argv;
   const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
@@ -851,8 +861,7 @@ function takeoverCommand(argv: string[]): void {
     // Nothing is replayed: the summary below carries what needs attention.
     const latest = readEvents().at(-1)?.id ?? 0;
     const cursor = delivery(state, session);
-    cursor.wake = Math.max(cursor.wake, latest);
-    cursor.quiet = Math.max(cursor.quiet, latest);
+    cursor.cursor = Math.max(cursor.cursor, latest);
   }));
   console.log(`cdx: ownership connected to session=${session}; target=${target}`);
   const summary = sessionSummary(session);
@@ -1604,13 +1613,18 @@ function storedOwnership(lane: Lane): LaneOwner | undefined {
   return { ...(lane.ownerSession ? { ownerSession: lane.ownerSession } : {}), ownerCwd: lane.ownerCwd };
 }
 
-// A brief of "-" reads stdin, so long prompts with quotes and backticks never
-// fight the shell.
-async function resolveBrief(text: string | undefined): Promise<string | undefined> {
+function resolveStdinText(text: string | undefined, stdinContent: string, usage: string): string | undefined {
   if (text !== "-") return text;
-  const stdin = (await Bun.stdin.text()).trim();
-  if (!stdin) fail("brief was '-' but stdin is empty");
-  return stdin;
+  const trimmed = stdinContent.trim();
+  if (!trimmed) fail(usage);
+  return trimmed;
+}
+
+// An argument of "-" reads stdin, so long prompts with quotes and backticks never
+// fight the shell. An empty stdin fails with the command's usage line.
+async function resolveBrief(text: string | undefined, usage: string): Promise<string | undefined> {
+  if (text !== "-") return text;
+  return resolveStdinText(text, await Bun.stdin.text(), usage);
 }
 
 interface WorktreeInfo { path: string; repo: string; branch: string }
@@ -3575,10 +3589,13 @@ function expireRoundQuestions(lane: string, round: number): void {
   }
 }
 
-function sendCommand(argv: string[]): void {
+async function sendCommand(argv: string[]): Promise<void> {
   const [lane, ...parts] = argv;
-  const text = singleLine(parts.join(" "));
-  if (!lane || !text) fail('usage: cdx send <lane> "<text>"');
+  const usage = 'usage: cdx send <lane> "<text>"';
+  const rawText = parts.length === 1 && parts[0] === "-" ? "-" : parts.join(" ");
+  const textArg = await resolveBrief(rawText, usage);
+  const text = textArg ? singleLine(textArg) : "";
+  if (!lane || !text) fail(usage);
   const record: ControlRecord = {
     text,
     sentAt: new Date().toISOString(),
@@ -3655,11 +3672,14 @@ async function askCommand(argv: string[]): Promise<void> {
   console.log("cdx ask timed out. No approval was received. Continue independent authorized work and report the unresolved dependency; do not guess a required answer.");
 }
 
-function replyCommand(argv: string[]): void {
+async function replyCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["id"]);
   const [lane, ...parts] = parsed.rest;
-  const answer = singleLine(parts.join(" "));
-  if (!lane || !answer) fail('usage: cdx reply <lane> [--id <seq>] "<answer>"');
+  const usage = 'usage: cdx reply <lane> [--id <seq>] "<answer>"';
+  const rawAnswer = parts.length === 1 && parts[0] === "-" ? "-" : parts.join(" ");
+  const answerArg = await resolveBrief(rawAnswer, usage);
+  const answer = answerArg ? singleLine(answerArg) : "";
+  if (!lane || !answer) fail(usage);
   const requestedId = parsed.flags.id === undefined ? undefined : Number(parsed.flags.id);
   if (requestedId !== undefined && (!Number.isInteger(requestedId) || requestedId < 1)) fail("--id must be a positive integer");
   requireOwnChild(lane, readLedger()[lane]);
@@ -3698,10 +3718,13 @@ function questionsCommand(argv: string[]): void {
   }
 }
 
-function msgCommand(argv: string[]): void {
+async function msgCommand(argv: string[]): Promise<void> {
   const [target, ...parts] = argv;
-  const message = singleLine(parts.join(" "));
-  if (!target || !message) fail('usage: cdx msg <target> "<text>"');
+  const usage = 'usage: cdx msg <target> "<text>"';
+  const rawMessage = parts.length === 1 && parts[0] === "-" ? "-" : parts.join(" ");
+  const messageArg = await resolveBrief(rawMessage, usage);
+  const message = messageArg ? singleLine(messageArg) : "";
+  if (!target || !message) fail(usage);
   const caller = callerSession();
   if (caller === "terminal") fail("cdx msg needs a Claude session owner");
   const lane = readLedger()[target];
@@ -3754,8 +3777,9 @@ async function spawnCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "model", "supervisor", "pre"]);
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
-  const brief = await resolveBrief(briefArg);
-  if (!lane || !brief) fail(`usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`);
+  const usage = `usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`;
+  const brief = await resolveBrief(briefArg, usage);
+  if (!lane || !brief) fail(usage);
   validLane(lane);
   const supervisor = parsed.bools.has("supervisor");
   const parent = supervisorLane();
@@ -3879,8 +3903,9 @@ async function spawnCommand(argv: string[]) {
 async function resumeCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre"]);
   const [lane, followUpArg] = parsed.rest;
-  const followUp = await resolveBrief(followUpArg);
-  if (!lane || !followUp) fail('usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"');
+  const usage = 'usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"';
+  const followUp = await resolveBrief(followUpArg, usage);
+  if (!lane || !followUp) fail(usage);
   const before = readLane(lane);
   requireOwnChild(lane, before);
   const parent = supervisorLane();
@@ -3946,8 +3971,9 @@ async function resumeCommand(argv: string[]) {
 async function forkCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["effort", "bg", "account", "model"]);
   const [newLane, source, briefArg] = parsed.rest;
-  const brief = await resolveBrief(briefArg);
-  if (!newLane || !source || !brief) fail('usage: cdx fork <newLane> <fromLane|sessionId> [--bg] "<brief>"');
+  const usage = 'usage: cdx fork <newLane> <fromLane|sessionId> [--bg] "<brief>"';
+  const brief = await resolveBrief(briefArg, usage);
+  if (!newLane || !source || !brief) fail(usage);
   validLane(newLane);
   const ledger = readLedger();
   const sourceLane = ledger[source];
@@ -3994,22 +4020,26 @@ async function forkCommand(argv: string[]) {
 async function consultCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
   const [lane, questionArg] = parsed.rest;
-  if (!lane || !questionArg) fail('usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"');
+  const usage = 'usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"';
+  const question = await resolveBrief(questionArg, usage);
+  if (!lane || !question) fail(usage);
   const parent = supervisorLane();
   const parentEntry = parent ? readLedger()[parent] : undefined;
   if (parentEntry?.consult && parsed.flags.engine && parsed.flags.engine !== "gemini") {
     fail("consult supervisor may only spawn read-only gemini helpers; gpt helpers are refused");
   }
   const engine = parsed.flags.engine ?? (parentEntry?.consult ? "gemini" : "gpt");
-  return reviewCommand(["--engine", engine, ...argv], { consult: true, supervisor: parsed.bools.has("supervisor") });
+  const forwardArgv = argv.filter((arg) => arg !== questionArg);
+  return reviewCommand(["--engine", engine, ...forwardArgv, question], { consult: true, supervisor: parsed.bools.has("supervisor") });
 }
 
 async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
   const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
-  const intent = await resolveBrief(intentArg);
-  if (!lane) fail('usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]');
+  const usage = 'usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]';
+  const intent = await resolveBrief(intentArg, usage);
+  if (!lane) fail(usage);
   validLane(lane);
   if (opts.consult && engine !== "gpt" && engine !== "gemini") fail("consult runs on gpt or gemini only");
   const parent = supervisorLane();
@@ -4255,17 +4285,125 @@ function statusBrief(ledger: Ledger, jobs: Jobs, io: {
   return lines.join("\n");
 }
 
-export { changedFileCount, jobPhase, jobPhaseText, laneProgress, porcelainFileCount, statusBrief, statusText };
+interface StatusLineIO {
+  ownsLane?: (name: string, entry: Lane) => boolean;
+  ownsJob?: (name: string, job: Job) => boolean;
+  now?: number;
+}
+
+function statusLine(
+  ledger: Ledger,
+  jobs: Jobs,
+  questions: number | { record: QuestionRecord }[] = 0,
+  quota: GeminiQuotaState | number | undefined = undefined,
+  io: StatusLineIO = {}
+): string {
+  const now = io.now ?? Date.now();
+  const runningLanes: { name: string; stage: string; age: string }[] = [];
+  for (const [name, entry] of Object.entries(ledger)) {
+    if (!laneRunning(entry)) continue;
+    if (io.ownsLane && !io.ownsLane(name, entry)) continue;
+    const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
+    const age = statusAge(entry.lastActionAt ?? entry.lastEventAt, now);
+    runningLanes.push({ name, stage, age });
+  }
+
+  const runningJobs: { name: string; age: string }[] = [];
+  for (const [name, job] of Object.entries(jobs)) {
+    if (!jobRunning(job)) continue;
+    if (io.ownsJob && !io.ownsJob(name, job)) continue;
+    const age = statusAge(job.startedAt, now);
+    runningJobs.push({ name, age });
+  }
+
+  let questionCount = 0;
+  if (typeof questions === "number") {
+    questionCount = questions;
+  } else if (Array.isArray(questions)) {
+    for (const q of questions) {
+      const rec = "record" in q ? q.record : q;
+      const entry = ledger[rec.lane];
+      if (entry && entry.rounds === rec.round && questionOpen(rec)) {
+        if (!io.ownsLane || io.ownsLane(rec.lane, entry)) questionCount += 1;
+      }
+    }
+  }
+
+  if (runningLanes.length === 0 && runningJobs.length === 0 && questionCount === 0) {
+    return "";
+  }
+
+  let blockedMinutes: number | undefined;
+  if (typeof quota === "number") {
+    blockedMinutes = quota;
+  } else if (quota && "block" in quota && quota.block) {
+    blockedMinutes = quota.block.minutesRemaining;
+  }
+
+  const head = runningLanes.length > 0
+    ? `cdx ${runningLanes.length} ${runningLanes.length === 1 ? "lane" : "lanes"}`
+    : runningJobs.length > 0
+    ? `cdx ${runningJobs.length} ${runningJobs.length === 1 ? "job" : "jobs"}`
+    : "cdx";
+
+  const laneItems = runningLanes.map((l) => `${l.name} ${l.stage} ${l.age}`);
+  const jobItems = runningJobs.map((j) => `job ${j.name} ${j.age}`);
+  const middle = [...laneItems, ...jobItems];
+
+  const trailing: string[] = [];
+  if (questionCount > 0) {
+    trailing.push(`${questionCount} ${questionCount === 1 ? "question" : "questions"}`);
+  }
+  if (blockedMinutes !== undefined && blockedMinutes > 0) {
+    trailing.push(`gemini blocked ${blockedMinutes}m`);
+  }
+
+  function assemble(mid: string[]): string {
+    return [head, ...mid, ...trailing].join(" · ");
+  }
+
+  let currentMiddle = [...middle];
+  let line = assemble(currentMiddle);
+  while (line.length > 100 && currentMiddle.length > 0) {
+    currentMiddle.pop();
+    line = assemble(currentMiddle);
+  }
+  if (line.length > 100) {
+    line = line.slice(0, 100);
+  }
+  return line;
+}
+
+export { changedFileCount, jobPhase, jobPhaseText, laneProgress, porcelainFileCount, statusBrief, statusLine, statusText };
 
 async function statusCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["json", "all", "brief", "watch", "interval"]);
-  if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --watch [--interval S]]");
+  const parsed = parseArgs(argv, ["json", "all", "brief", "line", "watch", "interval"]);
+  if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --line | --watch [--interval S]]");
   const watch = parsed.bools.has("watch");
   const interval = Number(parsed.flags.interval ?? 2);
   if (!Number.isFinite(interval) || interval <= 0 || interval > 2_147_483) fail("--interval must be positive seconds below 2147483");
   if (parsed.flags.interval !== undefined && !watch) fail("--interval requires --watch");
+  if (parsed.bools.has("line") && (watch || parsed.bools.has("brief") || parsed.bools.has("json") || parsed.bools.has("all"))) fail("--line cannot be combined with other display modes");
   if (parsed.bools.has("json") && (watch || parsed.bools.has("brief"))) fail("--json cannot be combined with --brief or --watch");
   if (parsed.bools.has("all") && (watch || parsed.bools.has("brief"))) fail("--all lists finished jobs; --brief and --watch show only running work");
+  if (parsed.bools.has("line")) {
+    const session = callerSession();
+    const state = readSessions();
+    const ledger = readLedger();
+    const jobs = readJobs();
+    const questions = questionFiles().filter(({ record }) => {
+      const entry = ledger[record.lane];
+      return entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state);
+    }).length;
+    const quota = geminiQuotaState();
+    const line = statusLine(ledger, jobs, questions, quota, {
+      ownsLane: (name, entry) => owned(entry.ownerSession, name, session, state),
+      ownsJob: (_name, job) => owned(job.ownerSession, undefined, session, state),
+      now: Date.now(),
+    });
+    if (line) console.log(line);
+    return;
+  }
   if (watch || parsed.bools.has("brief")) {
     const render = () => statusBrief(readLedger(), readJobs(), { files: changedFileCount, phase: jobPhase, ownsJob: (job) => owned(job.ownerSession), now: Date.now() });
     if (!watch) { const text = render(); if (text) console.log(text); return; }
@@ -6038,37 +6176,61 @@ async function doctorCommand(argv: string[]) {
 
   if (!Bun.which("cdx")) bad("path", "cdx not on PATH", `ln -s ${SELF} ~/.local/bin/cdx`);
 
-  const guard = `${SELF.replace(/\/cdx\.ts$/, "")}/hooks/guard-raw-codex.ts`;
-  if (!existsSync(guard)) bad("plugin", "guard-raw-codex.ts missing", "restore the hooks/ folder of the cdx plugin");
-  else if (!(statSync(guard).mode & 0o111)) bad("plugin", "guard-raw-codex.ts not executable", `chmod +x ${guard}`);
-  else good("plugin: guard hook present and executable");
   const pluginLink = `${HOME}/.claude/skills/cdx`;
-  const currentSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-  const receipt = currentSession ? readSessions().sessions[currentSession] : undefined;
-  const expectedEvents = ["PreToolUse", "SessionStart", "PostToolBatch", "UserPromptSubmit"];
+  const thisRepo = realpathSync(REPO_ROOT);
+  let resolvedPlugin: string | undefined;
   try {
-    const pluginRoot = realpathSync(pluginLink);
-    const manifest = JSON.parse(readFileSync(`${pluginRoot}/.claude-plugin/plugin.json`, "utf8"));
-    const hookText = readFileSync(`${pluginRoot}/hooks/hooks.json`, "utf8");
-    const hooks = JSON.parse(hookText).hooks;
-    if (manifest.name !== "cdx") throw new Error("plugin name is not cdx");
-    good(`plugin: cdx@skills-dir personal path=${pluginRoot} version=${manifest.version}`);
-    const missing = expectedEvents.filter((event) => !hooks?.[event]?.some((group: any) => group.hooks?.some((hook: any) =>
-      hook.type === "command" && hook.command?.includes(event === "PreToolUse" ? "guard-raw-codex.ts" : "cdx.ts\" _session"))));
-    if (missing.length) warn(`plugin: missing hooks ${missing.join(", ")}; restore hooks/hooks.json and /reload-plugins`);
-    else good(`plugin: hook set ${expectedEvents.join(", ")}`);
-    const hash = createHash("sha256").update(hookText).digest("hex");
-    if (receipt?.plugin?.root === pluginRoot && receipt.plugin.version === manifest.version && receipt.plugin.hooks === hash) {
-      good(`plugin: this session observed ${receipt.plugin.observed.join(", ")}`);
-    } else warn("plugin: this session has no current hook receipt; /reload-plugins or restart, then submit a prompt");
-    const monitors = JSON.parse(readFileSync(`${pluginRoot}/monitors/monitors.json`, "utf8"));
-    if (!monitors.some((monitor: any) => monitor.command === '\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" watch')) warn("plugin: scoped watcher declaration missing; /reload-plugins after restoring monitors/monitors.json");
-  } catch {
-    warn("plugin: cdx@skills-dir personal link or plugin files unavailable; check ~/.claude/skills/cdx");
+    resolvedPlugin = realpathSync(pluginLink);
+  } catch { /* link missing or unresolvable */ }
+  if (resolvedPlugin && resolvedPlugin === thisRepo) {
+    good(`plugin: personal link ${displayPath(pluginLink)} -> ${displayPath(thisRepo)}`);
+  } else {
+    bad("plugin", `${displayPath(pluginLink)} does not resolve to this repository (${displayPath(thisRepo)})`, `ln -sfn "${thisRepo}" "${pluginLink}"`);
   }
-  if (receipt?.lease && receipt.lease.claudePid === Number(process.env.CLAUDE_PID)
-    && pidAlive(receipt.lease.pid) && pidAlive(receipt.lease.claudePid)) good("plugin: this session's watcher holds its lease");
-  else warn("plugin: this session has no live watcher lease; /reload-plugins or restart");
+
+  const hooksFile = `${REPO_ROOT}/hooks/hooks.json`;
+  try {
+    const hookConfig = JSON.parse(readFileSync(hooksFile, "utf8"));
+    const modules = hookConfig.modules;
+    const hasModules = Array.isArray(modules) && modules.length === 1 && modules[0] === "./register.ts";
+    const hasClassic = Boolean(hookConfig.hooks && Object.keys(hookConfig.hooks).length > 0);
+    if (hasModules && !hasClassic) {
+      good('plugin: hooks/hooks.json names modules: ["./register.ts"]');
+    } else {
+      bad("plugin", 'hooks/hooks.json must declare modules: ["./register.ts"] and no classic hooks', "update hooks/hooks.json to use function hooks");
+    }
+  } catch (error) {
+    bad("plugin", `hooks/hooks.json unreadable: ${error instanceof Error ? error.message : String(error)}`, "restore hooks/hooks.json");
+  }
+
+  const currentSession = callerSession();
+  const sessionRecord = currentSession && currentSession !== "terminal" ? readSessions().sessions[currentSession] : undefined;
+  if (sessionRecord?.polledAt) {
+    const pollAgeSec = Math.max(0, Math.round((Date.now() - Date.parse(sessionRecord.polledAt)) / 1000));
+    if (pollAgeSec <= 15) {
+      good(`plugin: mod live, last poll ${pollAgeSec}s ago`);
+    } else {
+      warn("plugin: mod not polling; set CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 in ~/.claude/settings.json env and /reload-plugins");
+    }
+  } else {
+    warn("plugin: mod not polling; set CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 in ~/.claude/settings.json env and /reload-plugins");
+  }
+
+  let envHasFlag = process.env.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS === "1";
+  if (!envHasFlag) {
+    const settingsPath = `${HOME}/.claude/settings.json`;
+    if (existsSync(settingsPath)) {
+      try {
+        const settings = JSON.parse(readFileSync(settingsPath, "utf8"));
+        if (settings?.env?.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS === "1" || settings?.env?.CLAUDE_CODE_ENABLE_FUNCTION_HOOKS === 1) {
+          envHasFlag = true;
+        }
+      } catch { /* ignore */ }
+    }
+  }
+  if (!envHasFlag) {
+    warn("plugin: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 is not set in environment or ~/.claude/settings.json env");
+  }
 
   if (parsed.bools.has("fix")) withLedger(() => {});
   good(`ledger: ${LEDGER} (${Object.keys(readLedger()).length} lanes)`);
@@ -6169,14 +6331,13 @@ function cleanCommand(argv: string[]) {
     }
     withEvents((state) => {
       for (const lane of removed) delete state.lanes[lane];
-      for (const pid of Object.keys(state.heads)) if (!pidAlive(Number(pid))) delete state.heads[pid];
       const records = readEvents();
       state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
       const keep = records.filter((record, index) => {
         if (record.lane && removed.includes(record.lane)) return false;
         if (index >= records.length - 2000) return true;
         const session = state.sessions[recipientOf(record.recipient ?? record.owner, record.lane, state)];
-        return session && record.id > session[WAKE_EVENTS.has(record.kind) ? "wake" : "quiet"];
+        return session && record.id > session.cursor;
       });
       const temporary = `${ROOT}/feed.log.tmp.${process.pid}`;
       writeFileSync(temporary, keep.map((record) => JSON.stringify(record) + "\n").join(""));
@@ -6685,8 +6846,8 @@ ${ENGINE_PICKER}
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   takeover <lane|full-session-id> # explicitly connect ownership to this head
-  watch                    # plugin monitor; finds its head through CLAUDE_PID
-  status [--all | --json | --brief | --watch [--interval S]]
+  events [--json] [--peek] # unread feed events for the Claude session
+  status [--all | --json | --brief | --line | --watch [--interval S]]
   wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json]         # per-account plan, rate-limit windows, ledger totals
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
@@ -6712,7 +6873,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 
 const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "fork", "review", "consult", "adopt",
-  "kill", "close", "clean", "gate", "reply", "job", "takeover", "watch", "_session",
+  "kill", "close", "clean", "gate", "reply", "job", "takeover",
 ]);
 // A supervisor drives its children with these; each mutation checks ownership.
 const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "kill", "close", "gate", "reply"]);
@@ -6740,6 +6901,7 @@ export {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
+  selectEvents, resolveStdinText,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
@@ -6751,19 +6913,18 @@ async function dispatch(command: string | undefined, argv: string[]) {
     if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the liaison`);
   }
 switch (command) {
-  case "watch": await watchCommand(argv); break;
-  case "_session": await sessionCommand(); break;
+  case "events": await eventsCommand(argv); break;
   case "takeover": takeoverCommand(argv); break;
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "fork": await forkCommand(argv); break;
-  case "send": sendCommand(argv); break;
+  case "send": await sendCommand(argv); break;
   case "ask": await askCommand(argv); break;
-  case "reply": replyCommand(argv); break;
+  case "reply": await replyCommand(argv); break;
   case "questions": questionsCommand(argv); break;
-  case "msg": msgCommand(argv); break;
+  case "msg": await msgCommand(argv); break;
   case "inbox": inboxCommand(argv); break;
   case "hook": await hookCommand(argv); break;
   case "_run": {
