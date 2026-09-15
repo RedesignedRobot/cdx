@@ -1,21 +1,58 @@
 <div align="center">
 
-# cdx 7.0.0
+# cdx
 
-**Codex and Antigravity execution lanes for Claude Code.**
+**A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
-Astra drives. Gemini executes. Liaison reviews and merges. cdx keeps the books.
+Claude is the head. Astra drives. Gemini executes. cdx keeps the books and wakes the head when a lane needs it.
 
-[![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
+[![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
+[![Function hooks](https://img.shields.io/badge/function_hooks-21_tools-d97757)](#registered-tools)
+[![Version](https://img.shields.io/badge/version-7.0.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
-[![Claude Code plugin](https://img.shields.io/badge/Claude_Code-plugin-d97757?logo=claude&logoColor=white)](#claude-code-integration)
+[![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
 
 <img src="assets/demo.svg" alt="cdx spawning detached workers, checking status, and collecting reports" width="760">
 
 </div>
 
-cdx is a CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. [Claude Code](https://claude.com/claude-code) is the owner's liaison. It briefs an outcome to one Astra supervisor, answers questions, arranges independent review, and merges. Astra owns design and implementation and delegates bounded work to Gemini. cdx records lane state, reports, questions, logs, and token use.
+cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. Claude Code is the owner's liaison. It briefs an outcome to one Astra supervisor, answers questions, arranges independent review, and merges. Astra owns design and implementation and delegates bounded work to Gemini. cdx records lane state, reports, questions, logs, and token use.
+
+## Native in Claude Code
+
+cdx 7.0 runs inside Claude Code as a [function hooks](#claude-code-integration) module, not as a shell wrapper. When a session starts, the mod registers 21 tools under `mcp__cdx__`, the `/lanes` command, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. Nothing blocks. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
+
+```mermaid
+sequenceDiagram
+    participant Head as Claude Code head
+    participant Mod as cdx mod (in-process)
+    participant CLI as cdx CLI
+    participant Lane as Codex or Antigravity lane
+    Head->>Mod: mcp__cdx__spawn { lane, brief }
+    Mod->>CLI: cdx spawn --bg -
+    CLI->>Lane: detached round starts
+    Note over Head: turn ends, nothing waits
+    loop every 2 s
+        Mod->>CLI: cdx events --json
+    end
+    Lane-->>CLI: question, report, stall, 503
+    CLI-->>Mod: wake event
+    Mod-->>Head: [cdx] prompt when idle, tool context mid-turn
+    Head->>Mod: mcp__cdx__reply, report, close
+```
+
+| In the session | What it does |
+|---|---|
+| `mcp__cdx__spawn`, `resume`, `review`, `consult`, `fork` | Start work. The brief travels as a tool field, never through the shell. |
+| `mcp__cdx__reply`, `send`, `msg` | Answer a question, steer a running lane, message a peer session. |
+| `mcp__cdx__status`, `events`, `report`, `tail`, `questions`, `usage` | Check in without waiting. |
+| `mcp__cdx__close`, `kill`, `gate`, `job`, `takeover`, `doctor` | Finish, stop, gate, run detached jobs, claim work, diagnose. |
+| `[cdx]` prompts and toasts | Wake events arrive as a prompt when the head is idle and as context on the next tool result mid-turn. |
+| `/lanes` | Lane status, or any read-only cdx command, from the prompt. |
+| Status line | Running lanes, open questions, and quota, refreshed every ten seconds. |
+
+There is no wait tool by design. The CLI keeps `cdx wait` for Astra, Gemini, and people at a terminal.
 
 ## Setup in 60 seconds
 
@@ -106,12 +143,14 @@ cdx close slow-query "landed in a1b2c3d"
 
 ```mermaid
 flowchart LR
-    liaison["Claude liaison"] -->|brief| cdx["cdx"]
+    head["Claude Code head"] -->|"mcp__cdx__* tools"| mod["cdx mod<br/>(function hooks)"]
+    mod -->|argv and stdin| cdx["cdx CLI"]
     cdx -->|supervisor lane| astra["Astra driver"]
     astra -->|delegate and verify| cdx
     cdx -->|bounded tasks| children["Gemini or GPT children"]
     children -->|reports and questions| cdx
-    cdx -->|feed and final report| liaison
+    cdx -->|"feed, polled every 2 s"| mod
+    mod -->|"[cdx] prompt or tool context"| head
 ```
 
 
@@ -496,13 +535,13 @@ Everything is plain files. `cdx feed` and `cdx inbox` render scoped events. `cdx
 
 ## Testing
 
-`bun run check` is the acceptance gate for changes to cdx. It runs `tsc --noEmit`, builds the CLI, and runs the pure ownership and feed parsing tests in `cdx.test.ts`:
+`bun run check` is the acceptance gate for changes to cdx. It type-checks the CLI and the hooks module, builds the CLI, and runs every test file:
 
 ```bash
-tsc --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test cdx.test.ts
+tsc --noEmit && tsc -p hooks --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test
 ```
 
-The script runs TypeScript type checking with `tsc --noEmit`, bundles the code with Bun, and runs fast regression tests. The tests protect full-session ownership routing and reject malformed feed records without spawning processes, sleeping, using fake engines, or creating temporary homes. Keep the test run within about two seconds.
+The tests cover ownership routing, feed parsing, flag parsing, the delivery buffer, and the tool definitions without spawning processes, sleeping, using fake engines, or creating temporary homes. Keep the run within about two seconds. After a change to `hooks/`, also run `claude plugin validate .` and one headless smoke with `claude -p ... --debug-file <path>`, then grep the log for `hook failed` and `refused`.
 
 The owner removed the 135 end-to-end tests after a run took 226 seconds. Process lifecycle, engine integration, question timeouts, gate execution, and browser behavior no longer have automated end-to-end coverage. Do not rebuild that suite. The lane gate runs once after the report; workers and reviewers reuse its result.
 
