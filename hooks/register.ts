@@ -12,7 +12,6 @@ import {
   type PendingEvent,
 } from "./delivery";
 import {
-  CDX_TOOL_MATCHERS,
   CDX_TOOL_PREFIX,
   formatToolOutput,
   TOOLS,
