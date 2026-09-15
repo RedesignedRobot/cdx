@@ -433,9 +433,6 @@ export const TOOLS: ToolDefinition[] = [
 
 export const TOOL_NAMES = TOOLS.map((t) => t.name);
 export const CDX_TOOL_PREFIX = "mcp__cdx__";
-export const CDX_TOOL_MATCHERS: readonly `mcp__${string}__${string}`[] = TOOL_NAMES.map(
-  (name) => `${CDX_TOOL_PREFIX}${name}` as const,
-);
 
 export const TOOLS_BY_NAME = new Map<string, ToolDefinition>(
   TOOLS.map((tool) => [tool.name, tool]),
