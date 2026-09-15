@@ -85,17 +85,23 @@ export function register(on: On) {
     CDX = ["bun", `${root}/cdx.ts`];
     surface = e.surface;
 
-    await $.command.register({
-      name: "cdx",
-      description: "cdx lanes: status, or any read-only cdx command",
-    });
-
     for (const tool of TOOLS) {
       await $.tool.register({
         name: tool.name,
         description: tool.description,
         inputSchema: tool.inputSchema,
       });
+    }
+
+    // /cdx is the user's skill, so the engine refuses that name. A refused
+    // command must never stop the tools and the poll from starting.
+    try {
+      await $.command.register({
+        name: "lanes",
+        description: "cdx lanes: status, or any read-only cdx command",
+      });
+    } catch (error) {
+      await $.ui.log(`cdx: /lanes not registered: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     $.clock.every(2000, async () => {
@@ -130,7 +136,7 @@ export function register(on: On) {
     return next(e);
   });
 
-  on("command.run", { command: "cdx" }, async ($, e) => {
+  on("command.run", { command: "lanes" }, async ($, e) => {
     const args = e.args.trim().length > 0 ? e.args.trim().split(/\s+/) : ["status"];
     const res = await $.process.run(CDX.concat(args), {
       env: { CLAUDE_CODE_SESSION_ID: session },
