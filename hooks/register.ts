@@ -1,5 +1,5 @@
 import type { EngineInterface, On, RenderSurface } from "claude-code";
-import { invokedRawEngine, rawEngineRefusal } from "../guard";
+import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, rawEngineRefusal } from "../guard";
 import {
   afterPoll,
   afterToolCall,
@@ -210,6 +210,10 @@ export function register(on: On) {
     const engine = invokedRawEngine(command);
     if (engine) {
       return { deny: rawEngineRefusal(engine) };
+    }
+    const blocking = blockingCdxCommand(command);
+    if (blocking) {
+      return { deny: blockingCdxRefusal(blocking) };
     }
     return next(e);
   });

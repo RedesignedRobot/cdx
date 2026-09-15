@@ -80,7 +80,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.1.0";
+const VERSION = "7.2.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -1863,7 +1863,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     });
     child.unref();
     withLedger((ledger) => { ledger[spec.lane]!.pid = child.pid; });
-    console.log(`cdx: detached pid=${child.pid}; poll with cdx status / cdx wait ${color.magenta(spec.lane)}`);
+    console.log(`cdx: detached pid=${child.pid}; ${settleHint(spec.lane)}`);
     process.exit(0);
   }
   return runRound(spec.lane, spec.round).then((code) => process.exit(code));
@@ -4147,6 +4147,14 @@ function fmtTokens(tokens?: Tokens, incomplete?: boolean): string {
   const k = (n?: number) => { const v = n ?? 0; return v >= 1000 ? `${(v / 1000).toFixed(v >= 100_000 ? 0 : 1)}k` : String(v); };
   const base = `${k(tokens.input)}in/${k(tokens.output)}out`;
   return incomplete ? `${base} (incomplete)` : base;
+}
+
+// What to do until a detached lane or job settles. A lane has only the CLI,
+// so it waits; the head is woken by the mod and must not.
+function settleHint(target: string): string {
+  return process.env.CDX_LANE
+    ? `cdx wait ${color.magenta(target)} blocks until it settles`
+    : `end your turn; a [cdx] event wakes you when ${color.magenta(target)} settles (mcp__cdx__status checks in)`;
 }
 
 function fmtAge(iso?: string): string {
@@ -6664,7 +6672,7 @@ async function jobCommand(argv: string[]) {
   child.unref();
   withJobs((jobs) => { jobs[name]!.pid = child.pid; });
   console.log(`cdx: job=${color.magenta(name)} pid=${child.pid} cwd=${cwd}`);
-  console.log(`cdx: log=${log}; a feed line arrives on exit; cdx wait ${color.magenta(name)} blocks until then`);
+  console.log(`cdx: log=${log}; ${settleHint(name)}`);
   process.exit(0);
 }
 

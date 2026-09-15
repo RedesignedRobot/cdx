@@ -363,6 +363,7 @@ There is no `mcp__cdx__wait` tool.
 The head spawns a lane, keeps working or ends its turn, and the mod wakes it when events occur.
 `cdx wait` stays in the CLI for Astra, Gemini, and terminal operators.
 Mid-turn checks use `mcp__cdx__events` or `mcp__cdx__status`.
+The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, or a `while`/`until` loop around any cdx command is denied with the same guidance, the way raw `codex` and `agy` calls are. Spawn `--bg` and `job` output tells the head to end its turn; inside a lane the same lines still point at `cdx wait`.
 
 ### Slash command
 
