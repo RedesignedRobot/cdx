@@ -1,5 +1,8 @@
 {
   "name": "cdx",
-  "description": "Run OpenAI Codex and Google Antigravity work and review lanes from Claude Code, with completion notifications and a guard against raw work commands",
-  "version": "6.6.0"
+  "version": "7.0.0",
+  "description": "Run OpenAI Codex and Google Antigravity execution lanes from Claude Code with background event delivery, status tracking, and raw command protection.",
+  "author": {
+    "name": "RedesignedRobot"
+  }
 }
