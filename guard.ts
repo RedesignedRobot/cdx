@@ -112,18 +112,12 @@ function skipPrefixes(words: string[], start: number): number {
   }
 }
 
-function invokedRawEngineIn(command: string): RawEngine | undefined {
-  for (const match of command.matchAll(/\$\(([^()]*)\)|`([^`]*)`/gs)) {
-    const nested = invokedRawEngineIn(match[1] ?? match[2] ?? "");
-    if (nested) return nested;
-  }
-  const withoutArrayData = command.replace(/\b[A-Za-z_][A-Za-z0-9_]*=\([^)]*\)/gs, "");
-  for (const segment of withoutArrayData.split(/[;&|()`\n]+/)) {
-    const words = segment.trim().split(/\s+/).filter(Boolean);
-    let index = 0;
-
-    while (CONTROL_WORDS.has(words[index] ?? "")) index += 1;
-    index = skipPrefixes(words, index);
+// The index of the binary a segment runs, past control words, assignments,
+// redirections, and wrappers such as env, nice, or sudo.
+function commandStart(words: string[]): number {
+  let index = 0;
+  while (CONTROL_WORDS.has(words[index] ?? "")) index += 1;
+  index = skipPrefixes(words, index);
 
     while (WRAPPERS.has((words[index] ?? "").split("/").at(-1) ?? "")) {
       const wrapper = (words[index] ?? "").split("/").at(-1);
@@ -148,6 +142,18 @@ function invokedRawEngineIn(command: string): RawEngine | undefined {
       }
       index = skipPrefixes(words, index);
     }
+  return index;
+}
+
+function invokedRawEngineIn(command: string): RawEngine | undefined {
+  for (const match of command.matchAll(/\$\(([^()]*)\)|`([^`]*)`/gs)) {
+    const nested = invokedRawEngineIn(match[1] ?? match[2] ?? "");
+    if (nested) return nested;
+  }
+  const withoutArrayData = command.replace(/\b[A-Za-z_][A-Za-z0-9_]*=\([^)]*\)/gs, "");
+  for (const segment of withoutArrayData.split(/[;&|()`\n]+/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    const index = commandStart(words);
 
     const binary = (words[index] ?? "").split("/").at(-1);
     if (binary === "codex" && codexWorkVerb(words, index)) return "gpt";
@@ -173,4 +179,49 @@ export function rawEngineRefusal(engine: RawEngine): string {
   return engine === "gemini"
     ? "Use cdx --engine gemini for Antigravity work. Run 'cdx help'."
     : "Use cdx for Codex work. Run 'cdx help'.";
+}
+
+// The head of a Claude Code session must never block on a lane or job (owner
+// ruling 2026-09-15): the cdx mod wakes it with a [cdx] event. These are the
+// shell shapes that block anyway.
+export type BlockingCdx = "wait" | "status --watch" | "poll loop";
+
+// The cdx subcommand a segment runs, as `cdx ...` or `bun .../cdx.ts ...`.
+function cdxInvocation(words: string[], index: number): { subcommand: string; args: string[] } | undefined {
+  const binary = (words[index] ?? "").split("/").at(-1);
+  let next = index + 1;
+  if (binary === "bun") {
+    while ((words[next] ?? "").startsWith("-")) next += 1;
+    if (!(words[next] ?? "").endsWith("cdx.ts")) return undefined;
+    next += 1;
+  } else if (binary !== "cdx") {
+    return undefined;
+  }
+  const args = words.slice(next);
+  const subcommand = args.find((word) => !word.startsWith("-"));
+  return subcommand === undefined ? undefined : { subcommand, args };
+}
+
+export function blockingCdxCommand(command: string): BlockingCdx | undefined {
+  const text = stripHeredocBodies(stripQuotedSegments(command), command);
+  let loop = false;
+  let cdxInsideCommand = false;
+  for (const segment of text.split(/[;&|()`\n]+/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    if (words[0] === "while" || words[0] === "until") loop = true;
+    const invocation = cdxInvocation(words, commandStart(words));
+    if (!invocation) continue;
+    if (invocation.subcommand === "wait") return "wait";
+    if (invocation.subcommand === "status" && invocation.args.includes("--watch")) return "status --watch";
+    cdxInsideCommand = true;
+  }
+  return loop && cdxInsideCommand ? "poll loop" : undefined;
+}
+
+export function blockingCdxRefusal(kind: BlockingCdx): string {
+  const what = kind === "wait" ? "cdx wait" : kind === "status --watch" ? "cdx status --watch" : "a shell loop polling cdx";
+  return `${what} blocks the head; the head never blocks on a lane or job (owner ruling 2026-09-15). `
+    + "End your turn: a [cdx] event wakes you when it finishes, asks, stalls, or fails. "
+    + "To check right now, call mcp__cdx__status or mcp__cdx__events. "
+    + "If nothing else is pending, ending the turn is the correct move, not a wait.";
 }

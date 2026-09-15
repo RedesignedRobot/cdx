@@ -1,3 +1,9 @@
+## 7.2.0
+
+- Never block, enforced: the mod's Bash hook denies `cdx wait`, `cdx status --watch`, and `while`/`until` loops around any cdx command from the head and its subagents, with guidance to end the turn and let the `[cdx]` event wake it, or to call `mcp__cdx__status` / `mcp__cdx__events` for a check now. Lanes keep `cdx wait` (they run outside the session).
+- Spawn `--bg` and `job` output no longer tell the head to wait; they say to end the turn. Inside a lane (`CDX_LANE` set) the same lines still point at `cdx wait`.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 7.2.0.
+
 ## 7.1.0
 
 - Reset credit expiry: `cdx usage` and `cdx doctor` name each banked reset credit's expiry next to the count, read from the app-server's `rateLimitResetCredits.credits[]` (status, grantedAt, expiresAt); cached snapshots keep the expiries.
