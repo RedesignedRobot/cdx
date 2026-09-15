@@ -1,3 +1,19 @@
+## 7.0.0
+
+- Breaking change: removed background monitor process (cdx watch), watcher leases, CLAUDE_PID lookup, session hook receipts, and classic hook entries. Deleted monitors/ directory and hooks/guard-raw-codex.ts.
+- Breaking change: replaced external process monitors with native Claude Code function hooks. The mod configuration in hooks/hooks.json declares modules: ["./register.ts"] and executes directly inside the Claude Code runtime using the engine interface $.
+- Breaking change: function hooks require the feature flag CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 set in ~/.claude/settings.json env or exported in the environment.
+- Registered native tools: registered 21 first-party MCP tools with the mcp__cdx__ prefix (spawn, resume, consult, review, fork, events, send, reply, questions, status, report, tail, close, kill, gate, job, msg, inbox, usage, takeover, doctor). There is no wait tool; the head never blocks on a lane (owner ruling 2026-09-15).
+- Registered slash command: registered /lanes in Claude Code (no arguments runs cdx status; arguments pass through to the cdx CLI). The /cdx command remains the user skill that loads SKILL.md.
+- Buffered event delivery: pending owned events accumulate in memory. When the session is idle, wake events drain as an automatic prompt starting with [cdx]. When a turn is active, pending events drain and attach as additional context under [cdx] events after the next non-subagent tool call (when not denied) or on user prompt submission.
+- Status line and toasts: polls cdx events --json every 2 seconds. Every fifth poll updates the Claude Code status line ($.ui.status) via cdx status --line. Emits 8-second toast notifications ($.ui.toast) for wake events when a render surface exists.
+- New command cdx events [--json] [--peek]: reads unread owned feed events for the caller session and advances the cursor to the last record id. The --peek flag returns events without advancing the cursor. Generates inline progress events when the heartbeat interval is due.
+- Status line cdx status --line: formats a single line of at most 100 characters showing active lanes, stages, elapsed times, running jobs, open questions, and Gemini quota blocks. Outputs an empty string when the caller owns no active work.
+- Stdin support across free-text commands: every command taking free text accepts - to stream text from stdin (spawn, resume, consult, review intent, fork, send, reply, msg, job, and close). An empty stdin fails with command usage.
+- Doctor checks: replaced monitor lease and receipt checks with verification that ~/.claude/skills/cdx resolves to the repository, hooks/hooks.json declares modules: ["./register.ts"] with no classic hooks, the caller session has polled within 15 seconds, and CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 is configured.
+- Early access API: Claude Code function hooks are early access and subject to change. Vendored type definitions in hooks/types/claude-code.d.ts state their source Claude Code version on line 1 (2.1.270).
+- Version alignment: runtime VERSION in cdx.ts, package.json, and plugin.json align to 7.0.0.
+
 ## 6.6.0
 
 - Gemini 503 handling: a 503 is a service outage, not a stream fault. The live agy process is kept and cdx retries up to six times with waits of 30 s, 1, 2, 4, 5 and 5 minutes; a completed step restarts the ladder. Other transport faults keep the single immediate retry from 6.5.0. The continue prompt tells the model the service recovered and not to redo finished work.
