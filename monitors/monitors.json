@@ -1,7 +1,0 @@
-[
-  {
-    "name": "cdx-lanes",
-    "command": "\"${CLAUDE_PLUGIN_ROOT}/cdx.ts\" watch",
-    "description": "Session-owned cdx questions and completions"
-  }
-]
