@@ -7050,8 +7050,10 @@ switch (command) {
   }
   case "close": {
     const parsed = parseArgs(argv, ["remove-worktree"]);
-    const [lane, note] = parsed.rest;
-    if (!lane) fail('usage: cdx close <lane> [--remove-worktree] ["note"]');
+    const usage = 'usage: cdx close <lane> [--remove-worktree] ["note" | -]';
+    const [lane, noteArg] = parsed.rest;
+    if (!lane) fail(usage);
+    const note = await resolveBrief(noteArg, usage);
     const entry = readLane(lane);
     requireOwnChild(lane, entry);
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
