@@ -471,8 +471,8 @@ Each account needs its own Codex home. cdx sets `CODEX_HOME` for each Codex proc
 
 With an accounts map, `cdx usage` and launch admission share one decision:
 
-1. Work needs 15% remaining weekly capacity and supervisors need 25%. Light turns prefer 5% but may use lower capacity; exhausted accounts are refused for every tier. Choose the earliest reset, then the fuller account when resets tie.
-2. Active rounds hold fixed demand against their assigned account during execution: light holds 5%, work holds 15%, and supervisors hold 25%. Admission subtracts active holds before evaluating remaining headroom.
+1. The risk line is 3% remaining weekly capacity for every lane kind (owner ruling 2026-09-11); it is a placement hint, and only exhaustion refuses. Among accounts above the line, spend first the one with the highest forfeit rate: the share above the risk line divided by the days until its reset (floored at one day), which is what waiting loses per day. Equal rates go to the earlier reset, then the fuller account.
+2. Active rounds hold 3% against their assigned account during execution. Admission subtracts active holds before evaluating remaining headroom.
 3. Dead runner release: admission reconciles crashed runners and releases their holds while preserving live child holds.
 4. Consuming round completion invalidates the account usage snapshot, forcing fresh probes on subsequent rounds.
 5. `--account NAME` obeys exhaustion eligibility instead of forcing a depleted account. If the specified account is exhausted or lacks required headroom, admission rejects the launch.
@@ -482,7 +482,9 @@ Snapshot thresholds and demand holds guide placement and concurrency control. Th
 
 Usage readings cache for 30 minutes unless a window has reset or the reading lacks per-window data. Failed probes cache for 5 minutes. A failed probe with no usable reading leaves capacity unknown. Exhaustion markers carry provenance (recorded time, window length, reason) and reconcile against fresh usage probes; a marker clears only when no window of that account is exhausted, while a live block on any window stays. `cdx usage` advice reads the reconciled standings.
 
-`usage --json` includes `advice.picks` and account `remainingPercent`, reset times, and reasons. Text output also shows the daily pace that would spend the remaining weekly share before reset.
+`usage --json` includes `advice.picks`, account `remainingPercent`, reset times, `forfeitRate`, and reasons, plus `advice.resetCredits` (count, expiries, whether to redeem) and `alerts`. Text output also shows the daily pace that would spend the remaining weekly share before reset.
+
+Reset credits: each account line names every banked credit's expiry (the app-server grants them for 30 days). The advice adds a `reset credits` line and tells you to redeem one on an account that is exhausted or under the risk line, since a credit restores a full window instead of waiting for the reset. A credit inside three days of expiry prints a red `CRITICAL` line at the top of `cdx usage`, in `cdx doctor`, and on every GPT launch until it is redeemed or gone; cdx cannot redeem it, the codex TUI `/usage` on that home can.
 
 A GPT review of a Gemini lane selects an account when it has no affinity. A Gemini review preserves the GPT work account. Gemini work rejects `--account`. Tracked lane forks can start a fresh session on another eligible home. Raw-session forks require the source home from `--account` or the primary home to be eligible because cdx has no saved brief or reports for that session. Adopts record `--account` or the primary home without consuming quota. Incomplete account records fail explicitly; migrated rows without affinity pass admission.
 

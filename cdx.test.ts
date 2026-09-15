@@ -5,6 +5,7 @@ import { unlinkSync } from "node:fs";
 import {
   checkRoundCap, eventOwned, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
+  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
@@ -704,4 +705,101 @@ test("a 6.x session record migrates to one cursor without replaying history", ()
   const legacy: any = { sequence: 9, bindings: {}, lanes: {}, sessions: { head: { wake: 7, quiet: 4, lease: { pid: 1, claudePid: 2 }, plugin: { root: "/x" } } } };
   expect(delivery(legacy, "head")).toEqual({ cursor: 7 });
   expect(delivery(legacy, "fresh")).toEqual({ cursor: 0 });
+});
+
+// Reset credits: the app-server lists each banked credit with its expiry.
+const creditResponse = (expiries: number[], available = expiries.length) => ({
+  result: {
+    rateLimits: { planType: "pro", primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 2_000_000_000 }, secondary: null, spendControlReached: false, rateLimitReachedType: null },
+    rateLimitResetCredits: {
+      availableCount: available,
+      credits: [
+        ...expiries.map((expiresAt, index) => ({ id: `c${index}`, status: "available", grantedAt: expiresAt - 30 * 86_400, expiresAt })),
+        { id: "used", status: "redeemed", grantedAt: 1, expiresAt: 5 },
+      ],
+    },
+  },
+});
+
+test("parseAccountUsage keeps available credit expiries, ascending, and drops redeemed ones", () => {
+  const usage = parseAccountUsage(creditResponse([1_800_000_000, 1_700_000_000]));
+  expect(usage?.resetCredits).toBe(2);
+  expect(usage?.resetCreditExpiresAt).toEqual([1_700_000_000, 1_800_000_000]);
+  expect(parseAccountUsage(creditResponse([], 0))?.resetCreditExpiresAt).toEqual([]);
+});
+
+test("formatAccountUsage names each credit's expiry", () => {
+  const now = Date.UTC(2026, 8, 15, 12);
+  const expiresAt = Math.floor(now / 1000) + 19 * 86_400;
+  const usage = parseAccountUsage(creditResponse([expiresAt]))!;
+  const detail = formatAccountUsage(usage).detail;
+  expect(detail).toContain("1 reset credit available, expires");
+  expect(describeResetCredits(2, [expiresAt, expiresAt + 86_400], now)).toMatch(/^2 reset credits available, expire .* in 19\.0d and .* in 20\.0d$/);
+  expect(describeResetCredits(0, [], now)).toBe("0 reset credits available");
+});
+
+test("resetCreditAlerts fires only inside the three-day window before expiry", () => {
+  const now = Date.now();
+  const snapshotWith = (expiresAt: number[]) => ({
+    checkedAt: new Date(now).toISOString(), usedPercent: 10, windowDurationMins: 10080, resetsAt: Math.floor(now / 1000) + 86_400,
+    planType: "pro", resetCreditsAvailable: expiresAt.length, resetCreditExpiresAt: expiresAt, reached: false,
+  });
+  const seconds = (days: number) => Math.floor(now / 1000) + Math.round(days * 86_400);
+  expect(RESET_CREDIT_ALERT_DAYS).toBe(3);
+  expect(resetCreditAlerts([{ name: "codex-1", snapshot: snapshotWith([seconds(19)]) }], now)).toEqual([]);
+  expect(resetCreditAlerts([{ name: "codex-1", snapshot: snapshotWith([seconds(-1)]) }], now)).toEqual([]);
+  const lines = resetCreditAlerts([
+    { name: "codex-1", home: "/Users/x/.codex", snapshot: snapshotWith([seconds(2.5), seconds(19)]) },
+    { name: "codex-2", snapshot: snapshotWith([seconds(1), seconds(2)]) },
+    { name: "codex-3", snapshot: undefined },
+  ], now);
+  expect(lines).toHaveLength(2);
+  expect(lines[0]).toMatch(/^CRITICAL: codex-1 has an unused reset credit expiring .* in 2\.5d; redeem before then in the codex TUI \(CODEX_HOME=.*\.codex codex, then \/usage\)$/);
+  expect(lines[1]).toMatch(/^CRITICAL: codex-2 has 2 unused reset credits expiring .* in 1\.0d and .* in 2\.0d; redeem/);
+});
+
+// Ranking: spend first the account that its reset will forfeit the most from.
+test("rankAccounts orders by forfeit rate above the risk line, then deadline, then fullness", () => {
+  const now = Date.now();
+  const standingWith = (name: string, usedPercent: number, daysToReset: number) => standingOf(
+    { name, home: `/home/${name}` },
+    {
+      checkedAt: new Date(now).toISOString(), usedPercent, windowDurationMins: 10080,
+      resetsAt: Math.floor(now / 1000) + Math.round(daysToReset * 86_400), planType: "pro", resetCreditsAvailable: 0, reached: false,
+      windows: [{ usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(now / 1000) + Math.round(daysToReset * 86_400) }],
+    },
+  );
+  // The live estate on 2026-09-15: a nearly dry account resetting soonest no
+  // longer leads a work lane; the fullest account with the shortest runway does.
+  const estate = [standingWith("codex-1", 97, 3.6), standingWith("codex-2", 43, 5.1), standingWith("codex-3", 27, 5.1), standingWith("codex-4", 28, 5.1)];
+  expect(rankAccounts(estate, "work", now).map((s) => s.choice.name)).toEqual(["codex-3", "codex-4", "codex-2", "codex-1"]);
+  expect(Math.round(forfeitRate(estate[0], "work", now))).toBe(0);
+  expect(Math.round(forfeitRate(estate[2], "work", now))).toBe(14);
+  // Half a window resetting within the hour outranks a full window with six days.
+  const urgent = [standingWith("slow", 0, 6), standingWith("soon", 50, 0.04)];
+  expect(rankAccounts(urgent, "work", now).map((s) => s.choice.name)).toEqual(["soon", "slow"]);
+  // A nearly dry account resetting within the hour does not: the one-day floor.
+  const dry = [standingWith("slow", 0, 6), standingWith("dry", 95, 0.04)];
+  expect(rankAccounts(dry, "work", now).map((s) => s.choice.name)).toEqual(["slow", "dry"]);
+  // Equal rates: earlier deadline first, then fuller.
+  const tie = [standingWith("later", 50, 5), standingWith("earlier", 50, 5 - 0.001), standingWith("fuller-later", 49, 5)];
+  expect(rankAccounts(tie, "work", now).map((s) => s.choice.name)).toEqual(["earlier", "fuller-later", "later"]);
+});
+
+test("adviceLines lists banked credits and tells a thin account to redeem", () => {
+  const now = Date.now();
+  const at = Math.floor(now / 1000);
+  const standingWith = (name: string, usedPercent: number, credits: number[]) => standingOf(
+    { name, home: `/home/${name}` },
+    {
+      checkedAt: new Date(now).toISOString(), usedPercent, windowDurationMins: 10080, resetsAt: at + 4 * 86_400, planType: "pro",
+      resetCreditsAvailable: credits.length, resetCreditExpiresAt: credits, reached: false,
+      windows: [{ usedPercent, windowDurationMins: 10080, resetsAt: at + 4 * 86_400 }],
+    },
+  );
+  // codex-1 sits exactly on the 3% risk line: nothing spendable, so redeem.
+  const lines = adviceLines([standingWith("codex-1", 97, [at + 19 * 86_400]), standingWith("codex-2", 40, [at + 20 * 86_400, at + 21 * 86_400]), standingWith("codex-3", 30, [])], now);
+  expect(lines[0]).toMatch(/^advice: spend codex-3 .*, then codex-2 .*, then codex-1/);
+  expect(lines[2]).toMatch(/^  reset credits: codex-1 1 reset credit, expires .*; codex-2 2 reset credits, expire .* and .*; redeem one on codex-1 now for a full window/);
+  expect(adviceLines([standingWith("codex-3", 30, [])], now)).toHaveLength(2);
 });

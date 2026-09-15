@@ -1,3 +1,12 @@
+## 7.1.0
+
+- Reset credit expiry: `cdx usage` and `cdx doctor` name each banked reset credit's expiry next to the count, read from the app-server's `rateLimitResetCredits.credits[]` (status, grantedAt, expiresAt); cached snapshots keep the expiries.
+- Critical alert: an unused reset credit within three days of expiry prints a red `CRITICAL` line at the top of `cdx usage`, in `cdx doctor`, and to stderr on every GPT launch (spawn, resume, fork, review, consult). `usage --json` carries the same lines under `alerts`.
+- Reset credit advice: a `reset credits` advice line lists what each account holds and says to redeem one on an account that is exhausted or under the risk line. `usage --json` adds `advice.resetCredits`.
+- Account ranking: among accounts above the 3% risk line, the spend order and the per-demand picks now follow the forfeit rate (share above the line per day until reset, floored at one day) instead of the earliest reset alone, so a nearly dry account resetting soonest no longer leads a work lane. Ties keep the earlier reset, then the fuller account. `usage --json` accounts carry `forfeitRate`.
+- Docs: README and SKILL.md state the 3% risk line and 3% holds from the 2026-09-11 ruling instead of the retired 5/15/25 thresholds.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 7.1.0.
+
 ## 7.0.0
 
 - Breaking change: removed background monitor process (cdx watch), watcher leases, CLAUDE_PID lookup, session hook receipts, and classic hook entries. Deleted monitors/ directory and hooks/guard-raw-codex.ts.
