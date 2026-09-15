@@ -80,7 +80,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.0.0";
+const VERSION = "7.1.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -4710,6 +4710,8 @@ interface AccountUsage {
   primary: RateLimitWindow;
   secondary?: RateLimitWindow;
   resetCredits: number;
+  // Unix seconds, ascending; one entry per banked credit the API listed.
+  resetCreditExpiresAt: number[];
   rateLimitReachedType: unknown;
   spendControlReached: boolean;
 }
@@ -4721,6 +4723,7 @@ interface UsageSnapshot {
   resetsAt: number;
   planType: string;
   resetCreditsAvailable: number;
+  resetCreditExpiresAt?: number[];
   reached: boolean;
   // Every window the probe returned; the folded fields above keep the most
   // consumed one, the advisor needs the weekly one for its deadline.
@@ -4747,6 +4750,18 @@ function isRateLimitWindow(value: unknown): value is RateLimitWindow {
     && typeof window.resetsAt === "number";
 }
 
+// The app-server lists every credit with a status and an expiry; only the
+// available ones can still be redeemed.
+function resetCreditExpiries(credits: unknown): number[] {
+  if (!Array.isArray(credits)) return [];
+  return credits
+    .filter((credit): credit is { status: string; expiresAt: number } => Boolean(credit) && typeof credit === "object"
+      && (credit as Record<string, unknown>).status === "available"
+      && typeof (credit as Record<string, unknown>).expiresAt === "number")
+    .map((credit) => credit.expiresAt)
+    .sort((a, b) => a - b);
+}
+
 function parseAccountUsage(response: unknown): AccountUsage | undefined {
   if (!response || typeof response !== "object") return undefined;
   const result = (response as { result?: unknown }).result;
@@ -4764,6 +4779,7 @@ function parseAccountUsage(response: unknown): AccountUsage | undefined {
     primary: value.primary,
     secondary: value.secondary == null ? undefined : value.secondary as RateLimitWindow,
     resetCredits: availableCount,
+    resetCreditExpiresAt: resetCreditExpiries((credits as Record<string, unknown>).credits),
     rateLimitReachedType: value.rateLimitReachedType,
     spendControlReached: value.spendControlReached === true,
   };
@@ -4829,6 +4845,7 @@ function isUsageSnapshot(value: unknown): value is UsageSnapshot {
     && typeof snapshot.reached === "boolean"
     && (snapshot.warnedAt === undefined || typeof snapshot.warnedAt === "string")
     && (snapshot.probeFailedAt === undefined || typeof snapshot.probeFailedAt === "string")
+    && (snapshot.resetCreditExpiresAt === undefined || (Array.isArray(snapshot.resetCreditExpiresAt) && snapshot.resetCreditExpiresAt.every((at) => typeof at === "number")))
     && (snapshot.windows === undefined || (Array.isArray(snapshot.windows) && snapshot.windows.every(isRateLimitWindow)));
 }
 
@@ -4881,6 +4898,7 @@ function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
     resetsAt: window.resetsAt,
     planType: usage.planType,
     resetCreditsAvailable: usage.resetCredits,
+    resetCreditExpiresAt: usage.resetCreditExpiresAt,
     reached: window.usedPercent >= 99 || usage.rateLimitReachedType != null || usage.spendControlReached,
     windows,
   };
@@ -5048,6 +5066,7 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
 }
 
 function warnCachedUsageBeforeLaunch(account?: AccountChoice) {
+  warnExpiringResetCredits();
   const snapshot = readUsageSnapshot(account);
   if (!snapshot || !snapshotReached(snapshot)) return;
   const checkedAt = Date.parse(snapshot.checkedAt);
@@ -5083,8 +5102,8 @@ interface AccountStanding {
   reason: string;
 }
 
-function fmtUntil(unixSeconds: number): string {
-  const ms = unixSeconds * 1000 - Date.now();
+function fmtUntil(unixSeconds: number, now = Date.now()): string {
+  const ms = unixSeconds * 1000 - now;
   if (ms <= 0) return "now";
   const minutes = Math.round(ms / 60_000);
   if (minutes < 60) return `in ${minutes}m`;
@@ -5135,23 +5154,36 @@ function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined):
   return { ...base, reason: `${Math.round(remainingPercent)}% left, resets ${rateLimitResetDate(weekly.resetsAt)} ${fmtUntil(weekly.resetsAt)}, ${paceToEmpty}%/day empties it` };
 }
 
-// Earliest deadline first. An account whose window resets soonest loses its
-// unspent share first, so it is spent first; among equal deadlines the fuller
-// one goes first. Accounts short of the demand's headroom rank next (fullest
-// first), unknown usage after them, exhausted windows last (soonest reset
-// first, for the warning).
+// Percent of the weekly window above the demand's risk line that the coming
+// reset forfeits per day if nothing spends it. A floor of one day keeps a
+// nearly dry account resetting in minutes from outranking a full one: what
+// matters is how much is at stake, not only how soon.
+function forfeitRate(standing: AccountStanding, demand: Demand, now = Date.now()): number {
+  if (!standing.weekly) return 0;
+  const spendable = Math.max(0, standing.remainingPercent - HEADROOM_PERCENT[demand]);
+  const days = Math.max(1, (standing.weekly.resetsAt * 1000 - now) / 86_400_000);
+  return spendable / days;
+}
+
+// Highest forfeit rate first: the account with the most spendable share per
+// day until its reset loses the most by waiting, so it is spent first. Equal
+// rates go to the earlier deadline, then the fuller account. Accounts short of
+// the demand's headroom rank next (fullest first), unknown usage after them,
+// exhausted windows last (soonest reset first, for the warning).
 function standingTier(standing: AccountStanding, demand: Demand): number {
   if (standing.reached) return 3;
   if (!standing.snapshot) return 2;
   return standing.remainingPercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
 }
 
-function rankAccounts(standings: AccountStanding[], demand: Demand): AccountStanding[] {
+function rankAccounts(standings: AccountStanding[], demand: Demand, now = Date.now()): AccountStanding[] {
   return standings.map((standing, index) => ({ standing, index })).sort((a, b) => {
     const tier = standingTier(a.standing, demand);
     const tierDelta = tier - standingTier(b.standing, demand);
     if (tierDelta !== 0) return tierDelta;
     if (tier === 0) {
+      const rate = forfeitRate(b.standing, demand, now) - forfeitRate(a.standing, demand, now);
+      if (Math.abs(rate) > 0.5) return rate;
       const deadline = a.standing.weekly!.resetsAt - b.standing.weekly!.resetsAt;
       if (deadline !== 0) return deadline;
       return b.standing.remainingPercent - a.standing.remainingPercent;
@@ -5209,11 +5241,27 @@ function cachedAccountStandings(ledger = readLedger()): AccountStanding[] {
 interface AccountAdvice {
   order: string[];
   picks: Record<Demand, string | null>;
-  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; reason: string }>;
+  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; forfeitRate?: number; reason: string }>;
+  resetCredits: Array<{ account: string; count: number; expiresAt: number[]; redeem: boolean }>;
+  alerts: string[];
 }
 
-function accountAdvice(standings: AccountStanding[]): AccountAdvice {
-  const ranked = rankAccounts(standings, "light");
+// A banked credit is worth redeeming once the account has nothing spendable
+// above the risk line: it restores a full window instead of waiting for the
+// reset.
+function resetCreditStandings(standings: AccountStanding[]): AccountAdvice["resetCredits"] {
+  return standings
+    .filter((standing) => (standing.snapshot?.resetCreditsAvailable ?? 0) > 0)
+    .map((standing) => ({
+      account: standing.choice.name,
+      count: standing.snapshot!.resetCreditsAvailable,
+      expiresAt: standing.snapshot!.resetCreditExpiresAt ?? [],
+      redeem: standing.reached || (Boolean(standing.weekly) && standing.remainingPercent <= HEADROOM_PERCENT.work),
+    }));
+}
+
+function accountAdvice(standings: AccountStanding[], now = Date.now()): AccountAdvice {
+  const ranked = rankAccounts(standings, "work", now);
   const pickFor = (demand: Demand) => decideAccount(standings, demand)?.choice.name ?? null;
   return {
     order: ranked.map((standing) => standing.choice.name),
@@ -5222,23 +5270,30 @@ function accountAdvice(standings: AccountStanding[]): AccountAdvice {
       account: standing.choice.name,
       remainingPercent: standing.remainingPercent,
       reached: standing.reached,
-      ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt } : {}),
+      ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt, forfeitRate: Math.round(forfeitRate(standing, "work", now)) } : {}),
       ...(standing.paceToEmpty !== undefined ? { paceToEmpty: standing.paceToEmpty } : {}),
       reason: standing.reason,
     })),
+    resetCredits: resetCreditStandings(standings),
+    alerts: resetCreditAlerts(standings.map((standing) => ({ name: standing.choice.name, home: standing.choice.home, snapshot: standing.snapshot })), now),
   };
 }
 
-function adviceLines(standings: AccountStanding[]): string[] {
+function adviceLines(standings: AccountStanding[], now = Date.now()): string[] {
   if (standings.length === 0) return [];
-  const ranked = rankAccounts(standings, "light");
-  const advice = accountAdvice(standings);
+  const ranked = rankAccounts(standings, "work", now);
+  const advice = accountAdvice(standings, now);
   const spend = ranked.filter((standing) => !standing.reached).map((standing) => `${standing.choice.name} (${standing.reason})`);
   const out = ranked.filter((standing) => standing.reached).map((standing) => `${standing.choice.name} ${standing.reason}`);
   const lines = [`advice: ${spend.length ? `spend ${spend.join(", then ")}` : "every account is exhausted"}${out.length ? `; ${out.join("; ")}` : ""}`];
   const picks = (Object.keys(HEADROOM_PERCENT) as Demand[])
     .map((demand) => `${DEMAND_LABEL[demand]} ${advice.picks[demand] ?? "none"}`).join(" · ");
   lines.push(`  picks by headroom (${(Object.keys(HEADROOM_PERCENT) as Demand[]).map((demand) => `${DEMAND_LABEL[demand]} ${HEADROOM_PERCENT[demand]}%`).join(", ")}): ${picks}`);
+  if (advice.resetCredits.length > 0) {
+    const banked = advice.resetCredits.map((credit) => `${credit.account} ${describeResetCredits(credit.count, credit.expiresAt, now).replace(" available", "")}`);
+    const redeem = advice.resetCredits.filter((credit) => credit.redeem).map((credit) => credit.account);
+    lines.push(`  reset credits: ${banked.join("; ")}${redeem.length ? `; redeem one on ${redeem.join(", ")} now for a full window instead of waiting for the reset` : ""}`);
+  }
   return lines;
 }
 
@@ -5307,6 +5362,7 @@ function invalidateAccountUsage(account?: AccountChoice): void {
 }
 
 function announceAccountSelection(lane: string, selection: AccountSelection) {
+  warnExpiringResetCredits();
   if (!selection.choice) return;
   const { pick, demand } = selection;
   if (pick && demand) {
@@ -5339,14 +5395,54 @@ function rateLimitResetDate(unixSeconds: number): string {
   return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]}`;
 }
 
+// An unused credit is money on the table; alert this many days before it lapses.
+const RESET_CREDIT_ALERT_DAYS = 3;
+
+function describeResetCredits(count: number, expiresAt: number[] = [], now = Date.now()): string {
+  const label = count === 1 ? "reset credit" : "reset credits";
+  if (count === 0 || expiresAt.length === 0) return `${count} ${label} available`;
+  const expiries = expiresAt.map((at) => `${rateLimitResetDate(at)} ${fmtUntil(at, now)}`);
+  return `${count} ${label} available, ${count === 1 ? "expires" : "expire"} ${expiries.join(" and ")}`;
+}
+
+function expiringResetCredits(snapshot: UsageSnapshot | undefined, now = Date.now()): number[] {
+  const cutoff = now + RESET_CREDIT_ALERT_DAYS * 86_400_000;
+  return (snapshot?.resetCreditExpiresAt ?? []).filter((at) => at * 1000 > now && at * 1000 <= cutoff);
+}
+
+// One line per account holding a credit inside the alert window; printed
+// unconditionally by usage, doctor, and every GPT launch so it cannot be missed.
+function resetCreditAlerts(accounts: Array<{ name: string; home?: string; snapshot?: UsageSnapshot }>, now = Date.now()): string[] {
+  return accounts.flatMap(({ name, home, snapshot }) => {
+    const expiring = expiringResetCredits(snapshot, now);
+    if (expiring.length === 0) return [];
+    const count = expiring.length === 1 ? "an unused reset credit" : `${expiring.length} unused reset credits`;
+    const when = expiring.map((at) => `${rateLimitResetDate(at)} ${fmtUntil(at, now)}`).join(" and ");
+    const where = home ? `CODEX_HOME=${displayPath(home)} codex` : "codex";
+    return [`CRITICAL: ${name} has ${count} expiring ${when}; redeem before then in the codex TUI (${where}, then /usage)`];
+  });
+}
+
+function configuredAccountSnapshots(): Array<{ name: string; home?: string; snapshot?: UsageSnapshot }> {
+  if (!config.accounts) return [{ name: "codex", snapshot: readUsageSnapshot() }];
+  return Object.entries(config.accounts).map(([name, home]) => ({ name, home, snapshot: readUsageSnapshot({ name, home }) }));
+}
+
+let resetCreditsWarned = false;
+// Launch paths call this from more than one hook; one print per process.
+function warnExpiringResetCredits(): void {
+  if (resetCreditsWarned) return;
+  resetCreditsWarned = true;
+  for (const line of resetCreditAlerts(configuredAccountSnapshots())) console.error(color.red(`cdx: ${line}`));
+}
+
 function formatAccountUsage(usage: AccountUsage): { detail: string; usedPercent: number } {
   const windows = [usage.primary, ...(usage.secondary ? [usage.secondary] : [])];
   const detail = windows.map((window) =>
     `${rateLimitWindowName(window.windowDurationMins)} window ${window.usedPercent}% used, resets ${rateLimitResetDate(window.resetsAt)}`
   ).join(", ");
-  const creditLabel = usage.resetCredits === 1 ? "reset credit" : "reset credits";
   return {
-    detail: `${usage.planType.toLowerCase()} plan, ${detail} (${usage.resetCredits} ${creditLabel} available)`,
+    detail: `${usage.planType.toLowerCase()} plan, ${detail} (${describeResetCredits(usage.resetCredits, usage.resetCreditExpiresAt)})`,
     usedPercent: Math.max(...windows.map((window) => window.usedPercent)),
   };
 }
@@ -5487,9 +5583,16 @@ async function usageCommand(argv: string[]): Promise<void> {
       };
     });
     const advice = config.accounts ? accountAdvice(effectiveStandings) : null;
-    console.log(JSON.stringify({ codex: rows, advice, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
+    const alerts = resetCreditAlerts(accounts.map((account, index) => ({
+      name: account?.name ?? "codex", home: account?.home, snapshot: refreshed[index]?.snapshot ?? readUsageSnapshot(account),
+    })));
+    console.log(JSON.stringify({ alerts, codex: rows, advice, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
     return;
   }
+  // The credit alert leads the report so a skim cannot miss it.
+  for (const line of resetCreditAlerts(accounts.map((account, index) => ({
+    name: account?.name ?? "codex", home: account?.home, snapshot: refreshed[index]?.snapshot ?? readUsageSnapshot(account),
+  })))) console.log(color.red(line));
   for (const [index, account] of accounts.entries()) {
     const key = account?.name ?? "default";
     const label = account ? `${color.bold(account.name)} ${color.dim(`(${displayPath(account.home)})`)}` : color.bold("codex");
@@ -6147,6 +6250,7 @@ async function doctorCommand(argv: string[]) {
       }
     }
     for (const line of adviceLines(cachedAccountStandings())) console.log(color.cyan(line));
+    for (const line of resetCreditAlerts(configuredAccountSnapshots())) console.log(color.red(line));
   } else if (version?.success) {
     const login = Bun.spawnSync({ cmd: ["codex", "login", "status"] });
     loggedIn = login.success;
@@ -6169,6 +6273,7 @@ async function doctorCommand(argv: string[]) {
       } else {
         good(`usage: ${formatted.detail}`);
       }
+      for (const line of resetCreditAlerts([{ name: "codex", snapshot: refreshed.snapshot }])) console.log(color.red(line));
     }
   }
 
@@ -6906,6 +7011,7 @@ if (import.meta.main) {
 export {
   summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
+  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
