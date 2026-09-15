@@ -114,7 +114,7 @@ Table-driven: `{ name, description, inputSchema, run(input) -> { argv, stdin?, t
 | consult | lane, question | engine, supervisor, model, effort, cd, account | `consult <lane> [flags] --bg -` |
 | review | lane | engine, model, effort, cd, uncommitted, base, commit, scope, intent | `review <lane> [flags] --bg [-]` |
 | fork | lane, source, brief | model, effort, account | `fork <lane> <source> [flags] --bg -` |
-| wait | targets[] | timeoutSec (default and cap 540), report | `wait <targets> --json [--report] --timeout N`; `timeoutMs = (N + 30) * 1000` |
+| events | | | `events --json --peek`; returns pending owned events without advancing the cursor |
 | send | lane, text | | `send <lane> -` |
 | reply | lane, answer | id | `reply <lane> [--id N] -` |
 | questions | | lane | `questions [lane]` |
@@ -131,7 +131,11 @@ Table-driven: `{ name, description, inputSchema, run(input) -> { argv, stdin?, t
 | takeover | target | | `takeover <target>` |
 | doctor | | fix, probe | `doctor [--fix] [--probe]` |
 
-Descriptions tell the model what the command does and when to use it in one or two sentences; `spawn`'s says the brief is delivered whole through stdin so quotes and newlines are safe, and that completion arrives as a `[cdx]` event, so the head should not block on `wait` unless it needs the report now.
+Descriptions tell the model what the command does and when to use it in one or two sentences; `spawn`'s says the brief is delivered whole through stdin so quotes and newlines are safe, and that completion arrives as a `[cdx]` event.
+
+### Never block
+
+Owner ruling, 2026-09-15: the head never blocks on a lane. There is no `wait` tool in the mod. The head spawns, keeps working or ends its turn, and the mod wakes it: a wake event becomes a `[cdx]` prompt when the session is idle and rides the next tool result as context while a turn runs. `events` and `status` are the check-in tools when the head wants to look. `cdx wait` stays in the CLI for Astra, Gemini and people at a terminal.
 
 ### Headless
 
@@ -139,7 +143,7 @@ Descriptions tell the model what the command does and when to use it in one or t
 
 ### Tests
 
-One test per rule in `hooks/delivery.test.ts` and `hooks/tools.test.ts`: wake drains only when idle, quiet stays for the next tool result, subagent calls never drain, argv for spawn puts the brief on stdin with `-`, wait caps the timeout, non-zero exits append stderr and the code. Run under `bun test`; no processes, no sleeps.
+One test per rule in `hooks/delivery.test.ts` and `hooks/tools.test.ts`: wake drains only when idle, quiet stays for the next tool result, subagent calls never drain, argv for spawn puts the brief on stdin with `-`, no tool argv contains `wait`, non-zero exits append stderr and the code. Run under `bun test`; no processes, no sleeps.
 
 ## Integration order
 
@@ -150,6 +154,6 @@ One test per rule in `hooks/delivery.test.ts` and `hooks/tools.test.ts`: wake dr
 
 ## Open risks, verified live after the merge
 
-- Hook budget: the cheat sheet says a hook that overruns 10 s is skipped. If that applies to a `tool.call` hook serving an own tool, `wait` cannot block and `WAIT_TIMEOUT_SEC` drops to 8; the head then relies on event delivery alone.
+- Hook budget: the cheat sheet says a hook that overruns 10 s is skipped. Every own tool runs a short cdx command (`--bg` launches return at once), so no tool call should approach it; `doctor --probe` is the longest and gets `timeoutMs` 120000.
 - `$.session.id()` must equal the `CLAUDE_CODE_SESSION_ID` the Bash tool exports, or Bash-launched lanes and mod-launched lanes would have different owners. Doctor's `polledAt` check proves it either way.
 - The API is early access and may change; `hooks/types/claude-code.d.ts` names the Claude Code version it came from on its first line.
