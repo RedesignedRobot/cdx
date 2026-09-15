@@ -764,7 +764,7 @@ async function eventsCommand(argv: string[]): Promise<void> {
   const now = Date.now();
   const visibilityCfg = config.visibility ?? VISIBILITY_DEFAULTS;
 
-  const { events } = withEvents((state) => {
+  withEvents((state) => {
     const current = delivery(state, session);
     current.polledAt = new Date(now).toISOString();
 
@@ -793,14 +793,15 @@ async function eventsCommand(argv: string[]): Promise<void> {
     }
 
     const records = readEvents();
-    return selectEvents(records, session, state, { peek });
+    const { events } = selectEvents(records, session, state, { peek: true });
+    if (json) {
+      console.log(JSON.stringify({ session, events }));
+    } else if (events.length > 0) {
+      console.log(events.map((e) => e.text).join("\n"));
+    }
+    // Persist only after stdout succeeds. A crash may replay, never acknowledge early.
+    if (!peek) current.cursor = Math.max(current.cursor, records.at(-1)?.id ?? 0);
   });
-
-  if (json) {
-    console.log(JSON.stringify({ session, events }));
-  } else if (events.length > 0) {
-    console.log(events.map((e) => e.text).join("\n"));
-  }
 }
 function sessionProgress(session: string, now: number): ProgressSample[] {
   const state = readSessions();
@@ -1288,6 +1289,8 @@ function parseArgs(argv: string[], allowed: string[]): Parsed {
   const parsed: Parsed = { flags: {}, lists: {}, bools: new Set(), rest: [] };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index]!;
+    // "--" ends the flags; free text that starts with dashes follows it.
+    if (arg === "--") { parsed.rest.push(...argv.slice(index + 1)); break; }
     const name = arg.startsWith("--") ? arg.slice(2) : arg === "-n" ? "n" : arg === "-f" ? "follow" : undefined;
     if (name && (BOOL_FLAGS.has(name) || VALUE_FLAGS.has(name) || LIST_FLAGS.has(name)) && !allowedSet.has(name)) {
       fail(`${arg} is not valid for this command`);
@@ -4035,7 +4038,7 @@ async function consultCommand(argv: string[]) {
   }
   const engine = parsed.flags.engine ?? (parentEntry?.consult ? "gemini" : "gpt");
   const forwardArgv = argv.filter((arg) => arg !== questionArg);
-  return reviewCommand(["--engine", engine, ...forwardArgv, question], { consult: true, supervisor: parsed.bools.has("supervisor") });
+  return reviewCommand(["--engine", engine, ...forwardArgv, "--", question], { consult: true, supervisor: parsed.bools.has("supervisor") });
 }
 
 async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {

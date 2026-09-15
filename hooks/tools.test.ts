@@ -92,11 +92,11 @@ describe("tool rules", () => {
     expect(formatToolOutput(1, "partial stdout", "")).toBe("partial stdout\nexit 1");
   });
 
-  test("events tool runs cdx events --json --peek without advancing cursor", () => {
+  test("events tool drains the feed; the mod merges its buffer in front", () => {
     const eventsTool = TOOLS_BY_NAME.get("events");
     expect(eventsTool).toBeDefined();
     const result = eventsTool!.run({});
-    expect(result.argv).toEqual(["events", "--json", "--peek"]);
+    expect(result.argv).toEqual(["events", "--json"]);
     expect(result.stdin).toBeUndefined();
   });
 

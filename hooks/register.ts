@@ -61,21 +61,50 @@ async function poll($: EngineInterface) {
       }
     }
 
+    // Everything the submit would carry, kept so a refused submit can put it
+    // back. The submit is issued before any await so no turn can start in
+    // between; it is not awaited because the prompt runs when the session is
+    // idle and the poll must not wait for that.
+    const drained = [...deliveryState.pending, ...incomingEvents];
     const outcome = afterPoll(deliveryState, incomingEvents);
     deliveryState = outcome.state;
+
+    if (outcome.submit) {
+      $.prompt.submit(outcome.submit).catch(async (error: unknown) => {
+        deliveryState = { ...deliveryState, pending: [...drained, ...deliveryState.pending] };
+        await $.ui.log(`cdx: prompt not submitted, events kept for the next tool result: ${error instanceof Error ? error.message : String(error)}`);
+      });
+    }
 
     if (surface !== null) {
       for (const toastText of outcome.toasts) {
         await $.ui.toast(toastText, { timeoutMs: 8000 });
       }
     }
-
-    if (outcome.submit) {
-      await $.prompt.submit(outcome.submit);
-    }
   } finally {
     pollInFlight = false;
   }
+}
+
+// The poll drains the feed every two seconds into the buffer, so the CLI
+// alone would answer "nothing" while wake events sit in memory. The tool
+// answers with the buffer first, then whatever the feed still held, and
+// empties the buffer so the after-hook does not deliver it a second time.
+function eventsToolResult(exitCode: number, stdout: string, stderr: string): string {
+  const buffered = deliveryState.pending.map((e) => e.text);
+  deliveryState = clearBuffer(deliveryState);
+  let fresh: string[] = [];
+  if (exitCode === 0 && stdout.trim()) {
+    try {
+      const parsed = JSON.parse(stdout);
+      if (parsed && Array.isArray(parsed.events)) fresh = parsed.events.map((e: PendingEvent) => e.text);
+    } catch {
+      // malformed JSON: report the raw output below
+    }
+  }
+  if (exitCode !== 0) return formatToolOutput(exitCode, [...buffered, stdout].join("\n"), stderr);
+  const lines = [...buffered, ...fresh];
+  return lines.length ? lines.join("\n") : "no pending events";
 }
 
 export function register(on: On) {
@@ -126,13 +155,15 @@ export function register(on: On) {
     return next(e);
   });
 
+  // A subagent's loop raises its own turn events with agentId set. Only the
+  // head's turn decides whether the session is idle.
   on("turn.start", async ($, e, next) => {
-    deliveryState = onTurnStart(deliveryState);
+    if (!(e as { agentId?: string }).agentId) deliveryState = onTurnStart(deliveryState);
     return next(e);
   });
 
   on("turn.complete", async ($, e, next) => {
-    deliveryState = onTurnComplete(deliveryState);
+    if (!e.agentId) deliveryState = onTurnComplete(deliveryState);
     return next(e);
   });
 
@@ -255,6 +286,9 @@ export function register(on: On) {
       procInit.timeoutMs = runSpec.timeoutMs;
     }
     const res = await $.process.run(CDX.concat(runSpec.argv), procInit);
+    if (toolName === "events") {
+      return { result: eventsToolResult(res.exitCode, res.stdout, res.stderr) };
+    }
     const text = formatToolOutput(res.exitCode, res.stdout, res.stderr);
     return { result: text };
   });

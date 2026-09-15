@@ -694,6 +694,12 @@ test("events and status accept their boolean flags at the command line", () => {
   expect(parseArgs(["--line"], ["json", "all", "brief", "line", "watch", "interval"]).bools).toEqual(new Set(["line"]));
 });
 
+test("-- ends the flags so free text may start with dashes", () => {
+  const parsed = parseArgs(["--engine", "gpt", "lane", "--", "--model is refused; why?"], ["engine"]);
+  expect(parsed.flags.engine).toBe("gpt");
+  expect(parsed.rest).toEqual(["lane", "--model is refused; why?"]);
+});
+
 test("a 6.x session record migrates to one cursor without replaying history", () => {
   const legacy: any = { sequence: 9, bindings: {}, lanes: {}, sessions: { head: { wake: 7, quiet: 4, lease: { pid: 1, claudePid: 2 }, plugin: { root: "/x" } } } };
   expect(delivery(legacy, "head")).toEqual({ cursor: 7 });

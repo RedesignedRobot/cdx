@@ -114,7 +114,7 @@ Table-driven: `{ name, description, inputSchema, run(input) -> { argv, stdin?, t
 | consult | lane, question | engine, supervisor, model, effort, cd, account | `consult <lane> [flags] --bg -` |
 | review | lane | engine, model, effort, cd, uncommitted, base, commit, scope, intent | `review <lane> [flags] --bg [-]` |
 | fork | lane, source, brief | model, effort, account | `fork <lane> <source> [flags] --bg -` |
-| events | | | `events --json --peek`; returns pending owned events without advancing the cursor |
+| events | | | `events --json`; the mod answers with its own buffer first, then the feed, and empties the buffer |
 | send | lane, text | | `send <lane> -` |
 | reply | lane, answer | id | `reply <lane> [--id N] -` |
 | questions | | lane | `questions [lane]` |
