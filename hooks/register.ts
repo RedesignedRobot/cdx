@@ -6,6 +6,7 @@ import {
   clearBuffer,
   initialDeliveryState,
   onPromptSubmit,
+  onSubmitRefused,
   onTurnComplete,
   onTurnStart,
   type DeliveryState,
@@ -25,6 +26,13 @@ let surface: RenderSurface | null = null;
 let deliveryState: DeliveryState = initialDeliveryState();
 let pollInFlight = false;
 let pollCount = 0;
+// Each refusal message is logged once; the poll runs every two seconds and
+// a repeated log would flood the transcript.
+const loggedRefusals = new Set<string>();
+
+const BUDGET_SPENT_NOTICE = "cdx: the engine's per-session prompt budget is spent (50 prompts); lane events no longer wake an idle head. "
+  + "They still land on the next tool result or typed prompt, a fresh wake goes into the prompt box as a Tab suggestion, "
+  + "and the status line shows 'wakes off'. A new session restores wakes.";
 
 async function poll($: EngineInterface) {
   if (pollInFlight || !session || !root) {
@@ -45,7 +53,8 @@ async function poll($: EngineInterface) {
       });
       const line = statusResult.stdout.trim();
       if (surface !== null) {
-        await $.ui.status(line || undefined);
+        const shown = deliveryState.budgetSpent ? `wakes off${line ? ` · ${line}` : ""}` : line;
+        await $.ui.status(shown || undefined);
       }
     }
 
@@ -71,9 +80,18 @@ async function poll($: EngineInterface) {
 
     if (outcome.submit) {
       $.prompt.submit(outcome.submit).catch(async (error: unknown) => {
-        deliveryState = { ...deliveryState, pending: [...drained, ...deliveryState.pending] };
-        await $.ui.log(`cdx: prompt not submitted, events kept for the next tool result: ${error instanceof Error ? error.message : String(error)}`);
+        const message = error instanceof Error ? error.message : String(error);
+        deliveryState = onSubmitRefused(deliveryState, drained, message);
+        if (loggedRefusals.has(message)) return;
+        loggedRefusals.add(message);
+        await $.ui.log(deliveryState.budgetSpent
+          ? BUDGET_SPENT_NOTICE
+          : `cdx: prompt not submitted, events kept for the next tool result: ${message}`);
       });
+    }
+
+    if (outcome.suggest && surface !== null) {
+      await $.prompt.suggest(outcome.suggest).catch(() => undefined);
     }
 
     if (surface !== null) {

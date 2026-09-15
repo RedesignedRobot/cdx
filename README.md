@@ -383,7 +383,8 @@ When running in headless mode (`surface === null`), UI status, toasts, and UI lo
 ### Event delivery
 
 Events flow into Claude Code through two delivery paths:
-- Idle wake: when no turn is running and the pending buffer contains at least one wake event, the mod drains the buffer into `$.prompt.submit`. The prompt starts with `[cdx]` followed by the event lines.
+- Idle wake: when no turn is running and the pending buffer contains at least one wake event, the mod holds it for 15 seconds so a burst of lane events costs one prompt, then drains the buffer into `$.prompt.submit`. The prompt starts with `[cdx]` followed by the event lines.
+- Prompt budget: Claude Code refuses a plugin's `$.prompt.submit` after 50 in one session. On that refusal the mod stops submitting for the session, logs one notice, keeps the events for the next tool result or typed prompt, puts each fresh wake into the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. A new session restores wakes. Any other refusal is retried after the coalesce window and logged once per message.
 - Mid-turn context: when a turn is active, pending events stay buffered. After each non-subagent tool call completes without a denial, the mod drains the buffer into additional context under `[cdx] events`. User prompt submissions also receive pending buffered events as context.
 Subagent tool calls never drain events.
 

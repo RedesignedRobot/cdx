@@ -5,25 +5,98 @@ import {
   clearBuffer,
   initialDeliveryState,
   onPromptSubmit,
+  onSubmitRefused,
   onTurnComplete,
   onTurnStart,
+  WAKE_COALESCE_MS,
 } from "./delivery";
 
 describe("delivery rules", () => {
-  test("a wake event submits a prompt only when no turn runs", () => {
+  test("a wake event submits a prompt only when no turn runs, after the coalesce window", () => {
     const idleState = initialDeliveryState();
     const event = { text: "[cdx] lane=alpha round=1 started", wake: true };
+    const t0 = 1_000_000;
 
-    const idleOutcome = afterPoll(idleState, [event]);
+    const held = afterPoll(idleState, [event], t0);
+    expect(held.submit).toBeUndefined();
+    expect(held.state.wakeSince).toBe(t0);
+    expect(held.state.pending).toEqual([event]);
+
+    const idleOutcome = afterPoll(held.state, [], t0 + WAKE_COALESCE_MS);
     expect(idleOutcome.submit).toBeDefined();
     expect(idleOutcome.submit?.text.startsWith("[cdx]")).toBe(true);
     expect(idleOutcome.submit?.text).toContain("lane=alpha round=1 started");
     expect(idleOutcome.state.pending).toHaveLength(0);
+    expect(idleOutcome.state.wakeSince).toBeUndefined();
+    expect(idleOutcome.state.submits).toBe(1);
 
     const busyState = { ...initialDeliveryState(), inTurn: true };
-    const busyOutcome = afterPoll(busyState, [event]);
+    const busyOutcome = afterPoll(busyState, [event], t0);
     expect(busyOutcome.submit).toBeUndefined();
     expect(busyOutcome.state.pending).toEqual([event]);
+  });
+
+  test("a burst of wake events costs one prompt", () => {
+    const t0 = 1_000_000;
+    let state = initialDeliveryState();
+    const lanes = ["a", "b", "c"].map((lane) => ({ text: `[cdx] lane=${lane} finished`, wake: true }));
+    let submits = 0;
+    for (const [index, event] of lanes.entries()) {
+      const outcome = afterPoll(state, [event], t0 + index * 4_000);
+      state = outcome.state;
+      if (outcome.submit) submits += 1;
+    }
+    const flush = afterPoll(state, [], t0 + WAKE_COALESCE_MS);
+    if (flush.submit) submits += 1;
+    expect(submits).toBe(1);
+    expect(flush.submit?.text).toBe("[cdx] lane=a finished\n[cdx] lane=b finished\n[cdx] lane=c finished");
+    expect(flush.state.submits).toBe(1);
+  });
+
+  test("a turn start drops the held wake so the tool result carries it", () => {
+    const t0 = 1_000_000;
+    const held = afterPoll(initialDeliveryState(), [{ text: "[cdx] lane=a finished", wake: true }], t0);
+    const running = onTurnStart(held.state);
+    expect(running.wakeSince).toBeUndefined();
+    expect(afterToolCall(running).context).toContain("lane=a finished");
+  });
+
+  test("a budget refusal ends submitting and suggests fresh wakes instead", () => {
+    const t0 = 1_000_000;
+    const event = { text: "[cdx] lane=a finished", wake: true };
+    const held = afterPoll(initialDeliveryState(), [event], t0);
+    const sent = afterPoll(held.state, [], t0 + WAKE_COALESCE_MS);
+    expect(sent.submit).toBeDefined();
+
+    const refused = onSubmitRefused(sent.state, [event], "cdx: $.prompt.submit refused: 50 prompts this session is the budget");
+    expect(refused.budgetSpent).toBe(true);
+    expect(refused.pending).toEqual([event]);
+    expect(refused.submits).toBe(0);
+
+    // No retry on the next polls, however long the session idles.
+    const quiet = afterPoll(refused, [], t0 + 10 * WAKE_COALESCE_MS);
+    expect(quiet.submit).toBeUndefined();
+    expect(quiet.suggest).toBeUndefined();
+    expect(quiet.state.pending).toEqual([event]);
+
+    // A fresh wake goes to the prompt box; the buffer still drains on a tool result.
+    const later = { text: "[cdx] lane=b asks a question", wake: true };
+    const nudged = afterPoll(quiet.state, [later], t0 + 11 * WAKE_COALESCE_MS);
+    expect(nudged.submit).toBeUndefined();
+    expect(nudged.suggest?.text).toBe("[cdx] lane=a finished\n[cdx] lane=b asks a question");
+    expect(afterToolCall(nudged.state).context).toContain("lane=b asks a question");
+  });
+
+  test("a transient refusal is retried after the coalesce window", () => {
+    const t0 = 1_000_000;
+    const event = { text: "[cdx] lane=a finished", wake: true };
+    const sent = afterPoll({ ...initialDeliveryState(), pending: [event], wakeSince: t0 - WAKE_COALESCE_MS }, [], t0);
+    expect(sent.submit).toBeDefined();
+    const refused = onSubmitRefused(sent.state, [event], "a dialog holds the keys");
+    expect(refused.budgetSpent).toBe(false);
+    const retry = afterPoll(refused, [], t0 + WAKE_COALESCE_MS + 1);
+    expect(retry.submit).toBeUndefined();
+    expect(afterPoll(retry.state, [], t0 + 2 * WAKE_COALESCE_MS + 1).submit).toBeDefined();
   });
 
   test("a quiet event waits for the next tool result", () => {
@@ -43,6 +116,7 @@ describe("delivery rules", () => {
 
   test("a subagent tool call never drains", () => {
     const state = {
+      ...initialDeliveryState(),
       pending: [{ text: "[cdx] lane=child round=1 finished", wake: true }],
       inTurn: true,
     };
@@ -55,8 +129,8 @@ describe("delivery rules", () => {
 
   test("prompt submission drains pending events into context", () => {
     const state = {
+      ...initialDeliveryState(),
       pending: [{ text: "[cdx] lane=beta round=1 started", wake: false }],
-      inTurn: false,
     };
 
     const outcome = onPromptSubmit(state);
@@ -91,11 +165,11 @@ describe("delivery rules", () => {
 
   test("clearBuffer removes all pending events", () => {
     const state = {
+      ...initialDeliveryState(),
       pending: [
         { text: "event 1", wake: false },
         { text: "event 2", wake: true },
       ],
-      inTurn: false,
     };
 
     const cleared = clearBuffer(state);

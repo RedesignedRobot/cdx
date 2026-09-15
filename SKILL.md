@@ -195,7 +195,7 @@ The integration requires `"env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }` i
 The mod registers native `mcp__cdx__*` tools directly inside Claude Code runtime.
 The `/lanes` command provides quick CLI access: `/lanes` runs status, while `/lanes <args>` forwards arguments to cdx.
 The `/cdx` command remains the skill that loads this document.
-The mod polls events every 2 seconds, updates the status line every 10 seconds, and delivers wake events as prompts when idle and as context mid-turn.
+The mod polls events every 2 seconds, updates the status line every 10 seconds, and delivers wake events as prompts when idle (held 15 seconds so a burst costs one prompt) and as context mid-turn. Claude Code allows a plugin 50 prompts per session; once spent, the status line reads `wakes off`, events still land on the next tool result or typed prompt, fresh wakes appear as a Tab suggestion in the prompt box, and a new session restores wakes.
 Run `cdx doctor` to verify that the mod is polling and live.
 
 ## Browser view
