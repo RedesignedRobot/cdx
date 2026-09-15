@@ -300,7 +300,7 @@ The mod registers 21 native tools under the prefix `mcp__cdx__`:
 | `mcp__cdx__consult` | `lane, question` | `engine, supervisor, model, effort, cd, account` | Start a read-only consultation lane via `--bg -`. |
 | `mcp__cdx__review` | `lane` | `engine, model, effort, cd, uncommitted, base, commit, scope, intent` | Start an independent code review lane via `--bg`. Intent passes via stdin with `-` when provided. |
 | `mcp__cdx__fork` | `lane, source, brief` | `model, effort, account` | Fork an existing lane into a new branch lane via `--bg -`. |
-| `mcp__cdx__events` | (none) | (none) | Read pending owned events without advancing the cursor (`events --json --peek`). |
+| `mcp__cdx__events` | (none) | (none) | Every owned event not yet delivered: the mod's buffer, then the feed (`events --json`). |
 | `mcp__cdx__send` | `lane, text` | (none) | Deliver steering instructions to a running lane via stdin (`send <lane> -`). |
 | `mcp__cdx__reply` | `lane, answer` | `id` | Answer an open question asked by a lane via stdin (`reply <lane> [--id N] -`). |
 | `mcp__cdx__questions` | (none) | `lane` | List open questions across all lanes or for a specific lane. |
@@ -323,7 +323,7 @@ Owner ruling, 2026-09-15: the head never blocks on a lane.
 There is no `mcp__cdx__wait` tool.
 The head spawns a lane, keeps working or ends its turn, and the mod wakes it when events occur.
 `cdx wait` stays in the CLI for Astra, Gemini, and terminal operators.
-Mid-turn checks use `mcp__cdx__events` (peek) or `mcp__cdx__status`.
+Mid-turn checks use `mcp__cdx__events` or `mcp__cdx__status`.
 
 ### Slash command
 

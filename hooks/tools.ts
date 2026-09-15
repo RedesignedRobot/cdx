@@ -180,12 +180,12 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "events",
-    description: "Read pending owned events without advancing the cursor.",
+    description: "Return every owned event not yet delivered: the mod's buffer, then the feed.",
     inputSchema: {
       type: "object",
       properties: {},
     },
-    run: () => ({ argv: ["events", "--json", "--peek"] }),
+    run: () => ({ argv: ["events", "--json"] }),
   },
   {
     name: "send",
