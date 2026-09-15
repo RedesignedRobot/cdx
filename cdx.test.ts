@@ -8,6 +8,7 @@ import {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
+  selectEvents, statusLine, resolveStdinText,
 } from "./cdx.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -17,7 +18,6 @@ const state = {
   bindings: { "former-head": "current-head" },
   lanes: { claimed: "lane-head", unclaimed: "former-head", detached: "terminal" },
   sessions: {},
-  heads: {},
 };
 
 test("feed parsing requires a valid envelope before accepting a record", () => {
@@ -583,4 +583,108 @@ test("cdx usage --json row carries incomplete flag reflecting ledger state", () 
     incomplete: Boolean(ledgerTotalsClean.incomplete),
   };
   expect(rowClean.incomplete).toBe(false);
+});
+
+test("events selection advances cursor to last record read, marks wake events, and peek leaves cursor", () => {
+  const session = "current-head";
+  const records = [
+    { id: 1, timestamp: "2026-09-15T12:00:00Z", kind: "question", owner: session, message: "q1" },
+    { id: 2, timestamp: "2026-09-15T12:01:00Z", kind: "message", owner: session, message: "m1" },
+    { id: 3, timestamp: "2026-09-15T12:02:00Z", kind: "started", owner: "other", message: "s1" },
+    { id: 4, timestamp: "2026-09-15T12:03:00Z", kind: "terminal", owner: session, message: "t1" },
+    { id: 5, timestamp: "2026-09-15T12:04:00Z", kind: "started", owner: "other", message: "s2" },
+  ];
+  // Three owned events (1, 2, 4). Cursor is at the second owned event (cursor: 2).
+  const testState = {
+    sequence: 5,
+    bindings: {},
+    lanes: {},
+    sessions: { [session]: { cursor: 2 } },
+  };
+
+  // Peek returns event 4, marks wake from WAKE_EVENTS, but leaves cursor at 2
+  const peekResult = selectEvents(records, session, testState, { peek: true });
+  expect(peekResult.events).toHaveLength(1);
+  expect(peekResult.events[0].id).toBe(4);
+  expect(peekResult.events[0].wake).toBe(true);
+  expect(peekResult.cursor).toBe(2);
+  expect(testState.sessions[session].cursor).toBe(2);
+
+  // First call returns exactly one event (id 4), marks wake, advances cursor to last record id read (5, not 4)
+  const firstResult = selectEvents(records, session, testState);
+  expect(firstResult.events).toHaveLength(1);
+  expect(firstResult.events[0].id).toBe(4);
+  expect(firstResult.events[0].kind).toBe("terminal");
+  expect(firstResult.events[0].wake).toBe(true);
+  expect(firstResult.cursor).toBe(5);
+  expect(testState.sessions[session].cursor).toBe(5);
+
+  // A second call returns an empty list
+  const secondResult = selectEvents(records, session, testState);
+  expect(secondResult.events).toEqual([]);
+  expect(secondResult.cursor).toBe(5);
+  expect(testState.sessions[session].cursor).toBe(5);
+});
+
+test("statusLine returns empty string when nothing owned runs, formats shape, and cuts middle items before counts", () => {
+  const now = Date.parse("2026-09-15T12:15:00Z");
+
+  // Empty string when caller owns no running lane, job, or open question (not "cdx 0 lanes")
+  expect(statusLine({}, {}, 0, undefined, { now })).toBe("");
+  expect(statusLine({}, {}, 0, 15, { now })).toBe("");
+
+  // Exact shape matching doc specification
+  const ledger = {
+    "search-fix": {
+      kind: "work", work: { state: "running", cwd: "/work" },
+      stage: "gate", stageStartedAt: "2026-09-15T12:12:00Z",
+      lastActionAt: "2026-09-15T12:12:00Z",
+      ownerSession: "head",
+    },
+    "api-docs": {
+      kind: "work", work: { state: "running", cwd: "/docs" },
+      stage: "working",
+      lastActionAt: "2026-09-15T12:03:00Z",
+      ownerSession: "head",
+    },
+  } as any;
+  const shaped = statusLine(ledger, {}, 1, undefined, {
+    now,
+    ownsLane: () => true,
+    ownsJob: () => true,
+  });
+  expect(shaped).toBe("cdx 2 lanes · search-fix gate 3m · api-docs working 12m · 1 question");
+
+  // Middle cut: lines exceeding 100 characters drop middle items before counts
+  const wideLedger: any = {};
+  for (let i = 1; i <= 6; i++) {
+    wideLedger[`worker-long-lane-name-${i}`] = {
+      kind: "work", work: { state: "running", cwd: `/work/${i}` },
+      stage: "working",
+      lastActionAt: "2026-09-15T12:10:00Z",
+      ownerSession: "head",
+    };
+  }
+  const cut = statusLine(wideLedger, {}, 2, 15, {
+    now,
+    ownsLane: () => true,
+    ownsJob: () => true,
+  });
+  expect(cut.length).toBeLessThanOrEqual(100);
+  expect(cut.startsWith("cdx 6 lanes")).toBe(true);
+  expect(cut.endsWith("2 questions · gemini blocked 15m")).toBe(true);
+});
+
+test("free text from stdin accepts '-' and empty stdin fails with command usage line", () => {
+  const usage = 'usage: cdx send <lane> "<text>"';
+
+  // Regular text is accepted directly
+  expect(resolveStdinText("inline steer", "", usage)).toBe("inline steer");
+
+  // Dash with non-empty stdin returns trimmed content
+  expect(resolveStdinText("-", "  steer instructions from stdin \n", usage)).toBe("steer instructions from stdin");
+
+  // Dash with empty or whitespace-only stdin fails with the command usage line
+  expect(() => resolveStdinText("-", "", usage)).toThrow(usage);
+  expect(() => resolveStdinText("-", "   \t\n  ", usage)).toThrow(usage);
 });
