@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["cdx.ts", "cdx.test.ts", "account-sync.ts", "guard.ts"]
+  "include": ["cdx.ts", "cdx.test.ts", "account-sync.ts", "guard.ts", "hooks/*.test.ts"]
 }
