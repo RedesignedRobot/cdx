@@ -1,10 +1,10 @@
 ---
 name: cdx
-description: Run OpenAI Codex and Google Antigravity work, review, consult, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, consulting, monitoring, reporting, closing, or cleaning lanes from Claude Code.
-allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *)
+description: Run OpenAI Codex and Google Antigravity work, review, consult, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, consulting, reporting, closing, or cleaning lanes from Claude Code.
+allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *), mcp__cdx__*
 ---
 
-# cdx 6.5.0
+# cdx 7.0.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -13,17 +13,19 @@ cases are in `README.md` next to it; read that when a command surprises you.
 
 ## The execution loop
 
-Owner rulings, 2026-09-07 to 2026-09-12: Astra thinks, Gemini works. The head briefs outcomes, answers questions, arranges independent review, and merges. It challenges decisions with evidence and does not prescribe the implementation.
+Owner rulings, 2026-09-07 to 2026-09-15: Astra thinks, Gemini works. The head briefs outcomes, answers questions, arranges independent review, and merges. It challenges decisions with evidence and does not prescribe the implementation.
+
+Use the native tools: `mcp__cdx__spawn` with the brief as a field, `mcp__cdx__reply`, `mcp__cdx__send`, `mcp__cdx__status`, `mcp__cdx__report`, and `mcp__cdx__close`. There is no `mcp__cdx__wait` tool. The head never blocks on a lane (owner ruling 2026-09-15). End your turn after spawning. Completion, questions, stalls, outages, and peer messages arrive as `[cdx]` events: as an automatic prompt when idle, or as context on the next tool result mid-turn. To check in mid-turn, call `mcp__cdx__events` (peek) or `mcp__cdx__status`. `cdx wait` stays in the CLI for Astra, Gemini, and terminal operators. The Bash form `bun /Users/mas/code/cdx/cdx.ts ...` remains valid for anything without a dedicated tool.
 
 Delegation tree: the head creates Astra lanes; Astra may spawn Gemini helpers through its own cdx. A child lane can never run gpt-6-astra. The refusal is checked on the resolved model (explicit `--model`, alias such as "astra", config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Gemini children never delegate. Gemini lanes always run `--effort high` (spawn, resume, review). Astra runs at effort medium.
 
 One Astra lane per backlog, never one per finding. Give Astra the whole open set at once (every finding with full detail, every audit report, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Gemini lanes from that split, one worktree each off the integration branch. When the root cause is already known, skip Astra and brief Gemini directly with named files and a gate. When no account has supervisor headroom, a work-tier Astra lane still writes the plan and the head spawns the Geminis.
 
-1. Hand a whole change to one supervisor with an acceptance gate:
-   `cdx spawn <lane> --engine gpt --model gpt-6-astra --supervisor --bg --gate "<cmd>" "<brief>"`.
-   Astra owns the design and delegates bounded execution to tracked cdx child lanes or read-only consults. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate.
-2. Wait for its report with `cdx wait <lane> --report`. Exit 2 means a question is open; answer with `cdx reply`. Use `cdx send` for corrections without dropping the task.
-3. Read the report and the gate result, arrange one read-only Gemini review, and merge. Lanes must not commit, push, or deploy.
+1. Hand a whole change to one supervisor with an acceptance gate using `mcp__cdx__spawn`:
+   `lane`: name, `engine`: `gpt`, `model`: `gpt-6-astra`, `supervisor`: true, `gate`: `<cmd>`, `brief`: `<text>`.
+   The brief is delivered whole through stdin, so quotes and newlines are safe. Astra owns the design and delegates bounded execution to tracked cdx child lanes or read-only consults. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate. End your turn after spawning.
+2. When a question arrives in a `[cdx]` prompt or context, answer with `mcp__cdx__reply`. Use `mcp__cdx__send` for corrections without dropping the task.
+3. When completion arrives, read the report (`mcp__cdx__report`) and gate result, arrange one read-only Gemini review (`mcp__cdx__review`), and merge. Close the lane with `mcp__cdx__close`. Lanes must not commit, push, or deploy.
 
 The CLI defaults to Gemini (`gemini-3.8-flash-high`). Astra requires `--engine gpt --model gpt-6-astra`; its effort cap stays at `medium`. `cdx consult` accepts `--engine gpt|gemini` and `--supervisor`. A Gemini consult is a read-only helper. A consult with `--supervisor` may start only owned read-only Gemini consult helpers; it cannot spawn writable workers, GPT children, or grandchildren. Review hooks and fingerprints are accidental-write controls, not a security sandbox; the head copies artifacts out of the report. Every Bash call from the head starts with an absolute `cd` and invokes `bun /Users/mas/code/cdx/cdx.ts`, because batched calls share one cwd.
 
@@ -33,7 +35,7 @@ The head finishes code generation, packaging, and integration before naming the 
 
 ## Briefing
 
-State the outcome, constraints, acceptance command, and facts the lane would otherwise rediscover. Give Gemini exclusive files and a brief under a page. Let Astra choose the design and division of work. Long briefs can use stdin:
+State the outcome, constraints, acceptance command, and facts the lane would otherwise rediscover. Give Gemini exclusive files and a brief under a page. Let Astra choose the design and division of work. Free-text commands accept `-` to read stdin:
 `cdx spawn big --engine gpt --supervisor --bg --gate "<cmd>" - < /tmp/brief.md`.
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
@@ -70,28 +72,31 @@ Order one independent review per consequential diff, covering affected callers a
 
 ## Commands
 
+Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `fork`, `send`, `reply`, `msg`, `job`, and `close`.
+
 ```bash
-cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] "<brief>"
-cdx resume  <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] "<follow-up>"
-cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd D] [--bg] [--account NAME] "<question>"
-cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>"]
-cdx fork    <new> <lane|sessionId> [--model M] [--effort E] [--bg] [--account NAME] "<brief>"
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] ("<brief>" | -)
+cdx resume  <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
+cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd D] [--bg] [--account NAME] ("<question>" | -)
+cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
+cdx fork    <new> <lane|sessionId> [--model M] [--effort E] [--bg] [--account NAME] ("<brief>" | -)
 cdx gate    <lane> ("<cmd>" | --clear)
-cdx send    <lane> "<text>"          # steer a running work lane
+cdx send    <lane> ("<text>" | -)          # steer a running work lane
 cdx ask     [--timeout MIN] "<question>"   # inside a lane only
-cdx reply   <lane> [--id SEQ] "<answer>"
+cdx reply   <lane> [--id SEQ] ("<answer>" | -)
 cdx questions [lane]
+cdx events  [--json] [--peek]              # unread feed events; --peek leaves cursor unadvanced
 cdx wait    <lane|job>... [--timeout SEC] [--json] [--report]   # exit 1 on failure, 2 on an open question
-cdx status  [--all] [--json | --brief | --watch [--interval S]]
+cdx status  [--all] [--json | --brief | --line | --watch [--interval S]]
 cdx tail    <lane> [-n N] | cdx tail -f [lane]
 cdx report  <lane> [round]
 cdx log     <lane> [round] [--transcript]
 cdx feed    [-n N]
 cdx usage   [--json]
 cdx kill    <lane|job> ["note"]
-cdx close   <lane> [--remove-worktree] ["note"]
-cdx job     <name> [--cd D] "<cmd>"   # detached shell job with a feed line on exit
-cdx msg     <lane|full-session-id> "<text>" | cdx inbox [-n N]
+cdx close   <lane> [--remove-worktree] ["note" | -]
+cdx job     <name> [--cd D] ("<cmd>" | -)   # detached shell job with a feed line on exit
+cdx msg     <lane|full-session-id> ("<text>" | -) | cdx inbox [-n N]
 cdx takeover <lane|full-session-id>   # connect ownership explicitly
 cdx adopt   <lane> <sessionId> [--engine gpt|gemini] [--model M] [--cd D]
 cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
@@ -99,16 +104,16 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 
 ## Operating rules
 
-- One lane: run `cdx spawn` in the foreground from a background Bash call.
-  Independent lanes: `--bg` each, then one `cdx wait a b c`. Long liaison
-  commands can use `cdx job`; supervisors cannot start jobs, fork, adopt, or clean.
-- Multi-target `wait` prints the target list, then each completion and report
+- One lane: run `mcp__cdx__spawn` (or `cdx spawn ... --bg`).
+  Independent lanes: spawn each in background, then let completion events wake the turn. Long liaison
+  commands can use `cdx job` (or `mcp__cdx__job`); supervisors cannot start jobs, fork, adopt, or clean.
+- Multi-target `wait` in the CLI prints the target list, then each completion and report
   path as the five-second poll observes it. It ends with a summary and, with
   `--report`, report bodies. JSON output stays unchanged. Consult lanes show
   `consult` and their review state on the main status line.
-- Normal `cdx status` reports round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age. Running jobs show their latest log line capped at 80 characters, skipping blank tail lines. `status --brief` prints only running lanes and caller-owned jobs, one line each under 100 characters. `status --watch` with optional `--interval S` defaulting to 2 seconds re-renders the brief view in place read-only until stopped with Ctrl-C. Codex token usage is counted per thread from a per-thread baseline. Missing or non-finite counters mark the round incomplete instead of zero; status and usage output show "(incomplete)", and `usage --json` rows carry an `incomplete` field. Every round records a start time and emits a `started` feed event.
-- `wait` exit 2 means a lane is blocked on a question. Answer it promptly with
-  `cdx reply`. An unanswered question times out after 30 minutes. Timeout is
+- Normal `cdx status` reports round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age. Running jobs show their latest log line capped at 80 characters, skipping blank tail lines. `status --brief` prints only running lanes and caller-owned jobs, one line each under 100 characters. `status --line` renders at most 100 characters for the UI status slot. `status --watch` with optional `--interval S` defaulting to 2 seconds re-renders the brief view in place read-only until stopped with Ctrl-C. Codex token usage is counted per thread from a per-thread baseline. Missing or non-finite counters mark the round incomplete instead of zero; status and usage output show "(incomplete)", and `usage --json` rows carry an `incomplete` field. Every round records a start time and emits a `started` feed event.
+- A question event means a lane is blocked. Answer it promptly with
+  `mcp__cdx__reply` (or `cdx reply`). An unanswered question times out after 30 minutes. Timeout is
   not approval; the worker reports the unresolved dependency and stops only
   dependent work without guessing, continuing independent authorized work.
 - Calling `cdx resume` on an active running lane is refused by the harness;
@@ -165,16 +170,9 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   them. A session target moves that head's whole group: lanes, jobs, and
   messages. Takeover replays nothing; it prints the owned summary. `adopt`
   over an existing lane needs ownership like any other mutation.
-- SessionStart restores owned running and completed work and open questions,
-  including after compaction. Finished jobs are capped at 10 while running jobs
-  remain visible. Close completed lanes when handled. Hooks supply quiet
-  updates; the plugin watcher wakes the head for questions, stalls, thrash alerts,
-  and completions.
-- The session-wide plugin watcher emits a quiet progress digest every
-  visibility.heartbeatMinutes defaulting to 10 while owned work runs, showing
-  step and file deltas, stage transitions, and current action. The monitor reads
-  heartbeat configuration at startup, so a changed cadence requires a monitor restart.
-  Stage events gate-started, gate-finished with exit code, and report-written stay quiet.
+- Session start restores owned running and completed work and open questions.
+  Finished jobs are capped at 10 while running jobs remain visible. Close completed lanes when handled.
+  The mod wakes the head for questions, stalls, thrash alerts, 503 outages, and completions.
 - The thrash detector wakes once per round if the same command fails
   visibility.failureRepeats consecutive times defaulting to 5, or if the same file
   is edited more than visibility.fileEdits times in a round defaulting to 20.
@@ -189,20 +187,16 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - Gemini's five-hour window drains under heavy fan-out; cdx refuses Gemini
   spawns while `gemini-quota.json` says so. Wait or use `--engine gpt`.
 
-## Plugin
+## Claude Code integration
 
-cdx loads as `cdx@skills-dir` in personal scope through `~/.claude/skills/cdx`.
-The plugin monitor runs `cdx watch` with no argument. Its own session id is
-a child id, so it finds the head through `CLAUDE_PID` and the session hook's
-receipt. It fails closed without `CLAUDE_PID` and waits until the hook has
-run. No setup call is needed. One persisted lease prevents duplicate watchers.
-
-`hooks/guard-raw-codex.ts` keeps the raw-work guard. SessionStart,
-PostToolBatch, and UserPromptSubmit run `_session`; native subagent calls
-are skipped. Run `cdx doctor` to check this session's hook receipt and lease.
-Changes to `hooks/hooks.json` require `/reload-plugins` or a restart. `/reload-plugins` does not restart running monitors, so changes to monitors or watcher code require a session restart. Skill edits are live.
-Cancel old global-tail monitors or restart their sessions before upgrading.
-Version 6 ignores old free-text feed lines; cleanup removes them.
+cdx loads as a native mod through `~/.claude/skills/cdx`.
+`hooks/hooks.json` declares `modules: ["./register.ts"]`.
+The integration requires `"env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }` in `~/.claude/settings.json`.
+The mod registers native `mcp__cdx__*` tools directly inside Claude Code runtime.
+The `/lanes` command provides quick CLI access: `/lanes` runs status, while `/lanes <args>` forwards arguments to cdx.
+The `/cdx` command remains the skill that loads this document.
+The mod polls events every 2 seconds, updates the status line every 10 seconds, and delivers wake events as prompts when idle and as context mid-turn.
+Run `cdx doctor` to verify that the mod is polling and live.
 
 ## Browser view
 
