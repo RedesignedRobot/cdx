@@ -8,7 +8,7 @@ import {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
-  selectEvents, statusLine, resolveStdinText,
+  selectEvents, statusLine, resolveStdinText, delivery,
 } from "./cdx.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -687,4 +687,15 @@ test("free text from stdin accepts '-' and empty stdin fails with command usage 
   // Dash with empty or whitespace-only stdin fails with the command usage line
   expect(() => resolveStdinText("-", "", usage)).toThrow(usage);
   expect(() => resolveStdinText("-", "   \t\n  ", usage)).toThrow(usage);
+});
+
+test("events and status accept their boolean flags at the command line", () => {
+  expect(parseArgs(["--json", "--peek"], ["json", "peek"]).bools).toEqual(new Set(["json", "peek"]));
+  expect(parseArgs(["--line"], ["json", "all", "brief", "line", "watch", "interval"]).bools).toEqual(new Set(["line"]));
+});
+
+test("a 6.x session record migrates to one cursor without replaying history", () => {
+  const legacy: any = { sequence: 9, bindings: {}, lanes: {}, sessions: { head: { wake: 7, quiet: 4, lease: { pid: 1, claudePid: 2 }, plugin: { root: "/x" } } } };
+  expect(delivery(legacy, "head")).toEqual({ cursor: 7 });
+  expect(delivery(legacy, "fresh")).toEqual({ cursor: 0 });
 });

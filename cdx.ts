@@ -692,9 +692,14 @@ function scopedEvents(limit: number, session = callerSession(), messagesOnly = f
   return withEvents((state) => readEvents().filter((event) => eventOwned(event, session, state)
     && (!messagesOnly || event.kind === "message")).slice(-limit).map(renderEvent), false);
 }
+// A 6.x record carried two cursors (wake, quiet) and a hook receipt. The
+// higher cursor becomes the single cursor so an upgraded session never
+// replays its history; the receipt fields are dropped.
 function delivery(state: SessionState, session: string): SessionDelivery {
   const entry = state.sessions[session] ??= { cursor: 0 };
-  if (typeof entry.cursor !== "number") entry.cursor = 0;
+  const legacy = entry as SessionDelivery & { wake?: number; quiet?: number; lease?: unknown; plugin?: unknown };
+  if (typeof entry.cursor !== "number") entry.cursor = Math.max(legacy.wake ?? 0, legacy.quiet ?? 0);
+  delete legacy.wake; delete legacy.quiet; delete legacy.lease; delete legacy.plugin;
   return entry;
 }
 
@@ -1274,7 +1279,7 @@ const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. 
 
 const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch", "line", "peek"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -6901,7 +6906,7 @@ export {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
-  selectEvents, resolveStdinText,
+  selectEvents, resolveStdinText, delivery,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
