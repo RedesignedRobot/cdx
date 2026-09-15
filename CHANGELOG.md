@@ -1,3 +1,9 @@
+## 7.3.0
+
+- Prompt budget: Claude Code refuses a plugin's `$.prompt.submit` after 50 in one session. The mod used to put the events back and retry every two-second poll, logging each refusal into the transcript forever. Now a budget refusal ends submitting for the session, logs one notice, keeps the events for the next tool result or typed prompt, puts each fresh wake into the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. Any other refusal is retried after the coalesce window and logged once per message.
+- Wake coalescing: an idle head's wake events are held 15 seconds and sent as one prompt, so a burst of lane completions costs one prompt instead of one per poll.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 7.3.0.
+
 ## 7.2.0
 
 - Never block, enforced: the mod's Bash hook denies `cdx wait`, `cdx status --watch`, and `while`/`until` loops around any cdx command from the head and its subagents, with guidance to end the turn and let the `[cdx]` event wake it, or to call `mcp__cdx__status` / `mcp__cdx__events` for a check now. Lanes keep `cdx wait` (they run outside the session).

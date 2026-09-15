@@ -9,10 +9,22 @@ export interface PendingEvent {
 export interface DeliveryState {
   pending: PendingEvent[];
   inTurn: boolean;
+  // When the first undelivered wake event arrived while idle; the submit
+  // waits WAKE_COALESCE_MS from then so one burst costs one prompt.
+  wakeSince?: number;
+  // Prompts the engine accepted this session.
+  submits: number;
+  // The engine refused a submit on its per-session prompt budget; no submit
+  // is tried again this session.
+  budgetSpent: boolean;
 }
 
+// The engine caps a plugin's prompts per session (50 in Claude Code 2.1.x),
+// so wake events are held this long and sent as one prompt.
+export const WAKE_COALESCE_MS = 15_000;
+
 export function initialDeliveryState(): DeliveryState {
-  return { pending: [], inTurn: false };
+  return { pending: [], inTurn: false, submits: 0, budgetSpent: false };
 }
 
 export function formatSubmitText(events: readonly PendingEvent[]): string {
@@ -27,21 +39,52 @@ export function formatContextText(events: readonly PendingEvent[]): string {
 export function afterPoll(
   state: DeliveryState,
   events: readonly PendingEvent[],
-): { state: DeliveryState; toasts: string[]; submit?: { text: string } } {
+  now = Date.now(),
+): { state: DeliveryState; toasts: string[]; submit?: { text: string }; suggest?: { text: string } } {
   const toasts = events.filter((e) => Boolean(e.wake)).map((e) => e.text);
   const pending = [...state.pending, ...events];
+  const wakePending = pending.some((e) => Boolean(e.wake));
 
-  if (!state.inTurn && pending.some((e) => Boolean(e.wake))) {
+  if (state.inTurn || !wakePending) {
+    return { state: { ...state, pending }, toasts };
+  }
+
+  // No prompt left: the events wait for the next tool result or typed
+  // prompt, and a fresh wake goes into the prompt box as a suggestion.
+  if (state.budgetSpent) {
+    const fresh = events.some((e) => Boolean(e.wake));
     return {
-      state: { ...state, pending: [] },
+      state: { ...state, pending },
       toasts,
-      submit: { text: formatSubmitText(pending) },
+      ...(fresh ? { suggest: { text: formatSubmitText(pending) } } : {}),
     };
   }
 
+  const wakeSince = state.wakeSince ?? now;
+  if (now - wakeSince < WAKE_COALESCE_MS) {
+    return { state: { ...state, pending, wakeSince }, toasts };
+  }
+
   return {
-    state: { ...state, pending },
+    state: { ...state, pending: [], wakeSince: undefined, submits: state.submits + 1 },
     toasts,
+    submit: { text: formatSubmitText(pending) },
+  };
+}
+
+// A refused submit puts its events back. A budget refusal ends submitting
+// for the session; any other refusal is retried after the coalesce window.
+export function onSubmitRefused(
+  state: DeliveryState,
+  drained: readonly PendingEvent[],
+  message: string,
+): DeliveryState {
+  return {
+    ...state,
+    pending: [...drained, ...state.pending],
+    wakeSince: undefined,
+    submits: Math.max(0, state.submits - 1),
+    budgetSpent: state.budgetSpent || /budget/i.test(message),
   };
 }
 
@@ -73,8 +116,10 @@ export function onPromptSubmit(
   };
 }
 
+// A running turn drains the buffer through tool results, so a held wake
+// stops waiting for its prompt.
 export function onTurnStart(state: DeliveryState): DeliveryState {
-  return { ...state, inTurn: true };
+  return { ...state, inTurn: true, wakeSince: undefined };
 }
 
 export function onTurnComplete(state: DeliveryState): DeliveryState {
