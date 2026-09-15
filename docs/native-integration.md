@@ -77,7 +77,7 @@ Reference material outside the repo: `/tmp/cdx-mods-reference/mods` (Anthropic's
 
 ### Binding
 
-On `session.start`: `session = await $.session.id()`; `root = await $.plugin.root()`; `CDX = [\"bun\", \`${root}/cdx.ts\`]`. Register every tool in the table, then `/lanes` with `$.command.register({ name: "lanes", ... })` inside a try/catch: Claude Code refuses the name `cdx` because `/cdx` is the user's skill, and a refused command must never stop the tools and the poll. Start `$.clock.every(2000, poll)`. Run `cdx brief`; a non-empty result goes to `$.ui.log` (when `e.surface` is not null) and into the pending buffer as one quiet entry so the first prompt carries it. Then `next(e)`.
+On `session.start`: `session = await $.session.id()`; `root = $.plugin.root`; `CDX = [\"bun\", \`${root}/cdx.ts\`]`. Register every tool in the table, then `/lanes` with `$.command.register({ name: "lanes", ... })` inside a try/catch: Claude Code refuses the name `cdx` because `/cdx` is the user's skill, and a refused command must never stop the tools and the poll. Start `$.clock.every(2000, poll)`. Run `cdx brief`; a non-empty result goes to `$.ui.log` (when `e.surface` is not null) and into the pending buffer as one quiet entry so the first prompt carries it. Then `next(e)`.
 
 Every `$.process.run` on cdx passes `env: { CLAUDE_CODE_SESSION_ID: session }` and `cwd: root`.
 
