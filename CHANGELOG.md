@@ -1,3 +1,15 @@
+## 7.4.0
+
+- Gemini 503 visibility: cdx passes `--log-file logs/<lane>-r<n>.agy.log` to agy and tails it, so agy's in-process retries (which used to be invisible until the round ended) appear in the ledger, in `cdx status` as an `outage` line (`503 no capacity for 30s · agy in-process retry 3 · next retry in 12s · agy retries this round 5`), and on the feed as `progress` events. A burst of three or more consecutive attempts wakes the head once with an `outage` event; an `active` event follows when Gemini answers again. The cdx ladder writes the same state (`cdx ladder 2/6`).
+- False outages: a 503 or interrupted stream that came back after cdx itself stopped agy (max runtime, `cdx kill`, quota abort) no longer starts the ladder or wakes the head as an outage. Two lanes on 2026-09-16 were reported as "503 outage" when the cause was the 40-minute runtime cap.
+- Print timeout race: agy's `--print-timeout` now sits five minutes above `--max-runtime`, so cdx's own cap ends a round, never agy's timer (which returned a partial with exit 0).
+- Quota abort: an `Individual quota reached` retry seen in the agy log stops the round at once, writes the quota block, and emits an `account` event, instead of letting agy retry a spent five-hour window until the runtime cap.
+- Capacity fallback: when the 503 ladder runs out on the policy model, one automatic round continues the same conversation on `gemini.outageFallbackModel` (default `gemini-3.8-flash-medium`; empty disables; anything outside the 3.8 family is refused by config validation). The round is announced as `capacity fallback`, shows `model=... (capacity fallback)` in status, does not count against `maxRounds`, and the next resume returns to the policy model.
+- Capacity notice: every Gemini launch prints the time in Riyadh and US Pacific and whether it falls in the daily 503 peak (17:00-21:00 Riyadh, 07:00-11:00 US Pacific) or the midday bump, with the quiet window as the recommended time. The same line is part of outage wakes and of `cdx doctor`. Windows come from the 265 first-attempt 503s in cdx's logs.
+- Progress digest fix: `steps=0(+0)` for a whole round. The ledger throttle dropped unforced patches while forced token writes (one per step) kept resetting it, so the step counter never landed and the 503 ladder never saw progress. Throttled patches now queue and ride the next write; the runner flushes before finalize.
+- `cdx doctor` names the outage fallback model.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 7.4.0.
+
 ## 7.3.0
 
 - Prompt budget: Claude Code refuses a plugin's `$.prompt.submit` after 50 in one session. The mod used to put the events back and retry every two-second poll, logging each refusal into the transcript forever. Now a budget refusal ends submitting for the session, logs one notice, keeps the events for the next tool result or typed prompt, puts each fresh wake into the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. Any other refusal is retried after the coalesce window and logged once per message.

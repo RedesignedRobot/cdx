@@ -74,6 +74,23 @@ const GEMINI_TRANSPORT_RETRIES = 1;
 // ladder waits out an outage of about a quarter of an hour before giving up.
 const GEMINI_OUTAGE_RETRIES = 6;
 const GEMINI_OUTAGE_BACKOFF_MS = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+// agy's own retry loop (4 s, 6 s, 12 s, 25 s, 50 s, server-supplied) has no
+// tunables and is bounded only by --print-timeout, so cdx's --max-runtime
+// kill has to land first: the print timeout sits this far above the cap.
+const GEMINI_PRINT_TIMEOUT_SLACK_MINS = 5;
+// Gemini capacity follows Google's US serving day. The windows come from
+// cdx's own logs (265 first-attempt 503s up to 2026-09-16): seven in ten
+// landed between 17:00 and 21:00 Riyadh, a second bump 12:00 to 14:00.
+const GEMINI_PEAK_WINDOWS_RIYADH: ReadonlyArray<{ from: number; to: number; label: string }> = [
+  { from: 17, to: 21, label: "daily peak" },
+  { from: 12, to: 14, label: "midday bump" },
+];
+const GEMINI_QUIET_WINDOW_RIYADH = { from: 21, to: 12 };
+// agy logs each in-process retry as one line; cdx tails the per-round log
+// for them so the head sees a 503 burst while agy is still handling it.
+const AGY_RETRY_LINE = /Run: attempt (\d+) failed \((.*)\), retrying in (\S+)$/;
+// A burst this deep (about 22 s of consecutive 503s) is worth waking the head.
+const AGY_RETRY_WAKE_ATTEMPT = 3;
 // Every codex process cdx starts carries these overrides. Native subagents are
 // off because lanes fan out through cdx, and the service tier is pinned to
 // standard: the ChatGPT app writes `service_tier = "priority"` (Fast mode,
@@ -88,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.3.0";
+const VERSION = "7.4.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -202,6 +219,10 @@ interface GeminiConfig {
   reviewAgent: string;
   maxRounds: number;
   maxRuntimeMins: number;
+  // Model for the one automatic round that continues a conversation after
+  // the 503 ladder is exhausted. Stays in the 3.8 family: the medium
+  // reasoning tier answers from its own capacity pool. Empty disables.
+  outageFallbackModel: string;
 }
 
 interface Config {
@@ -390,6 +411,16 @@ interface RoundRecord<S extends WorkState = WorkState> {
   tokensIncomplete?: boolean;
 }
 
+interface LaneOutage {
+  // Which retry layer is waiting: agy's in-process loop or cdx's ladder.
+  layer: "agy" | "cdx";
+  since: string;
+  attempt: number;
+  limit?: number;
+  reason: string;
+  nextRetryAt?: string;
+}
+
 interface Lane {
   work: RoundRecord;
   review?: RoundRecord<ReviewState>;
@@ -417,6 +448,15 @@ interface Lane {
   roundAccount?: AccountChoice & { demand: Demand };
   quotaFailure?: string;
   switchingAccount?: true;
+  // Set when finalize decided the next round continues on the outage
+  // fallback model; the runner opens that round itself.
+  outageFallbackPending?: true;
+  // Model of the current round when it is the outage fallback round.
+  fallbackModel?: string;
+  // Live 503 state for status and the digest; cleared when Gemini answers.
+  outage?: LaneOutage;
+  // agy in-process retries seen this round (from the per-round agy log).
+  agyRetries?: number;
   kind: "work" | "review";
   rounds: number;
   workRounds?: number;
@@ -623,7 +663,7 @@ function parseConfig(text: string): Config {
       configError("gemini must be an object");
     }
     const geminiInput = value as Record<string, unknown>;
-    const geminiAllowed = new Set(["model", "agent", "reviewAgent", "maxRounds", "maxRuntimeMins"]);
+    const geminiAllowed = new Set(["model", "agent", "reviewAgent", "maxRounds", "maxRuntimeMins", "outageFallbackModel"]);
     const unknownGemini = Object.keys(geminiInput).filter((key) => !geminiAllowed.has(key));
     if (unknownGemini.length > 0) {
       configError(`unknown gemini key${unknownGemini.length === 1 ? "" : "s"}: ${unknownGemini.join(", ")}`);
@@ -635,7 +675,10 @@ function parseConfig(text: string): Config {
       reviewAgent: Object.hasOwn(geminiInput, "reviewAgent") ? geminiInput.reviewAgent : defaults.reviewAgent,
       maxRounds: Object.hasOwn(geminiInput, "maxRounds") ? geminiInput.maxRounds : defaults.maxRounds,
       maxRuntimeMins: Object.hasOwn(geminiInput, "maxRuntimeMins") ? geminiInput.maxRuntimeMins : defaults.maxRuntimeMins,
+      outageFallbackModel: Object.hasOwn(geminiInput, "outageFallbackModel") ? geminiInput.outageFallbackModel : defaults.outageFallbackModel,
     };
+    if (typeof values.outageFallbackModel !== "string") configError("gemini.outageFallbackModel must be a string (empty disables the fallback round)");
+    if (/gemini-3\.[0-7]\b|gemini-3\.1\b/.test(values.outageFallbackModel)) configError("gemini.outageFallbackModel must stay in the gemini-3.8 family (owner ruling 2026-09-16: 3.7 and 3.1 are never used)");
     for (const key of ["model", "agent", "reviewAgent"] as const) {
       const field = values[key];
       if (typeof field !== "string" || field.trim().length === 0) configError(`gemini.${key} must be a nonempty string`);
@@ -695,6 +738,7 @@ function geminiConfig(): GeminiConfig {
     reviewAgent: "cdx-review",
     maxRounds: 2,
     maxRuntimeMins: 90,
+    outageFallbackModel: "gemini-3.8-flash-medium",
   };
 }
 
@@ -1144,7 +1188,7 @@ function workStateOf(entry: Lane): WorkState {
 }
 
 function activeStateOf(entry: Lane): WorkState | ReviewState {
-  if (entry.switchingAccount) return "running";
+  if (entry.switchingAccount || entry.outageFallbackPending) return "running";
   return entry.kind === "review" ? entry.review!.state : entry.work.state;
 }
 
@@ -1205,6 +1249,62 @@ function writeDeliveredCount(lane: string, round: number, count: number): void {
 
 function outageMinutes(retries: number): number {
   return Math.round(GEMINI_OUTAGE_BACKOFF_MS.slice(0, retries).reduce((sum, ms) => sum + ms, 0) / 60_000);
+}
+
+function zoneClock(now: Date, timeZone: string): { hour: number; minute: number } {
+  const parts = new Intl.DateTimeFormat("en-GB", { timeZone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(now);
+  const read = (type: string) => Number(parts.find((part) => part.type === type)?.value ?? 0);
+  return { hour: read("hour") % 24, minute: read("minute") };
+}
+
+function clockText(hour: number, minute = 0): string {
+  return `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+}
+
+// Gemini capacity notice, always in both clocks: Riyadh (the owner's) and
+// US Pacific (Google's serving day). Riyadh has no daylight saving, so the
+// window edges convert with the whole-hour offset between the two clocks now.
+function geminiCapacityNotice(now = new Date()): { peak: boolean; text: string } {
+  const riyadh = zoneClock(now, "Asia/Riyadh");
+  const pacific = zoneClock(now, "America/Los_Angeles");
+  const offset = (riyadh.hour - pacific.hour + 24) % 24;
+  const toPacific = (hour: number) => (hour - offset + 24) % 24;
+  const window = (from: number, to: number) => `${clockText(from)}-${clockText(to)} Riyadh (${clockText(toPacific(from))}-${clockText(toPacific(to))} US Pacific)`;
+  const clocks = `${clockText(riyadh.hour, riyadh.minute)} Riyadh / ${clockText(pacific.hour, pacific.minute)} US Pacific`;
+  const quiet = `quiet window ${window(GEMINI_QUIET_WINDOW_RIYADH.from, GEMINI_QUIET_WINDOW_RIYADH.to)}`;
+  const hit = GEMINI_PEAK_WINDOWS_RIYADH.find(({ from, to }) => riyadh.hour >= from && riyadh.hour < to);
+  const main = GEMINI_PEAK_WINDOWS_RIYADH[0]!;
+  if (hit) {
+    return {
+      peak: true,
+      text: `gemini capacity: ${clocks} is inside the ${hit.label} ${window(hit.from, hit.to)} when Google answers 503 no-capacity most often; agy retries in-process and cdx ladders on top, expect a slower round; ${quiet}`,
+    };
+  }
+  return {
+    peak: false,
+    text: `gemini capacity: ${clocks}, off-peak; the next ${main.label} is ${window(main.from, main.to)}; ${quiet}`,
+  };
+}
+
+function parseAgyRetryLine(line: string): { attempt: number; reason: string; delay: string } | undefined {
+  const match = AGY_RETRY_LINE.exec(line.trimEnd());
+  return match ? { attempt: Number(match[1]), reason: match[2]!, delay: match[3]! } : undefined;
+}
+
+// agy prints Go durations ("4s", "1m30s", "250ms").
+function goDurationMs(text: string): number {
+  const units: Record<string, number> = { h: 3_600_000, m: 60_000, s: 1_000, ms: 1 };
+  let total = 0;
+  for (const match of text.matchAll(/(\d+(?:\.\d+)?)(ms|h|m|s)/g)) total += Number(match[1]) * units[match[2]!]!;
+  return total;
+}
+
+function shortGeminiReason(reason: string): string {
+  const kind = classifyGeminiError(reason);
+  if (kind === "503") return "503 no capacity";
+  if (kind === "quota") return "429 quota";
+  if (kind === "transport") return "transport";
+  return singleLine(reason).slice(0, 60);
 }
 
 // A record cdx wrote itself is announced as a notice, never as a head steer,
@@ -1905,7 +2005,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       const existing = ledger[lane];
       if (process.argv[2] !== "_run") requireOwnChild(lane, existing);
       if (existing && laneRunning(existing) && (pidAlive(existing.pid) || pidAlive(existing.codexPid))
-        && !(existing.switchingAccount && existing.pid === process.pid)) {
+        && !((existing.switchingAccount || existing.outageFallbackPending) && existing.pid === process.pid)) {
         throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
       }
       if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
@@ -1981,6 +2081,10 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         ...(hooksActive ? { hooksActive: true } : {}),
         quotaFailure: undefined,
         switchingAccount: undefined,
+        outageFallbackPending: undefined,
+        fallbackModel: undefined,
+        outage: undefined,
+        agyRetries: 0,
         lastAction: undefined,
         lastEventAt: undefined,
         diffEmpty: undefined,
@@ -2025,6 +2129,10 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
   console.log(`cdx: log=${logPathOf(spec.lane, spec.round, jsonMode)} report=${reportPathOf(spec.lane, spec.round)}`);
+  if (spec.engine === "gemini") {
+    const capacity = geminiCapacityNotice();
+    console.log(capacity.peak ? color.yellow(`cdx: ${capacity.text}`) : `cdx: ${capacity.text}`);
+  }
   if (background) {
     const crashLog = openSync(`${ROOT}/logs/${spec.lane}-r${spec.round}.runner.log`, "a");
     const child = nodeSpawn(process.execPath, [SELF, "_run", spec.lane, String(spec.round)], {
@@ -2265,6 +2373,8 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
 function failActiveRound(lane: string, item: Lane, note: string): void {
   if (roundEngine(item) === "gpt") invalidateAccountUsage(item.roundAccount);
   item.switchingAccount = undefined;
+  item.outageFallbackPending = undefined;
+  item.outage = undefined;
   const now = new Date().toISOString();
   const report = availableReportPath(lane, item.rounds);
   if (report?.endsWith(".partial.md")) note = `${singleLine(note)}; partial report=${report}`;
@@ -2450,6 +2560,44 @@ async function runRound(lane: string, round: number): Promise<number> {
     if (!spec || !entry || entry.rounds !== round) return code;
     if (spec.engine === "gemini") {
       try { await refreshGeminiUsage(); } catch { /* best-effort */ }
+    }
+    if (spec.engine === "gemini" && entry.outageFallbackPending) {
+      const policy = config.gemini ?? geminiConfig();
+      const previousModel = spec.model ?? policy.model;
+      try {
+        const thread = entry.kind === "review" ? entry.sessionId : entry.workSessionId ?? entry.sessionId;
+        const partialPath = partialReportPathOf(lane, round);
+        const partial = existsSync(partialPath) ? readFileSync(partialPath, "utf8").trim() : "";
+        const prompt = `The model service was unavailable (503) for about ${outageMinutes(GEMINI_OUTAGE_RETRIES)} minutes; this round continues the same conversation on ${policy.outageFallbackModel}. Continue the task you were working on from where you left off, without redoing completed work.${partial ? `\n\nYour previous round ended with this partial report at ${partialPath}:\n${partial}` : ""}\n\nWhen the task is complete, print your final lane report.`;
+        const opened = await openRound(lane, entry.consult ? "review" : entry.kind, spec.cwd, spec.effort, {
+          engine: "gemini", preserveEngine: true, preserveOwner: true, preserveGate: true, requireSession: true,
+          ...(thread ? { sessionOverride: thread } : {}),
+        });
+        const next = readLane(lane);
+        spec = { ...spec, round: opened.round, mode: "resume", model: policy.outageFallbackModel, sourceThreadId: opened.sessionId, prompt, startedAt: next.roundStartedAt ?? new Date().toISOString() };
+        withLedger((ledger) => {
+          const item = ledger[lane];
+          if (!item) return;
+          item.fallbackModel = policy.outageFallbackModel;
+          // A harness-inserted round does not count against gemini.maxRounds;
+          // the head keeps its full resume budget.
+          if (item.kind === "work" && item.workRounds) item.workRounds -= 1;
+        });
+        writeFileSync(specPathOf(lane, spec.round), JSON.stringify(spec, null, 2));
+        writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, spec.prompt);
+        const notice = `[cdx] lane=${lane} round=${spec.round} capacity fallback: the 503 ladder on ${previousModel} ran out, this round continues the same conversation on ${policy.outageFallbackModel} (3.8 family, lower reasoning tier); the next resume returns to ${policy.model}; review this round's diff with the tier in mind`;
+        feedEvent("outage", notice, spec.ownerSession, { lane, round: spec.round });
+        notifyParent(lane, notice);
+        round = spec.round;
+        continue;
+      } catch (error) {
+        const note = `capacity fallback unavailable: ${error instanceof Error ? error.message : String(error)}`;
+        withLedger((ledger) => failActiveRound(lane, ledger[lane]!, note));
+        if (entry.supervisor) await killChildren(lane, note);
+        feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=failed note=${note} report=${availableReportPath(lane, round) ?? "-"} log=${logPathOf(lane, round, true)} gateExit=not-run verdict=${JSON.stringify(completionVerdict("failed", note))}`, spec.ownerSession, { lane, round });
+        console.error(`cdx: ${note}`);
+        return 1;
+      }
     }
     if (spec.engine !== "gpt" || !entry.quotaFailure || code === 0) {
       if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${roundReportOf(entry) ?? "-"} log=${logPathOf(lane, round, true)} gateExit=${entry.kind === "work" ? entry.gateReceipt?.exitCode ?? "not-run" : "not-run"} verdict=${JSON.stringify(completionVerdict(roundStateOf(entry), roundNoteOf(entry)))}`, entry.ownerSession, { lane, round });
@@ -2753,6 +2901,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     writeFileSync(geminiSchemaPath, `${JSON.stringify(spec.outputSchema, null, 2)}\n`);
   }
   const geminiPolicy = config.gemini ?? geminiConfig();
+  const agyLogPath = `${ROOT}/logs/${lane}-r${round}.agy.log`;
   const geminiArgs = [
     "agy", "--input-format", "stream-json", "--output-format", "stream-json",
     "--model", spec.model ?? geminiPolicy.model, "--dangerously-skip-permissions", "--add-dir", spec.cwd,
@@ -2760,7 +2909,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     "--agent", spec.agent ?? (startingLane?.kind === "review" ? geminiPolicy.reviewAgent : geminiPolicy.agent),
     ...(spec.sourceThreadId ? ["--conversation", spec.sourceThreadId] : []),
     ...(geminiSchemaPath ? ["--json-schema", geminiSchemaPath] : []),
-    "--print-timeout", spec.maxRuntimeMins ? `${spec.maxRuntimeMins}m` : "12h",
+    "--print-timeout", spec.maxRuntimeMins ? `${spec.maxRuntimeMins + GEMINI_PRINT_TIMEOUT_SLACK_MINS}m` : "12h",
+    "--log-file", agyLogPath,
   ];
   const proc = Bun.spawn({
     cmd: gemini ? geminiArgs : appServer ? ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"] : ["codex", ...(spec.codexArgs ?? [])],
@@ -2784,13 +2934,31 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const log = Bun.file(logPath).writer();
   const errLog = Bun.file(`${ROOT}/logs/${lane}-r${round}.stderr.log`).writer();
   let lastFlush = 0;
-  const touchLedger = (patch: (item: Lane) => void, force = false) => {
-    if (!force && Date.now() - lastFlush < 3000) return;
+  // Throttled patches queue instead of dropping. A forced write (token
+  // deltas arrive with every step) used to reset the throttle, so the
+  // unforced step counter never landed and status showed steps=0 all round.
+  let pendingPatches: Array<(item: Lane) => void> = [];
+  let flushTimer: ReturnType<typeof setTimeout> | undefined;
+  const flushLedger = () => {
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = undefined; }
+    if (pendingPatches.length === 0) return;
+    const patches = pendingPatches;
+    pendingPatches = [];
     lastFlush = Date.now();
     withLedger((ledger) => {
       const item = ledger[lane];
-      if (item) { patch(item); item.updatedAt = new Date().toISOString(); }
+      if (!item) return;
+      for (const patch of patches) patch(item);
+      item.updatedAt = new Date().toISOString();
     });
+  };
+  const touchLedger = (patch: (item: Lane) => void, force = false) => {
+    pendingPatches.push(patch);
+    const due = 3000 - (Date.now() - lastFlush);
+    if (force || due <= 0) { flushLedger(); return; }
+    // A quiet stretch after a throttled patch (the model thinking after a
+    // tool step) must not hold the step counter back until the next event.
+    flushTimer ??= setTimeout(flushLedger, due);
   };
 
   // Stall watchdog: a lane that goes quiet gets flagged on the feed without
@@ -2822,6 +2990,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       }, spec.maxRuntimeMins * 60_000)
     : undefined;
   const watchdog = setInterval(() => {
+    flushLedger();
     const quiet = Date.now() - lastEventMs;
     if (quiet >= 300_000 && !lastStallWarn) {
       lastStallWarn = Date.now();
@@ -2858,6 +3027,86 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     geminiTurnsSent += 1;
   };
 
+  // Live 503 state. agy retries in-process first (its per-round log names
+  // each attempt); cdx's ladder takes over when agy returns the error. Both
+  // layers land in item.outage for status, and the head is woken once per
+  // burst, not once per attempt.
+  let roundStepCount = 0;
+  let outageSince: string | undefined;
+  let outageAttempts = 0;
+  let outageAnnounced = false;
+  let earlyAbort: string | undefined;
+  const clearOutage = () => {
+    if (!outageSince) return;
+    const detail = `${outageAttempts} retr${outageAttempts === 1 ? "y" : "ies"} over ${Math.round((Date.now() - Date.parse(outageSince)) / 1000)}s`;
+    outageSince = undefined;
+    outageAttempts = 0;
+    touchLedger((item) => { item.outage = undefined; }, true);
+    if (!outageAnnounced) return;
+    outageAnnounced = false;
+    feedEvent("active", `[cdx] lane=${lane} round=${round} gemini answering again after ${detail}; no action needed`, spec.ownerSession, { lane, round });
+  };
+  const announceOutage = (notice: string) => {
+    if (outageAnnounced) return;
+    outageAnnounced = true;
+    const full = `${notice}; ${geminiCapacityNotice().text}`;
+    feedEvent("outage", full, spec.ownerSession, { lane, round });
+    notifyParent(lane, full);
+  };
+  const onAgyRetry = ({ attempt, reason, delay }: { attempt: number; reason: string; delay: string }) => {
+    const now = new Date().toISOString();
+    const short = shortGeminiReason(reason);
+    outageSince ??= now;
+    outageAttempts += 1;
+    noteActivity();
+    touchLedger((item) => {
+      item.agyRetries = (item.agyRetries ?? 0) + 1;
+      item.outage = { layer: "agy", since: outageSince!, attempt, reason: short, nextRetryAt: new Date(Date.now() + goDurationMs(delay)).toISOString() };
+      item.lastAction = `agy retry ${attempt}: ${short}, next in ${delay}`;
+      item.lastEventAt = now;
+      item.lastActionAt = now;
+    }, true);
+    if (/Individual quota reached/i.test(reason) && !earlyAbort) {
+      // agy would retry a spent five-hour window until its print timeout;
+      // cdx stops the round now and records the block so the next resume
+      // waits for the reset instead of burning the runtime cap.
+      const blockedUntil = parseQuotaResetIso(reason);
+      writeGeminiQuota({ blockedUntil, observedAt: now, lane, round });
+      earlyAbort = `gemini five-hour quota exhausted mid-turn (agy attempt ${attempt}); resets at ${blockedUntil}; resume this lane after the reset, the partial report is kept`;
+      feedEvent("account", `[cdx] lane=${lane} round=${round} ${earlyAbort}`, spec.ownerSession, { lane, round });
+      try { proc.kill("SIGTERM"); } catch { /* already gone */ }
+      return;
+    }
+    if (attempt >= AGY_RETRY_WAKE_ATTEMPT) {
+      announceOutage(`[cdx] lane=${lane} round=${round} gemini ${short}: agy is retrying in-process (attempt ${attempt}, next in ${delay}) and cdx ladders up to ${GEMINI_OUTAGE_RETRIES} more times (~${outageMinutes(GEMINI_OUTAGE_RETRIES)} min) if agy gives up; the process is alive, do not resume or respawn it`);
+    } else {
+      feedEvent("progress", `[cdx] lane=${lane} round=${round} agy retry ${attempt} ${short} next=${delay}`, spec.ownerSession, { lane, round });
+    }
+  };
+  let agyLogOffset = 0;
+  let agyLogCarry = "";
+  const pollAgyLog = () => {
+    let size: number;
+    try { size = statSync(agyLogPath).size; } catch { return; }
+    if (size <= agyLogOffset) return;
+    const chunk = Buffer.alloc(size - agyLogOffset);
+    const fd = openSync(agyLogPath, "r");
+    try { readSync(fd, chunk, 0, chunk.length, agyLogOffset); } finally { closeSync(fd); }
+    agyLogOffset = size;
+    const lines = (agyLogCarry + chunk.toString("utf8")).split("\n");
+    agyLogCarry = lines.pop() ?? "";
+    for (const line of lines) {
+      const retry = parseAgyRetryLine(line);
+      if (retry) onAgyRetry(retry);
+    }
+  };
+  const agyLogPoll = gemini ? setInterval(pollAgyLog, 2_000) : undefined;
+  const stopAgyLogPoll = () => {
+    if (!agyLogPoll) return;
+    clearInterval(agyLogPoll);
+    pollAgyLog();
+  };
+
   const persistCapturedReport = () => {
     const candidate = latestReportCandidate;
     if (!candidate || candidate.order <= writtenReportOrder || !completedTurns.has(candidate.turnId)) return;
@@ -2890,6 +3139,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const observation = toolObservation(event);
     if (!observation) return;
     const progress = trackProgress(observation);
+    roundStepCount = progress.steps;
     touchLedger((item) => {
       item.roundSteps = progress.steps;
       item.lastActionAt = now;
@@ -2942,6 +3192,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
           }
         }
       }
+      if (update.step_type === "tool" || update.step_type === "agent_response") clearOutage();
       if (update.step_type === "tool") {
         const tool = update.tool_name ?? update.tool_info?.name ?? "tool";
         const params = update.tool_info?.parameters;
@@ -2982,18 +3233,29 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const finalAgentResponse = extractFinalAgentResponse(turnAgentResponses);
 
       if (isSuccess) {
+        clearOutage();
         const qualified = await qualifyGeminiResult({
           lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
           turnFailureReason, touchLedger, reportPath,
         });
         turnFailureReason = qualified.turnFailureReason;
       } else {
-        const currentSteps = readLedger()[lane]?.roundSteps ?? 0;
+        const currentSteps = roundStepCount;
         const hasProgress = stepsAtLastContinuation !== undefined && currentSteps > stepsAtLastContinuation;
         const kind = classifyGeminiError(errorText);
         const isTransport = kind === "transport" || kind === "503";
 
-        if (isTransport && proc.exitCode !== null) {
+        if (earlyAbort || maxRuntimeHit || receivedSignal) {
+          // cdx stopped agy itself (quota abort, runtime cap, kill). The 503
+          // or interrupted stream that came back with the result is the
+          // stop, not an outage, so no ladder and no wake.
+          turnFailureReason = earlyAbort ?? turnFailureReason ?? `stopped by cdx with a ${kind} error in flight`;
+          const qualified = await qualifyGeminiResult({
+            lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
+            turnFailureReason, touchLedger, reportPath,
+          });
+          turnFailureReason = qualified.turnFailureReason ?? turnFailureReason;
+        } else if (isTransport && proc.exitCode !== null) {
           turnFailureReason = "transport death; cdx resume continues from the partial";
           const qualified = await qualifyGeminiResult({
             lane, round, ownerSession: spec.ownerSession, result, finalAgentResponse, isReview,
@@ -3018,10 +3280,20 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
             const reason = singleLine(errorText).slice(0, 80);
             const waitNotice = retryDecision.backoffMs > 0 ? ` wait=${retryDecision.backoffMs / 1000}s` : "";
             feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${retryDecision.limit}${waitNotice} reason=${reason}`, spec.ownerSession, { lane, round });
-            if (kind === "503" && geminiContinuations === 1) {
-              const notice = `[cdx] lane=${lane} round=${round} gemini 503 outage: the process is alive and cdx retries up to ${retryDecision.limit} times over ~${outageMinutes(retryDecision.limit)} min; do not resume or respawn it, a terminal event follows if the outage outlasts the ladder`;
-              feedEvent("outage", notice, spec.ownerSession, { lane, round });
-              notifyParent(lane, notice);
+            outageSince ??= now;
+            outageAttempts += 1;
+            const short = shortGeminiReason(errorText);
+            const ladderOutage: LaneOutage = { layer: "cdx", since: outageSince, attempt: geminiContinuations, limit: retryDecision.limit, reason: short, nextRetryAt: new Date(Date.now() + retryDecision.backoffMs).toISOString() };
+            touchLedger((item) => {
+              item.outage = ladderOutage;
+              item.lastAction = `cdx ladder ${geminiContinuations}/${retryDecision.limit}: ${short}, retry in ${Math.round(retryDecision.backoffMs / 1000)}s`;
+              item.lastActionAt = now;
+            }, true);
+            if (kind === "503") {
+              const fallback = geminiPolicy.outageFallbackModel && spec.model !== geminiPolicy.outageFallbackModel
+                ? `, then one round on ${geminiPolicy.outageFallbackModel} continues the same conversation`
+                : "";
+              announceOutage(`[cdx] lane=${lane} round=${round} gemini 503 outage: agy gave up after its in-process retries; the process is alive and cdx retries up to ${retryDecision.limit} times over ~${outageMinutes(retryDecision.limit)} min${fallback}; do not resume or respawn it, a terminal event follows if the outage outlasts all of that`);
             }
             const response = typeof result.response === "string" ? result.response.trim() : "";
             const partial = finalAgentResponse || response;
@@ -3252,7 +3524,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     exitCode = await proc.exited;
     await Promise.allSettled([stdoutPump, stderrPump]);
     if (geminiTurnsCompleted < geminiTurnsSent && !maxRuntimeHit && !receivedSignal) {
-      turnFailureReason ??= `agy exited before result (${geminiTurnsCompleted}/${geminiTurnsSent} turns completed)`;
+      turnFailureReason ??= earlyAbort ?? `agy exited before result (${geminiTurnsCompleted}/${geminiTurnsSent} turns completed)`;
     }
     if (turnFailureReason) exitCode ||= 1;
   } else if (appServer) {
@@ -3482,6 +3754,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         exitCode = proc.exitCode ?? 143;
       } else {
         clearInterval(watchdog);
+        stopAgyLogPoll();
         if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
         if (maxRuntimeForceTimer) clearTimeout(maxRuntimeForceTimer);
         log.end();
@@ -3500,6 +3773,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     turnFailureReason = undefined;
   }
   clearInterval(watchdog);
+  stopAgyLogPoll();
   if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
   if (maxRuntimeForceTimer) clearTimeout(maxRuntimeForceTimer);
   log.end();
@@ -3507,6 +3781,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   process.off("SIGTERM", onTerm);
   process.off("SIGINT", onInt);
 
+  flushLedger();
   return finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
@@ -3547,6 +3822,13 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   if (!gemini && !receivedSignal && !maxRuntimeHit && exitCode !== 0 && isCodexQuotaFailure(stderrText)) recordCodexExhaustion(spec, stderrText);
   const beforeFinalize = readLedger()[lane];
   const retryQuota = !gemini && !receivedSignal && !maxRuntimeHit && (exitCode !== 0 || Boolean(turnFailureReason)) && Boolean(beforeFinalize?.quotaFailure);
+  // The 503 ladder ran out on the policy model: one more round continues the
+  // same conversation on the fallback tier (same 3.8 family, own capacity
+  // pool). The runner opens it; the lane stays "running" meanwhile.
+  const geminiPolicy = config.gemini ?? geminiConfig();
+  const ladderExhausted = gemini && turnFailureReason === "gemini service unavailable (503)" && geminiContinuations >= GEMINI_OUTAGE_RETRIES;
+  const fallbackRound = ladderExhausted && !receivedSignal && !maxRuntimeHit
+    && Boolean(geminiPolicy.outageFallbackModel) && spec.model !== geminiPolicy.outageFallbackModel && Boolean(beforeFinalize?.sessionId);
   const reviewModifiedPath = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(spec.cwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
@@ -3596,7 +3878,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   // A supervisor's round ends with its children. Whatever the outcome, any
   // child still running is stopped so nothing keeps editing after the
   // report; a round that finished with children running cannot be done.
-  const orphanedChildren = (beforeFinalize?.kind === "work" || beforeFinalize?.consult) && beforeFinalize.supervisor && !retryQuota
+  const orphanedChildren = (beforeFinalize?.kind === "work" || beforeFinalize?.consult) && beforeFinalize.supervisor && !retryQuota && !fallbackRound
     ? await killChildren(lane, receivedSignal ? `supervisor ${lane} killed` : maxRuntimeHit ? `supervisor ${lane} hit max runtime` : `supervisor ${lane} round ${round} ended`)
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
@@ -3638,9 +3920,11 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
         const continuePrefix = geminiContinuations > 0
           ? `turn failed after ${geminiContinuations} auto-continue${geminiContinuations === 1 ? "" : "s"}`
           : "turn failed";
-        roundNote = turnFailureReason === "gemini service unavailable (503)" && geminiContinuations >= GEMINI_OUTAGE_RETRIES
-          ? `gemini 503 outage outlasted ${geminiContinuations} auto-retries (~${outageMinutes(geminiContinuations)} min); when Gemini answers again run cdx resume ${lane}, the partial report is kept`
-          : `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
+        roundNote = fallbackRound
+          ? `gemini 503 outage outlasted ${geminiContinuations} auto-retries (~${outageMinutes(geminiContinuations)} min) on ${spec.model}; round ${round + 1} continues the conversation on ${geminiPolicy.outageFallbackModel}`
+          : ladderExhausted
+            ? `gemini 503 outage outlasted ${geminiContinuations} auto-retries (~${outageMinutes(geminiContinuations)} min)${spec.model === geminiPolicy.outageFallbackModel ? ` on the fallback model ${spec.model} too` : ""}; when Gemini answers again run cdx resume ${lane}, the partial report is kept`
+            : `${continuePrefix}: ${turnFailureReason.slice(0, 200)}`;
       }
     }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
@@ -3687,7 +3971,9 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     }
     item.pid = undefined;
     item.codexPid = undefined;
+    item.outage = undefined;
     if (retryQuota) { item.switchingAccount = true; item.pid = process.pid; }
+    if (fallbackRound) { item.outageFallbackPending = true; item.pid = process.pid; }
     if (existsSync(reportPath)) item.reports.push(reportPath);
     if (geminiContinuations > 0) item.continuations = geminiContinuations;
     item.updatedAt = new Date().toISOString();
@@ -3712,8 +3998,8 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const roundIncomplete = entry.kind === "review" ? entry.review?.tokensIncomplete : entry.work.tokensIncomplete;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
-  if (finalRoundState === "failed" || finalRoundState === "gate-invalid") {
+  if (!entry.quotaFailure && !fallbackRound) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
+  if (!fallbackRound && (finalRoundState === "failed" || finalRoundState === "gate-invalid")) {
     notifyParent(lane, `[cdx] child lane=${lane} round=${round} state=${finalRoundState}${finalRoundNote ? ` note=${finalRoundNote}` : ""} report=${capturedReport ?? "-"}; read the report or partial before deciding between cdx resume ${lane} and a new lane`);
   }
   console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${capturedReport ?? "-"}`);
@@ -4415,6 +4701,16 @@ function statusAge(iso: string | undefined, now: number): string {
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.round(seconds / 60)}m` : `${(seconds / 3600).toFixed(1)}h`;
 }
 
+function outageText(outage: LaneOutage, agyRetries: number | undefined, now = Date.now()): string {
+  const layer = outage.layer === "agy"
+    ? `agy in-process retry ${outage.attempt}`
+    : `cdx ladder ${outage.attempt}/${outage.limit ?? GEMINI_OUTAGE_RETRIES}`;
+  const nextMs = outage.nextRetryAt ? Date.parse(outage.nextRetryAt) - now : Number.NaN;
+  const next = Number.isFinite(nextMs) ? (nextMs > 0 ? `next retry in ${Math.round(nextMs / 1000)}s` : "retry in flight") : "";
+  const total = agyRetries ? `agy retries this round ${agyRetries}` : "";
+  return [`${outage.reason} for ${statusAge(outage.since, now)}`, layer, next, total].filter(Boolean).join(" · ");
+}
+
 function laneProgress(entry: Lane, files: number | undefined, now = Date.now()): string {
   const stage = entry.stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)}` : entry.stage ?? "working";
   return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
@@ -4433,7 +4729,8 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : "";
   const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
   const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
-  const modelDetail = engine === "gpt" && entry.model ? `  model=${entry.model}` : "";
+  const modelDetail = engine === "gpt" && entry.model ? `  model=${entry.model}`
+    : engine === "gemini" && active && entry.fallbackModel ? `  model=${entry.fallbackModel} (capacity fallback)` : "";
   const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
   const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.consult ? "consult" : "work"}${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
@@ -4460,6 +4757,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : lastParts.join(" · ") || "-";
   const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
   if (active) lines.push(line("progress", laneProgress(entry, changedFileCount(entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd))));
+  if (active && entry.outage) lines.push(line("outage", color.yellow(outageText(entry.outage, entry.agyRetries))));
   const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
   if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
   if (entry.review?.state && !entry.consult) {
@@ -6379,6 +6677,10 @@ async function doctorCommand(argv: string[]) {
     }
 
     await checkDoctorGeminiModel(good, warn, bad);
+    const capacity = geminiCapacityNotice();
+    (capacity.peak ? warn : good)(capacity.text);
+    const fallback = (config.gemini ?? geminiConfig()).outageFallbackModel;
+    good(`gemini outage fallback: ${fallback ? `${fallback} for one round after the 503 ladder` : "off"}`);
   } else {
     warn("agy usage: unavailable");
     const quotaState = geminiQuotaState();
@@ -7231,6 +7533,7 @@ export {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
+  geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText, GEMINI_PEAK_WINDOWS_RIYADH,
   selectEvents, resolveStdinText, delivery,
 };
 
