@@ -264,7 +264,7 @@ export function register(on: On) {
 
   on(
     "tool.call",
-    { tool: TOOL_NAMES.map((name) => `${CDX_TOOL_PREFIX}${name}`) },
+    { tool: TOOL_NAMES.map((name) => `${CDX_TOOL_PREFIX}${name}` as `mcp__cdx__${string}`) },
     async ($, e) => {
     const toolName = e.tool.startsWith(CDX_TOOL_PREFIX)
       ? e.tool.slice(CDX_TOOL_PREFIX.length)
