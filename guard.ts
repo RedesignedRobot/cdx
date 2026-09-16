@@ -401,3 +401,24 @@ export function blockingCdxRefusal(kind: BlockingCdx): string {
     + "To check right now, call mcp__cdx__status or mcp__cdx__events. "
     + "If nothing else is pending, ending the turn is the correct move, not a wait.";
 }
+
+// Inside Claude Code every cdx command with a native tool goes through the
+// plugin: the tool runs in the session directory and its result lands in
+// the transcript, while a shell invocation guesses a cwd and drifts with the
+// last `cd`. The shell form stays for lanes and terminals outside Claude Code.
+export function nativeCdxCommand(command: string, nativeTools: ReadonlySet<string>): string | undefined {
+  const clean = stripHeredocBodies(stripQuotedPreservingSubstitutions(command), command);
+  for (const segment of clean.split(/[;&|()\n]+/)) {
+    const words = segment.trim().split(/\s+/).filter(Boolean);
+    if (words.length === 0) continue;
+    const invocation = cdxInvocation(words, commandStart(words));
+    if (invocation && nativeTools.has(invocation.subcommand)) return invocation.subcommand;
+  }
+  return undefined;
+}
+
+export function nativeCdxRefusal(subcommand: string): string {
+  return `cdx ${subcommand} from the shell is refused inside Claude Code; call mcp__cdx__${subcommand} instead. `
+    + "The native tool runs in the session directory and keeps the result in the transcript; "
+    + "the shell form is for lanes and terminals outside Claude Code.";
+}

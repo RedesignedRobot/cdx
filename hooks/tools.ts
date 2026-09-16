@@ -27,7 +27,7 @@ export const TOOLS: ToolDefinition[] = [
         engine: { type: "string", enum: ["gpt", "gemini"], description: "Execution engine" },
         model: { type: "string", description: "Model alias or id" },
         supervisor: { type: "boolean", description: "Run lane as supervisor" },
-        cd: { type: "string", description: "Working directory, absolute or relative to the session directory; with worktree, the repository the worktree is cut from" },
+        cd: { type: "string", description: "Absolute path of the repository the lane runs in (required: the session directory follows the shell, so the tool never guesses); with worktree, the repository the worktree is cut from" },
         worktree: { type: "string", description: "Worktree path or name" },
         gate: { type: "string", description: "Verification command to run before reporting" },
         pre: { type: "string", description: "Setup command to run before starting work" },
@@ -38,7 +38,7 @@ export const TOOLS: ToolDefinition[] = [
         schema: { type: "string", description: "Structured output JSON schema path" },
         images: { type: "array", items: { type: "string" }, description: "Image paths to attach" },
       },
-      required: ["lane", "brief"],
+      required: ["lane", "brief", "cd"],
     },
     run: (input) => {
       const argv = ["spawn", String(input.lane)];
@@ -102,10 +102,10 @@ export const TOOLS: ToolDefinition[] = [
         supervisor: { type: "boolean", description: "Run consultation as supervisor" },
         model: { type: "string", description: "Model alias or id" },
         effort: { type: "string", description: "Reasoning effort" },
-        cd: { type: "string", description: "Working directory, absolute or relative to the session directory; with worktree, the repository the worktree is cut from" },
+        cd: { type: "string", description: "Absolute path of the repository the lane runs in (required: the session directory follows the shell, so the tool never guesses); with worktree, the repository the worktree is cut from" },
         account: { type: "string", description: "Account name" },
       },
-      required: ["lane", "question"],
+      required: ["lane", "question", "cd"],
     },
     run: (input) => {
       const argv = ["consult", String(input.lane)];
@@ -129,14 +129,14 @@ export const TOOLS: ToolDefinition[] = [
         engine: { type: "string", enum: ["gpt", "gemini"], description: "Execution engine" },
         model: { type: "string", description: "Model alias or id" },
         effort: { type: "string", description: "Reasoning effort" },
-        cd: { type: "string", description: "Working directory, absolute or relative to the session directory; with worktree, the repository the worktree is cut from" },
+        cd: { type: "string", description: "Absolute path of the repository the lane runs in (required: the session directory follows the shell, so the tool never guesses); with worktree, the repository the worktree is cut from" },
         uncommitted: { type: "boolean", description: "Review uncommitted changes" },
         base: { type: "string", description: "Base branch to compare against" },
         commit: { type: "string", description: "Specific commit to review" },
         scope: { type: "string", description: "File path pattern scope" },
         intent: { type: "string", description: "Review intent or focus" },
       },
-      required: ["lane"],
+      required: ["lane", "cd"],
     },
     run: (input) => {
       const argv = ["review", String(input.lane)];
