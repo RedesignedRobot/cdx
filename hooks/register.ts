@@ -292,6 +292,9 @@ export function register(on: On) {
     }
     const toolInput = (e as { input?: Record<string, unknown> }).input ?? (e as Record<string, unknown>);
     const runSpec = def.run(toolInput);
+    // Tool commands run where the head works, not in the plugin root: a
+    // spawn --worktree without cd cuts from the caller's directory, and a
+    // relative cd resolves against it.
     const procInit: {
       env: Record<string, string>;
       cwd: string;
@@ -299,7 +302,7 @@ export function register(on: On) {
       timeoutMs?: number;
     } = {
       env: { CLAUDE_CODE_SESSION_ID: session },
-      cwd: root,
+      cwd: await $.session.cwd().catch(() => root),
     };
     if (runSpec.stdin !== undefined) {
       procInit.stdin = runSpec.stdin;

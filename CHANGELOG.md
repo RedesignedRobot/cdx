@@ -1,3 +1,9 @@
+## 7.4.1
+
+- Spawn directory: the native tools ran every cdx command in the plugin root, so `mcp__cdx__spawn` with `worktree` and no `cd` cut the worktree from ~/code/cdx instead of the head's repository. Tool commands now run in the session directory, and `cd` resolves against it.
+- Stale worktree source: a respawn under a closed lane name kept the old `worktreeRepo` even with `--cd`, and failed with "cwd does not exist" without it once the worktree was removed. `spawnRoots` now takes an explicit `--cd` outright, keeps a reused lane's directory and repository only while that directory exists, and falls back to the caller's directory. Two lanes cut from the wrong repository on 2026-09-17 motivated both fixes.
+- Version alignment: cdx.ts VERSION, package.json and plugin.json align to 7.4.1.
+
 ## 7.4.0
 
 - Gemini 503 visibility: cdx passes `--log-file logs/<lane>-r<n>.agy.log` to agy and tails it, so agy's in-process retries (which used to be invisible until the round ended) appear in the ledger, in `cdx status` as an `outage` line (`503 no capacity for 30s · agy in-process retry 3 · next retry in 12s · agy retries this round 5`), and on the feed as `progress` events. A burst of three or more consecutive attempts wakes the head once with an `outage` event; an `active` event follows when Gemini answers again. The cdx ladder writes the same state (`cdx ladder 2/6`).

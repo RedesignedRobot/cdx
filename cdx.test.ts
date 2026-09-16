@@ -10,7 +10,7 @@ import {
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
   geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText,
-  selectEvents, statusLine, resolveStdinText, delivery,
+  selectEvents, statusLine, resolveStdinText, delivery, spawnRoots,
 } from "./cdx.ts";
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
@@ -1032,4 +1032,15 @@ test("gemini.outageFallbackModel defaults to the 3.8 medium tier, accepts empty,
   expect(parseConfig(JSON.stringify({ gemini: { maxRounds: 3 } })).gemini?.outageFallbackModel).toBe("gemini-3.8-flash-medium");
   expect(() => parseConfig(JSON.stringify({ gemini: { outageFallbackModel: "gemini-3.7-flash-high" } }))).toThrow(/3\.8 family/);
   expect(() => parseConfig(JSON.stringify({ gemini: { outageFallbackModel: "gemini-3.1-pro-high" } }))).toThrow(/3\.8 family/);
+});
+
+test("spawn roots follow an explicit cd, else a still-present lane directory, else the caller", () => {
+  const exists = (path: string) => path === "/wt/old";
+  const lane = { work: { cwd: "/wt/old" }, worktreeRepo: "/repo-a", worktreePath: "/wt/old" } as Parameters<typeof spawnRoots>[1];
+  expect(spawnRoots("/repo-b", lane, "/elsewhere", exists)).toEqual({ cwd: "/repo-b", worktreeRepo: "/repo-b" });
+  expect(spawnRoots("sub", undefined, "/repo-b", exists)).toEqual({ cwd: "/repo-b/sub", worktreeRepo: "/repo-b/sub" });
+  expect(spawnRoots(undefined, lane, "/elsewhere", exists)).toEqual({ cwd: "/wt/old", worktreeRepo: "/repo-a" });
+  const removed = { ...lane, work: { cwd: "/wt/gone" }, worktreePath: "/wt/gone" } as typeof lane;
+  expect(spawnRoots(undefined, removed, "/repo-b", exists)).toEqual({ cwd: "/repo-b", worktreeRepo: "/repo-b" });
+  expect(spawnRoots(undefined, undefined, "/repo-b", exists)).toEqual({ cwd: "/repo-b", worktreeRepo: "/repo-b" });
 });
