@@ -383,9 +383,10 @@ test("Rank 3: child Astra is refused across all resolution routes while head Ast
   expect(() => checkChildAstraRefusal(true, "gpt", "gpt-5-codex")).not.toThrow();
   expect(() => checkChildAstraRefusal(true, "gemini", undefined)).not.toThrow();
 
-  // Native subagent disabling flags are passed to GPT sessions
+  // Native subagent disabling flags and the standard service tier are passed to GPT sessions
   expect(CODEX_DISABLE_NATIVE_SUBAGENTS).toEqual([
     "-c", "agents.enabled=false",
+    "-c", 'service_tier="default"',
     "--disable", "multi_agent",
     "--disable", "multi_agent_v2",
   ]);
