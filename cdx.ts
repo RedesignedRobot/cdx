@@ -34,11 +34,11 @@
 // Worktree creation runs config.worktreeSetup if set, followed by an executable
 // .cdx-worktree-setup at the new worktree root if present.
 //
-// CLI facts this harness absorbs (codex-cli 0.149.1, verified):
+// CLI facts this harness absorbs (codex-cli 0.154.0, verified):
 // - Work rounds use app-server JSON-RPC over newline-delimited stdio. Reviews
 //   stay on `codex exec` and `codex review` as read-only one-shot commands.
 // - app-server uses thread/start, thread/resume, thread/fork, turn/start, and
-//   turn/steer. turn/steer requires the active expectedTurnId on 0.149.1.
+//   turn/steer. turn/steer requires the active expectedTurnId on 0.149.1 and later.
 // - `codex review` takes exactly one of --uncommitted/--base/--commit OR a
 //   custom prompt, never both; it reviews the process cwd.
 // - app-server emits thread/started, turn/started, item/*,
@@ -6598,7 +6598,7 @@ async function doctorCommand(argv: string[]) {
         const detail = error instanceof Error ? error.message : String(error);
         const remedy = /auth|login|401|unauthorized/i.test(detail) ? "run `codex login`"
           : /model/i.test(detail) ? `model ${config.model} rejected; check \`codex features\` and account access`
-          : "check the 0.149.1 app-server schema, network, and `codex login status`";
+          : "check the 0.154.0 app-server schema, network, and `codex login status`";
         bad("probe", detail.slice(0, 240), remedy);
       }
     }
