@@ -74,8 +74,15 @@ const GEMINI_TRANSPORT_RETRIES = 1;
 // ladder waits out an outage of about a quarter of an hour before giving up.
 const GEMINI_OUTAGE_RETRIES = 6;
 const GEMINI_OUTAGE_BACKOFF_MS = [30_000, 60_000, 120_000, 240_000, 300_000, 300_000];
+// Every codex process cdx starts carries these overrides. Native subagents are
+// off because lanes fan out through cdx, and the service tier is pinned to
+// standard: the ChatGPT app writes `service_tier = "priority"` (Fast mode,
+// "1.5x speed, increased usage") into each codex home's config.toml, and a
+// lane running at that tier drains the weekly window faster for no gain in
+// a background job (usage study 2026-09-16).
 const CODEX_DISABLE_NATIVE_SUBAGENTS = [
   "-c", "agents.enabled=false",
+  "-c", 'service_tier="default"',
   "--disable", "multi_agent",
   "--disable", "multi_agent_v2",
 ];
@@ -2309,6 +2316,7 @@ function appThreadParams(spec: Spec): Record<string, unknown> {
   const configOverrides: Record<string, unknown> = {
     agents: { enabled: false },
     features: { multi_agent: false, multi_agent_v2: false },
+    service_tier: "default",
   };
   if (spec.additionalDirectories?.length) {
     configOverrides.sandbox_workspace_write = { writable_roots: spec.additionalDirectories };
