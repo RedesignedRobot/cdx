@@ -12,6 +12,10 @@ import {
   selectEvents, statusLine, resolveStdinText, delivery,
 } from "./cdx.ts";
 
+import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
+import { blockingCdxCommand } from "./guard.ts";
+import { TOOLS_BY_NAME } from "./hooks/tools.ts";
+
 // Keep tests pure. Pass state explicitly so these tests
 // never read user files, spawn engines, or wait on timers.
 const state = {
@@ -802,4 +806,183 @@ test("adviceLines lists banked credits and tells a thin account to redeem", () =
   expect(lines[0]).toMatch(/^advice: spend codex-3 .*, then codex-2 .*, then codex-1/);
   expect(lines[2]).toMatch(/^  reset credits: codex-1 1 reset credit, expires .*; codex-2 2 reset credits, expire .* and .*; redeem one on codex-1 now for a full window/);
   expect(adviceLines([standingWith("codex-3", 30, [])], now)).toHaveLength(2);
+});
+
+
+test("receipt admission requires a successful unchanged tree from the current work round", () => {
+  const before = { head: "commit-a", tree: "tree-a" };
+  const receipt = makeGateReceipt(2, "/repo", "check", 0, "finished", before, before);
+  expect(receiptRefusal(receipt, { round: 2, state: "done", exitCode: 0 })).toBeUndefined();
+  expect(receiptRefusal(receipt, { round: 2, state: "closed", exitCode: 0 })).toBeUndefined();
+  expect(receiptRefusal(receipt, { round: 2, state: "closed", exitCode: 1 })).toContain("did not exit");
+  expect(receiptRefusal(undefined, { round: 2, state: "done", exitCode: 0 })).toContain("no content-bound");
+  expect(receiptRefusal(receipt, { round: 3, state: "done", exitCode: 0 })).toContain("older");
+  expect(receiptRefusal(receipt, { round: 2, state: "running" })).toContain("running");
+  for (const after of [{ ...before, tree: "tree-b" }, { ...before, head: "commit-b" }]) {
+    const changed = makeGateReceipt(2, "/repo", "check", 0, "finished", before, after);
+    expect(receiptRefusal(changed, { round: 2, state: "done", exitCode: 0 })).toBe("tree changed during gate");
+  }
+  expect(makeGateReceipt(2, "/repo", "check", 1, "finished", before, before).valid).toBe(false);
+  expect(makeGateReceipt(2, "/repo", "check", 0, "finished").valid).toBe(false);
+  expect(makeGateReceipt(2, "/repo", "check", 0, "finished", before, before, "snapshot failed").valid).toBe(false);
+});
+
+test("required gate survives a missing lane gate and isolates shell control commands", () => {
+  expect(composeGate("check-all", undefined)).toBe("check-all");
+  expect(composeGate(" check-all ", "check-all")).toBe("check-all");
+  expect(composeGate(undefined, "spec")).toBe("spec");
+  expect(composeGate(undefined, undefined)).toBeUndefined();
+  expect(composeGate("check-all", "exit 0")).toBe("(/bin/sh -lc 'check-all') && (/bin/sh -lc 'exit 0')");
+  expect(shellQuote("echo 'ok'")).toBe("'echo '\"'\"'ok'\"'\"''");
+});
+
+test("job target must be explicit in CLI and native tool", () => {
+  expect(() => jobCwd(undefined)).toThrow("requires --cd");
+  expect(() => jobCwd(" ")).toThrow("requires --cd");
+  expect(jobCwd("/repo/child/..")).toBe("/repo");
+  expect(TOOLS_BY_NAME.get("job")!.inputSchema.required).toContain("cd");
+  expect(TOOLS_BY_NAME.get("gate-receipt")!.run({ lane: "lane" }).argv).toEqual(["gate-receipt", "lane", "--json"]);
+});
+
+test("resume unions directories and passes repeated add-dir flags", () => {
+  expect(mergeDirectories(["/one"], ["/two", "/one"])).toEqual(["/one", "/two"]);
+  expect(mergeDirectories()).toEqual([]);
+  const parsed = parseArgs(["lane", "--add-dir", "/one", "--add-dir", "/two", "continue"], ["add-dir"]);
+  expect(parsed.lists["add-dir"]).toEqual(["/one", "/two"]);
+  expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "lane", followUp: "continue", addDirs: ["/one", "/two"] }).argv)
+    .toEqual(["resume", "lane", "--add-dir", "/one", "--add-dir", "/two", "--bg", "-"]);
+});
+
+test("worktree reuse needs the exact lane branch, repository and clean files", () => {
+  expect(worktreeReuseRefusal("lane/a", "lane/a", true, true)).toBeUndefined();
+  expect(worktreeReuseRefusal("lane/a", "lane/b", true, true)).toBeDefined();
+  expect(worktreeReuseRefusal("lane/a", "lane/a", false, true)).toBeDefined();
+  expect(worktreeReuseRefusal("lane/a", "lane/a", true, false)).toBeDefined();
+});
+
+test("cleanup refuses dirty, unmerged or switched worktrees including main", () => {
+  expect(cleanupRefusal("lane/a", "lane/a", true, true)).toBeUndefined();
+  expect(cleanupRefusal("lane/a", "lane/a", false, true)).toBeDefined();
+  expect(cleanupRefusal("lane/a", "lane/a", true, false)).toBeDefined();
+  expect(cleanupRefusal("lane/a", "lane/b", true, true)).toBeDefined();
+  expect(cleanupRefusal("main", "main", true, true)).toBeDefined();
+  expect(cleanupRefusal(undefined, "lane/a", true, true)).toBeDefined();
+});
+
+test("completion verdict includes failure reason on one bounded line", () => {
+  expect(completionVerdict("done")).toBe("done");
+  expect(completionVerdict("failed", "gate failed\ninspect log")).toBe("failed: gate failed inspect log");
+  expect(completionVerdict("failed", "x".repeat(500)).length).toBe(240);
+});
+
+
+test("follow-tail recognizes quoted cdx logs without claiming unrelated round-named files", () => {
+  expect(blockingCdxCommand('tail -f "/Users/a/.cdx/logs/lane-r1.log"')).toBe("tail -f");
+  expect(blockingCdxCommand("tail -F '/Users/a/.cdx/logs/lane-r1.log'")).toBe("tail -f");
+  expect(blockingCdxCommand('tail -f "${CDX_HOME}/logs/lane-r1.log"')).toBe("tail -f");
+  expect(blockingCdxCommand("tail -f /var/log/import-r1.log")).toBeUndefined();
+  expect(blockingCdxCommand('tail -n 20 "/Users/a/.cdx/logs/lane-r1.log"')).toBeUndefined();
+});
+
+test("bounded for-loop polling with sleep is denied while finite report batches stay allowed", () => {
+  expect(blockingCdxCommand("for n in 1 2 3; do cdx status; sleep 5; done")).toBeDefined();
+  expect(blockingCdxCommand("for lane in a b; do cdx report $lane; done")).toBeUndefined();
+});
+
+
+test("non-Git gates retain shell verdicts but never supply content proof", () => {
+  const absent = makeGateReceipt(1, "/notes", "test -s report", 0, "finished");
+  expect(gateAcceptanceFailed(0, absent, false)).toBe(false);
+  expect(receiptRefusal(absent, { round: 1, state: "done", exitCode: 0 })).toBeDefined();
+  expect(gateAcceptanceFailed(0, absent, true)).toBe(true);
+  expect(gateAcceptanceFailed(1, absent, false)).toBe(true);
+  expect(gateAcceptanceFailed(undefined, undefined, false)).toBe(false);
+});
+
+
+test("close can keep an abandoned worktree without selecting cleanup", () => {
+  const flags = parseArgs(["lane", "--keep-worktree"], ["keep-worktree", "remove-worktree"]).bools;
+  expect(closeKeepsWorktree(flags)).toBe(true);
+  expect(closeKeepsWorktree(new Set())).toBe(false);
+  expect(closeKeepsWorktree(new Set(["remove-worktree"]))).toBe(false);
+  expect(() => closeKeepsWorktree(new Set(["remove-worktree", "keep-worktree"]))).toThrow("cannot be combined");
+  const commands = worktreeCleanupCommands({ worktreeRepo: "/repo", worktreePath: "/repo-wt", branch: "lane/fix" });
+  expect(commands[0]).toContain("worktree remove '/repo-wt'");
+  expect(commands[1]).toContain("merge-base --is-ancestor 'refs/heads/lane/fix' refs/heads/main &&");
+  expect(TOOLS_BY_NAME.get("close")!.run({ lane: "lane", keepWorktree: true, note: "abandoned" }))
+    .toEqual({ argv: ["close", "lane", "--keep-worktree", "-"], stdin: "abandoned" });
+});
+
+test("cleanup uses proven main ancestry when primary HEAD and upstream lack the lane commit", () => {
+  const entry = { worktreeRepo: "/repo", worktreePath: "/wt", branch: "lane/fix" };
+  const run = (merged: boolean) => {
+    let present = true;
+    let branchPresent = true;
+    let proved = false;
+    const git = (cwd: string, args: string[]) => {
+      let success = true;
+      let stdout = "";
+      if (args[0] === "symbolic-ref") stdout = cwd === "/wt" ? "lane/fix" : "unrelated";
+      if (args[0] === "merge-base") {
+        proved = merged && args[2] === "refs/heads/lane/fix" && args[3] === "refs/heads/main";
+        success = proved;
+      }
+      if (args[0] === "worktree") {
+        expect(proved).toBe(true);
+        present = false;
+      }
+      if (args[0] === "branch") {
+        success = proved && args[1] === "-D";
+        if (success) branchPresent = false;
+      }
+      return { success, stdout, stderr: "not merged into primary HEAD or upstream" };
+    };
+    if (merged) removeWorktree(entry, git, () => {});
+    else expect(() => removeWorktree(entry, git, () => {})).toThrow("not merged into local main");
+    return { present, branchPresent };
+  };
+  expect(run(true)).toEqual({ present: false, branchPresent: false });
+  expect(run(false)).toEqual({ present: true, branchPresent: true });
+});
+
+test("gate tree refuses a gitlink outside the lane subdirectory", () => {
+  let wroteTree = false;
+  const git = (cwd: string, ...args: string[]) => {
+    if (args[0] === "ls-files") return cwd === "/repo" ? "160000 abc 0\tvendor/engine" : "100644 def 0\tsource.ts";
+    if (args[0] === "write-tree") wroteTree = true;
+    return "digest";
+  };
+  expect(() => gateTreeFromGit("/repo", git)).toThrow("submodules");
+  expect(wroteTree).toBe(false);
+});
+
+test("legacy directory recovery uses the lane round when the work round is absent", () => {
+  const entry = { work: { state: "done" as const, cwd: "/repo" }, rounds: 4 };
+  const readSpec = (_lane: string, round: number) => round === 4 ? { additionalDirectories: ["/shared"] } : undefined;
+  expect(storedDirectories("old", entry, readSpec)).toEqual(["/shared"]);
+  expect(storedDirectories("reviewed", { ...entry, rounds: 5, work: { ...entry.work, round: 4 } }, readSpec)).toEqual(["/shared"]);
+  expect(storedDirectories("new", { ...entry, additionalDirectories: ["/stored"] }, () => { throw new Error("should not read spec"); })).toEqual(["/stored"]);
+});
+
+test("post-gate round failure invalidates the report and receipt together", () => {
+  const tree = { head: "head", tree: "tree" };
+  const green = makeGateReceipt(1, "/repo", "check", 0, "finished", tree, tree);
+  const failed = finishGateReceipt(green, "failed");
+  expect(failed.receipt.valid).toBe(false);
+  expect(failed.report).toContain("Receipt invalid");
+  expect(failed.report).toContain(failed.receipt.reason!);
+  expect(failed.report).not.toContain("Receipt valid");
+  const passed = finishGateReceipt(green, "done");
+  expect(passed.receipt.valid).toBe(true);
+  expect(passed.report).toContain("Receipt valid");
+  const red = makeGateReceipt(1, "/repo", "check", 1, "finished", tree, tree);
+  expect(finishGateReceipt(red, "failed").receipt.reason).toBe("gate failed");
+});
+
+
+test("finite for batches permit launches and classify only their own loop header", () => {
+  expect(blockingCdxCommand('for lane in a b; do cdx spawn $lane --bg "brief"; done')).toBeUndefined();
+  expect(blockingCdxCommand('for lane in a b; do cdx report $lane; done; echo "for ((;;))"')).toBeUndefined();
+  expect(blockingCdxCommand('for lane in seq other; do cdx report $lane; done')).toBeUndefined();
+  expect(blockingCdxCommand('for lane in a b; do cdx status; done')).toBe("poll loop");
 });

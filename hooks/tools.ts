@@ -73,6 +73,7 @@ export const TOOLS: ToolDefinition[] = [
         followUp: { type: "string", description: "Follow-up instructions for the lane" },
         effort: { type: "string", description: "Reasoning effort" },
         gate: { type: "string", description: "Verification command" },
+        addDirs: { type: "array", items: { type: "string" }, description: "Additional directories retained for work resumes" },
         pre: { type: "string", description: "Setup command" },
         maxRuntime: { type: "number", description: "Maximum runtime in minutes" },
       },
@@ -84,6 +85,7 @@ export const TOOLS: ToolDefinition[] = [
       if (input.gate) argv.push("--gate", String(input.gate));
       if (input.pre) argv.push("--pre", String(input.pre));
       if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
+      if (Array.isArray(input.addDirs)) for (const dir of input.addDirs) argv.push("--add-dir", String(dir));
       argv.push("--bg", "-");
       return { argv, stdin: String(input.followUp) };
     },
@@ -292,12 +294,14 @@ export const TOOLS: ToolDefinition[] = [
       type: "object",
       properties: {
         lane: { type: "string", description: "Lane name" },
+        keepWorktree: { type: "boolean", description: "Close without removing the worktree or branch; print manual cleanup commands" },
         note: { type: "string", description: "Optional closing note" },
       },
       required: ["lane"],
     },
     run: (input) => {
       const argv = ["close", String(input.lane)];
+      if (input.keepWorktree) argv.push("--keep-worktree");
       if (input.note !== undefined && input.note !== null && String(input.note).length > 0) {
         argv.push("-");
         return { argv, stdin: String(input.note) };
@@ -340,6 +344,12 @@ export const TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "gate-receipt",
+    description: "Read content-bound acceptance proof for the latest work round.",
+    inputSchema: { type: "object", properties: { lane: { type: "string", description: "Lane name" } }, required: ["lane"] },
+    run: (input) => ({ argv: ["gate-receipt", String(input.lane), "--json"] }),
+  },
+  {
     name: "job",
     description: "Launch a detached background job command beside lanes.",
     inputSchema: {
@@ -347,9 +357,9 @@ export const TOOLS: ToolDefinition[] = [
       properties: {
         name: { type: "string", description: "Job name" },
         cmd: { type: "string", description: "Shell command to run" },
-        cd: { type: "string", description: "Working directory relative to repo root" },
+        cd: { type: "string", description: "Explicit working directory for the job" },
       },
-      required: ["name", "cmd"],
+      required: ["name", "cmd", "cd"],
     },
     run: (input) => {
       const argv = ["job", String(input.name)];

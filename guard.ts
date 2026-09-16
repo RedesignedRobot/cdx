@@ -3,7 +3,7 @@
 // module and by tests. No Bun or Node API here.
 
 const WORK_VERBS = new Set(["e", "exec", "review", "resume", "fork", "cloud", "apply"]);
-const CONTROL_WORDS = new Set(["if", "then", "elif", "else", "while", "until", "do", "!", "{"]);
+const CONTROL_WORDS = new Set(["if", "then", "elif", "else", "while", "until", "for", "do", "!", "{"]);
 const WRAPPERS = new Set(["command", "exec", "env", "nice", "nohup", "sudo", "time"]);
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const CODEX_GLOBAL_VALUE_OPTIONS = new Set([
@@ -184,42 +184,218 @@ export function rawEngineRefusal(engine: RawEngine): string {
 // The head of a Claude Code session must never block on a lane or job (owner
 // ruling 2026-09-15): the cdx mod wakes it with a [cdx] event. These are the
 // shell shapes that block anyway.
-export type BlockingCdx = "wait" | "status --watch" | "poll loop";
+export type BlockingCdx = "wait" | "status --watch" | "poll loop" | "sleep chain" | "tail -f";
+
+const POLLING_SUBCOMMANDS = new Set([
+  "status", "events", "report", "brief", "log", "tail", "questions", "feed",
+]);
 
 // The cdx subcommand a segment runs, as `cdx ...` or `bun .../cdx.ts ...`.
 function cdxInvocation(words: string[], index: number): { subcommand: string; args: string[] } | undefined {
-  const binary = (words[index] ?? "").split("/").at(-1);
+  const binary = (words[index] ?? "").split("/").at(-1) ?? "";
   let next = index + 1;
-  if (binary === "bun") {
+
+  if (binary === "bun" || binary === "node") {
     while ((words[next] ?? "").startsWith("-")) next += 1;
-    if (!(words[next] ?? "").endsWith("cdx.ts")) return undefined;
+    if (words[next] === "run") {
+      next += 1;
+      while ((words[next] ?? "").startsWith("-")) next += 1;
+    }
+    const target = (words[next] ?? "").split("/").at(-1) ?? "";
+    if (target !== "cdx.ts" && target !== "cdx") return undefined;
     next += 1;
-  } else if (binary !== "cdx") {
+  } else if (binary === "bunx" || binary === "npx") {
+    while ((words[next] ?? "").startsWith("-")) next += 1;
+    const target = (words[next] ?? "").split("/").at(-1) ?? "";
+    if (target !== "cdx" && target !== "cdx.ts") return undefined;
+    next += 1;
+  } else if (binary !== "cdx" && binary !== "cdx.ts") {
     return undefined;
   }
-  const args = words.slice(next);
-  const subcommand = args.find((word) => !word.startsWith("-"));
-  return subcommand === undefined ? undefined : { subcommand, args };
+
+  while ((words[next] ?? "").startsWith("-")) {
+    next += ["-C", "--cd", "--cwd"].includes(words[next]!) ? 2 : 1;
+  }
+  const subcommand = words[next];
+  return subcommand === undefined ? undefined : { subcommand, args: words.slice(next + 1) };
+}
+
+function isStatusWatch(invocation: { subcommand: string; args: string[] }): boolean {
+  if (invocation.subcommand !== "status") return false;
+  return invocation.args.some((arg) => arg === "--watch" || arg.startsWith("--watch=") || arg === "-w" || arg.startsWith("-w="));
+}
+
+function isTailFollow(invocation: { subcommand: string; args: string[] }): boolean {
+  if (invocation.subcommand !== "tail") return false;
+  return invocation.args.some((arg) => arg === "-f" || arg === "--follow" || arg.startsWith("--follow=") || /^-[a-zA-Z]*f/.test(arg));
+}
+
+function hasFollowFlag(args: string[]): boolean {
+  return args.some((arg) => arg === "-f" || arg === "-F" || arg === "--follow" || arg.startsWith("--follow=") || /^-[a-zA-Z]*[fF]/.test(arg));
+}
+
+function isCdxLogPath(arg: string): boolean {
+  if (/(?:\.cdx|CDX_HOME|CDX_STATE_HOME)[/\\](?:logs[/\\])?.*(?:\.log|\.jsonl)\b/i.test(arg)) return true;
+  if (/(?:^|[/\\])\.cdx[/\\]logs\b/i.test(arg)) return true;
+  if (arg === "__CDX_LOG__" || /\$\{(?:CDX_HOME|CDX_STATE_HOME)\}[/\\]logs[/\\]/.test(arg)) return true;
+  return false;
+}
+
+function watchCdxTarget(words: string[], index: number): { subcommand: string; args: string[] } | undefined {
+  let next = index + 1;
+  while (next < words.length) {
+    const word = words[next]!;
+    if (word === "-n" || word === "--interval") {
+      next += 2;
+      continue;
+    }
+    if (word.startsWith("-")) {
+      next += 1;
+      continue;
+    }
+    break;
+  }
+  return cdxInvocation(words, next);
+}
+
+type LoopKind = "while" | "until" | "for-finite-batch" | "for-poll";
+
+function loopKindAtStart(words: string[]): LoopKind | undefined {
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i]!;
+    if (word === "while") return "while";
+    if (word === "until") return "until";
+    if (word === "for") {
+      const items = words.slice(i + 3);
+      if (words[i + 2] === "in" && items.length > 0 && items.every((item) => !/[$`{}]/.test(item))) {
+        return "for-finite-batch";
+      }
+      return "for-poll";
+    }
+    if (!CONTROL_WORDS.has(word) && !ASSIGNMENT.test(word)) break;
+  }
+  return undefined;
+}
+
+function hasDoneKeywordAtStart(words: string[]): boolean {
+  for (let i = 0; i < words.length; i += 1) {
+    const word = words[i]!;
+    if (word === "done") return true;
+    if (!CONTROL_WORDS.has(word) && !ASSIGNMENT.test(word)) break;
+  }
+  return false;
+}
+
+function isCdxLogSubstitution(sub: string): boolean {
+  return /\bcdx(?:\.ts)?\s+log\b/.test(sub);
+}
+
+function extractSubstitutions(text: string): string[] {
+  const result: string[] = [];
+  for (const match of text.matchAll(/\$\(([^()]*)\)|(?:\\`|`)([^`]*?)(?:\\`|`)/gs)) {
+    const inner = (match[1] ?? match[2] ?? "").replace(/^\\+/, "").replace(/\\+$/, "").trim();
+    if (inner) result.push(inner);
+  }
+  return result;
+}
+
+function replaceUnquotedSubstitutions(text: string): string {
+  return text.replace(/\$\(([^()]*)\)|(?:\\`|`)([^`]*?)(?:\\`|`)/gs, (_, p1, p2) => {
+    const inner = (p1 ?? p2 ?? "").replace(/^\\+/, "").replace(/\\+$/, "").trim();
+    if (!inner) return " ";
+    return isCdxLogSubstitution(inner) ? ` __CDX_LOG__ ; ${inner} ; ` : ` ; ${inner} ; `;
+  });
+}
+
+function stripQuotedPreservingSubstitutions(command: string): string {
+  const withoutSingle = command.replace(/'([^']*)'/gs, (_, content: string) => isCdxLogPath(content) ? " __CDX_LOG__ " : " ");
+  const withoutDouble = withoutSingle.replace(/"((?:\\.|[^"\\])*)"/gs, (_, content: string) => {
+    const subs = extractSubstitutions(content);
+    if (subs.length > 0) {
+      const hasLog = subs.some(isCdxLogSubstitution);
+      const prefix = hasLog ? " __CDX_LOG__ ; " : " ";
+      return `${prefix} ; ${subs.join(" ; ")} ; `;
+    }
+    return isCdxLogPath(content) ? " __CDX_LOG__ " : " ";
+  });
+  return replaceUnquotedSubstitutions(withoutDouble);
 }
 
 export function blockingCdxCommand(command: string): BlockingCdx | undefined {
-  const text = stripHeredocBodies(stripQuotedSegments(command), command);
-  let loop = false;
-  let cdxInsideCommand = false;
-  for (const segment of text.split(/[;&|()`\n]+/)) {
+  const clean = stripHeredocBodies(stripQuotedPreservingSubstitutions(command), command);
+  const loopStack: LoopKind[] = [];
+  let cdxInLoop = false;
+  let hasSleepOutsideLoop = false;
+  let hasPollingOutsideLoop = false;
+
+  for (const segment of clean.split(/[;&|()\n]+/)) {
     const words = segment.trim().split(/\s+/).filter(Boolean);
-    if (words[0] === "while" || words[0] === "until") loop = true;
-    const invocation = cdxInvocation(words, commandStart(words));
-    if (!invocation) continue;
-    if (invocation.subcommand === "wait") return "wait";
-    if (invocation.subcommand === "status" && invocation.args.includes("--watch")) return "status --watch";
-    cdxInsideCommand = true;
+    if (words.length === 0) continue;
+
+    const loopKind = loopKindAtStart(words);
+    if (loopKind) {
+      loopStack.push(loopKind);
+    }
+
+    const start = commandStart(words);
+    const binary = (words[start] ?? "").split("/").at(-1) ?? "";
+
+    if (binary === "watch") {
+      const target = watchCdxTarget(words, start);
+      if (target) {
+        if (isStatusWatch(target) || target.subcommand === "status") return "status --watch";
+        if (target.subcommand === "wait") return "wait";
+        if (POLLING_SUBCOMMANDS.has(target.subcommand)) return "poll loop";
+      }
+    } else if (binary === "tail") {
+      const tailArgs = words.slice(start + 1);
+      if (hasFollowFlag(tailArgs)) {
+        if (tailArgs.some(isCdxLogPath) || (/cdx\s+log\b/.test(command) && tailArgs.some((arg) => arg.includes("$")))) {
+          return "tail -f";
+        }
+      }
+    } else if (binary === "sleep") {
+      if (loopStack.length === 0) {
+        hasSleepOutsideLoop = true;
+      }
+    } else {
+      const invocation = cdxInvocation(words, start);
+      if (invocation) {
+        if (invocation.subcommand === "wait") return "wait";
+        if (isStatusWatch(invocation)) return "status --watch";
+        if (isTailFollow(invocation)) return "tail -f";
+        if (loopStack.length > 0) {
+          const isFiniteBatch = loopStack.every((k) => k === "for-finite-batch")
+            && (!POLLING_SUBCOMMANDS.has(invocation.subcommand) || invocation.subcommand === "report" || invocation.subcommand === "brief");
+          if (!isFiniteBatch) {
+            cdxInLoop = true;
+          }
+        } else if (POLLING_SUBCOMMANDS.has(invocation.subcommand)) {
+          hasPollingOutsideLoop = true;
+        }
+      }
+    }
+
+    if (hasDoneKeywordAtStart(words)) {
+      loopStack.pop();
+    }
   }
-  return loop && cdxInsideCommand ? "poll loop" : undefined;
+
+  if (cdxInLoop) return "poll loop";
+  if (hasSleepOutsideLoop && hasPollingOutsideLoop) return "sleep chain";
+  return undefined;
 }
 
 export function blockingCdxRefusal(kind: BlockingCdx): string {
-  const what = kind === "wait" ? "cdx wait" : kind === "status --watch" ? "cdx status --watch" : "a shell loop polling cdx";
+  const what = kind === "wait"
+    ? "cdx wait"
+    : kind === "status --watch"
+      ? "cdx status --watch"
+      : kind === "sleep chain"
+        ? "a sleep chain polling cdx"
+        : kind === "tail -f"
+          ? "tail -f on cdx logs"
+          : "a shell loop polling cdx";
   return `${what} blocks the head; the head never blocks on a lane or job (owner ruling 2026-09-15). `
     + "End your turn: a [cdx] event wakes you when it finishes, asks, stalls, or fails. "
     + "To check right now, call mcp__cdx__status or mcp__cdx__events. "

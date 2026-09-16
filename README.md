@@ -21,7 +21,7 @@ cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone C
 
 ## Native in Claude Code
 
-cdx 7.0 runs inside Claude Code as a [function hooks](#claude-code-integration) module, not as a shell wrapper. When a session starts, the mod registers 21 tools under `mcp__cdx__`, the `/lanes` command, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. Nothing blocks. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
+cdx 7.0 runs inside Claude Code as a [function hooks](#claude-code-integration) module, not as a shell wrapper. When a session starts, the mod registers tools under `mcp__cdx__`, the `/lanes` command, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. Nothing blocks. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
 
 ```mermaid
 sequenceDiagram
@@ -187,7 +187,7 @@ flowchart LR
 | `cdx status` | Show lane state, tool steps, dirty file count, stage, timing, and last action; `--line` renders a 100-character status line |
 | `cdx usage` | Codex account limits, which account to spend next and why, Gemini limits, and all-time ledger totals |
 | `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
-| `cdx job <name> "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
+| `cdx job <name> --cd /repo "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
 | `cdx feed` | Replay recent completion and stall lines from the feed |
 | `cdx report <lane>` | Print a lane's final report |
@@ -201,8 +201,9 @@ flowchart LR
 
 ```
 cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] ("<brief>" | -)
-cdx resume <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
+cdx resume <lane> [--add-dir D]... [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
 cdx gate   <lane> ("<cmd>" | --clear)
+cdx gate-receipt <lane> [--json]
 cdx fork   <new> <lane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] ("<brief>" | -)
 cdx send   <lane> ("<text>" | -)
 cdx ask    [--timeout MIN] "<question>"
@@ -225,8 +226,8 @@ cdx feed   [-n N]
 cdx report <lane> [round]
 cdx log    <lane> [round] [--transcript]
 cdx kill   <lane> ["note"]
-cdx close  <lane> [--remove-worktree] ["note" | -]
-cdx job    <name> [--cd D] ("<cmd>" | -)
+cdx close  <lane> [--remove-worktree | --keep-worktree] ["note" | -]
+cdx job    <name> --cd D ("<cmd>" | -)
 cdx clean  [--days N]
 cdx doctor [--fix] [--probe]
 cdx brief
@@ -266,17 +267,37 @@ Only `--gate-baseline-check` runs the gate on the untouched baseline tree before
 
 `kill` sends SIGTERM to the runner, which reaps its engine child and finalizes the round with a signal note. A runner still silent after 10 seconds gets SIGKILL, and cdx finalizes the ledger with note `killed`. `--max-runtime MIN` uses the same signal sequence on either engine child.
 
-`close --remove-worktree` removes the lane worktree and deletes its branch only when the branch is merged into the repo's HEAD and the worktree is clean; otherwise it refuses with the reason and prints the manual commands.
+`close` removes a recorded worktree and its lane branch only when the worktree still names that branch, the branch is merged into local `main`, and the worktree is clean. Otherwise it refuses before marking the lane closed. `--remove-worktree` remains accepted and uses the same checks. Worktree removal is never forced. After the explicit local-main ancestry check, branch deletion uses `-D` so another primary HEAD or upstream cannot reject that proof. `--keep-worktree` closes the ledger entry without touching the worktree or branch and prints guarded manual cleanup commands. Use it for abandoned, dirty or unmerged lanes. It cannot combine with `--remove-worktree`. Lanes without worktrees close as before.
 
 A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini --bg - < brief.md`), so long prompts with quotes and backticks never fight the shell. Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `fork`, `send`, `reply`, `msg`, `job`, and `close`. An empty stdin fails with the command's usage line. Headless agy expands `/skill-name ...` at the start of a prompt, so a brief may open with a project skill invocation such as `/hyperscale-change ...` when the workspace ships that skill under `.agents/skills`.
 
-`spawn --worktree <path>` creates a git worktree at that path on a new branch `lane/<lane>` from the repo at `--cd` (or the current directory), runs the optional `worktreeSetup` command from config inside it, and runs the lane there. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit. The worktree and branch are recorded in the ledger and shown by `status`; `close` prints the removal commands but never deletes anything itself. This gives each parallel worker exclusive files without sharing a dirty tree.
+`spawn --worktree <path>` creates a git worktree at that path on a new branch `lane/<lane>` from the repo at `--cd` (or the current directory), runs the optional `worktreeSetup` command from config inside it, and runs the lane there. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit. The worktree and branch are recorded in the ledger and shown by `status`; `close` performs the guarded cleanup described above. An existing target is reused only if it is the exact worktree root in the same repository, on `lane/<lane>`, and clean, including untracked files. Reuse skips setup commands. This gives each parallel worker exclusive files without sharing a dirty tree.
 
 For multiple targets, text-mode `wait` names the targets at the start and prints each completion with its name, state, and report path as the existing five-second poll observes it. Jobs use their log path. After all targets finish, it prints a summary, then report bodies when `--report` is set. A question still returns exit 2 immediately; a timeout names unfinished targets. Single-target report output stays immediate.
 
 `wait --json` prints one JSON object per finished lane, in completion order: `work` and `review` records, roundState, exit code, tokens, report path, note, session ID.
 
 </details>
+
+### Required gates and content receipts
+
+Put the required repository checks in `.cdx-gate` in the primary checkout. The file is a nonempty shell command, for example `bun run check`. cdx resolves the shared Git directory to find that checkout, reads the file before spawn, resume or fork, and pins the command in the round spec. Keep the primary checkout policy under the head's control. Repositories with a separate Git directory or bare layout must place `.cdx-gate` beside that common Git directory. The file is optional; without it, the existing lane gate applies.
+
+Every work round runs the required command followed by the lane gate in separate shells. An exact duplicate runs once. `cdx gate --clear` clears only the lane command. Reviews do not run gates. `--gate-baseline-check` is separate: it optionally executes the composed gate before work to detect an already broken baseline. It does not define required coverage and it costs a second gate run. Use it only to diagnose a suspected baseline failure.
+
+`cdx gate-receipt <lane> --json` and `mcp__cdx__gate-receipt` return a version 1 envelope with `lane`, work `state`, `workExitCode`, `usable`, and `receipt`. A refusal includes `reason` and exits 1. The receipt contains `version`, `round`, `cwd`, `command`, `exitCode`, `finishedAt`, `head`, `tree`, `valid`, and an optional `reason`. Ledger v5 gains optional `gateReceipt` and `additionalDirectories` fields. Old rows remain readable but cannot claim content proof. A new work round or gate change invalidates the old receipt; a read-only review preserves it.
+
+cdx uses a temporary Git index with `read-tree HEAD`, `add --all`, and `write-tree`. It leaves the real index untouched. The digest covers the whole repository's tracked and untracked nonignored files. Ignored files, external inputs, tool versions and environment variables are outside this proof. Submodules and embedded repositories refuse content proof. Non-Git lanes retain their shell gate verdict, but the receipt command refuses content proof for them. cdx captures HEAD and tree before and after the gate; a changed tree, failed Git snapshot or failed command makes the work round fail. Gate commands must leave source bytes unchanged. The receipt records Git's canonical tree bytes, including configured clean filters, rather than a hash of raw filesystem bytes.
+
+Consumers must compare the receipt's tree with the tree they will land, verify the expected HEAD and cwd, and require `usable`, work exit 0 and gate exit 0. A receipt is historical evidence, not a lock against later edits. Arc's `lane-land` should call this command instead of reading ledger.json, capture the candidate tree, and require exact equality before merging. Legacy rows need a new gated work round; timestamps are not a content-proof fallback.
+
+### Jobs, restart and completion
+
+`cdx job <name> --cd /absolute/repo "<command>"` requires an explicit directory. Relative paths resolve against the caller's cwd; absolute paths avoid that dependency. The native job tool requires `cd` too. Listing jobs still needs no directory. Jobs have no implicit lane target and cdx does not guess a repo from shell text.
+
+`cdx resume <lane> --add-dir /path --add-dir /another "<follow-up>"` unions directories with the lane's stored directories. The native resume tool accepts `addDirs`. Gemini receives them with its resumed conversation; GPT receives them in the existing app-server thread configuration. Both work engines already run with broad permissions. This option supplies directories, not a security boundary. Read-only review resumes reject newly supplied directories. Respawn retains stored directories too.
+
+Lane completion events include state, engine exit, `verdict`, log path, report path, gate exit and gate log. Job completion includes state, exit, verdict and log path, with `report=-` and `gateExit=not-applicable`. The verdict is the harness result and failure reason, not a model claim or an arbitrary final log line. Read the report once for review; finite `tail -n`, `status --brief`, and `questions` remain useful for diagnosis. The head should end its turn after dispatch and consume completion or question events. Supervisors keep `cdx wait` to join their own children. Finite unquoted literal-list `for` batches may read reports or briefs and launch work. Status polling, arithmetic loops and generated-range loops remain blocked.
 
 ## Orchestration patterns
 
@@ -330,12 +351,12 @@ You can also export `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in your shell environm
 
 ### Registered tools
 
-The mod registers 21 native tools under the prefix `mcp__cdx__`:
+The mod registers native tools under the prefix `mcp__cdx__`:
 
 | Tool | Required | Optional | Description |
 |---|---|---|---|
 | `mcp__cdx__spawn` | `lane, brief` | `engine, model, supervisor, cd, worktree, gate, pre, effort, maxRuntime, account, addDirs, schema, images` | Spawn a new lane with a brief. The brief passes via stdin using `--bg -`. Quotes and newlines remain intact. Completion arrives as a `[cdx]` event. |
-| `mcp__cdx__resume` | `lane, followUp` | `effort, gate, pre, maxRuntime` | Resume a finished or stopped lane with a follow-up instruction via `--bg -`. |
+| `mcp__cdx__resume` | `lane, followUp` | `effort, gate, pre, maxRuntime, addDirs` | Resume a finished or stopped lane with a follow-up instruction via `--bg -`. |
 | `mcp__cdx__consult` | `lane, question` | `engine, supervisor, model, effort, cd, account` | Start a read-only consultation lane via `--bg -`. |
 | `mcp__cdx__review` | `lane` | `engine, model, effort, cd, uncommitted, base, commit, scope, intent` | Start an independent code review lane via `--bg`. Intent passes via stdin with `-` when provided. |
 | `mcp__cdx__fork` | `lane, source, brief` | `model, effort, account` | Fork an existing lane into a new branch lane via `--bg -`. |
@@ -346,10 +367,11 @@ The mod registers 21 native tools under the prefix `mcp__cdx__`:
 | `mcp__cdx__status` | (none) | `all` | Show active lane status (`status [--all]`). |
 | `mcp__cdx__report` | `lane` | (none) | Read the final report written by a finished lane. |
 | `mcp__cdx__tail` | `lane` | `lines` | Inspect latest execution log lines (`tail <lane> [-n N]`). |
-| `mcp__cdx__close` | `lane` | `note` | Close a completed lane. Note passes via stdin with `-` when provided. |
+| `mcp__cdx__close` | `lane` | `note, keepWorktree` | Close a completed lane. Note passes via stdin with `-` when provided. |
 | `mcp__cdx__kill` | `lane` | (none) | Terminate a running lane process immediately. |
 | `mcp__cdx__gate` | `lane` | `cmd, clear` | Set or clear the verification gate command for a lane. |
-| `mcp__cdx__job` | `name, cmd` | `cd` | Launch a detached background job command via stdin (`job <name> [--cd D] -`). |
+| `mcp__cdx__gate-receipt` | `lane` | (none) | Read the latest work round's gate proof as JSON. |
+| `mcp__cdx__job` | `name, cmd, cd` | | Launch a detached background job command via stdin (`job <name> --cd D -`). |
 | `mcp__cdx__msg` | `target, text` | (none) | Send a notification message via stdin (`msg <target> -`). |
 | `mcp__cdx__inbox` | (none) | `lines` | Read incoming messages sent to this session (`inbox [-n N]`). |
 | `mcp__cdx__usage` | (none) | (none) | Report token consumption and rate limit windows. |
@@ -363,7 +385,7 @@ There is no `mcp__cdx__wait` tool.
 The head spawns a lane, keeps working or ends its turn, and the mod wakes it when events occur.
 `cdx wait` stays in the CLI for Astra, Gemini, and terminal operators.
 Mid-turn checks use `mcp__cdx__events` or `mcp__cdx__status`.
-The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, or a `while`/`until` loop around any cdx command is denied with the same guidance, the way raw `codex` and `agy` calls are. Spawn `--bg` and `job` output tells the head to end its turn; inside a lane the same lines still point at `cdx wait`.
+The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, a `while`/`until`/`for` loop polling cdx, a sleep chain polling cdx, or follow-tail on cdx logs is denied with the same guidance, the way raw `codex` and `agy` calls are. Spawn `--bg` and `job` output tells the head to end its turn; inside a lane the same lines still point at `cdx wait`.
 
 ### Slash command
 

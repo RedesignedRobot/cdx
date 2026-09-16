@@ -70,17 +70,26 @@ A brief requires seven elements: outcome, consumer, exclusive files, prohibited 
 
 Order one independent review per consequential diff, covering affected callers and contracts. Ask the reviewer for severity, trigger, file location, and failure mechanism. Classify review output into accepted defects, disputed findings, integration hygiene, and unverified candidates. Do not treat untracked file hygiene as a runtime defect. A clean review is a result, not a reason for another review; a changed commit or a failed review justifies one more. The reviewer reads the recorded gate result and never runs the test suite.
 
+## Gate and lifecycle playbook
+
+Before spawning, put the repository's mandatory checks in `.cdx-gate` in its primary checkout. cdx pins that baseline and adds any lane-specific gate. `--gate-baseline-check` only diagnoses an already broken checkout and runs the gate twice; leave it off for ordinary work. Gates must leave source bytes unchanged. After completion and independent review, read `cdx gate-receipt <lane> --json`. Land only the exact tree it proves. Ledger v5 remains readable; old rows without a receipt need a fresh gated work round.
+
+Start jobs with `cdx job <name> --cd /absolute/repo "<command>"`; the native job tool requires `cd`. End the head turn and use the completion event's verdict, report, log and gate exit. Read the report once to review it. Keep finite status, question and tail reads for diagnosis. Do not poll with sleep chains, shell loops, follow-tail or watch commands.
+
+Resume work with `--add-dir` to extend the stored directories, or native `addDirs`. A respawn can reuse an existing clean worktree on the expected lane branch in the same repository. After landing, `cdx close <lane>` removes the clean worktree and branch only when the branch is merged into local `main`. `--remove-worktree` remains accepted. Dirty, switched or unmerged worktrees refuse default cleanup. To abandon a lane, use `cdx close <lane> --keep-worktree` or native `keepWorktree: true`; it closes only the ledger entry and prints manual cleanup commands. Do not combine it with `--remove-worktree`. Default cleanup checks ancestry against local main before deleting the branch with `-D`, independent of primary HEAD or upstream.
+
 ## Commands
 
 Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `fork`, `send`, `reply`, `msg`, `job`, and `close`.
 
 ```bash
 cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] ("<brief>" | -)
-cdx resume  <lane> [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
+cdx resume  <lane> [--add-dir D]... [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd D] [--bg] [--account NAME] ("<question>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
 cdx fork    <new> <lane|sessionId> [--model M] [--effort E] [--bg] [--account NAME] ("<brief>" | -)
 cdx gate    <lane> ("<cmd>" | --clear)
+cdx gate-receipt <lane> [--json]
 cdx send    <lane> ("<text>" | -)          # steer a running work lane
 cdx ask     [--timeout MIN] "<question>"   # inside a lane only
 cdx reply   <lane> [--id SEQ] ("<answer>" | -)
@@ -94,8 +103,8 @@ cdx log     <lane> [round] [--transcript]
 cdx feed    [-n N]
 cdx usage   [--json]
 cdx kill    <lane|job> ["note"]
-cdx close   <lane> [--remove-worktree] ["note" | -]
-cdx job     <name> [--cd D] ("<cmd>" | -)   # detached shell job with a feed line on exit
+cdx close   <lane> [--remove-worktree | --keep-worktree] ["note" | -]
+cdx job     <name> --cd D ("<cmd>" | -)   # detached shell job with a feed line on exit
 cdx msg     <lane|full-session-id> ("<text>" | -) | cdx inbox [-n N]
 cdx takeover <lane|full-session-id>   # connect ownership explicitly
 cdx adopt   <lane> <sessionId> [--engine gpt|gemini] [--model M] [--cd D]
@@ -183,7 +192,8 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - With configured accounts, `cdx usage` and launch admission share one decision. The risk line is 3% weekly capacity for every lane kind; every tier refuses exhausted accounts. Above the line, the account with the highest forfeit rate (share above the line per day until its reset) is spent first, then the earlier reset, then the fuller account. Each account line names its banked reset credits and their expiries; a credit within three days of expiry prints a red CRITICAL line in usage, doctor, and every GPT launch, and the advice says which thin account to redeem one on. Active rounds hold 3% against the account during execution. Admission subtracts active holds from remaining headroom before account selection. Dead runners release their hold during admission while preserving live child holds. Consuming round completion invalidates the account snapshot to force fresh usage probes. Exhaustion markers carry provenance (recorded time, window length, reason) and reconcile against a fresh usage probe: the marker clears only when no window of that account is exhausted; a live block on any window stays. `cdx usage` advice reads the reconciled standings. Thresholds guide placement; they do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish. `--account` obeys exhaustion eligibility instead of forcing a depleted account. A GPT quota exhaustion failure triggers automatic account failover: cdx starts a fresh round on an available account carrying the brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
 - `doctor` compares secondary Codex homes against the primary home. Running `cdx doctor --fix` synchronizes primary `AGENTS.md` directives, shared MCP server definitions and shared config keys in `config.toml`, and `hooks.json` across configured homes while preserving credentials, auth sessions, and account-specific settings.
 - Close finished lanes with an outcome note. `close --remove-worktree` deletes
-  a merged, clean worktree and its branch; otherwise it prints the commands.
+  a merged, clean worktree and its branch; otherwise it refuses. Use
+  `close --keep-worktree` to close without cleanup and print manual commands.
 - Gemini's five-hour window drains under heavy fan-out; cdx refuses Gemini
   spawns while `gemini-quota.json` says so. Wait or use `--engine gpt`.
 
