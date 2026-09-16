@@ -1,5 +1,5 @@
 import type { EngineInterface, On, RenderSurface } from "claude-code";
-import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, rawEngineRefusal } from "../guard";
+import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, nativeCdxCommand, nativeCdxRefusal, rawEngineRefusal } from "../guard";
 import {
   afterPoll,
   afterToolCall,
@@ -15,9 +15,12 @@ import {
 import {
   CDX_TOOL_PREFIX,
   formatToolOutput,
+  TOOL_NAMES,
   TOOLS,
   TOOLS_BY_NAME,
 } from "./tools";
+
+const NATIVE_TOOLS: ReadonlySet<string> = new Set(TOOL_NAMES);
 
 let session = "";
 let root = "";
@@ -232,6 +235,10 @@ export function register(on: On) {
     const blocking = blockingCdxCommand(command);
     if (blocking) {
       return { deny: blockingCdxRefusal(blocking) };
+    }
+    const native = nativeCdxCommand(command, NATIVE_TOOLS);
+    if (native) {
+      return { deny: nativeCdxRefusal(native) };
     }
     return next(e);
   });

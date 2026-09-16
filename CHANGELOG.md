@@ -1,3 +1,9 @@
+## 7.4.2
+
+- Native only inside Claude Code: a Bash call that runs a cdx subcommand with a native tool (spawn, status, close, job and the rest of the table) is denied with the tool name. The native tool keeps the result in the transcript and runs in the session directory; the shell form remains for lanes and terminals outside Claude Code. Commands without a tool (brief, clean, feed, log, adopt) still run from the shell.
+- The native spawn, consult and review tools require `cd`, an absolute repository path. The session directory follows the head's last shell `cd`, so a probe spawned without `cd` right after a shell visit to ~/code/cdx was cut from there; the tool no longer guesses. `job` already required it for the same reason.
+- Version alignment: 7.4.2.
+
 ## 7.4.1
 
 - Spawn directory: the native tools ran every cdx command in the plugin root, so `mcp__cdx__spawn` with `worktree` and no `cd` cut the worktree from ~/code/cdx instead of the head's repository. Tool commands now run in the session directory, and `cd` resolves against it.

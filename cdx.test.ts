@@ -14,7 +14,7 @@ import {
 } from "./cdx.ts";
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
-import { blockingCdxCommand } from "./guard.ts";
+import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -1043,4 +1043,20 @@ test("spawn roots follow an explicit cd, else a still-present lane directory, el
   const removed = { ...lane, work: { cwd: "/wt/gone" }, worktreePath: "/wt/gone" } as typeof lane;
   expect(spawnRoots(undefined, removed, "/repo-b", exists)).toEqual({ cwd: "/repo-b", worktreeRepo: "/repo-b" });
   expect(spawnRoots(undefined, undefined, "/repo-b", exists)).toEqual({ cwd: "/repo-b", worktreeRepo: "/repo-b" });
+});
+
+test("inside Claude Code a shell cdx command with a native tool is refused by name", () => {
+  const native = new Set(["spawn", "status", "close", "gate-receipt"]);
+  expect(nativeCdxCommand("cd /repo && bun /Users/mas/code/cdx/cdx.ts spawn x --bg - < /tmp/b.md", native)).toBe("spawn");
+  expect(nativeCdxCommand("cdx status --brief", native)).toBe("status");
+  expect(nativeCdxCommand("bun cdx.ts gate-receipt lane --json", native)).toBe("gate-receipt");
+  expect(nativeCdxCommand("bun cdx.ts brief", native)).toBeUndefined();
+  expect(nativeCdxCommand("echo 'cdx spawn' > /tmp/note", native)).toBeUndefined();
+  expect(nativeCdxRefusal("spawn")).toContain("mcp__cdx__spawn");
+});
+
+test("spawn, consult and review tools require the repository path", () => {
+  for (const name of ["spawn", "consult", "review"]) {
+    expect(TOOLS_BY_NAME.get(name)!.inputSchema.required).toContain("cd");
+  }
 });
