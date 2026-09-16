@@ -9,6 +9,7 @@ import {
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
+  geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText,
   selectEvents, statusLine, resolveStdinText, delivery,
 } from "./cdx.ts";
 
@@ -986,4 +987,49 @@ test("finite for batches permit launches and classify only their own loop header
   expect(blockingCdxCommand('for lane in a b; do cdx report $lane; done; echo "for ((;;))"')).toBeUndefined();
   expect(blockingCdxCommand('for lane in seq other; do cdx report $lane; done')).toBeUndefined();
   expect(blockingCdxCommand('for lane in a b; do cdx status; done')).toBe("poll loop");
+});
+
+test("geminiCapacityNotice prints Riyadh and US Pacific clocks and names the peak window", () => {
+  // 16:30Z on a September day: 19:30 Riyadh, 09:30 Pacific (daylight time).
+  const peak = geminiCapacityNotice(new Date("2026-09-16T16:30:00Z"));
+  expect(peak.peak).toBe(true);
+  expect(peak.text).toContain("19:30 Riyadh / 09:30 US Pacific");
+  expect(peak.text).toContain("daily peak 17:00-21:00 Riyadh (07:00-11:00 US Pacific)");
+  expect(peak.text).toContain("quiet window 21:00-12:00 Riyadh (11:00-02:00 US Pacific)");
+  // The same wall clock in December: Pacific standard time shifts the window edges by an hour.
+  const winter = geminiCapacityNotice(new Date("2026-12-16T16:30:00Z"));
+  expect(winter.text).toContain("19:30 Riyadh / 08:30 US Pacific");
+  expect(winter.text).toContain("17:00-21:00 Riyadh (06:00-10:00 US Pacific)");
+  const midday = geminiCapacityNotice(new Date("2026-09-16T09:30:00Z"));
+  expect(midday.peak).toBe(true);
+  expect(midday.text).toContain("midday bump 12:00-14:00 Riyadh");
+  const quiet = geminiCapacityNotice(new Date("2026-09-17T00:10:00Z"));
+  expect(quiet.peak).toBe(false);
+  expect(quiet.text).toContain("03:10 Riyadh / 17:10 US Pacific, off-peak");
+  expect(quiet.text).toContain("next daily peak is 17:00-21:00 Riyadh");
+});
+
+test("parseAgyRetryLine reads agy's in-process retry line and goDurationMs reads Go durations", () => {
+  const line = "I0916 20:16:16.265769     208 run.go:389] Run: attempt 2 failed (UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server), retrying in 6s";
+  expect(parseAgyRetryLine(line)).toEqual({ attempt: 2, reason: "UNAVAILABLE (code 503): No capacity available for model gemini-3.8-flash-high on the server", delay: "6s" });
+  expect(parseAgyRetryLine("I0916 20:16:15.051522    1501 http_helpers.go:299] URL: https://example.test")).toBeUndefined();
+  expect(goDurationMs("4s")).toBe(4_000);
+  expect(goDurationMs("1m30s")).toBe(90_000);
+  expect(goDurationMs("250ms")).toBe(250);
+});
+
+test("outageText names the retry layer, the wait, and the round's agy retry count", () => {
+  const now = Date.parse("2026-09-16T16:40:00Z");
+  const agy = outageText({ layer: "agy", since: "2026-09-16T16:39:30Z", attempt: 3, reason: "503 no capacity", nextRetryAt: "2026-09-16T16:40:12Z" }, 5, now);
+  expect(agy).toBe("503 no capacity for 30s · agy in-process retry 3 · next retry in 12s · agy retries this round 5");
+  const ladder = outageText({ layer: "cdx", since: "2026-09-16T16:30:00Z", attempt: 2, limit: 6, reason: "503 no capacity", nextRetryAt: "2026-09-16T16:39:00Z" }, undefined, now);
+  expect(ladder).toBe("503 no capacity for 10m · cdx ladder 2/6 · retry in flight");
+});
+
+test("gemini.outageFallbackModel defaults to the 3.8 medium tier, accepts empty, refuses older families", () => {
+  expect(parseConfig("{}").gemini?.outageFallbackModel).toBe("gemini-3.8-flash-medium");
+  expect(parseConfig(JSON.stringify({ gemini: { outageFallbackModel: "" } })).gemini?.outageFallbackModel).toBe("");
+  expect(parseConfig(JSON.stringify({ gemini: { maxRounds: 3 } })).gemini?.outageFallbackModel).toBe("gemini-3.8-flash-medium");
+  expect(() => parseConfig(JSON.stringify({ gemini: { outageFallbackModel: "gemini-3.7-flash-high" } }))).toThrow(/3\.8 family/);
+  expect(() => parseConfig(JSON.stringify({ gemini: { outageFallbackModel: "gemini-3.1-pro-high" } }))).toThrow(/3\.8 family/);
 });
