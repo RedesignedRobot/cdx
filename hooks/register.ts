@@ -264,31 +264,7 @@ export function register(on: On) {
 
   on(
     "tool.call",
-    {
-      tool: [
-        "mcp__cdx__spawn",
-        "mcp__cdx__resume",
-        "mcp__cdx__consult",
-        "mcp__cdx__review",
-        "mcp__cdx__fork",
-        "mcp__cdx__events",
-        "mcp__cdx__send",
-        "mcp__cdx__reply",
-        "mcp__cdx__questions",
-        "mcp__cdx__status",
-        "mcp__cdx__report",
-        "mcp__cdx__tail",
-        "mcp__cdx__close",
-        "mcp__cdx__kill",
-        "mcp__cdx__gate",
-        "mcp__cdx__job",
-        "mcp__cdx__msg",
-        "mcp__cdx__inbox",
-        "mcp__cdx__usage",
-        "mcp__cdx__takeover",
-        "mcp__cdx__doctor",
-      ],
-    },
+    { tool: TOOL_NAMES.map((name) => `${CDX_TOOL_PREFIX}${name}`) },
     async ($, e) => {
     const toolName = e.tool.startsWith(CDX_TOOL_PREFIX)
       ? e.tool.slice(CDX_TOOL_PREFIX.length)

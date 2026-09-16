@@ -1,3 +1,7 @@
+## 7.4.3
+
+- `mcp__cdx__gate-receipt` was registered but the tool.call hook listed the tools by hand and missed it, so the call failed with "no tool.call hook answered". The hook now matches every name in the tool table.
+
 ## 7.4.2
 
 - Native only inside Claude Code: a Bash call that runs a cdx subcommand with a native tool (spawn, status, close, job and the rest of the table) is denied with the tool name. The native tool keeps the result in the transcript and runs in the session directory; the shell form remains for lanes and terminals outside Claude Code. Commands without a tool (brief, clean, feed, log, adopt) still run from the shell.

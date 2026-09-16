@@ -1,6 +1,6 @@
 {
   "name": "cdx-lanes",
-  "version": "7.4.2",
+  "version": "7.4.3",
   "license": "MIT",
   "type": "module",
   "bin": {
