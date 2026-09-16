@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.4.0";
+const VERSION = "7.4.1";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -1181,6 +1181,28 @@ function readLane(lane: string): Lane {
 
 function workCwdOf(entry: Lane): string {
   return entry.work.cwd;
+}
+
+// Where a spawn runs and which repository a --worktree is cut from. An
+// explicit --cd wins outright. A reused lane name keeps its old directory and
+// repository only while that directory still exists; a closed lane whose
+// worktree was removed used to pin every respawn to the stale repository
+// (two lanes cut from ~/code/cdx instead of Arc on 2026-09-17).
+function spawnRoots(
+  explicitCd: string | undefined,
+  existing: Pick<Lane, "work" | "worktreeRepo" | "worktreePath"> | undefined,
+  callerCwd: string,
+  exists: (path: string) => boolean,
+): { cwd: string; worktreeRepo: string } {
+  if (explicitCd !== undefined) {
+    const cwd = resolve(callerCwd, explicitCd);
+    return { cwd, worktreeRepo: cwd };
+  }
+  const previous = existing ? workCwdOf(existing as Lane) : undefined;
+  if (existing && previous && exists(previous)) {
+    return { cwd: previous, worktreeRepo: existing.worktreeRepo ?? previous };
+  }
+  return { cwd: callerCwd, worktreeRepo: callerCwd };
 }
 
 function workStateOf(entry: Lane): WorkState {
@@ -4291,7 +4313,8 @@ async function spawnCommand(argv: string[]) {
   requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gemini" && (parsed.lists.image?.length ?? 0) > 0) fail("--image is not supported for gemini");
-  let cwd = parsed.flags.cd ?? (existingLane ? workCwdOf(existingLane) : process.cwd());
+  const roots = spawnRoots(parsed.flags.cd, existingLane, process.cwd(), existsSync);
+  let cwd = roots.cwd;
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
@@ -4343,7 +4366,7 @@ async function spawnCommand(argv: string[]) {
   });
   if (parsed.flags.worktree) {
     try {
-      worktree = createWorktree(existingLane?.worktreeRepo ?? cwd, parsed.flags.worktree, lane);
+      worktree = createWorktree(roots.worktreeRepo, parsed.flags.worktree, lane);
       cwd = worktree.path;
       withLedger((ledger) => {
         const item = ledger[lane]!;
@@ -7534,7 +7557,7 @@ export {
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
   geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText, GEMINI_PEAK_WINDOWS_RIYADH,
-  selectEvents, resolveStdinText, delivery,
+  selectEvents, resolveStdinText, delivery, spawnRoots,
 };
 
 async function dispatch(command: string | undefined, argv: string[]) {
