@@ -2,7 +2,7 @@
 // cdx runs tracked Codex and Gemini execution lanes for Claude Code users.
 //
 //   cdx spawn  <lane> --engine gpt|gemini [--account <name>] [--effort <effort>] [--cd <dir>] [--worktree <path>] [--bg] [--add-dir <d>]... [--schema <file>] [--image <f>]... [--gate <cmd>] [--gate-baseline-check] [--max-runtime <min>] "<brief>"
-//   cdx resume <lane> [--effort <effort>] [--gate <cmd>] [--bg] [--max-runtime <min>] "<follow-up>"
+//   cdx resume <lane> [--add-dir <dir>]... [--effort <effort>] [--gate <cmd>] [--bg] [--max-runtime <min>] "<follow-up>"
 //   cdx fork   <newLane> <fromLane|sessionId> [--account <name>] [--effort <effort>] [--bg] "<brief>"
 //   cdx review <lane> --engine gpt|gemini [--account <name>] [--effort <effort>] [--cd <dir>] [--bg] [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]
 //   cdx adopt  <lane> <sessionId> --engine gpt|gemini [--account <name>] [--cd <dir>]
@@ -21,7 +21,7 @@
 //   cdx log    <lane> [round]
 //   cdx gate   <lane> "<cmd>" | --clear
 //   cdx kill   <lane> ["note"]
-//   cdx close  <lane> [--remove-worktree] ["note"]
+//   cdx close  <lane> [--remove-worktree | --keep-worktree] ["note"]
 //   cdx clean  [--days <n>]
 //   cdx doctor [--fix] [--probe]
 //
@@ -48,13 +48,14 @@
 
 import {
   appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync,
-  lstatSync, readlinkSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync,
+  lstatSync, readlinkSync, readdirSync, realpathSync, renameSync, rmdirSync, rmSync, mkdtempSync,
   statSync, symlinkSync, unlinkSync, writeFileSync,
 } from "node:fs";
 import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { VISIBILITY_DEFAULTS, roundProgress, toolObservation, digestLines, heartbeatDue, type VisibilityConfig, type ProgressSample } from "./visibility.ts";
 import { syncAccountHomes } from "./account-sync.ts";
+import { tmpdir } from "node:os";
 import { isatty } from "node:tty";
 import { isAbsolute, join, relative, resolve } from "node:path";
 
@@ -229,6 +230,147 @@ interface GateBaseline {
   checkedAt: string;
 }
 
+interface GateTree { head: string; tree: string }
+interface GateReceipt {
+  version: 1;
+  round: number;
+  cwd: string;
+  command: string;
+  exitCode: number;
+  finishedAt: string;
+  head?: string;
+  tree?: string;
+  valid: boolean;
+  reason?: string;
+}
+
+// Keep ledger v5 readable by older clients. Absence means no content proof.
+function makeGateReceipt(round: number, cwd: string, command: string, exitCode: number,
+  finishedAt: string, before?: GateTree, after?: GateTree, error?: string): GateReceipt {
+  const reason = error ?? (!before || !after ? "tree snapshot unavailable"
+    : before.head !== after.head || before.tree !== after.tree ? "tree changed during gate"
+    : exitCode !== 0 ? "gate failed" : undefined);
+  return { version: 1, round, cwd, command, exitCode, finishedAt, ...after, valid: !reason, ...(reason ? { reason } : {}) };
+}
+
+function finishGateReceipt(receipt: GateReceipt, state: "done" | "failed"): { receipt: GateReceipt; report: string } {
+  const final = state !== "done" && receipt.valid
+    ? { ...receipt, valid: false, reason: "work round failed after gate" } : receipt;
+  return { receipt: final, report: `\nReceipt ${final.valid ? "valid" : "invalid"}. HEAD ${final.head ?? "unavailable"}, tree ${final.tree ?? "unavailable"}.${final.reason ? ` ${final.reason}.` : ""}\n` };
+}
+
+function gateAcceptanceFailed(exitCode: number | undefined, receipt: GateReceipt | undefined, proofRequired: boolean): boolean {
+  return exitCode !== undefined && (exitCode !== 0 || proofRequired && !receipt?.valid);
+}
+
+function receiptRefusal(receipt: GateReceipt | undefined, work: Pick<RoundRecord, "round" | "state" | "exitCode">): string | undefined {
+  if (!receipt) return "no content-bound gate receipt; run a new work round";
+  if (receipt.round !== work.round) return "receipt belongs to an older work round";
+  if (work.state !== "done" && work.state !== "closed") return `work state is ${work.state}`;
+  if (work.exitCode !== 0) return "work did not exit successfully";
+  if (!receipt.valid || receipt.exitCode !== 0 || !receipt.head || !receipt.tree) return receipt.reason ?? "invalid gate receipt";
+}
+
+function composeGate(required: string | undefined, requested: string | undefined): string | undefined {
+  const baseline = required?.trim();
+  const gate = requested?.trim();
+  if (!baseline) return gate || undefined;
+  if (!gate || baseline === gate) return baseline;
+  // Separate shells prevent exit, cd and shell options in one check skipping the other.
+  return `(/bin/sh -lc ${shellQuote(baseline)}) && (/bin/sh -lc ${shellQuote(gate)})`;
+}
+
+function shellQuote(value: string): string { return "'" + value.replaceAll("'", "'\"'\"'") + "'"; }
+
+function repositoryGate(cwd: string): string | undefined {
+  const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+  if (!top.success) return undefined;
+  // The primary checkout owns policy, so a lane cannot delete its own copy to skip it.
+  const common = top.stdout.toString().trim();
+  const path = join(common, "..", ".cdx-gate");
+  if (!existsSync(path)) return undefined;
+  const command = readFileSync(path, "utf8").trim();
+  if (!command) throw new CmdError(`${path} must contain a nonempty gate command`);
+  return command;
+}
+
+function gateTreeFromGit(root: string, git: (cwd: string, ...args: string[]) => string): GateTree {
+  const head = git(root, "rev-parse", "HEAD");
+  git(root, "read-tree", head);
+  git(root, "add", "--all", "--", ".");
+  // Inspect the whole repository even when the lane works in a subdirectory.
+  if (/^160000 /m.test(git(root, "ls-files", "--stage"))) throw new CmdError("gate receipts do not support submodules or embedded repositories");
+  return { head, tree: git(root, "write-tree") };
+}
+
+function captureGateTree(cwd: string): GateTree | undefined {
+  const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
+  if (!top.success) return undefined;
+  const root = top.stdout.toString().trim();
+  const scratch = mkdtempSync(join(tmpdir(), "cdx-gate-"));
+  const index = join(scratch, "index");
+  const env = { ...process.env, GIT_INDEX_FILE: index };
+  const git = (directory: string, ...args: string[]) => {
+    const result = Bun.spawnSync({ cmd: ["git", "-C", directory, ...args], env });
+    if (!result.success) throw new CmdError(`gate snapshot failed: git ${args[0]}`);
+    return result.stdout.toString().trim();
+  };
+  try {
+    return gateTreeFromGit(root, git);
+  } finally {
+    for (const file of [index, `${index}.lock`]) { if (existsSync(file)) unlinkSync(file); }
+    rmdirSync(scratch);
+  }
+}
+
+function gateReceiptCommand(argv: string[]): void {
+  const parsed = parseArgs(argv, ["json"]);
+  const [lane, extra] = parsed.rest;
+  if (!lane || extra) fail("usage: cdx gate-receipt <lane> [--json]");
+  const entry = readLane(lane);
+  const reason = receiptRefusal(entry.gateReceipt, entry.work);
+  const result = { version: 1, lane, state: entry.work.state, workExitCode: entry.work.exitCode,
+    receipt: entry.gateReceipt ?? null, usable: !reason, ...(reason ? { reason } : {}) };
+  console.log(parsed.bools.has("json") ? JSON.stringify(result) : reason
+    ? `cdx: ${lane}: ${reason}` : `cdx: ${lane} tree=${entry.gateReceipt!.tree} head=${entry.gateReceipt!.head} gate=0`);
+  if (reason) process.exitCode = 1;
+}
+
+function completionVerdict(state: string, note?: string): string {
+  return statusText(note ? `${state}: ${note}` : state, 240);
+}
+
+function jobCwd(explicit: string | undefined): string {
+  if (!explicit?.trim()) throw new CmdError("cdx job requires --cd <repo>; caller cwd is not a job target");
+  return resolve(explicit);
+}
+
+function storedDirectories(lane: string, entry?: Pick<Lane, "additionalDirectories" | "work" | "rounds">,
+  readSpec: (lane: string, round: number) => Pick<Spec, "additionalDirectories"> | undefined = (name, round) => {
+    const path = specPathOf(name, round);
+    return existsSync(path) ? JSON.parse(readFileSync(path, "utf8")) as Spec : undefined;
+  }): string[] {
+  if (!entry) return [];
+  if (entry.additionalDirectories) return entry.additionalDirectories;
+  return readSpec(lane, entry.work.round ?? entry.rounds)?.additionalDirectories ?? [];
+}
+
+function mergeDirectories(previous: string[] = [], added: string[] = []): string[] {
+  return [...new Set([...previous, ...added])];
+}
+
+function worktreeReuseRefusal(expectedBranch: string, actualBranch: string, sameRepo: boolean, clean: boolean): string | undefined {
+  if (!sameRepo) return "target is not a worktree of this repository";
+  if (actualBranch !== expectedBranch) return `target must be on ${expectedBranch}`;
+  if (!clean) return "target worktree has uncommitted changes";
+}
+
+function cleanupRefusal(branch: string | undefined, currentBranch: string, merged: boolean, clean: boolean): string | undefined {
+  if (!branch || branch === "main" || currentBranch !== branch) return "worktree is not on its recorded lane branch";
+  if (!merged) return `branch ${branch} is not merged into local main`;
+  if (!clean) return "worktree has uncommitted changes";
+}
+
 interface RoundRecord<S extends WorkState = WorkState> {
   exitCode?: number;
   note?: string;
@@ -286,6 +428,8 @@ interface Lane {
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
   gateBaseline?: GateBaseline;
+  gateReceipt?: GateReceipt;
+  additionalDirectories?: string[];
   // Pre-check command; runs in cwd before opening the round.
   pre?: string;
   pid?: number;
@@ -1280,7 +1424,7 @@ const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. 
 
 const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch", "line", "peek"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch", "line", "peek"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -1642,8 +1786,22 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
   if (!top.success) fail(`--worktree needs a git repository at ${repo}`);
   const repoRoot = top.stdout.toString().trim();
   const path = target.startsWith("/") ? target : `${process.cwd()}/${target}`;
-  if (existsSync(path)) fail(`worktree target already exists: ${path}`);
   const branch = `lane/${lane}`;
+  if (existsSync(path)) {
+    const probe = (...args: string[]) => Bun.spawnSync({ cmd: ["git", "-C", path, ...args] });
+    const common = probe("rev-parse", "--path-format=absolute", "--git-common-dir");
+    const sourceCommon = Bun.spawnSync({ cmd: ["git", "-C", repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+    const root = probe("rev-parse", "--show-toplevel");
+    const current = probe("symbolic-ref", "--short", "HEAD");
+    const status = probe("status", "--porcelain", "--untracked-files=all");
+    const sameRepo = common.success && sourceCommon.success && root.success
+      && realpathSync(root.stdout.toString().trim()) === realpathSync(path)
+      && common.stdout.toString().trim() === sourceCommon.stdout.toString().trim();
+    const reason = worktreeReuseRefusal(branch, current.stdout.toString().trim(), sameRepo, status.success && !status.stdout.toString().trim());
+    if (reason) fail(`cannot reuse ${path}: ${reason}`);
+    console.log(`cdx: reusing clean worktree ${path} on ${branch}`);
+    return { path, repo: repoRoot, branch };
+  }
   const add = Bun.spawnSync({ cmd: ["git", "-C", repoRoot, "worktree", "add", path, "-b", branch] });
   if (!add.success) {
     fail(`git worktree add failed: ${(add.stderr.toString() || add.stdout.toString()).trim().split("\n").at(-1)}`);
@@ -1677,34 +1835,39 @@ function createWorktree(repo: string, target: string, lane: string): WorktreeInf
   return { path, repo: repoRoot, branch };
 }
 
-function printWorktreeCleanup(entry: Lane) {
-  const repo = entry.worktreeRepo ?? entry.worktreePath;
-  console.log(`cdx: worktree remains; after merging: git -C ${repo} worktree remove ${entry.worktreePath}${entry.branch ? ` && git -C ${repo} branch -d ${entry.branch}` : ""}`);
+type WorktreeRecord = Pick<Lane, "worktreeRepo" | "worktreePath" | "branch">;
+type GitProbe = (cwd: string, args: string[]) => { success: boolean; stdout: { toString(): string }; stderr: { toString(): string } };
+
+function closeKeepsWorktree(flags: Set<string>): boolean {
+  if (flags.has("keep-worktree") && flags.has("remove-worktree")) throw new CmdError("--keep-worktree and --remove-worktree cannot be combined");
+  return flags.has("keep-worktree");
 }
 
-// Removal only when provably safe: the lane branch is merged into the repo's
-// HEAD and the worktree has no uncommitted changes. Anything else refuses
-// with the reason and prints the manual commands instead.
-function removeWorktree(entry: Lane) {
+function worktreeCleanupCommands(entry: WorktreeRecord): string[] {
+  if (!entry.worktreePath) return [];
+  const git = `git -C ${shellQuote(entry.worktreeRepo ?? entry.worktreePath)}`;
+  return [
+    `${git} worktree remove ${shellQuote(entry.worktreePath)}`,
+    ...(entry.branch ? [`${git} merge-base --is-ancestor ${shellQuote(`refs/heads/${entry.branch}`)} refs/heads/main && ${git} branch -D ${shellQuote(entry.branch)}`] : []),
+  ];
+}
+
+// main owns merge admission; branch -d would apply another check against HEAD or upstream.
+function removeWorktree(entry: WorktreeRecord,
+  run: GitProbe = (cwd, args) => Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] }),
+  log: (message: string) => void = console.log) {
   const repo = entry.worktreeRepo ?? entry.worktreePath!;
-  const refuse = (reason: string) => {
-    console.log(color.yellow(`cdx: not removing worktree: ${reason}`));
-    printWorktreeCleanup(entry);
-  };
-  if (!entry.branch) return refuse("the lane has no recorded branch");
-  const merged = Bun.spawnSync({ cmd: ["git", "-C", repo, "branch", "--merged", "HEAD"] });
-  if (!merged.success) return refuse(`git branch --merged failed in ${repo}`);
-  const branches = merged.stdout.toString().split("\n").map((line) => line.replace(/^[*+]\s*/, "").trim());
-  if (!branches.includes(entry.branch)) return refuse(`branch ${entry.branch} is not merged into HEAD of ${repo}`);
-  const status = Bun.spawnSync({ cmd: ["git", "-C", entry.worktreePath!, "status", "--porcelain"] });
-  if (!status.success) return refuse(`git status failed in ${entry.worktreePath}`);
-  if (status.stdout.toString().trim() !== "") return refuse(`worktree ${entry.worktreePath} has uncommitted changes`);
-  const remove = Bun.spawnSync({ cmd: ["git", "-C", repo, "worktree", "remove", entry.worktreePath!] });
-  if (!remove.success) return refuse(`git worktree remove failed: ${(remove.stderr.toString() || remove.stdout.toString()).trim().split("\n").at(-1)}`);
-  console.log(`cdx: removed worktree ${displayPath(entry.worktreePath!)}`);
-  const del = Bun.spawnSync({ cmd: ["git", "-C", repo, "branch", "-d", entry.branch] });
-  if (del.success) console.log(`cdx: deleted branch ${entry.branch}`);
-  else console.log(color.yellow(`cdx: branch ${entry.branch} not deleted: ${(del.stderr.toString() || del.stdout.toString()).trim().split("\n").at(-1)}`));
+  const probe = (...args: string[]) => run(repo, args);
+  const current = run(entry.worktreePath!, ["symbolic-ref", "--short", "HEAD"]);
+  const status = run(entry.worktreePath!, ["status", "--porcelain", "--untracked-files=all"]);
+  const merged = entry.branch ? probe("merge-base", "--is-ancestor", `refs/heads/${entry.branch}`, "refs/heads/main").success : false;
+  const reason = cleanupRefusal(entry.branch, current.stdout.toString().trim(), merged, status.success && !status.stdout.toString().trim());
+  if (reason) fail(`not removing worktree: ${reason}`);
+  const remove = probe("worktree", "remove", entry.worktreePath!);
+  if (!remove.success) fail(`git worktree remove failed: ${remove.stderr.toString().trim()}`);
+  const del = probe("branch", "-D", entry.branch!);
+  if (!del.success) fail(`worktree removed but branch retained: ${del.stderr.toString().trim()}`);
+  log(`cdx: removed worktree ${displayPath(entry.worktreePath!)} and branch ${entry.branch}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -1786,6 +1949,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
         workSessionId: kind === "review"
           ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
           : existing?.workSessionId,
+        gateReceipt: kind === "work" ? undefined : existing?.gateReceipt,
         gate: opts?.preserveGate ? existing?.gate : opts?.gate,
         pre: opts?.preservePre ? existing?.pre : opts?.pre,
         effort,
@@ -2085,7 +2249,7 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
     item.updatedAt = checkedAt;
     return item;
   });
-  feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath}`, entry.ownerSession, { lane, round });
+  feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath} log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log gateExit=${result.exitCode} verdict=${JSON.stringify(completionVerdict("gate-invalid", note))}`, entry.ownerSession, { lane, round });
   console.error(`cdx: lane=${color.magenta(lane)} state=${color.red("gate-invalid")} review the gate command before starting work`);
   console.error(`cdx: ${note}`);
   console.error(`cdx: gate log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log`);
@@ -2280,7 +2444,7 @@ async function runRound(lane: string, round: number): Promise<number> {
       try { await refreshGeminiUsage(); } catch { /* best-effort */ }
     }
     if (spec.engine !== "gpt" || !entry.quotaFailure || code === 0) {
-      if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${roundReportOf(entry) ?? "-"}`, entry.ownerSession, { lane, round });
+      if (code !== 0) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${roundStateOf(entry)} note=${roundNoteOf(entry) ?? "runner failed"} report=${roundReportOf(entry) ?? "-"} log=${logPathOf(lane, round, true)} gateExit=${entry.kind === "work" ? entry.gateReceipt?.exitCode ?? "not-run" : "not-run"} verdict=${JSON.stringify(completionVerdict(roundStateOf(entry), roundNoteOf(entry)))}`, entry.ownerSession, { lane, round });
       return code;
     }
     try {
@@ -2306,7 +2470,7 @@ async function runRound(lane: string, round: number): Promise<number> {
       const note = `account failover unavailable: ${error instanceof Error ? error.message : String(error)}`;
       withLedger((ledger) => failActiveRound(lane, ledger[lane]!, note));
       if (entry.supervisor) await killChildren(lane, note);
-      feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=failed note=${note}`, spec.ownerSession, { lane, round });
+      feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=failed note=${note} report=${availableReportPath(lane, round) ?? "-"} log=${logPathOf(lane, round, true)} gateExit=not-run verdict=${JSON.stringify(completionVerdict("failed", note))}`, spec.ownerSession, { lane, round });
       console.error(`cdx: ${note}`);
       return 1;
     }
@@ -3395,21 +3559,32 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   // rounds only (ledger kind, since intent reviews launch with mode "spawn").
   let gateExit: number | undefined;
   let gateTimedOut = false;
+  let gateReceipt: GateReceipt | undefined;
+  let proofRequired = false;
   if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason) {
     setStage("gate");
     feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
+    let before: GateTree | undefined;
+    let after: GateTree | undefined;
+    let snapshotError: string | undefined;
+    try { before = captureGateTree(spec.cwd); }
+    catch (error) { snapshotError = String(error); }
     const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
+    const finishedAt = new Date().toISOString();
+    try { after = captureGateTree(spec.cwd); }
+    catch (error) { snapshotError = String(error); }
+    gateReceipt = makeGateReceipt(round, spec.cwd, spec.gate, gate.exitCode, finishedAt, before, after, snapshotError);
+    proofRequired = Boolean(before || after || snapshotError);
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
     setStage("reporting");
-    feedEvent("gate-finished", `[cdx] lane=${lane} round=${round} gate finished exit=${gateExit}`, spec.ownerSession, { lane, round });
+    feedEvent("gate-finished", `[cdx] lane=${lane} round=${round} gate finished exit=${gateExit} receipt=${gateReceipt.valid ? "valid" : "invalid"} log=${ROOT}/logs/${lane}-r${round}.gate.log`, spec.ownerSession, { lane, round });
     writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
   }
   if (unchangedWork && existsSync(reportPath)) {
     appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
   }
-  if (reportOk) feedEvent("report-written", `[cdx] lane=${lane} round=${round} report written`, spec.ownerSession, { lane, round });
-  const gateFailed = gateExit !== undefined && gateExit !== 0;
+  const gateFailed = gateAcceptanceFailed(gateExit, gateReceipt, proofRequired);
   // A supervisor's round ends with its children. Whatever the outcome, any
   // child still running is stopped so nothing keeps editing after the
   // report; a round that finished with children running cannot be done.
@@ -3417,6 +3592,12 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     ? await killChildren(lane, receivedSignal ? `supervisor ${lane} killed` : maxRuntimeHit ? `supervisor ${lane} hit max runtime` : `supervisor ${lane} round ${round} ended`)
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
+  if (gateReceipt) {
+    const final = finishGateReceipt(gateReceipt, roundState);
+    gateReceipt = final.receipt;
+    appendFileSync(reportPath, final.report);
+  }
+  if (reportOk) feedEvent("report-written", `[cdx] lane=${lane} round=${round} report written`, spec.ownerSession, { lane, round });
   expireRoundQuestions(lane, round);
   const capturedReport = availableReportPath(lane, round);
   const entry = withLedger((ledger) => {
@@ -3430,6 +3611,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     let roundNote: string | undefined;
     if (reviewModifiedPath) roundNote = `review modified the tree: ${reviewModifiedPath}`;
     else if (orphanedChildren.length > 0 && !receivedSignal && !maxRuntimeHit) roundNote = `supervisor ended with running children: ${orphanedChildren.join(", ")} (stopped)`;
+    else if (gateFailed && gateExit === 0) roundNote = gateReceipt?.reason ?? "gate receipt unavailable";
     else if (gateFailed) {
       const gateLogPath = `${ROOT}/logs/${lane}-r${round}.gate.log`;
       let gateLogOutput = "";
@@ -3485,6 +3667,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       item.review!.report = capturedReport;
       item.review!.updatedAt = new Date().toISOString();
     } else {
+      item.gateReceipt = gateReceipt;
       item.work.state = roundState;
       item.work.exitCode = exitCode;
       item.work.note = roundNote;
@@ -3521,7 +3704,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const roundIncomplete = entry.kind === "review" ? entry.review?.tokensIncomplete : entry.work.tokensIncomplete;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"}`, entry.ownerSession, { lane, round });
+  if (!entry.quotaFailure) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
   if (finalRoundState === "failed" || finalRoundState === "gate-invalid") {
     notifyParent(lane, `[cdx] child lane=${lane} round=${round} state=${finalRoundState}${finalRoundNote ? ` note=${finalRoundNote}` : ""} report=${capturedReport ?? "-"}; read the report or partial before deciding between cdx resume ${lane} and a new lane`);
   }
@@ -3776,6 +3959,7 @@ function gateCommand(argv: string[]): void {
     const item = ledger[lane]!;
     requireOwnChild(lane, item);
     item.gate = next;
+    item.gateReceipt = undefined;
     item.updatedAt = new Date().toISOString();
   });
   printGateChange(lane, before.gate, next);
@@ -3819,7 +4003,6 @@ async function spawnCommand(argv: string[]) {
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
-  if (parsed.bools.has("gate-baseline-check") && parsed.flags.gate === undefined) fail("--gate-baseline-check requires --gate");
   if (existingLane) {
     requireOwnChild(lane, existingLane);
     if (parent && parsed.flags.gate !== undefined && parsed.flags.gate !== existingLane.gate) {
@@ -3831,11 +4014,13 @@ async function spawnCommand(argv: string[]) {
   }
   // A respawn keeps the stored gate and cwd unless the caller passes new ones.
   const gate = parsed.flags.gate ?? existingLane?.gate;
+  const effectiveGate = composeGate(repositoryGate(cwd), gate);
+  if (parsed.bools.has("gate-baseline-check") && !effectiveGate) fail("--gate-baseline-check requires --gate or .cdx-gate");
   const pre = parsed.flags.pre ?? existingLane?.pre;
-  const additionalDirectories = (parsed.lists["add-dir"] ?? []).map((dir) => {
-    if (!existsSync(dir)) fail(`--add-dir does not exist: ${dir}`);
+  const additionalDirectories = mergeDirectories(storedDirectories(lane, existingLane), (parsed.lists["add-dir"] ?? []).map((dir) => {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) fail(`--add-dir is not a directory: ${dir}`);
     return realpathSync(dir);
-  });
+  }));
   const images = (parsed.lists.image ?? []).map((image) => {
     if (!existsSync(image)) fail(`--image does not exist: ${image}`);
     return realpathSync(image);
@@ -3864,7 +4049,7 @@ async function spawnCommand(argv: string[]) {
   });
   if (parsed.flags.worktree) {
     try {
-      worktree = createWorktree(cwd, parsed.flags.worktree, lane);
+      worktree = createWorktree(existingLane?.worktreeRepo ?? cwd, parsed.flags.worktree, lane);
       cwd = worktree.path;
       withLedger((ledger) => {
         const item = ledger[lane]!;
@@ -3878,18 +4063,19 @@ async function spawnCommand(argv: string[]) {
   }
   if (selection) announceAccountSelection(lane, selection);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
-  const gateBaselineChecked = Boolean(gate && parsed.bools.has("gate-baseline-check"));
+  withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
+  const gateBaselineChecked = Boolean(effectiveGate && parsed.bools.has("gate-baseline-check"));
   if (gateBaselineChecked) {
     const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
-    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${gate}`);
-    const result = executeGate(gate!, cwd, baselineLog);
+    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${effectiveGate}`);
+    const result = executeGate(effectiveGate!, cwd, baselineLog);
     const checkedAt = new Date().toISOString();
     withLedger((ledger) => {
-      ledger[lane]!.gateBaseline = { round, command: gate!, cwd, exitCode: result.exitCode, checkedAt };
+      ledger[lane]!.gateBaseline = { round, command: effectiveGate!, cwd, exitCode: result.exitCode, checkedAt };
     });
     if (result.exitCode !== 0) {
       writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, fullBrief);
-      finishInvalidBaseline(lane, round, gate!, cwd, result);
+      finishInvalidBaseline(lane, round, effectiveGate!, cwd, result);
       process.exitCode = 1;
       return;
     }
@@ -3901,7 +4087,7 @@ async function spawnCommand(argv: string[]) {
     ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(images.length ? { images } : {}),
     ...(outputSchema !== undefined ? { outputSchema } : {}),
-    ...(gate ? { gate } : {}),
+    ...(effectiveGate ? { gate: effectiveGate } : {}),
     ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
@@ -3909,9 +4095,9 @@ async function spawnCommand(argv: string[]) {
 }
 
 async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre"]);
+  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir"]);
   const [lane, followUpArg] = parsed.rest;
-  const usage = 'usage: cdx resume <lane> [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"';
+  const usage = 'usage: cdx resume <lane> [--add-dir <dir>]... [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"';
   const followUp = await resolveBrief(followUpArg, usage);
   if (!lane || !followUp) fail(usage);
   const before = readLane(lane);
@@ -3940,6 +4126,12 @@ async function resumeCommand(argv: string[]) {
   const account = engine === "gpt" ? reviewResume ? before.roundAccount ?? laneAccount(before) : laneAccount(before) : undefined;
   if (engine === "gpt") warnCachedUsageBeforeLaunch(account);
   const cwd = workCwdOf(before);
+  const additionalDirectories = mergeDirectories(storedDirectories(lane, before), (parsed.lists["add-dir"] ?? []).map((dir) => {
+    if (!existsSync(dir) || !statSync(dir).isDirectory()) fail(`--add-dir is not a directory: ${dir}`);
+    return realpathSync(dir);
+  }));
+  if (reviewResume && parsed.lists["add-dir"]?.length) fail("--add-dir is only supported on work resumes");
+  const effectiveGate = composeGate(repositoryGate(cwd), parsed.flags.gate ?? before.gate);
   const pre = parsed.flags.pre ?? before.pre;
   if (pre) runPreCheck(pre, cwd);
   const partialPath = partialReportPathOf(lane, before.rounds);
@@ -3952,6 +4144,7 @@ async function resumeCommand(argv: string[]) {
     ...(parsed.flags.pre !== undefined ? { pre: parsed.flags.pre } : {}),
     ...(workThread ? { sessionOverride: workThread } : {}),
   });
+  withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
   if (selection) announceAccountSelection(lane, selection);
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const structuredInstruction = reviewResume && engine === "gemini"
@@ -3964,13 +4157,13 @@ async function resumeCommand(argv: string[]) {
   const codexArgs = reviewResume && engine === "gpt"
     ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : undefined;
-  const gate = parsed.flags.gate ?? before.gate;
   return launch({
     effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt,
     ...(before.supervisor ? { supervisor: true as const } : {}),
     ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
     ...(reviewResume && engine === "gemini" ? { reviewDir: cwd, outputSchema: REVIEW_FINDINGS_SCHEMA } : {}),
-    ...(!reviewResume && gate ? { gate } : {}),
+    ...(!reviewResume && effectiveGate ? { gate: effectiveGate } : {}),
+    ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
   }, prompt, parsed.bools.has("bg"));
@@ -4017,9 +4210,13 @@ async function forkCommand(argv: string[]) {
     cwd = sessionCwd ?? process.cwd();
   }
   const owner = callerOwnership();
-  const { round, selection } = await openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model, forcedAccount: sourceLane ? parsed.flags.account : account?.name });
+  const additionalDirectories = storedDirectories(source, sourceLane);
+  const effectiveGate = composeGate(repositoryGate(cwd), sourceLane?.gate);
+  const { round, selection } = await openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model, gate: sourceLane?.gate, forcedAccount: sourceLane ? parsed.flags.account : account?.name });
+  withLedger((ledger) => { ledger[newLane]!.additionalDirectories = additionalDirectories; });
   const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
-  return launch({ effort, engine: "gpt", mode: "fork", lane: newLane, round, cwd, prompt, ...(sourceLane ? { sourceLane: source } : { model }), sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
+  return launch({ effort, engine: "gpt", mode: "fork", ...(effectiveGate ? { gate: effectiveGate } : {}),
+    ...(additionalDirectories.length ? { additionalDirectories } : {}), lane: newLane, round, cwd, prompt, ...(sourceLane ? { sourceLane: source } : { model }), sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 // consult: a read-only advisor lane. It runs as a read-only review, framed
@@ -6547,7 +6744,7 @@ async function killLane(lane: string, entry: Lane, note?: string) {
     else item.work.exitCode = undefined;
     return item;
   });
-  feedEvent("terminal", `[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)}`, finalized.ownerSession, { lane, round: finalized.rounds });
+  feedEvent("terminal", `[cdx] lane=${lane} round=${finalized.rounds} kind=${finalized.kind} state=failed note=${roundNoteOf(finalized)} report=${roundReportOf(finalized) ?? "-"} log=${logPathOf(lane, finalized.rounds, true)} gateExit=not-run verdict=${JSON.stringify(completionVerdict("failed", roundNoteOf(finalized)))}`, finalized.ownerSession, { lane, round: finalized.rounds });
   console.log(`cdx: lane=${color.magenta(lane)} killed; ${finalized.kind} state=${coloredState("failed")} note=${roundNoteOf(finalized)}`);
 }
 
@@ -6644,9 +6841,9 @@ async function jobCommand(argv: string[]) {
   let cmd = rest.join(" ");
   if (cmd === "-") cmd = await Bun.stdin.text();
   cmd = cmd.trim();
-  if (!cmd) fail('usage: cdx job <name> [--cd <dir>] "<cmd>"   (a "-" command reads stdin; no arguments lists jobs)');
-  const cwd = parsed.flags.cd ?? process.cwd();
-  if (!existsSync(cwd)) fail(`--cd ${cwd} does not exist`);
+  if (!cmd) fail('usage: cdx job <name> --cd <dir> "<cmd>"   (a "-" command reads stdin; no arguments lists jobs)');
+  const cwd = jobCwd(parsed.flags.cd);
+  if (!existsSync(cwd) || !statSync(cwd).isDirectory()) fail(`--cd ${cwd} is not a directory`);
   mkdirSync(`${ROOT}/logs`, { recursive: true });
   const log = `${ROOT}/logs/job-${name}.log`;
   const startedAt = new Date().toISOString();
@@ -6708,7 +6905,7 @@ async function runJob(name: string): Promise<number> {
     if (note) entry.note = note;
     return entry;
   });
-  feedEvent("job-exit", `[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(finished)} log=${finished.log}${note ? ` note=${note}` : ""}`, process.env.CDX_JOB_OWNER, { job: name });
+  feedEvent("job-exit", `[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(finished)} log=${finished.log} report=- gateExit=not-applicable verdict=${JSON.stringify(completionVerdict(state, note))}${note ? ` note=${note}` : ""}`, process.env.CDX_JOB_OWNER, { job: name });
   return exitCode;
 }
 
@@ -6748,7 +6945,7 @@ async function killJob(name: string, job: Job, note?: string): Promise<void> {
   }
   signalGroup("SIGKILL");
   const finished = finalize(137, note ?? "killed");
-  feedEvent("job-exit", `[cdx] job=${name} state=failed exit=137 in=${jobDuration(finished)} log=${finished.log} note=${finished.note}`, finished.ownerSession, { job: name });
+  feedEvent("job-exit", `[cdx] job=${name} state=failed exit=137 in=${jobDuration(finished)} log=${finished.log} report=- gateExit=not-applicable verdict=${JSON.stringify(completionVerdict("failed", finished.note))} note=${finished.note}`, finished.ownerSession, { job: name });
   console.log(`cdx: ${renderJobLine(name, finished)}`);
 }
 
@@ -6953,7 +7150,7 @@ Engines:
 ${ENGINE_PICKER}
 
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
-  resume <lane> [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
+  resume <lane> [--add-dir D]... [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
   fork   <newLane> <fromLane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only gpt advisor; resume for follow-ups
@@ -6975,10 +7172,11 @@ ${ENGINE_PICKER}
   view   [--port N] [--open] # local browser view; Ctrl-C stops it
   feed   [-n N]           # replay recent completion/stall lines
   report <lane> [round]    log <lane> [round]
+  gate-receipt <lane> [--json] # content proof for the latest work round
   gate   <lane> "<cmd>" | gate <lane> --clear
   kill   <lane> ["note"]  # SIGTERM the runner; force-finalize if it hangs
-  close  <lane> [--remove-worktree] ["note"]       clean [--days N]
-  job    <name> [--cd D] "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
+  close  <lane> [--remove-worktree | --keep-worktree] ["note"]       clean [--days N]
+  job    <name> --cd D "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
   job                     # list jobs
   doctor [--fix] [--probe]
   brief                   # owned lanes, completed work awaiting attention, and open questions
@@ -7017,6 +7215,8 @@ if (import.meta.main) {
 }
 
 export {
+  finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree,
+  makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal,
   summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
@@ -7089,6 +7289,7 @@ switch (command) {
     process.exit(await runJob(argv[0]));
   }
   case "gate": gateCommand(argv); break;
+  case "gate-receipt": gateReceiptCommand(argv); break;
   case "usage": await usageCommand(argv); break;
   case "wait": await waitCommand(argv); break;
   case "feed": feedCommand(argv); break;
@@ -7166,14 +7367,16 @@ switch (command) {
     break;
   }
   case "close": {
-    const parsed = parseArgs(argv, ["remove-worktree"]);
-    const usage = 'usage: cdx close <lane> [--remove-worktree] ["note" | -]';
+    const parsed = parseArgs(argv, ["remove-worktree", "keep-worktree"]);
+    const keepWorktree = closeKeepsWorktree(parsed.bools);
+    const usage = 'usage: cdx close <lane> [--remove-worktree | --keep-worktree] ["note" | -]';
     const [lane, noteArg] = parsed.rest;
     if (!lane) fail(usage);
     const note = await resolveBrief(noteArg, usage);
     const entry = readLane(lane);
     requireOwnChild(lane, entry);
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
+    if (!keepWorktree && entry.worktreePath && existsSync(entry.worktreePath)) removeWorktree(entry);
     withLedger((ledger) => {
       const item = ledger[lane]!;
       requireOwnChild(lane, item);
@@ -7182,12 +7385,7 @@ switch (command) {
       item.updatedAt = new Date().toISOString();
     });
     console.log(`cdx: closed lane=${lane}`);
-    // Default: never auto-remove, the branch may be unmerged. --remove-worktree
-    // deletes only a merged branch with a clean worktree; otherwise it refuses.
-    if (entry.worktreePath && existsSync(entry.worktreePath)) {
-      if (parsed.bools.has("remove-worktree")) removeWorktree(entry);
-      else printWorktreeCleanup(entry);
-    }
+    if (keepWorktree) for (const command of worktreeCleanupCommands(entry)) console.log(command);
     break;
   }
   case "kill": await killCommand(argv); break;
