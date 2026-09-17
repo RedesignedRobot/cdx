@@ -1,7 +1,7 @@
 {
   "name": "cdx-lanes",
   "version": "7.4.3",
-  "license": "MIT",
+  "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
     "cdx": "./cdx.ts"
