@@ -575,4 +575,6 @@ The owner removed the 135 end-to-end tests after a run took 226 seconds. Process
 
 ## License
 
-[MIT](LICENSE)
+Copyright (c) 2026 Amir Ayub.
+
+cdx is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. Full text in [LICENSE](LICENSE).
