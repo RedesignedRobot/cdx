@@ -293,7 +293,16 @@ export function register(on: On) {
     if (runSpec.timeoutMs !== undefined) {
       procInit.timeoutMs = runSpec.timeoutMs;
     }
-    const res = await $.process.run(CDX.concat(runSpec.argv), procInit);
+    let res: Awaited<ReturnType<typeof $.process.run>>;
+    try {
+      res = await $.process.run(CDX.concat(runSpec.argv), procInit);
+    } catch (error) {
+      // The head's shell directory can be gone (it removed the worktree it
+      // stood in); a thrown hook reads as "no tool.call hook answered" in
+      // Claude Code, so rerun from the plugin root instead.
+      if (procInit.cwd === root) throw error;
+      res = await $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd: root });
+    }
     if (toolName === "events") {
       return { result: eventsToolResult(res.exitCode, res.stdout, res.stderr) };
     }
