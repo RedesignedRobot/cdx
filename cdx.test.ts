@@ -3,7 +3,7 @@ import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
-  checkRoundCap, eventOwned, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
+  checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
@@ -1059,4 +1059,16 @@ test("spawn, consult and review tools require the repository path", () => {
   for (const name of ["spawn", "consult", "review"]) {
     expect(TOOLS_BY_NAME.get(name)!.inputSchema.required).toContain("cd");
   }
+});
+
+test("the brief drops finished jobs older than the age window and keeps running ones", () => {
+  const now = Date.parse("2026-09-20T00:00:00Z");
+  const jobs = {
+    old: { log: "-", startedAt: "2026-09-17T00:00:00Z", finishedAt: "2026-09-17T00:10:00Z", state: "failed" as const, exitCode: 1 },
+    fresh: { log: "-", startedAt: "2026-09-19T22:00:00Z", finishedAt: "2026-09-19T22:05:00Z", state: "done" as const, exitCode: 0 },
+    live: { log: "-", startedAt: "2026-09-16T00:00:00Z", state: "running" as const, pid: process.pid },
+  };
+  const names = summaryJobs(jobs, 5, 24 * 60 * 60 * 1000, now).map(([name]) => name);
+  expect(names).toEqual(["live", "fresh"]);
+  expect(summaryJobs(jobs, 5).map(([name]) => name)).toEqual(["live", "fresh", "old"]);
 });

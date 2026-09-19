@@ -1019,9 +1019,16 @@ function sessionProgress(session: string, now: number): ProgressSample[] {
   return samples;
 }
 
-function summaryJobs(jobs: Jobs, finishedShown = FINISHED_SHOWN): [string, Job][] {
+// Finished jobs older than this stay out of the brief: a release job that
+// failed three days ago is history the head already handled, and cdx job
+// still lists it.
+const BRIEF_FINISHED_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+function summaryJobs(jobs: Jobs, finishedShown = FINISHED_SHOWN, maxFinishedAgeMs?: number, now = Date.now()): [string, Job][] {
   const entries = Object.entries(jobs).sort((a, b) => b[1].startedAt.localeCompare(a[1].startedAt));
-  return [...entries.filter(([, job]) => jobRunning(job)), ...entries.filter(([, job]) => !jobRunning(job)).slice(0, finishedShown)];
+  const recent = ([, job]: [string, Job]) => maxFinishedAgeMs === undefined
+    || now - Date.parse(job.finishedAt ?? job.startedAt) <= maxFinishedAgeMs;
+  return [...entries.filter(([, job]) => jobRunning(job)), ...entries.filter(([, job]) => !jobRunning(job)).filter(recent).slice(0, finishedShown)];
 }
 
 // The brief lands in the head's context on every session start, resume and
@@ -1047,7 +1054,7 @@ function sessionSummary(session: string): string {
     }
   }
   const jobs = Object.fromEntries(Object.entries(readJobs()).filter(([, job]) => owned(job.ownerSession, undefined, session, state)));
-  for (const [name, job] of summaryJobs(jobs, BRIEF_FINISHED_SHOWN)) lines.push(renderJobLine(name, job));
+  for (const [name, job] of summaryJobs(jobs, BRIEF_FINISHED_SHOWN, BRIEF_FINISHED_JOB_MAX_AGE_MS)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
 }
 
