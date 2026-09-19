@@ -243,14 +243,16 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "status",
-    description: "Show the status of active and recent cdx lanes.",
+    description: "Show the status of active and recent cdx lanes. brief returns one line per running or unclosed lane plus running jobs; the default is the detailed block per lane.",
     inputSchema: {
       type: "object",
       properties: {
         all: { type: "boolean", description: "Include closed lanes" },
+        brief: { type: "boolean", description: "One line per lane and job, the same text as the session brief" },
       },
     },
     run: (input) => {
+      if (input.brief === true) return { argv: ["brief"] };
       const argv = ["status"];
       if (input.all) argv.push("--all");
       return { argv };

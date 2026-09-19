@@ -820,6 +820,8 @@ interface SessionDelivery {
   polledAt?: string;
   digestAt?: string;
   progress?: ProgressSample[];
+  briefHash?: string;
+  briefAt?: string;
 }
 interface SessionState {
   sequence: number;
@@ -5003,9 +5005,11 @@ async function statusCommand(argv: string[]) {
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
+  const showAll = parsed.bools.has("all");
   const running = all.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
-  const finished = all.filter(([, entry]) => !laneRunning(entry)).sort(byRecency);
-  const hidden = parsed.bools.has("all") ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
+  // Closed lanes are handled history; only --all lists them.
+  const finished = all.filter(([, entry]) => !laneRunning(entry) && (showAll || entry.work.state !== "closed")).sort(byRecency);
+  const hidden = showAll ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
   const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
   console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
   if (hidden > 0) console.log(`\n${color.dim(`… ${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`)}`);
@@ -6979,11 +6983,28 @@ async function doctorCommand(argv: string[]) {
   if (failures > 0) process.exitCode = 1;
 }
 
+// A plugin reload registers a fresh hook instance beside the live ones, and
+// every instance asks for the brief at its session start; the head then
+// reads the same brief once per instance. The same text within this window
+// for the same session prints nothing.
+const BRIEF_REPEAT_WINDOW_MS = 10 * 60 * 1000;
+
+function briefRepeated(session: string, text: string, now = Date.now()): boolean {
+  const hash = createHash("sha256").update(text).digest("hex");
+  return withEvents((state) => {
+    const record = state.sessions[session] ?? { cursor: 0 };
+    const repeated = record.briefHash === hash && record.briefAt !== undefined && now - Date.parse(record.briefAt) < BRIEF_REPEAT_WINDOW_MS;
+    if (!repeated) state.sessions[session] = { ...record, briefHash: hash, briefAt: new Date(now).toISOString() };
+    return repeated;
+  });
+}
+
 function briefCommand() {
   const quotaState = geminiQuotaState();
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
-  const summary = sessionSummary(callerSession());
-  if (summary) console.log(summary);
+  const session = callerSession();
+  const summary = sessionSummary(session);
+  if (summary && !briefRepeated(session, summary)) console.log(summary);
 }
 
 function feedCommand(argv: string[]) {
