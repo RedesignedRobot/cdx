@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.4.5";
+const VERSION = "7.4.9";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -2171,6 +2171,14 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
   console.log(`cdx: log=${logPathOf(spec.lane, spec.round, jsonMode)} report=${reportPathOf(spec.lane, spec.round)}`);
   if (spec.engine === "gemini") {
+    const snapshot = readGeminiUsageSnapshot();
+    if (snapshot) {
+      const standing = formatGeminiStanding(snapshot);
+      const paint = standing.usedPercent >= 95 ? color.red : standing.usedPercent >= 75 ? color.yellow : (text: string) => text;
+      console.log(`cdx: gemini for this lane: ${paint(standing.detail)} (checked ${fmtAge(snapshot.checkedAt)} ago)`);
+    } else {
+      console.log("cdx: gemini for this lane: usage unknown (run cdx usage once agy is signed in)");
+    }
     const capacity = geminiCapacityNotice();
     console.log(capacity.peak ? color.yellow(`cdx: ${capacity.text}`) : `cdx: ${capacity.text}`);
   }
@@ -4047,7 +4055,9 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const finalRoundNote = entry.kind === "review" ? entry.review?.note : entry.work.note;
   const roundIncomplete = entry.kind === "review" ? entry.review?.tokensIncomplete : entry.work.tokensIncomplete;
   const diffToken = entry.diffEmpty ? " diff=empty" : "";
-  if (!entry.quotaFailure && !fallbackRound) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
+  const geminiStanding = gemini ? await refreshGeminiUsage().catch(() => undefined) : undefined;
+  const standingToken = geminiStanding ? ` gemini=${geminiStanding.weekly.remainingPercent}% weekly left/${geminiStanding.fiveHour.remainingPercent}% five-hour left` : "";
+  if (!entry.quotaFailure && !fallbackRound) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)}${standingToken} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
   if (!fallbackRound && (finalRoundState === "failed" || finalRoundState === "gate-invalid")) {
     notifyParent(lane, `[cdx] child lane=${lane} round=${round} state=${finalRoundState}${finalRoundNote ? ` note=${finalRoundNote}` : ""} report=${capturedReport ?? "-"}; read the report or partial before deciding between cdx resume ${lane} and a new lane`);
   }
@@ -6084,6 +6094,17 @@ async function refreshGeminiUsage(): Promise<GeminiUsageSnapshot | undefined> {
   }
 }
 
+// Gemini standing in the same shape as a Codex account line ("weekly window
+// 11% used, resets ..."), so the two engines read alike in every report.
+function formatGeminiStanding(snapshot: GeminiUsageSnapshot): { detail: string; usedPercent: number } {
+  const window = (label: string, usage: GeminiUsageWindow) =>
+    `${label} window ${100 - usage.remainingPercent}% used (${usage.remainingPercent}% left), resets ${formatGeminiReset(usage.resetsAt)}`;
+  return {
+    detail: `${window("weekly", snapshot.weekly)}, ${window("five-hour", snapshot.fiveHour)}`,
+    usedPercent: Math.max(100 - snapshot.weekly.remainingPercent, 100 - snapshot.fiveHour.remainingPercent),
+  };
+}
+
 function formatGeminiReset(iso: string): string {
   const ms = Date.parse(iso);
   return Number.isFinite(ms) ? `${fmtLocalInstant(ms)} ${fmtUntil(ms / 1000)}` : iso;
@@ -6187,10 +6208,9 @@ async function usageCommand(argv: string[]): Promise<void> {
   if (!gemini) {
     console.log(`${color.bold("gemini")}: ${color.yellow("usage probe failed (agy installed and signed in?)")}`);
   } else {
-    const paint = (remaining: number) => remaining <= 5 ? color.red : remaining <= 25 ? color.yellow : color.green;
-    const weekly = `${gemini.weekly.remainingPercent}% weekly remaining, resets ${formatGeminiReset(gemini.weekly.resetsAt)}`;
-    const fiveHour = `${gemini.fiveHour.remainingPercent}% five-hour remaining, resets ${formatGeminiReset(gemini.fiveHour.resetsAt)}`;
-    console.log(`${color.bold("gemini")}: ${paint(gemini.weekly.remainingPercent)(weekly)}, ${paint(gemini.fiveHour.remainingPercent)(fiveHour)}`);
+    const standing = formatGeminiStanding(gemini);
+    const paint = standing.usedPercent >= 95 ? color.red : standing.usedPercent >= 75 ? color.yellow : color.green;
+    console.log(`${color.bold("gemini")}: ${paint(`pro plan, ${standing.detail}`)}${color.dim(` · checked ${fmtAge(gemini.checkedAt)} ago`)}`);
   }
   if (geminiTotals.lanes > 0) console.log(color.dim(`  lanes ${geminiTotals.lanes} · ledger tokens ${fmtTokensFull(geminiTotals.tokens, geminiTotals.incomplete)}`));
 }
@@ -6723,7 +6743,7 @@ async function doctorCommand(argv: string[]) {
   if (agyVersion?.success) {
     const geminiUsage = await refreshGeminiUsage();
     if (geminiUsage) {
-      good(`agy usage: weekly ${geminiUsage.weekly.remainingPercent}% remaining, five-hour ${geminiUsage.fiveHour.remainingPercent}% remaining`);
+      good(`agy usage: ${formatGeminiStanding(geminiUsage).detail}`);
     } else warn("agy usage: unavailable");
 
     const quotaState = geminiQuotaState();

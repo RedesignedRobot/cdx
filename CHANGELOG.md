@@ -1,3 +1,12 @@
+## 7.4.9
+
+- Gemini standing reads like a Codex account line. `cdx usage` prints `gemini: pro plan, weekly window 17% used (83% left), resets Wed 23 Sep 09:51 in 3.3d, five-hour window 40% used (60% left), resets ...` with the snapshot age, `cdx doctor` prints the same detail, and every Gemini spawn prints `cdx: gemini for this lane: <standing> (checked 4m ago)` from the cached snapshot before the capacity notice. The round finish event carries `gemini=83% weekly left/60% five-hour left` after a fresh agy probe, so the feed shows what each round cost.
+- Version alignment: 7.4.9.
+
+## 7.4.8
+
+- Deleted session directory: when the head removed the worktree it stood in, every native tool call threw inside the hook and Claude Code reported "no tool.call hook answered". The hook now reruns the command from the plugin root when the session directory is gone.
+
 ## 7.4.3
 
 - `mcp__cdx__gate-receipt` was registered but the tool.call hook listed the tools by hand and missed it, so the call failed with "no tool.call hook answered". The hook now matches every name in the tool table.
