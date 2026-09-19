@@ -79,10 +79,13 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS) {
 }
 
 export interface ProgressSample { key: string; round?: number; steps?: number; files?: number; stage: string; action: string }
+// A job appears in the digest once, when it is first seen running; its end
+// arrives as its own job-exit event. Repeating a dev server's hmr line every
+// heartbeat told the head nothing and cost context each turn.
 export function digestLines(samples: ProgressSample[], previous: ProgressSample[]): string[] {
   const old = new Map(previous.map((sample) => [sample.key, sample]));
   const delta = (value: number) => `${value >= 0 ? "+" : ""}${value}`;
-  return samples.map((sample) => {
+  return samples.filter((sample) => !(sample.key.startsWith("job=") && old.has(sample.key))).map((sample) => {
     const prior = old.get(sample.key);
     const sameRound = prior?.round === sample.round;
     const steps = sample.steps === undefined ? "" : ` steps=${sample.steps}(${delta(sample.steps - (sameRound ? prior?.steps ?? 0 : 0))})`;

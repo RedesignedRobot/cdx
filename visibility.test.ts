@@ -63,6 +63,7 @@ test("digests combine rows and reset step deltas across rounds", () => {
   expect(lines[1]).toBe("job=train running land 10/15");
   expect(digestLines([{ ...current[0]!, round: 2, steps: 2 }], previous)[0]).toContain("steps=2(+2)");
   expect(digestLines([], previous)).toEqual([]);
+  expect(digestLines(current, [...previous, { key: "job=train", stage: "running", action: "land 9/15" }])).toHaveLength(1);
   expect(heartbeatDue(599_999, 0, 10)).toBe(false);
   expect(heartbeatDue(600_000, 0, 10)).toBe(true);
 });

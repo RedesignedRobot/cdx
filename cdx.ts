@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.4.3";
+const VERSION = "7.4.4";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -1019,17 +1019,27 @@ function sessionProgress(session: string, now: number): ProgressSample[] {
   return samples;
 }
 
-function summaryJobs(jobs: Jobs): [string, Job][] {
+function summaryJobs(jobs: Jobs, finishedShown = FINISHED_SHOWN): [string, Job][] {
   const entries = Object.entries(jobs).sort((a, b) => b[1].startedAt.localeCompare(a[1].startedAt));
-  return [...entries.filter(([, job]) => jobRunning(job)), ...entries.filter(([, job]) => !jobRunning(job)).slice(0, FINISHED_SHOWN)];
+  return [...entries.filter(([, job]) => jobRunning(job)), ...entries.filter(([, job]) => !jobRunning(job)).slice(0, finishedShown)];
 }
+
+// The brief lands in the head's context on every session start, resume and
+// compaction, so it carries the running lanes and only the few most recent
+// finished ones; a session that never closed forty old lanes used to reread
+// all forty each time.
+const BRIEF_FINISHED_SHOWN = 5;
 
 function sessionSummary(session: string): string {
   const state = readSessions();
   const ledger = readLedger();
-  const lines = Object.entries(ledger).filter(([lane, entry]) => owned(entry.ownerSession, lane, session, state)
-    && entry.work.state !== "closed").sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt))
+  const open = Object.entries(ledger).filter(([lane, entry]) => owned(entry.ownerSession, lane, session, state)
+    && entry.work.state !== "closed").sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
+  const finished = open.filter(([, entry]) => !laneRunning(entry));
+  const hidden = Math.max(0, finished.length - BRIEF_FINISHED_SHOWN);
+  const lines = [...open.filter(([, entry]) => laneRunning(entry)), ...finished.slice(0, BRIEF_FINISHED_SHOWN)]
     .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${roundStateOf(entry)} report=${roundReportOf(entry) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
+  if (hidden > 0) lines.push(`${hidden} older finished lanes not closed; cdx status --all lists them`);
   for (const { record } of questionFiles()) {
     const entry = ledger[record.lane];
     if (entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state)) {
@@ -1037,7 +1047,7 @@ function sessionSummary(session: string): string {
     }
   }
   const jobs = Object.fromEntries(Object.entries(readJobs()).filter(([, job]) => owned(job.ownerSession, undefined, session, state)));
-  for (const [name, job] of summaryJobs(jobs)) lines.push(renderJobLine(name, job));
+  for (const [name, job] of summaryJobs(jobs, BRIEF_FINISHED_SHOWN)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
 }
 
@@ -5922,11 +5932,18 @@ function rateLimitWindowName(minutes: number): string {
   return `${minutes / 60}h`;
 }
 
-function rateLimitResetDate(unixSeconds: number): string {
-  const date = new Date(unixSeconds * 1000);
+// Local wall-clock instant, "Sun 20 Sep 23:33": the head plans lanes against
+// the exact reset, so a day-only date sent it to the raw usage file.
+function fmtLocalInstant(ms: number): string {
+  const date = new Date(ms);
   const weekdays = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]}`;
+  const clock = `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `${weekdays[date.getDay()]} ${date.getDate()} ${months[date.getMonth()]} ${clock}`;
+}
+
+function rateLimitResetDate(unixSeconds: number): string {
+  return fmtLocalInstant(unixSeconds * 1000);
 }
 
 // An unused credit is money on the table; alert this many days before it lapses.
@@ -6049,8 +6066,8 @@ async function refreshGeminiUsage(): Promise<GeminiUsageSnapshot | undefined> {
 }
 
 function formatGeminiReset(iso: string): string {
-  const date = new Date(iso);
-  return Number.isFinite(date.getTime()) ? date.toISOString() : iso;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? `${fmtLocalInstant(ms)} ${fmtUntil(ms / 1000)}` : iso;
 }
 
 async function usageCommand(argv: string[]): Promise<void> {
@@ -6111,6 +6128,7 @@ async function usageCommand(argv: string[]): Promise<void> {
         home: account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`,
         usage: refreshed[index]?.usage ?? null,
         checkedAt: refreshed[index]?.snapshot.checkedAt ?? null,
+        resetsAt: refreshed[index] ? new Date(refreshed[index].snapshot.resetsAt * 1000).toISOString() : null,
         lanes: ledgerTotals?.lanes ?? 0,
         ledgerTokens: ledgerTotals?.tokens ?? null,
         incomplete: Boolean(ledgerTotals?.incomplete),

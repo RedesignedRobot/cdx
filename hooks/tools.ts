@@ -403,12 +403,14 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "usage",
-    description: "Report token consumption and rate limit windows for engines and accounts.",
+    description: "Report token consumption and rate limit windows for engines and accounts, with exact local reset times. json returns the raw snapshot (ISO resetsAt per account).",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        json: { type: "boolean", description: "Machine-readable output instead of the text report." },
+      },
     },
-    run: () => ({ argv: ["usage"] }),
+    run: (input) => ({ argv: input.json === true ? ["usage", "--json"] : ["usage"] }),
   },
   {
     name: "takeover",
