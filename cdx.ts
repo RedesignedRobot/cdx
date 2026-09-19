@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.4.4";
+const VERSION = "7.4.5";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -3163,6 +3163,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   };
 
   const trackProgress = roundProgress(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS);
+  // Files this round's own tool calls wrote, for the shared-worktree check below.
+  const writtenPaths = new Set<string>();
   // Review lanes refuse `cdx send`, so the alert points at the transcript instead.
   const thrashAdvice = (name: string): string => startingLane?.kind === "work"
     ? `cdx send ${name} "Stop repeating this attempt; inspect the cause and change approach."`
@@ -3170,6 +3172,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const observeTool = (event: any, now: string) => {
     const observation = toolObservation(event);
     if (!observation) return;
+    for (const file of observation.files) writtenPaths.add(resolve(spec.cwd, file));
     const progress = trackProgress(observation);
     roundStepCount = progress.steps;
     touchLedger((item) => {
@@ -3861,7 +3864,11 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const ladderExhausted = gemini && turnFailureReason === "gemini service unavailable (503)" && geminiContinuations >= GEMINI_OUTAGE_RETRIES;
   const fallbackRound = ladderExhausted && !receivedSignal && !maxRuntimeHit
     && Boolean(geminiPolicy.outageFallbackModel) && spec.model !== geminiPolicy.outageFallbackModel && Boolean(beforeFinalize?.sessionId);
-  const reviewModifiedPath = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
+  const treeChange = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
+  // A supervisor's read-only child shares the supervisor's worktree, so a
+  // changed file there is the supervisor's own edit unless this round wrote it.
+  const reviewModifiedPath = treeChange && treeChange !== "." && startingLane?.parent && !writtenPaths.has(resolve(spec.cwd, treeChange))
+    ? undefined : treeChange;
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(spec.cwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
   // An unchanged tree is evidence for the report, never a verdict: a
