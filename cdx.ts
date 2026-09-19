@@ -3817,13 +3817,14 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   process.off("SIGINT", onInt);
 
   flushLedger();
-  return finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
+  return finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, writtenPaths, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
-async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, writtenPaths, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
   spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
   logPath: string; reportPath: string;
   reviewSnapshot?: ReturnType<typeof captureReviewTree>;
+  writtenPaths: Set<string>;
   workTreeStartSnapshot?: ReturnType<typeof captureReviewTree>;
   exitCode: number; turnFailureReason?: string; receivedSignal?: "SIGTERM" | "SIGINT";
   maxRuntimeHit: boolean; geminiContinuations: number; roundCleanupWarning?: string;
@@ -3867,7 +3868,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   const treeChange = reviewSnapshot ? changedReviewPath(reviewSnapshot, captureReviewTree(spec.cwd)) : undefined;
   // A supervisor's read-only child shares the supervisor's worktree, so a
   // changed file there is the supervisor's own edit unless this round wrote it.
-  const reviewModifiedPath = treeChange && treeChange !== "." && startingLane?.parent && !writtenPaths.has(resolve(spec.cwd, treeChange))
+  const reviewModifiedPath = treeChange && treeChange !== "." && beforeFinalize?.parent && !writtenPaths.has(resolve(spec.cwd, treeChange))
     ? undefined : treeChange;
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(spec.cwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
