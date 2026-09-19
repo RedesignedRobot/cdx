@@ -121,7 +121,7 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "review",
-    description: "Start an independent code review lane on uncommitted changes, branches, or commits.",
+    description: "Start an independent code review lane. Two exclusive modes: intent alone reviews the working tree per the intent (exec review, any engine); one of uncommitted, base or commit without intent runs the engine's native review of that target. Passing intent with a target flag is refused.",
     inputSchema: {
       type: "object",
       properties: {
