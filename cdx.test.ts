@@ -912,6 +912,7 @@ test("demand sizing uses five complete round costs and observed window conversio
   const sized = withAccountHolds([standing], ledger, () => false);
   expect(accountAdvice(sized, usageNow).picks).toEqual({ light: "a", work: "a", supervisor: null });
   expect(() => chooseAccount(sized, "supervisor", undefined, undefined, usageNow)).toThrow("no account is eligible");
+  expect(chooseAccount(sized, "supervisor", "a", undefined, usageNow).choice?.name).toBe("a");
   const twoWindows = { ...standing, remainingPercent: 4, projections: [
     { ...standing.projections![0], remainingPercent: 70, tokensPerPercent: 10000 },
     { ...standing.projections![0], window: "5h", remainingPercent: 4, tokensPerPercent: 100000 },

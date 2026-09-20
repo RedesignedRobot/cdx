@@ -5959,8 +5959,8 @@ function probeFailedRecently(snapshot: UsageSnapshot | undefined): boolean {
 }
 
 function chooseAccount(standings: AccountStanding[], demand: Demand, forced?: string, preferred?: AccountChoice, now = Date.now()): AccountSelection {
-  if (forced !== undefined) configuredAccount(forced);
-  const pinned = standings.find((standing) => standing.choice.name === (forced ?? preferred?.name) && accountEligible(standing, demand));
+  if (forced !== undefined && !standings.some((standing) => standing.choice.name === forced)) configuredAccount(forced);
+  const pinned = standings.find((standing) => standing.choice.name === (forced ?? preferred?.name) && accountEligible(standing, forced !== undefined ? "light" : demand));
   const pick = pinned ?? (forced === undefined ? decideAccount(standings, demand, now) : undefined);
   if (!pick) {
     const detail = standings.map((standing) => `${standing.choice.name}: ${standing.reason}`).join("; ");

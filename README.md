@@ -501,7 +501,7 @@ With or without an accounts map, `cdx usage` and launch admission share one deci
 2. Active rounds hold 3% against their assigned account during execution. Admission subtracts active holds before evaluating remaining headroom.
 3. Dead runner release: admission reconciles crashed runners and releases their holds while preserving live child holds.
 4. Consuming round completion invalidates the account usage snapshot, forcing fresh probes on subsequent rounds.
-5. `--account NAME` obeys exhaustion eligibility instead of forcing a depleted account. If the specified account is exhausted or lacks required headroom, admission rejects the launch.
+5. `--account NAME` pins that account and admits it under the light rule: any known positive capacity, not the demand sizing. The owner spends a named account until the quota error itself arrives (ruling 2026-09-20). Only an exhausted or invalidated account refuses the launch.
 6. Automatic GPT quota failover recovers exhausted accounts across work, review, and consult rounds. When Codex hits quota exhaustion, the runner marks the account exhausted with its reset time and starts a fresh round on an eligible alternate account. The recovery prompt transfers the original brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
 
 Work and supervisor sizing uses the median input-plus-output tokens from at least five complete successful GPT rounds of that demand retained in the ledger, converts it through each window's observed tokens-per-percent, and falls back to 3% where evidence is sparse; the median is a sizing hint, never a completion guarantee.
