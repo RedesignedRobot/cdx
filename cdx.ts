@@ -13,7 +13,7 @@
 //   cdx msg    <target> "<text>"
 //   cdx inbox  [-n <lines>]
 //   cdx status [--all] [--json] [--brief] [--watch [--interval S]]
-//   cdx usage  [--json]
+//   cdx usage  [--json] [--totals]
 //   cdx wait   <lane>... [--timeout <sec>] [--json] [--report]
 //   cdx tail   <lane> [-n <lines>]
 //   cdx feed   [-n <lines>]
@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.4.9";
+const VERSION = "7.5.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -1781,8 +1781,7 @@ interface GeminiQuotaState {
   resetsAt?: string;
 }
 
-function geminiQuotaState(now = Date.now()): GeminiQuotaState {
-  const quota = readGeminiQuota();
+function geminiQuotaState(now = Date.now(), quota: GeminiQuotaRecord | null = readGeminiQuota() ?? null, snapshot: GeminiUsageSnapshot | null = readGeminiUsageSnapshot() ?? null): GeminiQuotaState {
   if (quota && Date.parse(quota.blockedUntil) > now) {
     return {
       block: {
@@ -1792,7 +1791,6 @@ function geminiQuotaState(now = Date.now()): GeminiQuotaState {
     };
   }
 
-  const snapshot = readGeminiUsageSnapshot();
   if (snapshot) {
     const ageMs = now - Date.parse(snapshot.checkedAt);
     const resetTime = Date.parse(snapshot.fiveHour.resetsAt);
@@ -2033,7 +2031,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
   checkChildAstraRefusal(isChildPre, roundEnginePre, resolvedModelCandidate);
 
   for (;;) {
-    if (engine === "gpt" && config.accounts) {
+    if (engine === "gpt") {
       withLedger(reconcileAccountHolds);
       await accountStandings();
     }
@@ -2042,7 +2040,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       reconcileAccountHolds(ledger);
       // A completion can invalidate evidence while the outside-lock probes run.
       // Commit reconciliation, then refresh before making an admission decision.
-      if (engine === "gpt" && Object.entries(config.accounts ?? {}).some(([name, home]) => readUsageSnapshot({ name, home })?.invalidatedAt)) return undefined;
+      if (engine === "gpt" && accountChoices().some((choice) => readUsageSnapshot(choice)?.invalidatedAt)) return undefined;
       const existing = ledger[lane];
       if (process.argv[2] !== "_run") requireOwnChild(lane, existing);
       if (existing && laneRunning(existing) && (pidAlive(existing.pid) || pidAlive(existing.codexPid))
@@ -2054,7 +2052,7 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       const existingWorkRounds = existing?.workRounds ?? existing?.rounds ?? 0;
       const workRounds = kind === "work" ? existingWorkRounds + 1 : existingWorkRounds;
       const preferred = opts?.account ?? (opts?.preserveAccount ? existing && laneAccount(existing) : undefined);
-      const demand: Demand = kind === "review" ? "light" : (opts?.lineage?.supervisor ?? existing?.supervisor) ? "supervisor" : "work";
+      const demand: Demand = kind === "review" || (opts?.consult ?? existing?.consult) ? "light" : (opts?.lineage?.supervisor ?? existing?.supervisor) ? "supervisor" : "work";
       const selection = engine === "gpt" ? chooseAccount(cachedAccountStandings(ledger).map((standing) => opts?.excludedHomes?.has(standing.choice.home) ? { ...standing, reached: true, reason: `already exhausted in this run; ${standing.reason}` } : standing), demand, opts?.forcedAccount, preferred) : undefined;
       const activeAccount = selection?.choice;
       const account = kind === "review" && existing ? existing.account : activeAccount?.name;
@@ -5310,6 +5308,81 @@ interface UsageSnapshot {
   exhaustedReason?: string;
 }
 
+const USAGE_HISTORY_PATH = `${ROOT}/usage-history.json`;
+const BURN_HORIZON_MS = 4 * 3_600_000;
+const HISTORY_LIMIT = 2048;
+interface UsageReading extends RateLimitWindow {
+  account: string;
+  checkedAt: string;
+  rounds?: Record<string, number>;
+}
+
+function readUsageHistory(): UsageReading[] {
+  try {
+    const rows = JSON.parse(readFileSync(USAGE_HISTORY_PATH, "utf8"));
+    return Array.isArray(rows) ? rows.filter((r) => r && typeof r.account === "string" && Number.isFinite(Date.parse(r.checkedAt)) && isRateLimitWindow(r)) : [];
+  } catch { return []; }
+}
+
+function mergeUsageHistory(history: UsageReading[], fresh: UsageReading[]): UsageReading[] {
+  const rows = new Map(history.concat(fresh).map((r) => [`${r.account}/${r.windowDurationMins}/${r.checkedAt}`, r]));
+  return [...rows.values()].sort((a, b) => Date.parse(a.checkedAt) - Date.parse(b.checkedAt)).slice(-HISTORY_LIMIT);
+}
+
+function recordUsageHistory(account: string, windows: RateLimitWindow[], checkedAt: string): void {
+  const rounds: Record<string, number> = {};
+  let complete = true;
+  for (const [name, lane] of Object.entries(readLedger())) {
+    if ((roundEngine(lane) === "gemini" ? "gemini" : lane.roundAccount?.name ?? lane.account ?? "default") !== account) continue;
+    if (!lane.roundStartedAt || Date.parse(lane.updatedAt) < Date.parse(checkedAt) - BURN_HORIZON_MS) continue;
+    const tokens = lane.roundTokens;
+    if (lane.tokensIncomplete || !tokens || ![tokens.input, tokens.output].every(Number.isFinite)) { complete = false; continue; }
+    rounds[`${name}/${lane.roundStartedAt}`] = tokens.input + tokens.output;
+  }
+  const merged = mergeUsageHistory(readUsageHistory(), windows.map((w) => ({ ...w, account, checkedAt, ...(complete ? { rounds } : {}) })));
+  const tmp = `${USAGE_HISTORY_PATH}.tmp.${process.pid}`;
+  writeFileSync(tmp, JSON.stringify(merged));
+  renameSync(tmp, USAGE_HISTORY_PATH);
+}
+
+function projectWindow(account: string, window: RateLimitWindow, checkedAt: string, history: UsageReading[], now = Date.now()) {
+  const remainingPercent = Math.max(0, 100 - window.usedPercent);
+  const hoursToReset = Math.max(0, (window.resetsAt * 1000 - now) / 3_600_000);
+  const rows = history.filter((r) => r.account === account && r.windowDurationMins === window.windowDurationMins
+    && r.resetsAt === window.resetsAt && Date.parse(r.checkedAt) >= now - BURN_HORIZON_MS
+    && Date.parse(r.checkedAt) <= Date.parse(checkedAt) && Date.parse(r.checkedAt) <= now)
+    .sort((a, b) => Date.parse(a.checkedAt) - Date.parse(b.checkedAt));
+  // A credit or corrected reading starts a new observation segment.
+  let start = 0;
+  for (let i = 1; i < rows.length; i++) if (rows[i].usedPercent < rows[i - 1].usedPercent) start = i;
+  const sample = rows.slice(start), first = sample[0], last = sample.at(-1);
+  const hours = first && last ? (Date.parse(last.checkedAt) - Date.parse(first.checkedAt)) / 3_600_000 : 0;
+  const observed = hours > 0 && hoursToReset > 0 && last?.checkedAt === checkedAt;
+  const burnPerHour = observed ? (last!.usedPercent - first!.usedPercent) / hours : null;
+  const elapsed = Math.max(0, (now - Date.parse(checkedAt)) / 3_600_000);
+  const exhaustion = burnPerHour && burnPerHour > 0 ? Math.max(0, remainingPercent / burnPerHour - elapsed) : null;
+  let tokensPerPercent: number | undefined;
+  const delta = first && last ? last.usedPercent - first.usedPercent : 0;
+  if (observed && delta > 0 && sample.every((r) => r.rounds && Object.values(r.rounds).every((n) => Number.isFinite(n) && n >= 0))) {
+    let tokens = 0, valid = true;
+    for (let i = 1; i < sample.length; i++) {
+      const before = sample[i - 1].rounds!, after = sample[i].rounds!;
+      if (Object.entries(before).some(([key, value]) => after[key] === undefined || after[key] < value)) valid = false;
+      for (const [key, value] of Object.entries(after)) tokens += value - (before[key] ?? 0);
+    }
+    if (valid && tokens > 0) tokensPerPercent = Math.round(tokens / delta);
+  }
+  return { account, window: rateLimitWindowName(window.windowDurationMins), usedPercent: window.usedPercent,
+    remainingPercent, resetsAt: window.resetsAt, checkedAt, hoursToReset, burnPerHour,
+    projectedRemainingAtReset: burnPerHour === null ? null : Math.max(0, remainingPercent - burnPerHour * (hoursToReset + elapsed)),
+    hoursToExhaustion: exhaustion !== null && exhaustion < hoursToReset ? exhaustion : null,
+    burnMethod: observed ? "observed" : "none", historyWindow: { horizonHours: 4, samples: sample.length, from: first?.checkedAt ?? null, to: last?.checkedAt ?? null },
+    ...(tokensPerPercent !== undefined ? { tokensPerPercent, estimatedRemainingTokens: Math.round(tokensPerPercent * remainingPercent) } : {}),
+    heldPercent: 0, blockedUntil: null as number | null,
+    available: hoursToReset > 0, reason: hoursToReset > 0 ? "spend normally" : "usage unknown; window reset" };
+}
+type WindowProjection = ReturnType<typeof projectWindow>;
+
 interface RefreshedUsage {
   usage: AccountUsage;
   snapshot: UsageSnapshot;
@@ -5432,7 +5505,7 @@ function readUsageState(): UsageState {
 }
 
 function usageSnapshotFrom(state: UsageState, account?: AccountChoice): UsageSnapshot | undefined {
-  const snapshot = account ? state.accounts?.[account.name] : state;
+  const snapshot = account && (account.name !== "default" || state.accounts) ? state.accounts?.[account.name] : state;
   return isUsageSnapshot(snapshot) ? snapshot : undefined;
 }
 
@@ -5441,6 +5514,7 @@ function readUsageSnapshot(account?: AccountChoice): UsageSnapshot | undefined {
 }
 
 function storeUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, account?: AccountChoice): void {
+  if (account?.name === "default" && !config.accounts) account = undefined;
   const accounts = account && state.accounts && typeof state.accounts === "object" && !Array.isArray(state.accounts)
     ? Object.fromEntries(Object.entries(state.accounts).filter((entry) => isUsageSnapshot(entry[1]))) : {};
   for (const key of Object.keys(state)) delete state[key];
@@ -5451,6 +5525,13 @@ function storeUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, account?
 // deduplication and failed probes. No nested or separate writer lock.
 function withUsageState<T>(mutate: (state: UsageState) => T): T {
   return withLockedJson(USAGE_PATH, `${ROOT}/.usage.lock`, readUsageState, mutate);
+}
+
+// Called under .usage.lock. A failed history write cannot publish the snapshot.
+function publishUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, account: AccountChoice | undefined, publishHistory: () => void): UsageSnapshot {
+  publishHistory();
+  storeUsageSnapshot(state, snapshot, account);
+  return snapshot;
 }
 
 function writeUsageSnapshot(snapshot: UsageSnapshot, account?: AccountChoice) {
@@ -5626,14 +5707,11 @@ async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: Acc
     if (options.warnFeed && snapshotReached(snapshot)) {
       const warnedAt = snapshot.warnedAt ? Date.parse(snapshot.warnedAt) : Number.NaN;
       if (!Number.isFinite(warnedAt) || Date.now() - warnedAt >= 3_600_000) {
-        const warned = { ...snapshot, warnedAt: new Date().toISOString() };
-        storeUsageSnapshot(state, warned, options.account);
-        feedEvent("account", usageFeedWarning(warned, options.account), options.ownerSession);
-        return warned;
+        snapshot = { ...snapshot, warnedAt: new Date().toISOString() };
+        feedEvent("account", usageFeedWarning(snapshot, options.account), options.ownerSession);
       }
     }
-    storeUsageSnapshot(state, snapshot, options.account);
-    return snapshot;
+    return publishUsageSnapshot(state, snapshot, options.account, () => recordUsageHistory(options.account?.name ?? "default", fresh.windows ?? [fresh], fresh.checkedAt));
   });
   return { usage, snapshot: stored };
 }
@@ -5652,10 +5730,9 @@ function warnCachedUsageBeforeLaunch(account?: AccountChoice) {
 interface ReachedAccount { choice: AccountChoice; snapshot: UsageSnapshot }
 interface AccountSelection { choice?: AccountChoice; skipped: ReachedAccount[]; pick?: AccountStanding; demand?: Demand }
 
-// Fixed allowances guide placement; they are not completion budgets.
+// Demand costs guide placement; they are not completion budgets.
 type Demand = "light" | "work" | "supervisor";
-// Owner ruling 2026-09-11: the risk line is 3% remaining, for every lane kind;
-// the allowance is a placement hint and never a refusal on its own.
+// Active lanes reserve 3%; sparse sizing evidence uses the same fallback.
 const HEADROOM_PERCENT: Record<Demand, number> = { light: 3, work: 3, supervisor: 3 };
 // A usage reading serves this long before the next launch probes again.
 const USAGE_CACHE_MS = 30 * 60 * 1000;
@@ -5664,13 +5741,14 @@ const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "w
 interface AccountStanding {
   choice: AccountChoice;
   snapshot?: UsageSnapshot;
+  creditSnapshot?: UsageSnapshot;
+  sizing?: Record<Demand, { minimumPercent: number; samples: number; medianTokens: number | null }>;
   // The longest window the probe returned, weekly on ChatGPT plans. Its reset
   // is the deadline: whatever is unspent then is lost.
   weekly?: RateLimitWindow;
   remainingPercent: number;
-  // Percent of the weekly window per day that spends the remainder exactly at
-  // reset; a pace far above real burn means the window will expire unused.
-  paceToEmpty?: number;
+  projections?: WindowProjection[];
+  heldPercent?: number;
   reached: boolean;
   reason: string;
 }
@@ -5695,58 +5773,47 @@ function unknownStanding(choice: AccountChoice, reason: string): AccountStanding
   return { choice, remainingPercent: 0, reached: false, reason: `usage unknown: ${reason}` };
 }
 
-function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined): AccountStanding {
-  const now = Date.now();
+function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | undefined, history: UsageReading[] = [], now = Date.now()): AccountStanding {
+  const unknown = (reason: string): AccountStanding => ({ ...unknownStanding(choice, reason), creditSnapshot: snapshot });
   if (snapshot?.exhaustedUntil && snapshot.exhaustedUntil * 1000 > now && !isExhaustionObsolete(snapshot, now)) return {
     choice, snapshot, reached: true, remainingPercent: 0,
     reason: `quota exhausted; resets ${new Date(snapshot.exhaustedUntil * 1000).toISOString()}`,
   };
-  if (snapshot?.invalidatedAt) return unknownStanding(choice, "consuming round ended; refresh required");
-  if (!snapshot || snapshot.planType === "unknown") return unknownStanding(choice, "probe failed; codex login?");
+  if (snapshot?.invalidatedAt) return unknown("consuming round ended; refresh required");
+  if (!snapshot || snapshot.planType === "unknown") return unknown("probe failed; codex login?");
   const weekly = weeklyWindow(snapshot);
-  if (!weekly) return unknownStanding(choice, "snapshot has no quota windows; run cdx usage");
-  if (weekly.resetsAt * 1000 <= now) return unknownStanding(choice, `window reset ${fmtAge(new Date(weekly.resetsAt * 1000).toISOString())} ago, probe failed`);
+  if (!weekly) return unknown("snapshot has no quota windows; run cdx usage");
+  if (weekly.resetsAt * 1000 <= now) return unknown("window reset; probe failed");
   // A reading older than the cache window that the last probe could not
   // confirm is history, not headroom. A fresh reading survives a failed
   // probe: it would not have been probed at all.
   const probeFailedAt = snapshot.probeFailedAt ? Date.parse(snapshot.probeFailedAt) : Number.NaN;
-  if (probeFailedAt > Date.parse(snapshot.checkedAt) && !snapshotFresh(snapshot, USAGE_CACHE_MS)) {
-    return unknownStanding(choice, `probe failed; last reading ${fmtAge(snapshot.checkedAt)} ago said ${Math.round(100 - weekly.usedPercent)}% left`);
+  if (probeFailedAt > Date.parse(snapshot.checkedAt) && !snapshotFresh(snapshot, USAGE_CACHE_MS, now)) {
+    return unknown(`probe failed; last reading ${((now - Date.parse(snapshot.checkedAt)) / 3_600_000).toFixed(1)}h ago said ${Math.round(100 - weekly.usedPercent)}% left`);
   }
-  const live = snapshot.windows!.filter((window) => window.resetsAt * 1000 > now);
-  const reached = snapshotReached(snapshot) || live.some((window) => window.usedPercent >= 99);
+  const live = (snapshot.windows ?? [snapshot]).filter((window) => window.resetsAt * 1000 > now);
+  const reached = snapshotReached(snapshot, now) || live.some((window) => window.usedPercent >= 99);
   // Exact share for decisions; the text rounds.
-  const remainingPercent = Math.max(0, 100 - weekly.usedPercent);
-  const daysToReset = (weekly.resetsAt * 1000 - now) / 86_400_000;
-  const paceToEmpty = Math.round(remainingPercent / daysToReset);
-  const base = { choice, snapshot, weekly, remainingPercent, paceToEmpty, reached };
-  if (reached) {
-    const blocking = live.filter((window) => window.usedPercent >= 99).sort((a, b) => a.resetsAt - b.resetsAt)[0] ?? snapshot;
-    return { ...base, reason: `${rateLimitWindowName(blocking.windowDurationMins)} window exhausted, back ${fmtUntil(blocking.resetsAt)}` };
-  }
-  return { ...base, reason: `${Math.round(remainingPercent)}% left, resets ${rateLimitResetDate(weekly.resetsAt)} ${fmtUntil(weekly.resetsAt)}, ${paceToEmpty}%/day empties it` };
+  const projections = live.map((w) => projectWindow(choice.name, w, snapshot.checkedAt, history, now));
+  const remainingPercent = Math.min(...projections.map((w) => w.remainingPercent));
+  const base = { choice, snapshot, weekly, projections, remainingPercent, reached };
+  const limiting = projections.find((w) => w.hoursToExhaustion !== null);
+  const deadline = Math.min(...live.map((w) => w.resetsAt));
+  const burn = projections.find((w) => w.resetsAt === deadline)!;
+  return { ...base, reason: reached ? "hold; quota exhausted" : limiting
+    ? `light only; exhausts in ${limiting.hoursToExhaustion!.toFixed(1)}h`
+    : `${Math.round(remainingPercent)}% left, reset ${fmtUntil(deadline, now)}, burn ${burn.burnPerHour === null ? "unknown" : `${burn.burnPerHour.toFixed(1)}%/h`}, at reset ${burn.projectedRemainingAtReset === null ? "unknown" : `${burn.projectedRemainingAtReset.toFixed(1)}%`}` };
 }
 
-// Percent of the weekly window above the demand's risk line that the coming
-// reset forfeits per day if nothing spends it. A floor of one day keeps a
-// nearly dry account resetting in minutes from outranking a full one: what
-// matters is how much is at stake, not only how soon.
-function forfeitRate(standing: AccountStanding, demand: Demand, now = Date.now()): number {
-  if (!standing.weekly) return 0;
-  const spendable = Math.max(0, standing.remainingPercent - HEADROOM_PERCENT[demand]);
-  const days = Math.max(1, (standing.weekly.resetsAt * 1000 - now) / 86_400_000);
-  return spendable / days;
+function exhausting(standing: AccountStanding): boolean {
+  return standing.projections?.some((w) => w.hoursToExhaustion !== null) ?? false;
 }
 
-// Highest forfeit rate first: the account with the most spendable share per
-// day until its reset loses the most by waiting, so it is spent first. Equal
-// rates go to the earlier deadline, then the fuller account. Accounts short of
-// the demand's headroom rank next (fullest first), unknown usage after them,
-// exhausted windows last (soonest reset first, for the warning).
+
 function standingTier(standing: AccountStanding, demand: Demand): number {
   if (standing.reached) return 3;
   if (!standing.snapshot) return 2;
-  return standing.remainingPercent >= HEADROOM_PERCENT[demand] ? 0 : 1;
+  return !exhausting(standing) && accountEligible(standing, demand) ? 0 : 1;
 }
 
 function rankAccounts(standings: AccountStanding[], demand: Demand, now = Date.now()): AccountStanding[] {
@@ -5755,10 +5822,11 @@ function rankAccounts(standings: AccountStanding[], demand: Demand, now = Date.n
     const tierDelta = tier - standingTier(b.standing, demand);
     if (tierDelta !== 0) return tierDelta;
     if (tier === 0) {
-      const rate = forfeitRate(b.standing, demand, now) - forfeitRate(a.standing, demand, now);
-      if (Math.abs(rate) > 0.5) return rate;
-      const deadline = a.standing.weekly!.resetsAt - b.standing.weekly!.resetsAt;
-      if (deadline !== 0) return deadline;
+      const deadlineOf = (s: AccountStanding) => s.projections
+        ? Math.min(...s.projections.filter((w) => w.resetsAt * 1000 > now && (w.projectedRemainingAtReset === null || w.projectedRemainingAtReset > 0)).map((w) => w.resetsAt))
+        : s.weekly?.resetsAt ?? Infinity;
+      const deadline = deadlineOf(a.standing) - deadlineOf(b.standing);
+      if (!Number.isNaN(deadline) && deadline !== 0) return deadline;
       return b.standing.remainingPercent - a.standing.remainingPercent;
     }
     if (tier === 1) return b.standing.remainingPercent - a.standing.remainingPercent;
@@ -5770,17 +5838,16 @@ function rankAccounts(standings: AccountStanding[], demand: Demand, now = Date.n
 // Eligibility is shared by launch and usage advice. Unknown evidence is a
 // fallback after sufficient known capacity; light turns admit with warnings.
 function accountEligible(standing: AccountStanding, demand: Demand): boolean {
-  return !standing.reached && (!standing.snapshot || (demand === "light" ? standing.remainingPercent > 0 : standing.remainingPercent >= HEADROOM_PERCENT[demand]));
+  if (standing.reached || (demand !== "light" && exhausting(standing))) return false;
+  if (!standing.snapshot) return true;
+  if (demand === "light") return standing.remainingPercent > 0;
+  return standing.projections?.length
+    ? standing.projections.every((w) => w.remainingPercent - (standing.heldPercent ?? 0) >= requiredPercent(standing, demand, w))
+    : standing.remainingPercent >= requiredPercent(standing, demand);
 }
 
-function decideAccount(standings: AccountStanding[], demand: Demand): AccountStanding | undefined {
-  return rankAccounts(standings.filter((standing) => accountEligible(standing, demand)), demand)[0];
-}
-
-function fullestOpenAccount(standings: AccountStanding[]): AccountStanding | undefined {
-  return standings
-    .filter((standing) => !standing.reached && (!standing.snapshot || standing.remainingPercent > 0))
-    .sort((a, b) => b.remainingPercent - a.remainingPercent)[0];
+function decideAccount(standings: AccountStanding[], demand: Demand, now = Date.now()): AccountStanding | undefined {
+  return rankAccounts(standings.filter((standing) => accountEligible(standing, demand)), demand, now)[0];
 }
 
 // A cached snapshot serves for 30 minutes unless a window has reset or it
@@ -5796,46 +5863,50 @@ async function accountSnapshot(choice: AccountChoice): Promise<UsageSnapshot | u
   return refreshed?.snapshot ?? readUsageSnapshot(choice);
 }
 
+function accountChoices(): AccountChoice[] {
+  return Object.entries(config.accounts ?? { default: process.env.CODEX_HOME ?? `${HOME}/.codex` }).map(([name, home]) => ({ name, home }));
+}
+
 async function accountStandings(): Promise<AccountStanding[]> {
-  const standings = await Promise.all(Object.entries(config.accounts ?? {}).map(async ([name, home]) => {
-    const choice = { name, home };
-    return standingOf(choice, await accountSnapshot(choice));
+  const standings = await Promise.all(accountChoices().map(async (choice) => {
+    return standingOf(choice, await accountSnapshot(choice), readUsageHistory());
   }));
   return withAccountHolds(standings, readLedger());
 }
 
 function cachedAccountStandings(ledger = readLedger()): AccountStanding[] {
-  return withAccountHolds(Object.entries(config.accounts ?? {}).map(([name, home]) => {
-    const choice = { name, home };
-    return standingOf(choice, readUsageSnapshot(choice));
+  return withAccountHolds(accountChoices().map((choice) => {
+    return standingOf(choice, readUsageSnapshot(choice), readUsageHistory());
   }), ledger);
 }
 
 interface AccountAdvice {
   order: string[];
   picks: Record<Demand, string | null>;
-  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; paceToEmpty?: number; forfeitRate?: number; reason: string }>;
+  accounts: Array<{ account: string; remainingPercent: number; reached: boolean; resetsAt?: number; projections?: WindowProjection[]; heldPercent: number; sizing?: AccountStanding["sizing"]; reason: string }>;
   resetCredits: Array<{ account: string; count: number; expiresAt: number[]; redeem: boolean }>;
   alerts: string[];
 }
 
-// A banked credit is worth redeeming once the account has nothing spendable
-// above the risk line: it restores a full window instead of waiting for the
-// reset.
+function shouldRedeemCredit(standing: AccountStanding): boolean {
+  return ((standing.creditSnapshot ?? standing.snapshot)?.resetCreditsAvailable ?? 0) > 0 && (standing.reached || exhausting(standing));
+}
+
+// Redeem only for exhaustion, observed or already reached.
 function resetCreditStandings(standings: AccountStanding[]): AccountAdvice["resetCredits"] {
   return standings
-    .filter((standing) => (standing.snapshot?.resetCreditsAvailable ?? 0) > 0)
+    .filter((standing) => ((standing.creditSnapshot ?? standing.snapshot)?.resetCreditsAvailable ?? 0) > 0)
     .map((standing) => ({
       account: standing.choice.name,
-      count: standing.snapshot!.resetCreditsAvailable,
-      expiresAt: standing.snapshot!.resetCreditExpiresAt ?? [],
-      redeem: standing.reached || (Boolean(standing.weekly) && standing.remainingPercent <= HEADROOM_PERCENT.work),
+      count: (standing.creditSnapshot ?? standing.snapshot)!.resetCreditsAvailable,
+      expiresAt: (standing.creditSnapshot ?? standing.snapshot)!.resetCreditExpiresAt ?? [],
+      redeem: shouldRedeemCredit(standing),
     }));
 }
 
 function accountAdvice(standings: AccountStanding[], now = Date.now()): AccountAdvice {
   const ranked = rankAccounts(standings, "work", now);
-  const pickFor = (demand: Demand) => decideAccount(standings, demand)?.choice.name ?? null;
+  const pickFor = (demand: Demand) => decideAccount(standings, demand, now)?.choice.name ?? null;
   return {
     order: ranked.map((standing) => standing.choice.name),
     picks: { light: pickFor("light"), work: pickFor("work"), supervisor: pickFor("supervisor") },
@@ -5843,45 +5914,42 @@ function accountAdvice(standings: AccountStanding[], now = Date.now()): AccountA
       account: standing.choice.name,
       remainingPercent: standing.remainingPercent,
       reached: standing.reached,
-      ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt, forfeitRate: Math.round(forfeitRate(standing, "work", now)) } : {}),
-      ...(standing.paceToEmpty !== undefined ? { paceToEmpty: standing.paceToEmpty } : {}),
+      ...(standing.weekly ? { resetsAt: standing.weekly.resetsAt } : {}),
+      projections: standing.projections, heldPercent: standing.heldPercent ?? 0, sizing: standing.sizing,
       reason: standing.reason,
     })),
     resetCredits: resetCreditStandings(standings),
-    alerts: resetCreditAlerts(standings.map((standing) => ({ name: standing.choice.name, home: standing.choice.home, snapshot: standing.snapshot })), now),
+    alerts: resetCreditAlerts(standings.map((standing) => ({ name: standing.choice.name, home: standing.choice.home, snapshot: standing.creditSnapshot ?? standing.snapshot })), now),
   };
 }
 
 function adviceLines(standings: AccountStanding[], now = Date.now()): string[] {
   if (standings.length === 0) return [];
-  const ranked = rankAccounts(standings, "work", now);
   const advice = accountAdvice(standings, now);
-  const spend = ranked.filter((standing) => !standing.reached).map((standing) => `${standing.choice.name} (${standing.reason})`);
-  const out = ranked.filter((standing) => standing.reached).map((standing) => `${standing.choice.name} ${standing.reason}`);
-  const lines = [`advice: ${spend.length ? `spend ${spend.join(", then ")}` : "every account is exhausted"}${out.length ? `; ${out.join("; ")}` : ""}`];
-  const picks = (Object.keys(HEADROOM_PERCENT) as Demand[])
-    .map((demand) => `${DEMAND_LABEL[demand]} ${advice.picks[demand] ?? "none"}`).join(" · ");
-  lines.push(`  picks by headroom (${(Object.keys(HEADROOM_PERCENT) as Demand[]).map((demand) => `${DEMAND_LABEL[demand]} ${HEADROOM_PERCENT[demand]}%`).join(", ")}): ${picks}`);
-  if (advice.resetCredits.length > 0) {
-    const banked = advice.resetCredits.map((credit) => `${credit.account} ${describeResetCredits(credit.count, credit.expiresAt, now).replace(" available", "")}`);
-    const redeem = advice.resetCredits.filter((credit) => credit.redeem).map((credit) => credit.account);
-    lines.push(`  reset credits: ${banked.join("; ")}${redeem.length ? `; redeem one on ${redeem.join(", ")} now for a full window instead of waiting for the reset` : ""}`);
-  }
+  const lines = [`picks: ${Object.entries(advice.picks).map(([demand, name]) => `${demand} ${name ?? "none"}`).join(" | ")}`];
+  const notes = standings.flatMap((s) => {
+    const credit = advice.resetCredits.find((c) => c.account === s.choice.name)?.redeem;
+    const note = s.reached ? "hold; quota exhausted" : exhausting(s) ? "light only; projected exhaustion before reset"
+      : !s.snapshot ? s.reason : s.heldPercent ? `${s.heldPercent}% held by running lanes` : "";
+    return note || credit ? [`${s.choice.name}: ${note}${credit ? "; redeem one reset credit" : ""}.`] : [];
+  });
+  notes.push(...advice.alerts);
+  if (notes.length) lines.push(notes.join(" "));
   return lines;
 }
 
-function snapshotFresh(snapshot: UsageSnapshot | undefined, maxAgeMs: number): boolean {
+function snapshotFresh(snapshot: UsageSnapshot | undefined, maxAgeMs: number, now = Date.now()): boolean {
   if (!snapshot) return false;
   const checkedAt = Date.parse(snapshot.checkedAt);
-  const age = Date.now() - checkedAt;
+  const age = now - checkedAt;
   return Number.isFinite(checkedAt) && age >= 0 && age < maxAgeMs;
 }
 
 // A cached reached=true snapshot stops being true the moment its window
 // resets; without this check a post-reset account is skipped for up to the
 // full cache TTL.
-function snapshotReached(snapshot: UsageSnapshot): boolean {
-  return snapshot.reached && snapshot.resetsAt * 1000 > Date.now();
+function snapshotReached(snapshot: UsageSnapshot, now = Date.now()): boolean {
+  return snapshot.reached && snapshot.resetsAt * 1000 > now;
 }
 
 function probeFailedRecently(snapshot: UsageSnapshot | undefined): boolean {
@@ -5890,19 +5958,13 @@ function probeFailedRecently(snapshot: UsageSnapshot | undefined): boolean {
   return Number.isFinite(failedAt) && Date.now() - failedAt < 5 * 60 * 1000;
 }
 
-function chooseAccount(standings: AccountStanding[], demand: Demand, forced?: string, preferred?: AccountChoice): AccountSelection {
-  if (!config.accounts) {
-    if (forced !== undefined) configuredAccount(forced);
-    return { skipped: [], choice: preferred };
-  }
+function chooseAccount(standings: AccountStanding[], demand: Demand, forced?: string, preferred?: AccountChoice, now = Date.now()): AccountSelection {
   if (forced !== undefined) configuredAccount(forced);
   const pinned = standings.find((standing) => standing.choice.name === (forced ?? preferred?.name) && accountEligible(standing, demand));
-  // Below the allowance, the fullest account that has not hit its limit still
-  // runs the lane (announceAccountSelection warns); only exhaustion refuses.
-  const pick = pinned ?? (forced === undefined ? (decideAccount(standings, demand) ?? fullestOpenAccount(standings)) : undefined);
+  const pick = pinned ?? (forced === undefined ? decideAccount(standings, demand, now) : undefined);
   if (!pick) {
     const detail = standings.map((standing) => `${standing.choice.name}: ${standing.reason}`).join("; ");
-    throw new CmdError(`every account has reached its limit for a ${DEMAND_LABEL[demand]} lane (${detail}); wait for a reset or use gemini`);
+    throw new CmdError(`no account is eligible for a ${DEMAND_LABEL[demand]} lane (${detail}); wait for a reset or use gemini`);
   }
   return { choice: pick.choice, skipped: standings.filter((s) => s.reached && s.snapshot).map((s) => ({ choice: s.choice, snapshot: s.snapshot! })), pick, demand };
 }
@@ -5915,13 +5977,43 @@ function reconcileAccountHolds(ledger: Ledger): void {
   }
 }
 
-function withAccountHolds(standings: AccountStanding[], ledger: Ledger): AccountStanding[] {
+function demandSizing(standing: AccountStanding, ledger: Ledger): NonNullable<AccountStanding["sizing"]> {
+  const costs: Record<Demand, number[]> = { light: [], work: [], supervisor: [] };
+  for (const lane of Object.values(ledger)) {
+    const record = lane.kind === "review" ? lane.review : lane.work;
+    if (roundEngine(lane) !== "gpt" || !record || !["done", "closed"].includes(record.state) || record.exitCode !== 0
+      || record.tokensIncomplete || lane.tokensIncomplete || !lane.roundTokens) continue;
+    const { input, output } = lane.roundTokens;
+    if (![input, output].every((n) => Number.isFinite(n) && n >= 0) || input + output === 0) continue;
+    const demand = lane.roundAccount?.demand ?? (lane.kind === "review" || lane.consult ? "light" : lane.supervisor ? "supervisor" : "work");
+    costs[demand].push(input + output);
+  }
+  const size = (demand: Demand) => {
+    const sorted = costs[demand].sort((a, b) => a - b), middle = Math.floor(sorted.length / 2);
+    const medianTokens = sorted.length >= 5 ? (sorted[middle] + sorted[Math.floor((sorted.length - 1) / 2)]) / 2 : null;
+    const minimumPercent = demand === "light" ? 0 : medianTokens === null ? 3
+      : Math.max(...(standing.projections?.length ? standing.projections.map((w) => w.tokensPerPercent && w.tokensPerPercent > 0 ? medianTokens / w.tokensPerPercent : 3) : [3]));
+    return { minimumPercent, samples: sorted.length, medianTokens };
+  };
+  return { light: size("light"), work: size("work"), supervisor: size("supervisor") };
+}
+
+function requiredPercent(standing: AccountStanding, demand: Demand, window?: WindowProjection): number {
+  if (window) {
+    const median = standing.sizing?.[demand].medianTokens;
+    return median != null && window.tokensPerPercent && window.tokensPerPercent > 0 ? median / window.tokensPerPercent : 3;
+  }
+  return standing.sizing?.[demand].minimumPercent ?? HEADROOM_PERCENT[demand];
+}
+
+function withAccountHolds(standings: AccountStanding[], ledger: Ledger, alive = pidAlive): AccountStanding[] {
   return standings.map((standing) => {
     const held = Object.values(ledger).filter((lane) => laneRunning(lane)
-      && (pidAlive(lane.pid) || pidAlive(lane.codexPid))
-      && lane.roundAccount?.home === standing.choice.home)
-      .reduce((total, lane) => total + HEADROOM_PERCENT[lane.roundAccount!.demand], 0);
-    return { ...standing, heldPercent: held, remainingPercent: Math.max(0, standing.remainingPercent - held),
+      && (alive(lane.pid) || alive(lane.codexPid))
+      && (lane.roundAccount?.home === standing.choice.home || (standing.choice.name === "default" && roundEngine(lane) === "gpt"
+        && !lane.roundAccount && !lane.account && !lane.codexHome)))
+      .reduce((total, lane) => total + HEADROOM_PERCENT[lane.roundAccount?.demand ?? "work"], 0);
+    return { ...standing, sizing: demandSizing(standing, ledger), heldPercent: held, projections: standing.projections?.map((w) => ({ ...w, heldPercent: held })), remainingPercent: Math.max(0, standing.remainingPercent - held),
       reason: held ? `${standing.reason}; ${held}% held by active rounds` : standing.reason };
   });
 }
@@ -5944,8 +6036,8 @@ function announceAccountSelection(lane: string, selection: AccountSelection) {
     if (Object.keys(config.accounts ?? {}).length > 1) console.log(`cdx: account=${color.bold(pick.choice.name)} for ${DEMAND_LABEL[demand]} lane: ${pick.reason}`);
     if (!pick.snapshot) {
       console.error(color.yellow(`cdx: WARNING: ${pick.choice.name} ${pick.reason}; ${lane} starts on it unverified`));
-    } else if (pick.remainingPercent < HEADROOM_PERCENT[demand]) {
-      console.error(color.yellow(`cdx: WARNING: no account has ${HEADROOM_PERCENT[demand]}% remaining headroom for a ${DEMAND_LABEL[demand]} lane; ${pick.choice.name} has ${Math.round(pick.remainingPercent)}% and ${lane} may hit the limit mid-run`));
+    } else if (demand === "light" && pick.remainingPercent < HEADROOM_PERCENT.light) {
+      console.error(color.yellow(`cdx: WARNING: ${pick.choice.name} has ${Math.round(pick.remainingPercent)}% free capacity; ${lane} may hit the limit mid-run`));
     }
   }
   if (selection.skipped.length === 0) return;
@@ -5999,7 +6091,7 @@ function resetCreditAlerts(accounts: Array<{ name: string; home?: string; snapsh
     const count = expiring.length === 1 ? "an unused reset credit" : `${expiring.length} unused reset credits`;
     const when = expiring.map((at) => `${rateLimitResetDate(at)} ${fmtUntil(at, now)}`).join(" and ");
     const where = home ? `CODEX_HOME=${displayPath(home)} codex` : "codex";
-    return [`CRITICAL: ${name} has ${count} expiring ${when}; redeem before then in the codex TUI (${where}, then /usage)`];
+    return [`CRITICAL: ${name} has ${count} expiring ${when}; inspect in the codex TUI (${where}, then /usage)`];
   });
 }
 
@@ -6051,7 +6143,7 @@ function parseGeminiUsage(text: string): GeminiUsageSnapshot | undefined {
     if (!row) return undefined;
     const remainingPercent = Number(row[2]?.replace(/%$/, ""));
     const resetsAt = row[3] ?? "";
-    if (!Number.isFinite(remainingPercent) || !resetsAt || !Number.isFinite(Date.parse(resetsAt))) return undefined;
+    if (!Number.isFinite(remainingPercent) || remainingPercent < 0 || remainingPercent > 100 || !resetsAt || !Number.isFinite(Date.parse(resetsAt))) return undefined;
     return { remainingPercent, resetsAt };
   };
   const weekly = parse("Weekly Limit Remaining");
@@ -6087,7 +6179,12 @@ async function refreshGeminiUsage(): Promise<GeminiUsageSnapshot | undefined> {
     await stderr;
     if (exitCode !== 0) return undefined;
     const snapshot = parseGeminiUsage(text);
-    if (snapshot) writeGeminiUsageSnapshot(snapshot);
+    if (snapshot) {
+      withUsageState(() => {
+        recordUsageHistory("gemini", geminiWindows(snapshot), snapshot.checkedAt);
+        writeGeminiUsageSnapshot(snapshot);
+      });
+    }
     return snapshot;
   } finally {
     clearTimeout(timeout);
@@ -6110,8 +6207,41 @@ function formatGeminiReset(iso: string): string {
   return Number.isFinite(ms) ? `${fmtLocalInstant(ms)} ${fmtUntil(ms / 1000)}` : iso;
 }
 
+function geminiWindows(snapshot: GeminiUsageSnapshot): RateLimitWindow[] {
+  return [snapshot.weekly, snapshot.fiveHour].map((window, index) => ({
+    usedPercent: 100 - window.remainingPercent, resetsAt: Date.parse(window.resetsAt) / 1000, windowDurationMins: index === 0 ? 10080 : 300,
+  }));
+}
+
+type UsageRow = Omit<WindowProjection, "usedPercent" | "remainingPercent" | "checkedAt"> & { usedPercent: number | null; remainingPercent: number | null; checkedAt: string | null };
+
+function geminiUsageRows(snapshot: GeminiUsageSnapshot | undefined, quota: GeminiQuotaState, history: UsageReading[], heldPercent: number, now: number): UsageRow[] {
+  const blockedUntil = quota.block ? Date.parse(quota.block.resetsAt) / 1000 : null;
+  const windows = snapshot ? geminiWindows(snapshot) : blockedUntil ? [{ usedPercent: 100, windowDurationMins: 300, resetsAt: blockedUntil }] : [];
+  return windows.map((w) => {
+    const row = { ...projectWindow("gemini", w, snapshot?.checkedAt ?? new Date(now).toISOString(), snapshot ? history : [], now), heldPercent,
+      blockedUntil: w.windowDurationMins === 300 ? blockedUntil : null };
+    row.available = row.available && !row.blockedUntil && Boolean(snapshot);
+    row.reason = row.blockedUntil ? `hold until ${rateLimitResetDate(row.blockedUntil)}` : !row.available ? "usage unknown; window reset"
+      : row.hoursToExhaustion !== null ? "hold; projected exhaustion before reset" : heldPercent ? `${heldPercent}% held by running lanes` : "spend normally";
+    return snapshot ? row : { ...row, usedPercent: null, remainingPercent: null, checkedAt: null };
+  });
+}
+
+function usageTable(rows: UsageRow[], now = Date.now()): string[] {
+  const percent = (n: number | null) => n === null ? "?" : `${n.toFixed(1)}%`;
+  const cells = rows.map((r) => [r.account, r.window, percent(r.usedPercent), percent(r.remainingPercent),
+    `${r.blockedUntil ? "blocked " : ""}${fmtUntil(r.blockedUntil ?? r.resetsAt, now)}`,
+    percent(r.burnPerHour), percent(r.projectedRemainingAtReset), r.hoursToExhaustion === null ? "-" : `${r.hoursToExhaustion.toFixed(1)}h`,
+    `${r.heldPercent}%`, r.tokensPerPercent === undefined ? "-" : String(r.tokensPerPercent)]);
+  const header = ["account", "window", "used", "left", "resets in", "burn/h", "at reset", "empty in", "holds", "tokens/%"];
+  if (!rows.some((r) => r.tokensPerPercent !== undefined)) { header.pop(); cells.forEach((c) => c.pop()); }
+  const widths = header.map((h, i) => Math.max(h.length, ...cells.map((c) => c[i].length)));
+  return [header, ...cells].map((c) => c.map((v, i) => v.padEnd(widths[i])).join("  ").trimEnd());
+}
+
 async function usageCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["json"]);
+  const parsed = parseArgs(argv, ["json", "totals"]);
   const json = parsed.bools.has("json");
   const accounts: (AccountChoice | undefined)[] = config.accounts
     ? Object.entries(config.accounts).map(([name, home]) => ({ name, home }))
@@ -6149,70 +6279,48 @@ async function usageCommand(argv: string[]): Promise<void> {
     Promise.all(accounts.map((account) => refreshUsageSnapshot({ account }))),
     refreshGeminiUsage(),
   ]);
-  const effectiveStandings = config.accounts
-    ? withAccountHolds(
-        accounts.map((account, index) => {
-          const choice = account!;
-          const snapshot = refreshed[index]?.snapshot ?? readUsageSnapshot(choice);
-          return standingOf(choice, snapshot);
-        }),
-        readLedger(),
-      )
-    : [];
+  const now = Date.now(), history = readUsageHistory(), ledger = readLedger();
+  const effectiveStandings = withAccountHolds(accounts.map((account, index) =>
+    standingOf(account ?? { name: "default", home: process.env.CODEX_HOME ?? `${HOME}/.codex` },
+      refreshed[index]?.snapshot ?? readUsageSnapshot(account), history, now)), ledger);
+  const gemini = geminiUsage ?? readGeminiUsageSnapshot();
+  const rows = accounts.flatMap((account, index) => {
+    const snapshot = refreshed[index]?.snapshot ?? readUsageSnapshot(account);
+    return (snapshot?.windows ?? (snapshot ? [snapshot] : [])).map((w) => ({
+      ...projectWindow(account?.name ?? "default", w, snapshot!.checkedAt, effectiveStandings[index].snapshot ? history : [], now),
+      heldPercent: effectiveStandings[index].heldPercent ?? 0,
+      reason: effectiveStandings[index].reason, available: Boolean(effectiveStandings[index].snapshot),
+    }));
+  });
+  const geminiHeld = Object.values(ledger).filter((lane) => roundEngine(lane) === "gemini" && laneRunning(lane)
+    && (pidAlive(lane.pid) || pidAlive(lane.codexPid))).length * HEADROOM_PERCENT.work;
+  const geminiRows = geminiUsageRows(gemini, geminiQuotaState(now), history, geminiHeld, now);
+  const windows = [...rows, ...geminiRows];
+  const advice = accountAdvice(effectiveStandings, now);
   if (json) {
-    const rows = accounts.map((account, index) => {
-      const key = account?.name ?? "default";
-      const ledgerTotals = totals.get(key);
-      return {
-        account: key,
-        home: account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`,
-        usage: refreshed[index]?.usage ?? null,
-        checkedAt: refreshed[index]?.snapshot.checkedAt ?? null,
-        resetsAt: refreshed[index] ? new Date(refreshed[index].snapshot.resetsAt * 1000).toISOString() : null,
-        lanes: ledgerTotals?.lanes ?? 0,
-        ledgerTokens: ledgerTotals?.tokens ?? null,
-        incomplete: Boolean(ledgerTotals?.incomplete),
-      };
+    const codex = accounts.map((account, index) => {
+      const key = account?.name ?? "default", total = totals.get(key), snapshot = refreshed[index]?.snapshot ?? readUsageSnapshot(account);
+      return { account: key, home: account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`,
+        usage: refreshed[index]?.usage ?? null, checkedAt: snapshot?.checkedAt ?? null,
+        resetsAt: snapshot ? new Date(snapshot.resetsAt * 1000).toISOString() : null,
+        lanes: total?.lanes ?? 0, ledgerTokens: total?.tokens ?? null, incomplete: Boolean(total?.incomplete) };
     });
-    const advice = config.accounts ? accountAdvice(effectiveStandings) : null;
-    const alerts = resetCreditAlerts(accounts.map((account, index) => ({
-      name: account?.name ?? "codex", home: account?.home, snapshot: refreshed[index]?.snapshot ?? readUsageSnapshot(account),
-    })));
-    console.log(JSON.stringify({ alerts, codex: rows, advice, gemini: geminiUsage ?? readGeminiUsageSnapshot() ?? null, geminiLedger: geminiTotals }, null, 2));
+    console.log(JSON.stringify({ windows, codex, advice, alerts: advice.alerts, gemini: gemini ?? null, geminiLedger: geminiTotals }, null, 2));
     return;
   }
-  // The credit alert leads the report so a skim cannot miss it.
-  for (const line of resetCreditAlerts(accounts.map((account, index) => ({
-    name: account?.name ?? "codex", home: account?.home, snapshot: refreshed[index]?.snapshot ?? readUsageSnapshot(account),
-  })))) console.log(color.red(line));
-  for (const [index, account] of accounts.entries()) {
-    const key = account?.name ?? "default";
-    const label = account ? `${color.bold(account.name)} ${color.dim(`(${displayPath(account.home)})`)}` : color.bold("codex");
-    const result = refreshed[index];
-    if (!result) {
-      const cached = readUsageSnapshot(account);
-      const detail = cached && cached.planType !== "unknown"
-        ? ` · cached ${fmtAge(cached.checkedAt)} ago: ${cached.planType.toLowerCase()} plan, ${cached.usedPercent}% used, resets ${rateLimitResetDate(cached.resetsAt)}`
-        : "";
-      console.log(`${label}: ${color.yellow("probe failed (codex login?)")}${color.dim(detail)}`);
-    } else {
-      const formatted = formatAccountUsage(result.usage);
-      const paint = formatted.usedPercent >= 95 ? color.red : formatted.usedPercent >= 75 ? color.yellow : color.green;
-      console.log(`${label}: ${paint(formatted.detail)}`);
-    }
-    const ledgerTotals = totals.get(key);
-    if (ledgerTotals) console.log(color.dim(`  lanes ${ledgerTotals.lanes} · ledger tokens ${fmtTokensFull(ledgerTotals.tokens, ledgerTotals.incomplete)}`));
+  usageTable(windows, now).forEach((line, index) => {
+    const used = windows[index - 1]?.usedPercent ?? 0;
+    console.log(used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
+  });
+  const lines = adviceLines(effectiveStandings, now);
+  const geminiReason = geminiRows.find((w) => w.blockedUntil)?.reason ?? geminiRows.find((w) => w.reason !== "spend normally")?.reason;
+  const geminiNote = geminiReason ? `gemini: ${geminiReason}.` : !gemini ? "gemini: usage unknown; probe failed." : "";
+  if (geminiNote) lines[1] = [lines[1], geminiNote].filter(Boolean).join(" ");
+  for (const line of lines) console.log(line);
+  if (parsed.bools.has("totals")) {
+    for (const [account, total] of [...totals, ["gemini", geminiTotals] as const])
+      console.log(`${account}: lanes ${total.lanes}, ledger tokens ${fmtTokensFull(total.tokens, total.incomplete)}`);
   }
-  for (const line of adviceLines(effectiveStandings)) console.log(color.cyan(line));
-  const gemini = geminiUsage ?? readGeminiUsageSnapshot();
-  if (!gemini) {
-    console.log(`${color.bold("gemini")}: ${color.yellow("usage probe failed (agy installed and signed in?)")}`);
-  } else {
-    const standing = formatGeminiStanding(gemini);
-    const paint = standing.usedPercent >= 95 ? color.red : standing.usedPercent >= 75 ? color.yellow : color.green;
-    console.log(`${color.bold("gemini")}: ${paint(`pro plan, ${standing.detail}`)}${color.dim(` · checked ${fmtAge(gemini.checkedAt)} ago`)}`);
-  }
-  if (geminiTotals.lanes > 0) console.log(color.dim(`  lanes ${geminiTotals.lanes} · ledger tokens ${fmtTokensFull(geminiTotals.tokens, geminiTotals.incomplete)}`));
 }
 
 async function probeAppServer(account?: AccountChoice): Promise<{ reply: string; usage: string }> {
@@ -6834,10 +6942,12 @@ async function doctorCommand(argv: string[]) {
         continue;
       }
       const formatted = formatAccountUsage(refreshed.usage);
-      if (refreshed.snapshot.reached || formatted.usedPercent >= 95) {
+      const standing = standingOf(account, refreshed.snapshot, readUsageHistory());
+      if (standing.reached || exhausting(standing) || formatted.usedPercent >= 95) {
         failures += 1;
         console.log(color.red(`  usage: ${formatted.detail}`));
-        console.log(color.yellow("       remedy: limits nearly exhausted; wait for reset or redeem a reset credit in the codex TUI /usage"));
+        console.log(color.yellow(shouldRedeemCredit(standing)
+          ? "       remedy: redeem a reset credit in the codex TUI /usage or wait for reset" : "       remedy: wait for reset or use another account"));
       } else if (formatted.usedPercent >= 75) {
         warn(`  usage: ${formatted.detail}; caution: 25% or less remains`);
       } else {
@@ -6859,10 +6969,12 @@ async function doctorCommand(argv: string[]) {
       warn("usage: unavailable");
     } else {
       const formatted = formatAccountUsage(refreshed.usage);
-      if (refreshed.snapshot.reached || formatted.usedPercent >= 95) {
+      const standing = standingOf(accountChoices()[0], refreshed.snapshot, readUsageHistory());
+      if (standing.reached || exhausting(standing) || formatted.usedPercent >= 95) {
         failures += 1;
         console.log(color.red(`usage: ${formatted.detail}`));
-        console.log(color.yellow("     remedy: limits nearly exhausted; wait for reset or redeem a reset credit in the codex TUI /usage"));
+        console.log(color.yellow(shouldRedeemCredit(standing)
+          ? "     remedy: redeem a reset credit in the codex TUI /usage or wait for reset" : "     remedy: wait for reset or use another account"));
       } else if (formatted.usedPercent >= 75) {
         warn(`usage: ${formatted.detail}; caution: 25% or less remains`);
       } else {
@@ -7574,7 +7686,7 @@ ${ENGINE_PICKER}
   events [--json] [--peek] # unread feed events for the Claude session
   status [--all | --json | --brief | --line | --watch [--interval S]]
   wait <lane>... [--timeout S] [--json] [--report]
-  usage  [--json]         # per-account plan, rate-limit windows, ledger totals
+  usage  [--json] [--totals] # quota windows, observed burn, account picks
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   view   [--port N] [--open] # local browser view; Ctrl-C stops it
   feed   [-n N]           # replay recent completion/stall lines
@@ -7626,7 +7738,7 @@ export {
   makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal,
   summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
-  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
+  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, projectWindow, mergeUsageHistory, usageTable, geminiWindows, withAccountHolds, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS, callerLineage,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,

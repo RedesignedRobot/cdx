@@ -405,14 +405,15 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "usage",
-    description: "Report token consumption and rate limit windows for engines and accounts, with exact local reset times. json returns the raw snapshot (ISO resetsAt per account).",
+    description: "Report Codex and Gemini quota rows, observed burn, projected forfeiture and exhaustion, holds, and GPT account picks. json includes evidence and ledger totals; totals adds ledger totals to text.",
     inputSchema: {
       type: "object",
       properties: {
+        totals: { type: "boolean", description: "Include all-time ledger totals in text." },
         json: { type: "boolean", description: "Machine-readable output instead of the text report." },
       },
     },
-    run: (input) => ({ argv: input.json === true ? ["usage", "--json"] : ["usage"] }),
+    run: (input) => ({ argv: ["usage", ...(input.json === true ? ["--json"] : []), ...(input.totals === true ? ["--totals"] : [])] }),
   },
   {
     name: "takeover",

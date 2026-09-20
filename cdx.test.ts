@@ -5,7 +5,7 @@ import { unlinkSync } from "node:fs";
 import {
   checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
-  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, forfeitRate, adviceLines, RESET_CREDIT_ALERT_DAYS,
+  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
@@ -760,56 +760,164 @@ test("resetCreditAlerts fires only inside the three-day window before expiry", (
     { name: "codex-3", snapshot: undefined },
   ], now);
   expect(lines).toHaveLength(2);
-  expect(lines[0]).toMatch(/^CRITICAL: codex-1 has an unused reset credit expiring .* in 2\.5d; redeem before then in the codex TUI \(CODEX_HOME=.*\.codex codex, then \/usage\)$/);
-  expect(lines[1]).toMatch(/^CRITICAL: codex-2 has 2 unused reset credits expiring .* in 1\.0d and .* in 2\.0d; redeem/);
+  expect(lines[0]).toMatch(/^CRITICAL: codex-1 has an unused reset credit expiring .* in 2\.5d; inspect in the codex TUI \(CODEX_HOME=.*\.codex codex, then \/usage\)$/);
+  expect(lines[1]).toMatch(/^CRITICAL: codex-2 has 2 unused reset credits expiring .* in 1\.0d and .* in 2\.0d; inspect/);
 });
 
 // Ranking: spend first the account that its reset will forfeit the most from.
-test("rankAccounts orders by forfeit rate above the risk line, then deadline, then fullness", () => {
-  const now = Date.now();
-  const standingWith = (name: string, usedPercent: number, daysToReset: number) => standingOf(
-    { name, home: `/home/${name}` },
-    {
-      checkedAt: new Date(now).toISOString(), usedPercent, windowDurationMins: 10080,
-      resetsAt: Math.floor(now / 1000) + Math.round(daysToReset * 86_400), planType: "pro", resetCreditsAvailable: 0, reached: false,
-      windows: [{ usedPercent, windowDurationMins: 10080, resetsAt: Math.floor(now / 1000) + Math.round(daysToReset * 86_400) }],
-    },
-  );
-  // The live estate on 2026-09-15: a nearly dry account resetting soonest no
-  // longer leads a work lane; the fullest account with the shortest runway does.
-  const estate = [standingWith("codex-1", 97, 3.6), standingWith("codex-2", 43, 5.1), standingWith("codex-3", 27, 5.1), standingWith("codex-4", 28, 5.1)];
-  expect(rankAccounts(estate, "work", now).map((s) => s.choice.name)).toEqual(["codex-3", "codex-4", "codex-2", "codex-1"]);
-  expect(Math.round(forfeitRate(estate[0], "work", now))).toBe(0);
-  expect(Math.round(forfeitRate(estate[2], "work", now))).toBe(14);
-  // Half a window resetting within the hour outranks a full window with six days.
-  const urgent = [standingWith("slow", 0, 6), standingWith("soon", 50, 0.04)];
-  expect(rankAccounts(urgent, "work", now).map((s) => s.choice.name)).toEqual(["soon", "slow"]);
-  // A nearly dry account resetting within the hour does not: the one-day floor.
-  const dry = [standingWith("slow", 0, 6), standingWith("dry", 95, 0.04)];
-  expect(rankAccounts(dry, "work", now).map((s) => s.choice.name)).toEqual(["slow", "dry"]);
-  // Equal rates: earlier deadline first, then fuller.
-  const tie = [standingWith("later", 50, 5), standingWith("earlier", 50, 5 - 0.001), standingWith("fuller-later", 49, 5)];
-  expect(rankAccounts(tie, "work", now).map((s) => s.choice.name)).toEqual(["earlier", "fuller-later", "later"]);
+const usageNow = Date.parse("2026-09-20T19:00:00Z");
+function usageFixture(account: string, usedPercent: number, resetHours: number, burn?: number) {
+  const window = { usedPercent, windowDurationMins: 10080, resetsAt: usageNow / 1000 + resetHours * 3600 };
+  const checkedAt = new Date(usageNow).toISOString();
+  const snapshot = { ...window, checkedAt, planType: "pro", resetCreditsAvailable: 1, reached: usedPercent >= 99, windows: [window] };
+  const history = burn === undefined ? [] : [
+    { ...window, account, checkedAt: new Date(usageNow - 3600000).toISOString(), usedPercent: usedPercent - burn, rounds: { round: 1000 } },
+    { ...window, account, checkedAt, rounds: { round: 21000 } },
+  ];
+  return { window, history, standing: standingOf({ name: account, home: `/home/${account}` }, snapshot, history, usageNow) };
+}
+
+test("expiring capacity leads; projected exhaustion is light only; picks share admission", () => {
+  const estate = [usageFixture("later", 25, 144, 0), usageFixture("soon", 90, 1, 1), usageFixture("burning", 80, 2, 15)].map((f) => f.standing);
+  expect(rankAccounts(estate, "work", usageNow).map((s) => s.choice.name)).toEqual(["soon", "later", "burning"]);
+  const advice = accountAdvice(estate, usageNow);
+  for (const demand of ["light", "work", "supervisor"] as const) expect(advice.picks[demand]).toBe(decideAccount(estate, demand, usageNow)?.choice.name ?? null);
+  expect(decideAccount([estate[2]], "work", usageNow)).toBeUndefined();
+  expect(decideAccount([estate[2]], "light", usageNow)?.choice.name).toBe("burning");
+  expect(accountAdvice([usageFixture("thin", 97, 1).standing, estate[0]], usageNow).picks.work).toBe("thin");
 });
 
-test("adviceLines lists banked credits and tells a thin account to redeem", () => {
-  const now = Date.now();
-  const at = Math.floor(now / 1000);
-  const standingWith = (name: string, usedPercent: number, credits: number[]) => standingOf(
-    { name, home: `/home/${name}` },
-    {
-      checkedAt: new Date(now).toISOString(), usedPercent, windowDurationMins: 10080, resetsAt: at + 4 * 86_400, planType: "pro",
-      resetCreditsAvailable: credits.length, resetCreditExpiresAt: credits, reached: false,
-      windows: [{ usedPercent, windowDurationMins: 10080, resetsAt: at + 4 * 86_400 }],
-    },
-  );
-  // codex-1 sits exactly on the 3% risk line: nothing spendable, so redeem.
-  const lines = adviceLines([standingWith("codex-1", 97, [at + 19 * 86_400]), standingWith("codex-2", 40, [at + 20 * 86_400, at + 21 * 86_400]), standingWith("codex-3", 30, [])], now);
-  expect(lines[0]).toMatch(/^advice: spend codex-3 .*, then codex-2 .*, then codex-1/);
-  expect(lines[2]).toMatch(/^  reset credits: codex-1 1 reset credit, expires .*; codex-2 2 reset credits, expire .* and .*; redeem one on codex-1 now for a full window/);
-  expect(adviceLines([standingWith("codex-3", 30, [])], now)).toHaveLength(2);
+test("credits redeem only for actual or projected exhaustion", () => {
+  const estate = [usageFixture("thin", 97, 1), usageFixture("empty", 100, 1), usageFixture("burning", 80, 2, 15), usageFixture("idle", 50, 2, 0)].map((f) => f.standing);
+  expect(Object.fromEntries(accountAdvice(estate, usageNow).resetCredits.map((c) => [c.account, c.redeem])))
+    .toEqual({ thin: false, empty: true, burning: true, idle: false });
+  expect(adviceLines(estate, usageNow)).toHaveLength(2);
 });
 
+test("burn projects the observed window and estimates tokens only from complete deltas", () => {
+  const { window, history } = usageFixture("a", 90, 1, 4);
+  const project = (rows: Parameters<typeof projectWindow>[3] = history, now = usageNow) => projectWindow("a", window, history[1].checkedAt, rows, now);
+  expect(project()).toMatchObject({ burnMethod: "observed", burnPerHour: 4, projectedRemainingAtReset: 6, hoursToExhaustion: null, tokensPerPercent: 5000 });
+  expect(project(history.slice(1))).toMatchObject({ burnMethod: "none", burnPerHour: null, projectedRemainingAtReset: null });
+  expect(project(history, usageNow + 5 * 3600000).burnMethod).toBe("none");
+  expect(project(history.map((r, i) => i ? r : { ...r, resetsAt: r.resetsAt - 3600 })).burnMethod).toBe("none");
+  expect(project(history.map((r, i) => i ? r : { ...r, usedPercent: 95 })).burnMethod).toBe("none");
+  expect(project(history.map((r, i) => i ? { ...r, rounds: {} } : r)).tokensPerPercent).toBeUndefined();
+  expect(project(history.map((r) => ({ ...r, rounds: undefined }))).tokensPerPercent).toBeUndefined();
+  expect(project(history.map((r) => ({ ...r, usedPercent: 90 }))).burnPerHour).toBe(0);
+});
+
+test("history merges concurrent account probes, deduplicates and caps oldest readings", () => {
+  const { history } = usageFixture("a", 50, 2, 1);
+  const rows = Array.from({ length: 2050 }, (_, i) => ({ ...history[0], checkedAt: new Date(usageNow - i * 1000).toISOString() }));
+  const merged = mergeUsageHistory(rows, [history[1], { ...history[1], account: "b" }]);
+  expect(merged).toHaveLength(2048);
+  expect(merged.filter((r) => r.account === "a" && r.checkedAt === history[1].checkedAt)).toHaveLength(1);
+  expect(merged.at(-1)?.account).toBe("b");
+});
+
+test("Gemini shares window columns and shows a quota block instead of its reset", () => {
+  const checkedAt = new Date(usageNow).toISOString();
+  const windows = geminiWindows({ checkedAt, weekly: { remainingPercent: 66, resetsAt: new Date(usageNow + 86400000).toISOString() }, fiveHour: { remainingPercent: 0, resetsAt: new Date(usageNow + 3600000).toISOString() } });
+  const rows = windows.map((w) => projectWindow("gemini", w, checkedAt, [], usageNow));
+  rows[1].blockedUntil = usageNow / 1000 + 7200;
+  const table = usageTable(rows, usageNow);
+  expect(table[1]).toContain("weekly");
+  expect(table[2]).toContain("blocked in 2h 0m");
+  expect(table[0]).not.toContain("tokens/%");
+  expect(TOOLS_BY_NAME.get("usage")!.run({ json: true, totals: true }).argv).toEqual(["usage", "--json", "--totals"]);
+});
+
+function costLane(demand: "light" | "work" | "supervisor", tokens: number): Parameters<typeof demandSizing>[1][string] {
+  return { engine: "gpt", kind: "work", effort: "high", rounds: 1, reports: [],
+    consult: demand === "light" ? true : undefined, supervisor: demand === "supervisor" ? true : undefined,
+    work: { state: "done", exitCode: 0, cwd: "/repo" }, roundTokens: { input: tokens, output: 0, cached: 0 },
+    createdAt: "created", updatedAt: "updated" };
+}
+
+test("default admission agrees with advice after holds and exhaustion", () => {
+  const open = usageFixture("default", 96, 1).standing;
+  const lane = { ...costLane("work", 100), work: { state: "running" as const, cwd: "/repo" }, pid: 7, roundAccount: { ...open.choice, demand: "work" as const } };
+  const held = withAccountHolds([open], { running: lane }, (pid) => pid === 7)[0];
+  expect(held.remainingPercent).toBe(1);
+  expect(withAccountHolds([open], { running: { ...lane, roundAccount: undefined } }, (pid) => pid === 7)[0].remainingPercent).toBe(1);
+  for (const standing of [open, held, usageFixture("default", 100, 1).standing]) {
+    const advice = accountAdvice([standing], usageNow);
+    for (const demand of ["light", "work", "supervisor"] as const) {
+      if (advice.picks[demand] === null) expect(() => chooseAccount([standing], demand, undefined, undefined, usageNow)).toThrow("no account is eligible");
+      else expect(chooseAccount([standing], demand, undefined, undefined, usageNow).choice?.name).toBe(advice.picks[demand]!);
+    }
+  }
+});
+
+test("light spends two percent expiring in ten minutes before long runway", () => {
+  const estate = [usageFixture("later", 50, 24).standing, usageFixture("soon", 98, 1 / 6).standing];
+  expect(chooseAccount(estate, "light", undefined, undefined, usageNow).choice?.name).toBe("soon");
+  expect(accountAdvice(estate, usageNow).picks.work).toBe("later");
+});
+
+test("history publication failure leaves the old snapshot visible", () => {
+  const before = usageFixture("default", 50, 1).standing.snapshot!;
+  const after = usageFixture("default", 80, 1).standing.snapshot!;
+  const state = { ...before };
+  expect(() => publishUsageSnapshot(state, after, undefined, () => { throw new Error("disk full"); })).toThrow("disk full");
+  expect(state.usedPercent).toBe(50);
+  publishUsageSnapshot(state, after, undefined, () => { expect(state.usedPercent).toBe(50); });
+  expect(state.usedPercent).toBe(80);
+});
+
+test("Gemini quota evidence survives missing and stale probes", () => {
+  const reset = new Date(usageNow + 3600000).toISOString();
+  const quota = { blockedUntil: reset, observedAt: new Date(usageNow).toISOString(), lane: "g", round: 1 };
+  const state = geminiQuotaState(usageNow, quota, null);
+  const rows = geminiUsageRows(undefined, state, [], 0, usageNow);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ window: "5h", available: false, usedPercent: null, remainingPercent: null });
+  expect(usageTable(rows, usageNow)[1]).toContain("blocked in 1h 0m");
+  const snapshot = { checkedAt: new Date(usageNow - 3600000).toISOString(), weekly: { remainingPercent: 90, resetsAt: reset }, fiveHour: { remainingPercent: 90, resetsAt: reset } };
+  expect(geminiUsageRows(snapshot, geminiQuotaState(usageNow, quota, snapshot), [], 0, usageNow)[1].available).toBe(false);
+  expect(geminiQuotaState(usageNow + 3600000, quota, snapshot).block).toBeUndefined();
+  const fresh = { ...snapshot, checkedAt: new Date(usageNow).toISOString(), fiveHour: { remainingPercent: 4, resetsAt: reset } };
+  expect(geminiUsageRows(fresh, geminiQuotaState(usageNow, null, fresh), [], 0, usageNow)[1].available).toBe(false);
+});
+
+test("credit alerts survive unusable capacity evidence in JSON and text", () => {
+  const original = usageFixture("a", 50, 24).standing;
+  const snapshot = { ...original.snapshot!, checkedAt: new Date(usageNow - 3600000).toISOString(), probeFailedAt: new Date(usageNow).toISOString(), resetCreditExpiresAt: [usageNow / 1000 + 86400] };
+  const unknown = standingOf(original.choice, snapshot, [], usageNow);
+  expect(unknown.snapshot).toBeUndefined();
+  expect(accountAdvice([unknown], usageNow).alerts[0]).toContain("unused reset credit");
+  expect(adviceLines([unknown], usageNow).join(" ")).toContain("unused reset credit");
+  expect(accountAdvice([unknown], usageNow).resetCredits[0].redeem).toBe(false);
+});
+
+test("doctor redemption uses exhaustion rather than the 95 percent warning", () => {
+  expect(shouldRedeemCredit(usageFixture("warning", 95, 1).standing)).toBe(false);
+  expect(shouldRedeemCredit(usageFixture("burning", 80, 2, 15).standing)).toBe(true);
+  expect(shouldRedeemCredit(usageFixture("empty", 100, 1).standing)).toBe(true);
+  const noCredit = usageFixture("empty", 100, 1).standing;
+  noCredit.snapshot!.resetCreditsAvailable = 0;
+  expect(shouldRedeemCredit(noCredit)).toBe(false);
+});
+
+test("demand sizing uses five complete round costs and observed window conversion", () => {
+  const standing = usageFixture("a", 90, 1, 1).standing;
+  const ledger = Object.fromEntries([10000, 20000, 30000, 40000, 900000].map((tokens, i) => [`work-${i}`, costLane("work", tokens)]));
+  expect(demandSizing(standing, ledger).work).toEqual({ minimumPercent: 1.5, samples: 5, medianTokens: 30000 });
+  expect(demandSizing(standing, ledger).supervisor.minimumPercent).toBe(3);
+  expect(demandSizing(usageFixture("unknown", 90, 1).standing, ledger).work.minimumPercent).toBe(3);
+  const incomplete = { ...ledger, "work-0": { ...ledger["work-0"], tokensIncomplete: true } };
+  expect(demandSizing(standing, incomplete).work).toEqual({ minimumPercent: 3, samples: 4, medianTokens: null });
+  for (let i = 0; i < 5; i++) ledger[`supervisor-${i}`] = costLane("supervisor", 300000);
+  const sized = withAccountHolds([standing], ledger, () => false);
+  expect(accountAdvice(sized, usageNow).picks).toEqual({ light: "a", work: "a", supervisor: null });
+  expect(() => chooseAccount(sized, "supervisor", undefined, undefined, usageNow)).toThrow("no account is eligible");
+  const twoWindows = { ...standing, remainingPercent: 4, projections: [
+    { ...standing.projections![0], remainingPercent: 70, tokensPerPercent: 10000 },
+    { ...standing.projections![0], window: "5h", remainingPercent: 4, tokensPerPercent: 100000 },
+  ] };
+  expect(accountAdvice(withAccountHolds([twoWindows], ledger, () => false), usageNow).picks.supervisor).toBe("a");
+});
 
 test("receipt admission requires a successful unchanged tree from the current work round", () => {
   const before = { head: "commit-a", tree: "tree-a" };

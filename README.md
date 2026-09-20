@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx
+# cdx 7.5.0
 
 **A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
@@ -156,7 +156,7 @@ flowchart LR
 
 - Each lane has discrete `work` and `review` round records. Version 5 writes `{ version: 5, lanes: { ... } }` and `.ledger-version` to reject older writers. The writer migrates 3.x and 4.0 ledgers once on write under lock and rejects legacy shapes thereafter. Flat `state` and `cwd` aliases are removed from the ledger and view summaries. A new round clears its predecessor's report and note.
 - The runner handles engine events, qualifies Gemini results, and finalizes reports and gates. Shared JSONL framing handles unterminated responses and skips non-object values. Effort is pinned in the round spec; every round spec requires an explicit engine and effort, and pre-4 effort and account fallbacks are removed. Resuming a live round is refused.
-- Usage mutations share one `.usage.lock` transaction so parallel probes preserve each other's account snapshots. Codex token usage is counted per thread from a per-thread baseline. Missing or non-finite counters mark the round "incomplete" instead of counting as zero; status and usage output show "(incomplete)", and `usage --json` rows carry an `incomplete` field. Every round records a start time and emits a `started` feed event.
+- Snapshot and probe history writes share `.usage.lock`; history is atomically replaced before its snapshot so a published snapshot always has its reading. Codex token usage is counted per thread from a per-thread baseline. Missing or non-finite counters mark the round "incomplete" instead of counting as zero; status and usage output show "(incomplete)", and `usage --json` rows carry an `incomplete` field. Every round records a start time and emits a `started` feed event.
 - Detached lanes: Detached lanes keep running after your shell exits.
 - One engine child per work round: GPT uses a Codex app-server over stdio. Gemini uses Antigravity stream JSON over stdio and keeps the conversation ID for resume.
 - Reports captured per round: Both GPT and Gemini work reports capture the final agent message of the turn, not concatenated turn text. Non-success Gemini results preserve the last agent response in `reports/<lane>-r<n>.partial.md` and never overwrite full reports. Transport error text does not replace captured partial work. Failed rounds expose that path in their ledger record and terminal feed when no full report exists. Failure notes contain the reason and partial path, not the report markdown.
@@ -186,7 +186,7 @@ flowchart LR
 | `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
 | `cdx consult <lane> [--engine gpt\|gemini] [--supervisor]` | Run a read-only advisory consult or supervisor helper |
 | `cdx status` | Show lane state, tool steps, dirty file count, stage, timing, and last action; `--line` renders a 100-character status line |
-| `cdx usage` | Codex account limits, which account to spend next and why, Gemini limits, and all-time ledger totals |
+| `cdx usage` | Codex and Gemini quota table, observed burn, projections and account picks; --totals adds ledger totals |
 | `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
 | `cdx job <name> --cd /repo "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
@@ -219,7 +219,7 @@ cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--account N
 cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 cdx view [--port N] [--open]
 cdx status [--all] [--json | --brief | --line | --watch [--interval S]]
-cdx usage  [--json]
+cdx usage  [--json] [--totals]
 cdx wait   <lane>... [--timeout S] [--json] [--report]
 cdx tail   <lane> [-n N]
 cdx tail   -f [lane]
@@ -375,7 +375,7 @@ The mod registers native tools under the prefix `mcp__cdx__`:
 | `mcp__cdx__job` | `name, cmd, cd` | | Launch a detached background job command via stdin (`job <name> --cd D -`). |
 | `mcp__cdx__msg` | `target, text` | (none) | Send a notification message via stdin (`msg <target> -`). |
 | `mcp__cdx__inbox` | (none) | `lines` | Read incoming messages sent to this session (`inbox [-n N]`). |
-| `mcp__cdx__usage` | (none) | (none) | Report token consumption and rate limit windows. |
+| `mcp__cdx__usage` | (none) | (none) | Quota rows, observed burn, projections and GPT account picks. Optional `json` and `totals`. |
 | `mcp__cdx__takeover` | `target` | (none) | Claim ownership of a lane or session. |
 | `mcp__cdx__doctor` | (none) | `fix, probe` | Diagnose plugin installation, engine accounts, and background workers. Timeout is 120 seconds. |
 
@@ -495,22 +495,30 @@ Each account needs its own Codex home. cdx sets `CODEX_HOME` for each Codex proc
 }
 ```
 
-With an accounts map, `cdx usage` and launch admission share one decision:
+With or without an accounts map, `cdx usage` and launch admission share one decision:
 
-1. The risk line is 3% remaining weekly capacity for every lane kind (owner ruling 2026-09-11); it is a placement hint, and only exhaustion refuses. Among accounts above the line, spend first the one with the highest forfeit rate: the share above the risk line divided by the days until its reset (floored at one day), which is what waiting loses per day. Equal rates go to the earlier reset, then the fuller account.
+1. Spend the account whose spendable window resets first. Observed exhaustion before reset makes an account light-only and ranks it behind accounts with runway. With no burn sample, reset time still orders accounts, but projections remain unknown. Work and supervisor lanes require their sampled demand cost in every live window, with 3% as the fallback; light lanes require positive capacity. Exhausted accounts cannot take a lane. Automatic admission and `advice.picks` use the same ranking; an explicit account or eligible resume affinity remains pinned.
 2. Active rounds hold 3% against their assigned account during execution. Admission subtracts active holds before evaluating remaining headroom.
 3. Dead runner release: admission reconciles crashed runners and releases their holds while preserving live child holds.
 4. Consuming round completion invalidates the account usage snapshot, forcing fresh probes on subsequent rounds.
 5. `--account NAME` obeys exhaustion eligibility instead of forcing a depleted account. If the specified account is exhausted or lacks required headroom, admission rejects the launch.
 6. Automatic GPT quota failover recovers exhausted accounts across work, review, and consult rounds. When Codex hits quota exhaustion, the runner marks the account exhausted with its reset time and starts a fresh round on an eligible alternate account. The recovery prompt transfers the original brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
 
+Work and supervisor sizing uses the median input-plus-output tokens from at least five complete successful GPT rounds of that demand retained in the ledger, converts it through each window's observed tokens-per-percent, and falls back to 3% where evidence is sparse; the median is a sizing hint, never a completion guarantee.
+
 Snapshot thresholds and demand holds guide placement and concurrency control. They do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish.
 
 Usage readings cache for 30 minutes unless a window has reset or the reading lacks per-window data. Failed probes cache for 5 minutes. A failed probe with no usable reading leaves capacity unknown. Exhaustion markers carry provenance (recorded time, window length, reason) and reconcile against fresh usage probes; a marker clears only when no window of that account is exhausted, while a live block on any window stays. `cdx usage` advice reads the reconciled standings.
 
-`usage --json` includes `advice.picks`, account `remainingPercent`, reset times, `forfeitRate`, and reasons, plus `advice.resetCredits` (count, expiries, whether to redeem) and `alerts`. Text output also shows the daily pace that would spend the remaining weekly share before reset.
+`usage` prints one row per Codex or Gemini window: account, window, used, left, resets in, burn/h, at reset, empty in, and holds. `left` is the last observed remaining percentage; admission subtracts holds from the smallest live window. `at reset` is the percentage projected to be forfeited at the observed burn. `empty in` appears only when exhaustion precedes reset. Gemini's five-hour quota block replaces its reset countdown while blocked; the blocked row remains with unknown percentages when no usage snapshot exists. Red starts at 95% used and yellow at 75%. Two lines below the table show GPT picks and account exceptions. `--totals` adds all-time ledger totals; JSON always includes them.
 
-Reset credits: each account line names every banked credit's expiry (the app-server grants them for 30 days). The advice adds a `reset credits` line and tells you to redeem one on an account that is exhausted or under the risk line, since a credit restores a full window instead of waiting for the reset. A credit inside three days of expiry prints a red `CRITICAL` line at the top of `cdx usage`, in `cdx doctor`, and on every GPT launch until it is redeemed or gone; cdx cannot redeem it, the codex TUI `/usage` on that home can.
+Each successful probe writes one reading per window to `~/.cdx/usage-history.json`, capped at 2,048 readings under a shared lock. Cached and failed probes add nothing. Burn is the percentage-point increase per hour between the earliest and latest readings within the last four hours, for the same account, window length and reset instant. A percentage decrease starts a new segment. Fewer than two distinct timestamps, an expired window or an old sample means no burn estimate, shown as `?`. Zero observed growth is zero burn. Projections include time elapsed since the latest reading; they assume that observed burn continues.
+
+`tokens/%` appears only with a positive percentage delta and complete, nondecreasing per-round ledger token deltas across the sample. Counters use input plus output tokens; cached tokens are not added again. Missing rounds or incomplete counters suppress the estimate. This is recorded cdx traffic, not all account traffic, and is an estimate for lane sizing. JSON also includes `estimatedRemainingTokens` before holds. Probes are the only samples; no background process collects history.
+
+`usage --json` preserves `advice.picks`, `remainingPercent`, reset times, raw engine snapshots, ledger totals, credit counts and expiries. Its shared `windows` array contains every table column, `checkedAt`, `historyWindow`, `burnMethod` as `observed` or `none`, `burnPerHour`, `projectedRemainingAtReset`, and `hoursToExhaustion`. `advice.accounts` includes reasons, projections and per-demand sizing evidence. `paceToEmpty` and `forfeitRate` were removed: neither represented observed burn or projected forfeiture. Consumers must use the new fields rather than interpret a per-day pace as burn. Window reset and block times use Unix seconds; legacy top-level Codex row reset times remain ISO strings.
+
+Reset credits are recommended only for an exhausted account or observed exhaustion before reset. Low remaining percentage and credit expiry alone do not justify redemption. Credits inside three days of expiry remain in text and JSON alerts, doctor and launch notices even when quota evidence is stale. Redeem through that home's codex TUI `/usage`; cdx cannot redeem credits.
 
 A GPT review of a Gemini lane selects an account when it has no affinity. A Gemini review preserves the GPT work account. Gemini work rejects `--account`. Tracked lane forks can start a fresh session on another eligible home. Raw-session forks require the source home from `--account` or the primary home to be eligible because cdx has no saved brief or reports for that session. Adopts record `--account` or the primary home without consuming quota. Incomplete account records fail explicitly; migrated rows without affinity pass admission.
 
