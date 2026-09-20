@@ -3,6 +3,7 @@ import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
+  verifyGate, requireAccountModel, recoveryPartial,
   checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
@@ -944,7 +945,59 @@ test("required gate survives a missing lane gate and isolates shell control comm
   expect(composeGate(undefined, "spec")).toBe("spec");
   expect(composeGate(undefined, undefined)).toBeUndefined();
   expect(composeGate("check-all", "exit 0")).toBe("(/bin/sh -lc 'check-all') && (/bin/sh -lc 'exit 0')");
+  const notices: string[] = [];
+  expect(composeGate("check-all", "check-all && extra", (message) => notices.push(message)))
+    .toBe("(/bin/sh -lc 'check-all') && (/bin/sh -lc 'extra')");
+  expect(notices).toHaveLength(1);
+  expect(composeGate("check-all", "check-all &&extra")).toContain("'check-all &&extra'");
   expect(shellQuote("echo 'ok'")).toBe("'echo '\"'\"'ok'\"'\"''");
+});
+
+test("a passing gate may prepare the tree once, but only a settled rerun earns a receipt", () => {
+  for (const finalTree of ["settled", "changed-again"]) {
+    let tree = "initial";
+    const checked: string[] = [];
+    const result = verifyGate(2, "/repo", "check", () => ({ head: "head", tree }), (attempt) => {
+      checked.push(tree);
+      tree = attempt === 0 ? "settled" : finalTree;
+      return { exitCode: 0, output: "", timedOut: false };
+    });
+    expect(checked).toEqual(["initial", "settled"]);
+    expect(result.receipt.tree).toBe(finalTree);
+    expect(result.receipt.valid).toBe(finalTree === "settled");
+    expect(result.receipt.reason).toBe(finalTree === "settled" ? undefined : "tree changed during gate");
+    expect(gateAcceptanceFailed(result.gate.exitCode, result.receipt, result.proofRequired)).toBe(finalTree !== "settled");
+  }
+  let runs = 0;
+  const failed = verifyGate(2, "/repo", "check", () => ({ head: "head", tree: String(runs) }), () => {
+    runs++;
+    return { exitCode: 1, output: "failure", timedOut: false };
+  });
+  expect(runs).toBe(1);
+  expect(failed.receipt.valid).toBe(false);
+});
+
+test("account model admission refuses only explicit catalog exclusions with the model and account named", () => {
+  expect(() => requireAccountModel("gpt-5.4", "codex-2", ["gpt-6-astra"]))
+    .toThrow('model "gpt-5.4" is not supported by account "codex-2"');
+  expect(() => requireAccountModel("gpt-6-astra", "codex-2", undefined)).not.toThrow();
+  expect(() => requireAccountModel("gpt-5.4", "codex-2", ["gpt-5.4"])).not.toThrow();
+});
+
+test("reportless recovery preserves changed paths, completed actions and transcript evidence under forty lines", () => {
+  const events = [
+    { method: "item/completed", params: { item: { type: "commandExecution", command: "check > /tmp/check.log", exitCode: 0 } } },
+    { event: "step_update", step_update: { step_type: "tool", state: "DONE", tool_name: "write_to_file", tool_info: { parameters: { TargetFile: "/tmp/proof.md" } } } },
+    { method: "item/started", params: { item: { type: "commandExecution", command: "unfinished" } } },
+  ];
+  const transcript = events.map((event) => JSON.stringify(event)).join("\n") + '\n{"incomplete":';
+  const partial = recoveryPartial(transcript, " M cdx.ts\n?? evidence.json\n", "Keep the admission fix.");
+  for (const text of [" M cdx.ts", "?? evidence.json", "Last completed tool action: write_to_file /tmp/proof.md", "/tmp/check.log", "Previous handoff: Keep the admission fix."]) expect(partial).toContain(text);
+  expect(partial).not.toContain("unfinished");
+  const many = Array.from({ length: 100 }, (_, index) => `/tmp/proof-${index}.md`).join("\n");
+  const bounded = recoveryPartial(transcript + "\n" + many, many, "previous\n".repeat(100));
+  expect(bounded.split("\n").length).toBeLessThan(40);
+  expect(bounded).toContain("more; inspect the transcript");
 });
 
 test("job target must be explicit in CLI and native tool", () => {

@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.5.0";
+const VERSION = "7.6.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -299,11 +299,15 @@ function receiptRefusal(receipt: GateReceipt | undefined, work: Pick<RoundRecord
   if (!receipt.valid || receipt.exitCode !== 0 || !receipt.head || !receipt.tree) return receipt.reason ?? "invalid gate receipt";
 }
 
-function composeGate(required: string | undefined, requested: string | undefined): string | undefined {
+function composeGate(required: string | undefined, requested: string | undefined, notice = console.error): string | undefined {
   const baseline = required?.trim();
-  const gate = requested?.trim();
+  let gate = requested?.trim();
   if (!baseline) return gate || undefined;
   if (!gate || baseline === gate) return baseline;
+  if (gate.startsWith(`${baseline} && `)) {
+    gate = gate.slice(baseline.length + 4);
+    notice("cdx: stripped leading repository baseline from lane gate; baseline runs once");
+  }
   // Separate shells prevent exit, cd and shell options in one check skipping the other.
   return `(/bin/sh -lc ${shellQuote(baseline)}) && (/bin/sh -lc ${shellQuote(gate)})`;
 }
@@ -1261,6 +1265,54 @@ function validLane(lane: string): string {
 const reportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.md`;
 const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.partial.md`;
 
+function recoveryPartial(transcript: string, status: string, previous = ""): string {
+  let lastAction = "No completed tool action recorded.";
+  const paths = new Set<string>();
+  const collectPaths = (text: string) => {
+    for (const match of text.matchAll(/(?:^|[\s"'`(=:])((?:\/|~\/|\.\.?\/|[\w.-]+\/)[^\s"'`<>\\),;]+)/g)) {
+      const path = match[1]!;
+      if (!path.startsWith("//") && (/^(?:\/|~\/|\.\.?\/)/.test(path) || /\.[a-z0-9]+$/i.test(path))) paths.add(path);
+    }
+  };
+  const strings = (value: unknown): void => {
+    if (typeof value === "string") collectPaths(value);
+    else if (value && typeof value === "object") for (const child of Object.values(value)) strings(child);
+  };
+  for (const line of transcript.split("\n")) {
+    try {
+      const event = JSON.parse(line);
+      strings(event);
+      const action = toolObservation(event);
+      if (!action?.completed) continue;
+      const item = event.params?.item ?? event.item;
+      const name = event.step_update?.tool_name ?? event.step_update?.tool_info?.name ?? item?.tool ?? item?.type ?? "tool";
+      lastAction = statusText(action.command || [name, ...action.files].join(" "), 600) + (action.failed ? " (failed)" : "");
+    } catch { collectPaths(line); }
+  }
+  const bounded = (lines: string[], limit: number) => [
+    ...lines.slice(0, limit), ...(lines.length > limit ? [`... ${lines.length - limit} more; inspect the transcript or git status --short.`] : []),
+  ];
+  const changed = status.split("\n").filter((line) => line.trim());
+  return [
+    "# Partial recovery", "", `Last completed tool action: ${lastAction}`, "",
+    "Changed paths (git status --short):", ...bounded(changed.length ? changed : ["No changed paths."], 16), "",
+    "Evidence paths mentioned in transcript:", ...bounded([...paths].length ? [...paths].slice().reverse() : ["None recorded."], 10),
+    ...(previous.trim() ? ["", `Previous handoff: ${statusText(previous, 600)}`] : []), "",
+  ].join("\n");
+}
+
+function captureRecoveryPartial(lane: string, round: number, cwd: string): void {
+  const full = reportPathOf(lane, round);
+  if (existsSync(full) && readFileSync(full, "utf8").trim()) return;
+  const transcriptPath = [logPathOf(lane, round, true), logPathOf(lane, round, false)].find(existsSync);
+  const transcript = transcriptPath ? readFileSync(transcriptPath, "utf8") : "";
+  const status = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--short"] });
+  const path = partialReportPathOf(lane, round);
+  const previous = existsSync(path) ? readFileSync(path, "utf8") : "";
+  mkdirSync(`${ROOT}/reports`, { recursive: true });
+  writeFileSync(path, recoveryPartial(transcript, status.success ? status.stdout.toString() : "Git status unavailable.", previous));
+}
+
 function availableReportPath(lane: string, round: number): string | undefined {
   return [reportPathOf(lane, round), partialReportPathOf(lane, round)]
     .find((path) => existsSync(path) && readFileSync(path, "utf8").trim().length > 0);
@@ -1523,7 +1575,7 @@ function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", op
     if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
-  builtIns.push("Write tool payloads larger than one screen to a file outside the repository and print only the path and a one-line digest.");
+  builtIns.push("Write shell results above 20 KB to a file outside the repository and print only the path and a one-line digest. Use bounded excerpts for follow-up reads.");
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
   const projectRules = `${cwd}/.cdx-rules.md`;
@@ -1853,6 +1905,10 @@ function defaultMaxRuntime(engine: Engine): number | undefined {
 
 interface AccountChoice { name: string; home: string }
 
+function requireAccountModel(model: string, account: string, models: string[] | undefined): void {
+  if (models && !models.includes(model)) throw new CmdError(`model "${model}" is not supported by account "${account}"`);
+}
+
 function configuredAccount(name: string): AccountChoice {
   const accounts = config.accounts;
   if (!accounts || !Object.hasOwn(accounts, name)) {
@@ -2055,6 +2111,11 @@ async function openRound(lane: string, kind: "work" | "review", cwd: string, eff
       const demand: Demand = kind === "review" || (opts?.consult ?? existing?.consult) ? "light" : (opts?.lineage?.supervisor ?? existing?.supervisor) ? "supervisor" : "work";
       const selection = engine === "gpt" ? chooseAccount(cachedAccountStandings(ledger).map((standing) => opts?.excludedHomes?.has(standing.choice.home) ? { ...standing, reached: true, reason: `already exhausted in this run; ${standing.reason}` } : standing), demand, opts?.forcedAccount, preferred) : undefined;
       const activeAccount = selection?.choice;
+      if (engine === "gpt" && activeAccount) {
+        const model = resolveCodexModel(opts?.model ?? existing?.model);
+        const models = readUsageSnapshot(activeAccount)?.models;
+        requireAccountModel(model, activeAccount.name, models);
+      }
       const account = kind === "review" && existing ? existing.account : activeAccount?.name;
       const codexHome = kind === "review" && existing ? existing.codexHome : activeAccount?.home;
       const ownerSession = existing ? existing.ownerSession : opts?.owner?.ownerSession;
@@ -2228,6 +2289,29 @@ function classifyGateFailure(exitCode: number, output: string): "setup" | "asser
 }
 
 interface GateResult { exitCode: number; output: string; timedOut: boolean }
+
+function verifyGate(round: number, cwd: string, command: string,
+  snapshot: () => GateTree | undefined, run: (attempt: number) => GateResult) {
+  let snapshotError: string | undefined;
+  const capture = () => {
+    try { return snapshot(); }
+    catch (error) { snapshotError = String(error); return undefined; }
+  };
+  let before = capture();
+  let gate: GateResult;
+  let receipt: GateReceipt;
+  let proofRequired = Boolean(before || snapshotError);
+  for (let attempt = 0; ; attempt++) {
+    gate = run(attempt);
+    const after = capture();
+    proofRequired ||= Boolean(after || snapshotError);
+    receipt = makeGateReceipt(round, cwd, command, gate.exitCode, new Date().toISOString(), before, after, snapshotError);
+    if (attempt !== 0 || gate.exitCode !== 0 || gate.timedOut || receipt.reason !== "tree changed during gate") break;
+    // The first passing gate prepared this tree. Only a stable rerun proves it.
+    before = after;
+  }
+  return { gate, receipt, proofRequired };
+}
 
 function executeGate(command: string, cwd: string, logPath: string): GateResult {
   const started = Date.now();
@@ -2418,6 +2502,7 @@ function finishInvalidBaseline(lane: string, round: number, command: string, cwd
 }
 
 function failActiveRound(lane: string, item: Lane, note: string): void {
+  captureRecoveryPartial(lane, item.rounds, item.kind === "review" ? item.review!.cwd : workCwdOf(item));
   if (roundEngine(item) === "gpt") invalidateAccountUsage(item.roundAccount);
   item.switchingAccount = undefined;
   item.outageFallbackPending = undefined;
@@ -3867,6 +3952,10 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   });
   setStage("reporting");
   const reportOk = existsSync(reportPath) && readFileSync(reportPath, "utf8").trim().length > 0;
+  if (!reportOk) {
+    captureRecoveryPartial(lane, round, spec.cwd);
+    feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, spec.ownerSession, { lane, round });
+  }
   const stderrText = (() => {
     try { return readFileSync(`${ROOT}/logs/${lane}-r${round}.stderr.log`, "utf8"); } catch { return ""; }
   })();
@@ -3909,17 +3998,15 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason) {
     setStage("gate");
     feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
-    let before: GateTree | undefined;
-    let after: GateTree | undefined;
-    let snapshotError: string | undefined;
-    try { before = captureGateTree(spec.cwd); }
-    catch (error) { snapshotError = String(error); }
-    const gate = executeGate(spec.gate, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`);
-    const finishedAt = new Date().toISOString();
-    try { after = captureGateTree(spec.cwd); }
-    catch (error) { snapshotError = String(error); }
-    gateReceipt = makeGateReceipt(round, spec.cwd, spec.gate, gate.exitCode, finishedAt, before, after, snapshotError);
-    proofRequired = Boolean(before || after || snapshotError);
+    const verified = verifyGate(round, spec.cwd, spec.gate, () => captureGateTree(spec.cwd), (attempt) => {
+      if (attempt) feedEvent("progress", `[cdx] lane=${lane} round=${round} passing gate changed the tree; verifying once on the settled tree`, spec.ownerSession, { lane, round });
+      const path = `${ROOT}/logs/${lane}-r${round}.gate.log`;
+      if (attempt && existsSync(path)) renameSync(path, `${ROOT}/logs/${lane}-r${round}.gate-preparation.log`);
+      return executeGate(spec.gate!, spec.cwd, path);
+    });
+    const { gate } = verified;
+    gateReceipt = verified.receipt;
+    proofRequired = verified.proofRequired;
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
     setStage("reporting");
@@ -5277,6 +5364,7 @@ interface RateLimitWindow {
 }
 
 interface AccountUsage {
+  models?: string[];
   planType: string;
   primary: RateLimitWindow;
   secondary?: RateLimitWindow;
@@ -5288,6 +5376,7 @@ interface AccountUsage {
 }
 
 interface UsageSnapshot {
+  models?: string[];
   checkedAt: string;
   usedPercent: number;
   windowDurationMins: number;
@@ -5431,8 +5520,9 @@ function parseAccountUsage(response: unknown): AccountUsage | undefined {
   };
 }
 
-async function readAccountUsage(codexHome?: string): Promise<AccountUsage | undefined> {
+async function readAccountProbe(codexHome?: string): Promise<{ usage?: AccountUsage; models?: string[] }> {
   let proc: any;
+  const result: { usage?: AccountUsage; models?: string[] } = {};
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let stderrDrain: Promise<string> | undefined;
   const deadline = Date.now() + 10_000;
@@ -5441,18 +5531,44 @@ async function readAccountUsage(codexHome?: string): Promise<AccountUsage | unde
       env: uncoloredChildEnv(codexHome), stdin: "pipe", stdout: "pipe", stderr: "pipe",
     });
     stderrDrain = new Response(proc.stderr).text().catch(() => "");
-    const messages = [
-      { id: 1, method: "initialize", params: { clientInfo: { name: "cdx", title: "cdx", version: VERSION } } },
-      { method: "initialized", params: {} },
-      { id: 2, method: "account/rateLimits/read", params: {} },
-    ];
-    proc.stdin.write(`${messages.map((message) => JSON.stringify(message)).join("\n")}\n`);
-    proc.stdin.flush();
+    const send = (message: object) => {
+      proc.stdin.write(`${JSON.stringify(message)}\n`);
+      proc.stdin.flush();
+    };
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "cdx", title: "cdx", version: VERSION } } });
 
-    const response = await Promise.race([
+    await Promise.race([
       (async () => {
+        let usageDone = false;
+        let modelsDone = false;
+        let modelId = 3;
+        const models: string[] = [];
+        const cursors = new Set<string>();
         for await (const message of readJsonLines(proc!.stdout)) {
-          if (message.id === 2) return message;
+          if (message.id === 1) {
+            if (message.error) return;
+            send({ method: "initialized", params: {} });
+            send({ id: 2, method: "account/rateLimits/read", params: {} });
+            send({ id: modelId, method: "model/list", params: { includeHidden: true } });
+          } else if (message.id === 2) {
+            result.usage = parseAccountUsage(message);
+            usageDone = true;
+          } else if (message.id === modelId) {
+            const page = message.result;
+            if (message.error || !Array.isArray(page?.data) || !page.data.every((item: any) => typeof item?.model === "string")) {
+              modelsDone = true;
+            } else {
+              models.push(...page.data.map((item: any) => item.model));
+              if (typeof page.nextCursor === "string" && !cursors.has(page.nextCursor)) {
+                cursors.add(page.nextCursor);
+                send({ id: ++modelId, method: "model/list", params: { includeHidden: true, cursor: page.nextCursor } });
+              } else {
+                if (page.nextCursor == null) result.models = models;
+                modelsDone = true;
+              }
+            }
+          }
+          if (usageDone && modelsDone) return;
         }
       })(),
       new Promise<never>((_, reject) => {
@@ -5462,9 +5578,9 @@ async function readAccountUsage(codexHome?: string): Promise<AccountUsage | unde
         }, Math.max(0, deadline - Date.now()));
       }),
     ]);
-    return parseAccountUsage(response);
+    return result;
   } catch {
-    return undefined;
+    return result;
   } finally {
     if (timeout) clearTimeout(timeout);
     try { proc?.stdin.end(); } catch { /* already closed */ }
@@ -5489,6 +5605,7 @@ function isUsageSnapshot(value: unknown): value is UsageSnapshot {
     && typeof snapshot.planType === "string"
     && typeof snapshot.resetCreditsAvailable === "number"
     && typeof snapshot.reached === "boolean"
+    && (snapshot.models === undefined || (Array.isArray(snapshot.models) && snapshot.models.every((model) => typeof model === "string")))
     && (snapshot.warnedAt === undefined || typeof snapshot.warnedAt === "string")
     && (snapshot.probeFailedAt === undefined || typeof snapshot.probeFailedAt === "string")
     && (snapshot.resetCreditExpiresAt === undefined || (Array.isArray(snapshot.resetCreditExpiresAt) && snapshot.resetCreditExpiresAt.every((at) => typeof at === "number")))
@@ -5547,6 +5664,7 @@ function snapshotFromAccountUsage(usage: AccountUsage): UsageSnapshot {
   });
   return {
     checkedAt: new Date().toISOString(),
+    ...(usage.models ? { models: usage.models } : {}),
     usedPercent: window.usedPercent,
     windowDurationMins: window.windowDurationMins,
     resetsAt: window.resetsAt,
@@ -5672,7 +5790,8 @@ function usageFeedWarning(snapshot: UsageSnapshot, account?: AccountChoice): str
 
 async function refreshUsageSnapshot(options: { warnFeed?: boolean; account?: AccountChoice; ownerSession?: string } = {}): Promise<RefreshedUsage | undefined> {
   const probeStartedAt = Date.now();
-  const usage = await readAccountUsage(options.account?.home);
+  const probe = await readAccountProbe(options.account?.home);
+  const usage = probe.usage ? { ...probe.usage, models: probe.models } : undefined;
   if (!usage) {
     // Negative-cache the failure so a hung app-server does not cost every
     // subsequent launch a fresh probe timeout (accountSnapshot honors this
@@ -7734,6 +7853,7 @@ if (import.meta.main) {
 }
 
 export {
+  verifyGate, requireAccountModel, recoveryPartial,
   finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree,
   makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal,
   summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
