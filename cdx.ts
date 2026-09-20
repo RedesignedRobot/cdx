@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.6.0";
+const VERSION = "7.6.1";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -260,6 +260,7 @@ interface GateBaseline {
 
 interface GateTree { head: string; tree: string }
 interface GateReceipt {
+  sharedTreeLanes?: string[];
   version: 1;
   round: number;
   cwd: string;
@@ -498,6 +499,7 @@ interface Lane {
 }
 
 interface Spec {
+  injectedRules?: string;
   visibility?: VisibilityConfig;
   effort: Effort;
   engine: Engine;
@@ -1267,6 +1269,7 @@ const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${
 
 function recoveryPartial(transcript: string, status: string, previous = ""): string {
   let lastAction = "No completed tool action recorded.";
+  const outstanding = new Map<string, string>();
   const paths = new Set<string>();
   const collectPaths = (text: string) => {
     for (const match of text.matchAll(/(?:^|[\s"'`(=:])((?:\/|~\/|\.\.?\/|[\w.-]+\/)[^\s"'`<>\\),;]+)/g)) {
@@ -1283,6 +1286,11 @@ function recoveryPartial(transcript: string, status: string, previous = ""): str
       const event = JSON.parse(line);
       strings(event);
       const action = toolObservation(event);
+      if (action?.id) {
+        if (action.completed) outstanding.delete(action.id);
+        else if (action.command && !outstanding.has(action.id)) outstanding.set(action.id,
+          `${action.command} (started-at: ${typeof event.timestamp === "string" ? event.timestamp : "unknown"})`);
+      }
       if (!action?.completed) continue;
       const item = event.params?.item ?? event.item;
       const name = event.step_update?.tool_name ?? event.step_update?.tool_info?.name ?? item?.tool ?? item?.type ?? "tool";
@@ -1294,7 +1302,8 @@ function recoveryPartial(transcript: string, status: string, previous = ""): str
   ];
   const changed = status.split("\n").filter((line) => line.trim());
   return [
-    "# Partial recovery", "", `Last completed tool action: ${lastAction}`, "",
+    "# Partial recovery", "", `Last completed tool action: ${lastAction}`,
+    `Outstanding process: ${outstanding.size ? statusText([...outstanding.values()].join("; "), 600) : "None recorded."}`, "",
     "Changed paths (git status --short):", ...bounded(changed.length ? changed : ["No changed paths."], 16), "",
     "Evidence paths mentioned in transcript:", ...bounded([...paths].length ? [...paths].slice().reverse() : ["None recorded."], 10),
     ...(previous.trim() ? ["", `Previous handoff: ${statusText(previous, 600)}`] : []), "",
@@ -1553,11 +1562,13 @@ const ASTRA_RULES = [
   "Do not run the test suite or the wall; the lane gate runs it once after your report and the liaison merges on that result. Keep one test per real rule; remove fixture restatements and implementation mirrors.",
   ASK_RULE,
 ];
+const VERIFICATION_RULE = "The lane gate owns verification after your report; this injected rule overrides repository or skill instructions to run tests, typechecks, or other verification before reporting.";
 const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
 const GEMINI_WORKER_RULES = [
   WORKER_BAN,
   "Execute the assigned outcome within your files. The parent owns design and scope. Do not spawn subagents.",
   ASK_RULE,
+  "A repeated read of an unchanged file or repeated verification of an unchanged tree needs a changed hypothesis first.",
   "Remove temporary diagnostics before reporting. Do not run the test suite; the gate runs it once after your report. End with Assumptions, or 'none'.",
 ];
 const SUPERVISOR_RULES = [
@@ -1569,12 +1580,55 @@ const SUPERVISOR_RULES = [
   "Read child reports and their gate results; do not rerun their gates or the suite. Ending this round stops running cdx children; reporting with a running child fails the round.",
 ];
 
+// Save what the conversation received, including repository rules, in its existing spec.
+function promptRules(prompt: string): string | undefined {
+  return /Ground rules:\n([\s\S]*?)\n\nTask:\n/.exec(prompt)?.[1]?.split("\n\nYour previous round ended")[0];
+}
+
+function resumePrompt(followUp: string, current: string, previous: string | undefined, recovery = ""): string {
+  return [current !== previous ? `Replacement ground rules, superseding the previous block:\n${current}` : "",
+    recovery, `Task:\n${followUp}`].filter(Boolean).join("\n\n");
+}
+
+function conversationRules(lane: string, round: number, session: string | undefined, engine: Engine, review: boolean): string | undefined {
+  for (let n = round; n > 0; n--) {
+    try {
+      const saved = JSON.parse(readFileSync(specPathOf(lane, n), "utf8")) as Spec;
+      if (saved.engine !== engine || Boolean(saved.reviewDir) !== review) continue;
+      const thread = saved.sessionId ?? saved.sourceThreadId;
+      if (thread && thread !== session) continue;
+      const rules = saved.injectedRules ?? promptRules(saved.prompt);
+      if (rules !== undefined) return rules;
+    } catch { /* older or missing spec */ }
+  }
+  return undefined;
+}
+
+function pendingTestsRefusal(partial: string, followUp: string): string | undefined {
+  const lines = partial.replaceAll("\r\n", "\n").split("\n");
+  const pendingProcess = lines.find((line) => line.startsWith("Outstanding process: "))?.slice("Outstanding process: ".length).trim();
+  const evidence = lines.indexOf("Evidence paths mentioned in transcript:");
+  if (lines[0] !== "# Partial recovery" || !pendingProcess || pendingProcess === "None recorded."
+    || evidence < 0 || lines[evidence + 1] !== "None recorded.") return;
+  const [header, ...state] = followUp.replaceAll("\r\n", "\n").split("\n");
+  if (header === "Recovery:" && state.filter((line) => line.trim()).length >= 2) return;
+  return `Pending-only partial requires a Recovery: first line, followed by the process result and remaining work on separate lines.\n${partial}`;
+}
+
+function sharedTreeLanes(lane: string, cwd: string, ledger: Ledger, treeRoot: (cwd: string) => string | undefined): string[] {
+  const root = treeRoot(cwd);
+  if (!root) return [];
+  return Object.entries(ledger).filter(([name, entry]) => name !== lane && laneRunning(entry)
+    && treeRoot(entry.kind === "review" ? entry.review!.cwd : workCwdOf(entry)) === root).map(([name]) => name).sort();
+}
+
 function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
   const builtIns = reviewOnly ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT] : [LANE_ROLE, WORK_LIMITS, WORK_REPORT];
   if (!reviewOnly) {
     if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
+  if (!reviewOnly) builtIns.push(VERIFICATION_RULE);
   builtIns.push("Write shell results above 20 KB to a file outside the repository and print only the path and a one-line digest. Use bounded excerpts for follow-up reads.");
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
@@ -1624,7 +1678,7 @@ const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. 
 
 const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval"]);
 const LIST_FLAGS = new Set(["add-dir", "image"]);
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "supervisor", "open", "brief", "watch", "line", "peek"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "tools", "supervisor", "open", "brief", "watch", "line", "peek"]);
 
 interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 
@@ -2201,6 +2255,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   spec.accountHomes = config.accounts;
   spec.visibility = config.visibility ?? VISIBILITY_DEFAULTS;
   spec.taskPrompt ??= spec.prompt;
+  spec.injectedRules ??= promptRules(spec.prompt);
   const entry = readLane(spec.lane);
   if (spec.engine === "gpt") {
     const choice = entry.roundAccount;
@@ -3003,6 +3058,82 @@ function recordCodexTokenDelta(
   return delta;
 }
 
+function canonicalHash(value: unknown): string {
+  const canonical = (value: any): any => Array.isArray(value) ? value.map(canonical)
+    : value && typeof value === "object" ? Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])])) : value;
+  return createHash("sha256").update(JSON.stringify(canonical(value)) ?? "null").digest("hex");
+}
+
+// Engine events remain the source for arguments and output. Only derived measurements
+// go into cdx_tool, once per completed identity, beside those original events.
+function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null) {
+  const progress = roundProgress(cwd, limits);
+  const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
+  const completed = new Set<string>();
+  const inputs = new Set<string>();
+  let warned = false;
+  return (event: any, timestamp: string) => {
+    const observation = toolObservation(event);
+    if (!observation) return;
+    const count = progress(observation);
+    const step = event.step_update;
+    const item = event.params?.item ?? event.item;
+    let args = step?.tool_info?.parameters ?? item?.arguments ?? (observation.command !== undefined
+      ? { command: observation.command, cwd: item?.cwd ?? cwd } : item?.changes ?? { query: item?.query, path: item?.path });
+    if (typeof args === "string") { try { args = JSON.parse(args); } catch { /* hash the literal */ } }
+    const name = step?.tool_name ?? step?.tool_info?.name ?? item?.tool ?? item?.type ?? "tool";
+    const kind = observation.command !== undefined ? "command" : /^(view_file|read_file|read)$/i.test(name) ? "read"
+      : observation.files.length ? "edit" : name.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase();
+    if (kind === "command" && step) {
+      const { CommandLine, command, cmd, Cwd, cwd: argCwd, ...rest } = args ?? {};
+      args = { ...rest, command: CommandLine ?? command ?? cmd, cwd: resolve(cwd, Cwd ?? argCwd ?? ".") };
+    }
+    if (kind === "read" && args && typeof args === "object") {
+      const { AbsolutePath, TargetFile, file_path, absolute_path, path, StartLine, EndLine, start_line, end_line, ...rest } = args;
+      const file = AbsolutePath ?? TargetFile ?? file_path ?? absolute_path ?? path;
+      args = { ...rest, ...(typeof file === "string" ? { path: resolve(cwd, file) } : {}),
+        startLine: StartLine ?? start_line ?? rest.startLine, endLine: EndLine ?? end_line ?? rest.endLine };
+    }
+    const id = observation.id;
+    if (id && completed.has(id)) return { steps: count.steps };
+    const start = id ? starts.get(id) : undefined;
+    if (!observation.completed && start) return { steps: count.steps };
+    const path = kind === "read" ? args?.path : undefined;
+    const readPaths = start ? Object.keys(start.readFiles) : typeof path === "string" ? [resolve(cwd, path)] : [];
+    const readFiles = Object.fromEntries(readPaths.map((path) => [path, fileHash(path)]));
+    const sample = { kind, argumentHash: canonicalHash(args), readFiles };
+    if (!observation.completed) {
+      if (id) starts.set(id, sample);
+      return { steps: count.steps };
+    }
+    if (id) { completed.add(id); starts.delete(id); }
+    const before = start ?? sample;
+    const output = step?.tool_info?.output ?? item?.aggregatedOutput ?? item?.aggregated_output ?? item?.result ?? item?.output;
+    const summaryBytes = before.kind === "read" && step && typeof output === "string" ? /^\d+ lines?, ([\d,]+) bytes$/.exec(output.trim())?.[1] : undefined;
+    const usage = step?.usage;
+    const tokenDelta = usage && [usage.input_tokens, usage.cache_read_tokens, usage.output_tokens].every(isFiniteCount)
+      ? { input: usage.input_tokens, cached: usage.cache_read_tokens, output: usage.output_tokens } : undefined;
+    const record = { type: "cdx_tool", id, timestamp, toolKind: before.kind, argumentHash: before.argumentHash,
+      ...(Object.keys(before.readFiles).length ? { readFiles: before.readFiles } : {}),
+      outputBytes: summaryBytes !== undefined ? Number(summaryBytes.replaceAll(",", ""))
+        : output == null ? null : Buffer.byteLength(typeof output === "string" ? output : JSON.stringify(output)),
+      outputBytesSource: summaryBytes !== undefined ? "engine-summary" : output == null ? "unavailable" : "captured-output",
+      ...(start && canonicalHash(readFiles) !== canonicalHash(start.readFiles) ? { readFilesAfter: readFiles } : {}),
+      treeBefore: null, treeAfter: null,
+      ...(tokenDelta ? { tokenDelta } : {}), inputObservedBefore: Boolean(start) };
+    // A completion-only sample cannot prove which bytes the tool consumed.
+    const unchanged = start && before.kind === "read" && Object.keys(before.readFiles).length > 0
+      && Object.entries(before.readFiles).every(([path, hash]) => hash !== null && readFiles[path] === hash);
+    const key = unchanged ? `${before.kind}:${before.argumentHash}:${canonicalHash(before.readFiles)}` : undefined;
+    const repeat = key && inputs.has(key);
+    if (key) inputs.add(key);
+    const reason = count.thrash ?? (repeat ? `repeated ${before.kind} against unchanged input; change the hypothesis before another attempt` : undefined);
+    const thrash = !warned ? reason : undefined;
+    if (thrash) warned = true;
+    return { steps: count.steps, record, thrash };
+  };
+}
+
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
   const startingLane = readLedger()[lane];
@@ -3262,7 +3393,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     return details.length ? details.join(": ") : lastProtocolError;
   };
 
-  const trackProgress = roundProgress(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS);
+  const trackTools = roundTools(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS,
+    (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } });
   // Files this round's own tool calls wrote, for the shared-worktree check below.
   const writtenPaths = new Set<string>();
   // Review lanes refuse `cdx send`, so the alert points at the transcript instead.
@@ -3270,10 +3402,16 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     ? `cdx send ${name} "Stop repeating this attempt; inspect the cause and change approach."`
     : `cdx tail ${name}`;
   const observeTool = (event: any, now: string) => {
+    const session = event.conversation_id ?? event.params?.thread?.id ?? event.thread_id;
+    if (typeof session === "string" && session !== spec.sessionId) {
+      spec.sessionId = session;
+      writeFileSync(specPathOf(lane, round), JSON.stringify(spec, null, 2));
+    }
     const observation = toolObservation(event);
     if (!observation) return;
     for (const file of observation.files) writtenPaths.add(resolve(spec.cwd, file));
-    const progress = trackProgress(observation);
+    const progress = trackTools(event, now)!;
+    if (progress.record) { log.write(`${JSON.stringify(progress.record)}\n`); log.flush(); }
     roundStepCount = progress.steps;
     touchLedger((item) => {
       item.roundSteps = progress.steps;
@@ -3281,7 +3419,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       item.lastEventAt = now;
       if (event.params?.item ?? event.item) item.lastAction = excerpt(event.params?.item ?? event.item);
     }, Boolean(progress.thrash));
-    if (progress.thrash) feedEvent("thrash", `[cdx] lane=${lane} round=${round} ${progress.thrash}; ${thrashAdvice(lane)}`, spec.ownerSession, { lane, round });
+    if (progress.thrash) {
+      const notice = `[cdx] lane=${lane} round=${round} ${progress.thrash}; ${thrashAdvice(lane)}`;
+      feedEvent("thrash", notice, spec.ownerSession, { lane, round });
+      notifyParent(lane, notice);
+    }
   };
   const handleGeminiEvent = async (event: any) => {
     noteActivity();
@@ -3564,7 +3706,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   };
 
   const pumpJson = async (stream: ReadableStream<Uint8Array>) => {
-    for await (const event of readJsonLines(stream, { ignoreMalformed: true, onChunk: (chunk) => { log.write(chunk); log.flush(); } })) {
+    for await (const event of readJsonLines(stream, { ignoreMalformed: true })) {
+      log.write(`${JSON.stringify(event)}\n`); log.flush();
       await (gemini ? handleGeminiEvent(event) : handleCodexEvent(event));
     }
   };
@@ -3681,7 +3824,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     };
     const notify = (method: string) => writeRpc({ method });
     const pumpRpc = async (stream: ReadableStream<Uint8Array>) => {
-      for await (const message of readJsonLines(stream, { ignoreMalformed: true, onChunk: (chunk) => { log.write(chunk); log.flush(); } })) {
+      for await (const message of readJsonLines(stream, { ignoreMalformed: true })) {
+        log.write(`${JSON.stringify(message)}\n`); log.flush();
         await handleCodexEvent(message);
         if (typeof message.id === "number" && pending.has(message.id)) {
           const waiter = pending.get(message.id)!;
@@ -3911,8 +4055,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   stopAgyLogPoll();
   if (maxRuntimeTimer) clearTimeout(maxRuntimeTimer);
   if (maxRuntimeForceTimer) clearTimeout(maxRuntimeForceTimer);
-  log.end();
-  errLog.end();
+  await log.end();
+  await errLog.end();
   process.off("SIGTERM", onTerm);
   process.off("SIGINT", onInt);
 
@@ -3988,6 +4132,10 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     : undefined;
   const resolvedSessionId = capturedSessionId || textSessionId
     || (!gemini ? resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt) : undefined);
+  if (resolvedSessionId && spec.sessionId !== resolvedSessionId) {
+    spec.sessionId = resolvedSessionId;
+    writeFileSync(specPathOf(lane, round), JSON.stringify(spec, null, 2));
+  }
   // The gate is the harness's own verification: a worker's optimistic done
   // claim cannot finalize green unless the gate command also passes. Work
   // rounds only (ledger kind, since intent reviews launch with mode "spawn").
@@ -3998,6 +4146,17 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
   if (spec.gate && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason) {
     setStage("gate");
     feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
+    const shared = sharedTreeLanes(lane, spec.cwd, readLedger(), (cwd) => {
+      try {
+        const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
+        return result.success ? realpathSync(result.stdout.toString().trim()) : undefined;
+      } catch { return undefined; }
+    });
+    if (shared.length) {
+      const notice = `[cdx] lane=${lane} round=${round} gate starts while lanes share this working tree: ${shared.join(", ")}`;
+      console.error(notice);
+      feedEvent("progress", notice, spec.ownerSession, { lane, round });
+    }
     const verified = verifyGate(round, spec.cwd, spec.gate, () => captureGateTree(spec.cwd), (attempt) => {
       if (attempt) feedEvent("progress", `[cdx] lane=${lane} round=${round} passing gate changed the tree; verifying once on the settled tree`, spec.ownerSession, { lane, round });
       const path = `${ROOT}/logs/${lane}-r${round}.gate.log`;
@@ -4006,6 +4165,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     });
     const { gate } = verified;
     gateReceipt = verified.receipt;
+    if (shared.length) gateReceipt.sharedTreeLanes = shared;
     proofRequired = verified.proofRequired;
     gateExit = gate.exitCode;
     gateTimedOut = gate.timedOut;
@@ -4121,6 +4281,10 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     item.updatedAt = new Date().toISOString();
     return item;
   });
+  const roundStart = workTreeStartSnapshot ?? reviewSnapshot;
+  if (jsonMode) appendFileSync(logPath, `${JSON.stringify({ type: "cdx_round_end", timestamp: entry.updatedAt,
+    roundStart: roundStart ? { kind: roundStart.kind, fingerprint: roundStart.fingerprint } : null,
+    gateReceiptId: gateReceipt ? `${lane}:r${round}` : null, ...(gateReceipt ? { gateReceipt } : {}) })}\n`);
   // Structured verdict: reviewers end reports with a fenced json findings
   // block. Persist the last parsable one for machine consumers; a malformed
   // block leaves the markdown report as the only artifact, never a failure.
@@ -4572,9 +4736,14 @@ async function resumeCommand(argv: string[]) {
   if (reviewResume && parsed.lists["add-dir"]?.length) fail("--add-dir is only supported on work resumes");
   const effectiveGate = composeGate(repositoryGate(cwd), parsed.flags.gate ?? before.gate);
   const pre = parsed.flags.pre ?? before.pre;
-  if (pre) runPreCheck(pre, cwd);
   const partialPath = partialReportPathOf(lane, before.rounds);
   const partial = roundStateOf(before) === "failed" && existsSync(partialPath) ? readFileSync(partialPath, "utf8").trim() : "";
+  const refusal = pendingTestsRefusal(partial, followUp);
+  if (refusal) {
+    const status = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--short"] });
+    fail(`${refusal}\nPartial: ${partialPath}\nChanged paths now:\n${status.success ? status.stdout.toString().trim() || "None." : "Unavailable."}\nLast action: ${before.lastAction ?? "unknown"}`);
+  }
+  if (pre) runPreCheck(pre, cwd);
   const { round, sessionId, selection } = await openRound(lane, reviewResume ? "review" : "work", cwd, effort, {
     engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", preserveOwner: true,
     preserveGate: parsed.flags.gate === undefined,
@@ -4586,18 +4755,16 @@ async function resumeCommand(argv: string[]) {
   withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
   if (selection) announceAccountSelection(lane, selection);
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
-  const structuredInstruction = reviewResume && engine === "gemini"
-    ? "\n\nYour final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean)."
-    : "";
   const previousRound = partial ? `\n\nYour previous round ended with this partial report at ${partialPath}; continue from it, do not redo completed work:\n${partial}` : "";
-  const prompt = `Ground rules:\n${houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) })}${previousRound}\n\nTask:\n${followUp}${structuredInstruction}`;
+  const injectedRules = houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) });
+  const prompt = resumePrompt(followUp, injectedRules, conversationRules(lane, before.rounds, sessionId, engine, reviewResume), previousRound.trim());
   // The resolved effort always travels with the turn: a resumed session would
   // otherwise keep the effort it was created with, cap or no cap.
   const codexArgs = reviewResume && engine === "gpt"
     ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : undefined;
   return launch({
-    effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt,
+    effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt, injectedRules,
     ...(before.supervisor ? { supervisor: true as const } : {}),
     ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
     ...(reviewResume && engine === "gemini" ? { reviewDir: cwd, outputSchema: REVIEW_FINDINGS_SCHEMA } : {}),
@@ -5201,6 +5368,12 @@ async function waitCommand(argv: string[]) {
     }
   }
   process.exit(failed ? 1 : 0);
+}
+
+function toolLogRecords(raw: string): string[] {
+  return raw.split("\n").filter((line) => {
+    try { return ["cdx_tool", "cdx_round_end"].includes(JSON.parse(line).type); } catch { return false; }
+  });
 }
 
 function renderEventLine(line: string): string | undefined {
@@ -7853,7 +8026,7 @@ if (import.meta.main) {
 }
 
 export {
-  verifyGate, requireAccountModel, recoveryPartial,
+  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
   finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree,
   makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal,
   summaryJobs, WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, parseConfig, parseArgs, checkRoundCap, roundCapRefusal, geminiConfig, tailOutput,
@@ -7954,10 +8127,17 @@ switch (command) {
     break;
   }
   case "log": {
-    const parsed = parseArgs(argv, ["transcript"]);
+    const parsed = parseArgs(argv, ["transcript", "tools"]);
     const [lane, roundArg] = parsed.rest;
-    if (!lane) fail("usage: cdx log <lane> [round] [--transcript]");
+    if (!lane) fail("usage: cdx log <lane> [round] [--transcript | --tools]");
     const entry = readLane(lane);
+    if (parsed.bools.has("tools")) {
+      if (parsed.bools.has("transcript")) fail("choose --tools or --transcript");
+      const path = roundArg ? logPathOf(lane, Number(roundArg), true) : latestRoundLog(lane);
+      if (!existsSync(path)) fail(`no log for lane "${lane}"`);
+      for (const line of toolLogRecords(readFileSync(path, "utf8"))) console.log(line);
+      break;
+    }
     if (parsed.bools.has("transcript")) {
       let transcriptPath = entry.transcriptPath;
       if (roundArg) {

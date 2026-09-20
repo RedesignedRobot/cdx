@@ -3,7 +3,7 @@ import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
 import { unlinkSync } from "node:fs";
 import {
-  verifyGate, requireAccountModel, recoveryPartial,
+  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
   checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
@@ -1233,4 +1233,97 @@ test("the brief drops finished jobs older than the age window and keeps running 
   const names = summaryJobs(jobs, 5, 24 * 60 * 60 * 1000, now).map(([name]) => name);
   expect(names).toEqual(["live", "fresh"]);
   expect(summaryJobs(jobs, 5).map(([name]) => name)).toEqual(["live", "fresh", "old"]);
+});
+
+test("a second unchanged read warns exactly once per round, despite repeated completion events", () => {
+  let hash: string | null = "first";
+  const tracker = () => roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => hash);
+  const track = tracker();
+  const event = (id: number, state: string) => ({ event: "step_update", step_update: {
+    conversation_id: "session", step_index: id, step_type: "tool", state, tool_name: "view_file",
+    tool_info: { parameters: { AbsolutePath: "/repo/file.ts" }, output: "2 lines, 77 bytes" },
+  } });
+  const notices: string[] = [];
+  const records: unknown[] = [];
+  for (let id = 1; id <= 4; id++) for (const phase of ["ACTIVE", "DONE", "DONE"]) {
+    const result = track(event(id, phase), "now")!;
+    if (result.thrash) notices.push(result.thrash);
+    if (result.record) records.push(result.record);
+    if (id === 1) expect(result.thrash).toBeUndefined();
+    if (id === 2 && phase === "ACTIVE") expect(notices).toHaveLength(0);
+  }
+  expect(notices).toHaveLength(1);
+  expect(records).toHaveLength(4);
+  expect(records[0]).toMatchObject({ toolKind: "read", readFiles: { "/repo/file.ts": "first" }, outputBytes: 77, outputBytesSource: "engine-summary" });
+  const fresh = tracker();
+  fresh(event(1, "ACTIVE"), "now");
+  fresh(event(1, "DONE"), "now");
+  hash = "changed";
+  fresh(event(2, "ACTIVE"), "now");
+  expect(fresh(event(2, "DONE"), "now")?.thrash).toBeUndefined();
+  hash = null;
+  for (let id = 3; id < 5; id++) {
+    fresh(event(id, "ACTIVE"), "now");
+    expect(fresh(event(id, "DONE"), "now")?.thrash).toBeUndefined();
+  }
+});
+
+test("tool measurements retain bytes and tokens without inventing tool tree hashes", () => {
+  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => null);
+  const event = (state: string) => ({ event: "step_update", step_update: {
+    conversation_id: "session", step_index: 1, step_type: "tool", state, tool_name: "write_to_file",
+    usage: { input_tokens: 5, cache_read_tokens: 2, output_tokens: 3 },
+    tool_info: { parameters: { TargetFile: "/repo/file.ts", CodeContent: "x" }, output: "é" },
+  } });
+  track(event("ACTIVE"), "start");
+  const record = track(event("DONE"), "end")!.record!;
+  expect(record).toMatchObject({ toolKind: "edit", outputBytes: 2, treeBefore: null, treeAfter: null, tokenDelta: { input: 5, cached: 2, output: 3 } });
+  const line = JSON.stringify(record);
+  const end = JSON.stringify({ type: "cdx_round_end", gateReceiptId: "lane:r1" });
+  expect(toolLogRecords([JSON.stringify(event("DONE")), line, "broken", end].join("\n"))).toEqual([line, end]);
+  const gpt = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => null);
+  const item = { id: "gpt", type: "commandExecution", command: "check", cwd: "/repo" };
+  gpt({ method: "item/started", params: { item } }, "start");
+  const measured = gpt({ method: "item/completed", params: { item: { ...item, aggregatedOutput: "ok" } } }, "end")!.record!;
+  expect(measured).toMatchObject({ toolKind: "command", outputBytes: 2, treeBefore: null, treeAfter: null });
+  expect(measured.tokenDelta).toBeUndefined();
+});
+
+test("Gemini resumes are shorter than spawn prompts and carry only changed rules and recovery", () => {
+  const rules = [...GEMINI_WORKER_RULES, VERIFICATION_RULE].map((rule) => `- ${rule}`).join("\n");
+  const spawn = `Ground rules:\n${rules}\n\nTask:\nFix the parser.`;
+  const resumed = resumePrompt("Continue.", rules, promptRules(spawn), "Last action: parser fixed.");
+  expect(resumed.length).toBeLessThan(spawn.length);
+  expect(promptRules(`Ground rules:\n${rules}\n\nYour previous round ended with this partial report: pending\n\nTask:\nContinue.`)).toBe(rules);
+  expect(resumed).toContain("Last action: parser fixed.");
+  expect(resumed).not.toContain("Ground rules");
+  expect(resumed).not.toContain(GEMINI_WORKER_RULES[0]!);
+  const previous = `${rules}\nAllowed edits:\n- a.ts\nForbidden edits:\n- b.ts`;
+  const current = `${rules}\nAllowed edits:\n- b.ts\nForbidden edits:\n- a.ts`;
+  expect(resumePrompt("Continue.", current, previous)).toContain(`superseding the previous block:\n${current}`);
+  expect(resumePrompt("Continue.", rules, undefined)).toContain(VERIFICATION_RULE);
+});
+
+test("only structured pending-only partials require an explicit recovery header", () => {
+  const start = { type: "item.started", timestamp: "2026-09-21T12:00:00Z", item: { id: "command-1", type: "command_execution", command: "bun test" } };
+  const partial = recoveryPartial(JSON.stringify(start), " M parser.ts", "Waiting for tests to finish.");
+  const legacy = partial.split("\n").filter((line) => !line.startsWith("Outstanding process:")).join("\n");
+  expect(partial).toContain("Outstanding process: bun test (started-at: 2026-09-21T12:00:00Z)");
+  for (const followUp of ["Continue.", "Tests succeeded with status 0. Continue.", "Tests have not passed", "Recovery:\n", "Recovery:\nTests exited 0.", "Recovery: tests exited 0.\nWork remains."]) {
+    expect(pendingTestsRefusal(partial, followUp)).toContain(" M parser.ts");
+  }
+  expect(pendingTestsRefusal(partial, "Recovery:\nTests succeeded with status 0.\nFinish the parser.")).toBeUndefined();
+  expect(pendingTestsRefusal(legacy, "Continue.")).toBeUndefined();
+  expect(pendingTestsRefusal("Waiting for tests to finish.", "Continue.")).toBeUndefined();
+  const completed = recoveryPartial([JSON.stringify(start), JSON.stringify({ ...start, type: "item.completed" })].join("\n"), " M parser.ts");
+  expect(pendingTestsRefusal(completed, "Continue.")).toBeUndefined();
+  expect(pendingTestsRefusal(partial.replace("None recorded.", "/tmp/test-result.log"), "Continue.")).toBeUndefined();
+});
+
+test("gate notices name only running lanes sharing the same working tree, including subdirectories", () => {
+  const lane = (cwd: string, state = "running") => ({ cwd, kind: "work", work: { cwd, state }, rounds: 1 } as any);
+  const ledger = { self: lane("/repo"), sibling: lane("/repo/src"), separate: lane("/other-worktree"), done: lane("/repo", "done"), outside: lane("/not-git") };
+  const root = (cwd: string) => cwd.startsWith("/repo") ? "/repo" : cwd === "/other-worktree" ? cwd : undefined;
+  expect(sharedTreeLanes("self", "/repo", ledger, root)).toEqual(["sibling"]);
+  expect(sharedTreeLanes("outside", "/not-git", ledger, root)).toEqual([]);
 });
