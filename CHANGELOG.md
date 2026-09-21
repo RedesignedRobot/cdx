@@ -1,3 +1,7 @@
+## 7.7.1
+
+- The repeated-read alert fires on the third identical read of an unchanged file, not the second. Every lane on 2026-09-21 tripped it during its opening reads, and each false alert woke the head for nothing.
+
 ## 7.7.0
 
 - Owner ruling 2026-09-21: agents are not boxed. Consult and review lanes run with full access on both engines (Codex `danger-full-access`, so Astra has shell writes and network; Gemini consults use the full lane agent). The Gemini pre-tool denial of write tools in review lanes is deleted.
