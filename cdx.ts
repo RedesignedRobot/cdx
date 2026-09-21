@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.7.1";
+const VERSION = "7.7.2";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -3070,8 +3070,8 @@ function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: stri
   const progress = roundProgress(cwd, limits);
   const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
   const completed = new Set<string>();
-  // A second identical read is normal model behaviour; the third is a loop.
-  const REPEAT_READ_ALERT = 3;
+  // Gemini rereads a file two to four times while it works; six identical reads is a loop.
+  const REPEAT_READ_ALERT = 6;
   const inputs = new Map<string, number>();
   let warned = false;
   return (event: any, timestamp: string) => {

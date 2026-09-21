@@ -1,3 +1,7 @@
+## 7.7.2
+
+- The repeated-read alert fires on the sixth identical read. Gemini lanes reread a file three times as routine, so the third-read alert from 7.7.1 still woke the head five times in one hour with nothing to act on.
+
 ## 7.7.1
 
 - The repeated-read alert fires on the third identical read of an unchanged file, not the second. Every lane on 2026-09-21 tripped it during its opening reads, and each false alert woke the head for nothing.

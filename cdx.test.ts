@@ -1235,7 +1235,7 @@ test("the brief drops finished jobs older than the age window and keeps running 
   expect(summaryJobs(jobs, 5).map(([name]) => name)).toEqual(["live", "fresh", "old"]);
 });
 
-test("a second unchanged read warns exactly once per round, despite repeated completion events", () => {
+test("the sixth unchanged read warns exactly once per round, despite repeated completion events", () => {
   let hash: string | null = "first";
   const tracker = () => roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => hash);
   const track = tracker();
@@ -1245,15 +1245,14 @@ test("a second unchanged read warns exactly once per round, despite repeated com
   } });
   const notices: string[] = [];
   const records: unknown[] = [];
-  for (let id = 1; id <= 4; id++) for (const phase of ["ACTIVE", "DONE", "DONE"]) {
+  for (let id = 1; id <= 8; id++) for (const phase of ["ACTIVE", "DONE", "DONE"]) {
     const result = track(event(id, phase), "now")!;
     if (result.thrash) notices.push(result.thrash);
     if (result.record) records.push(result.record);
-    if (id === 1) expect(result.thrash).toBeUndefined();
-    if (id === 2 && phase === "ACTIVE") expect(notices).toHaveLength(0);
+    if (id <= 5) expect(result.thrash).toBeUndefined();
   }
   expect(notices).toHaveLength(1);
-  expect(records).toHaveLength(4);
+  expect(records).toHaveLength(8);
   expect(records[0]).toMatchObject({ toolKind: "read", readFiles: { "/repo/file.ts": "first" }, outputBytes: 77, outputBytesSource: "engine-summary" });
   const fresh = tracker();
   fresh(event(1, "ACTIVE"), "now");
