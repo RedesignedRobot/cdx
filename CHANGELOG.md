@@ -1,3 +1,7 @@
+## 7.7.3
+
+- The repeated-read alert is deleted. Two threshold bumps did not stop it: Gemini lanes and reviews reread files as routine, review lanes take no steers, and each alert cost the head a turn. Reads stay measured in cdx_tool records. Failed-command and edit-loop alerts are unchanged.
+
 ## 7.7.2
 
 - The repeated-read alert fires on the sixth identical read. Gemini lanes reread a file three times as routine, so the third-read alert from 7.7.1 still woke the head five times in one hour with nothing to act on.

@@ -1235,36 +1235,20 @@ test("the brief drops finished jobs older than the age window and keeps running 
   expect(summaryJobs(jobs, 5).map(([name]) => name)).toEqual(["live", "fresh", "old"]);
 });
 
-test("the sixth unchanged read warns exactly once per round, despite repeated completion events", () => {
-  let hash: string | null = "first";
-  const tracker = () => roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => hash);
-  const track = tracker();
+test("unchanged rereads are measured once per step and never alert", () => {
+  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => "first");
   const event = (id: number, state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: id, step_type: "tool", state, tool_name: "view_file",
     tool_info: { parameters: { AbsolutePath: "/repo/file.ts" }, output: "2 lines, 77 bytes" },
   } });
-  const notices: string[] = [];
   const records: unknown[] = [];
   for (let id = 1; id <= 8; id++) for (const phase of ["ACTIVE", "DONE", "DONE"]) {
     const result = track(event(id, phase), "now")!;
-    if (result.thrash) notices.push(result.thrash);
+    expect(result.thrash).toBeUndefined();
     if (result.record) records.push(result.record);
-    if (id <= 5) expect(result.thrash).toBeUndefined();
   }
-  expect(notices).toHaveLength(1);
   expect(records).toHaveLength(8);
   expect(records[0]).toMatchObject({ toolKind: "read", readFiles: { "/repo/file.ts": "first" }, outputBytes: 77, outputBytesSource: "engine-summary" });
-  const fresh = tracker();
-  fresh(event(1, "ACTIVE"), "now");
-  fresh(event(1, "DONE"), "now");
-  hash = "changed";
-  fresh(event(2, "ACTIVE"), "now");
-  expect(fresh(event(2, "DONE"), "now")?.thrash).toBeUndefined();
-  hash = null;
-  for (let id = 3; id < 5; id++) {
-    fresh(event(id, "ACTIVE"), "now");
-    expect(fresh(event(id, "DONE"), "now")?.thrash).toBeUndefined();
-  }
 });
 
 test("tool measurements retain bytes and tokens without inventing tool tree hashes", () => {

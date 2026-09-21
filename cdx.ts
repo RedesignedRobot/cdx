@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.7.2";
+const VERSION = "7.7.3";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -3070,9 +3070,6 @@ function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: stri
   const progress = roundProgress(cwd, limits);
   const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
   const completed = new Set<string>();
-  // Gemini rereads a file two to four times while it works; six identical reads is a loop.
-  const REPEAT_READ_ALERT = 6;
-  const inputs = new Map<string, number>();
   let warned = false;
   return (event: any, timestamp: string) => {
     const observation = toolObservation(event);
@@ -3123,13 +3120,8 @@ function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: stri
       ...(start && canonicalHash(readFiles) !== canonicalHash(start.readFiles) ? { readFilesAfter: readFiles } : {}),
       treeBefore: null, treeAfter: null,
       ...(tokenDelta ? { tokenDelta } : {}), inputObservedBefore: Boolean(start) };
-    // A completion-only sample cannot prove which bytes the tool consumed.
-    const unchanged = start && before.kind === "read" && Object.keys(before.readFiles).length > 0
-      && Object.entries(before.readFiles).every(([path, hash]) => hash !== null && readFiles[path] === hash);
-    const key = unchanged ? `${before.kind}:${before.argumentHash}:${canonicalHash(before.readFiles)}` : undefined;
-    if (key) inputs.set(key, (inputs.get(key) ?? 0) + 1);
-    const repeat = key && inputs.get(key) === REPEAT_READ_ALERT;
-    const reason = count.thrash ?? (repeat ? `repeated ${before.kind} against unchanged input; change the hypothesis before another attempt` : undefined);
+    // Rereads are measured in the record above and never alert: every Gemini lane rereads files as routine.
+    const reason = count.thrash;
     const thrash = !warned ? reason : undefined;
     if (thrash) warned = true;
     return { steps: count.steps, record, thrash };

@@ -1,6 +1,6 @@
 {
   "name": "cdx-lanes",
-  "version": "7.7.2",
+  "version": "7.7.3",
   "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
