@@ -29,14 +29,14 @@
 // long prompts.
 //
 // cdx policy comes from $CDX_HOME/config.json. Work lanes cannot commit, push,
-// or deploy. Reviews always get a fresh session. Codex uses a read-only
-// sandbox, while Gemini fails the round if its before-and-after tree hash moves.
+// or deploy. Reviews always get a fresh session with full access and fail the
+// round if the before-and-after tree hash moves. Consults have no tree check.
 // Worktree creation runs config.worktreeSetup if set, followed by an executable
 // .cdx-worktree-setup at the new worktree root if present.
 //
 // CLI facts this harness absorbs (codex-cli 0.154.0, verified):
 // - Work rounds use app-server JSON-RPC over newline-delimited stdio. Reviews
-//   stay on `codex exec` and `codex review` as read-only one-shot commands.
+//   stay on `codex exec` and `codex review` as one-shot commands.
 // - app-server uses thread/start, thread/resume, thread/fork, turn/start, and
 //   turn/steer. turn/steer requires the active expectedTurnId on 0.149.1 and later.
 // - `codex review` takes exactly one of --uncommitted/--base/--commit OR a
@@ -105,7 +105,7 @@ const CODEX_DISABLE_NATIVE_SUBAGENTS = [
 ];
 const SELF = import.meta.path;
 const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
-const VERSION = "7.6.1";
+const VERSION = "7.7.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -1542,7 +1542,7 @@ function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): stri
 
 const LANE_ROLE = "The Claude session is the owner's liaison. It briefs outcomes, answers questions, reviews, and merges. Your final report is its handoff.";
 const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what tests start. The liaison integrates after independent review.";
-const READ_ONLY = "READ-ONLY: change nothing in the tree; write only your report. The runtime sandbox or before-and-after tree check enforces this.";
+const READ_ONLY = "Leave the reviewed tree unchanged: a before-and-after tree check fails the round if it moves. Everything else is open: run commands, use the network, write scratch files outside the tree.";
 const WORK_REPORT = "A final report is required. Lead with the outcome, then changed files and remaining risks. Include child outcomes and report paths. Use plain prose and short lists. No em dashes, filler, or praise.";
 const REVIEW_REPORT = "A final report is required. State the conclusion and evidence in plain prose and short lists. No em dashes or filler.";
 const ASK_RULE = 'Use `cdx ask "<question>"` only for a missing answer that changes the outcome or authorization. Read available evidence first. A timeout is not approval: continue independent authorized work, stop dependent work, and report the unanswered question.';
@@ -1670,7 +1670,7 @@ function reviewFrame(engine: Engine): string {
   return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
 }
 
-const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. Read-only: change nothing. End with Decisions for the caller, limited to choices that need the caller or owner.`;
+const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You have full access: run commands, use the network, and write notes or maps where the caller asks. Edit tracked source only when the question asks for it. End with Decisions for the caller, limited to choices that need the caller or owner.`;
 
 // ---------------------------------------------------------------------------
 // Flag parsing
@@ -2705,7 +2705,7 @@ function freshAccountSpec(spec: Spec, entry: Lane, prompt: string): void {
     spec.reviewDir = spec.cwd;
     spec.gate = undefined;
     spec.codexArgs = ["exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", spec.model ?? config.model,
-      "-c", `model_reasoning_effort=${spec.effort}`, "-s", "read-only",
+      "-c", `model_reasoning_effort=${spec.effort}`, "-s", "danger-full-access",
       "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", spec.cwd,
       "--output-last-message", reportPathOf(spec.lane, spec.round), prompt];
   } else {
@@ -3146,7 +3146,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
   try { unlinkSync(`${ROOT}/reports/${lane}-r${round}.findings.json`); } catch { /* ignore if missing */ }
-  const reviewSnapshot = gemini && startingLane?.kind === "review" ? captureReviewTree(spec.cwd) : undefined;
+  const reviewSnapshot = startingLane?.kind === "review" && !startingLane.consult ? captureReviewTree(spec.cwd) : undefined;
   const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(spec.cwd) : undefined;
   const hooksInstalled = gemini ? hookInstallState().state === "current" : false;
   withLedger((ledger) => {
@@ -3169,7 +3169,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     "agy", "--input-format", "stream-json", "--output-format", "stream-json",
     "--model", spec.model ?? geminiPolicy.model, "--dangerously-skip-permissions", "--add-dir", spec.cwd,
     ...(spec.additionalDirectories ?? []).flatMap((dir) => ["--add-dir", dir]),
-    "--agent", spec.agent ?? (startingLane?.kind === "review" ? geminiPolicy.reviewAgent : geminiPolicy.agent),
+    "--agent", spec.agent ?? (startingLane?.kind === "review" && !startingLane.consult ? geminiPolicy.reviewAgent : geminiPolicy.agent),
     ...(spec.sourceThreadId ? ["--conversation", spec.sourceThreadId] : []),
     ...(geminiSchemaPath ? ["--json-schema", geminiSchemaPath] : []),
     "--print-timeout", spec.maxRuntimeMins ? `${spec.maxRuntimeMins + GEMINI_PRINT_TIMEOUT_SLACK_MINS}m` : "12h",
@@ -4761,7 +4761,7 @@ async function resumeCommand(argv: string[]) {
   // The resolved effort always travels with the turn: a resumed session would
   // otherwise keep the effort it was created with, cap or no cap.
   const codexArgs = reviewResume && engine === "gpt"
-    ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
+    ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
     : undefined;
   return launch({
     effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt, injectedRules,
@@ -4919,7 +4919,7 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean; supervis
     if (selection) announceAccountSelection(lane, selection);
     const codexArgs = [
       "review", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
-      "-c", 'sandbox_mode="read-only"', "-c", 'approval_policy="never"',
+      "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
     ];
     if (parsed.bools.has("uncommitted")) codexArgs.push("--uncommitted");
     if (parsed.flags.base) codexArgs.push("--base", parsed.flags.base);
@@ -4936,10 +4936,11 @@ async function reviewCommand(argv: string[], opts: { consult?: boolean; supervis
     : "";
   const frame = opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope;
   const fullBrief = [frame, `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${intent}`].join("\n\n");
-  // Reviews are read-only: enforce it with the sandbox, not just the prompt.
+  // Reviews and consults run with full access (owner ruling 2026-09-21). A
+  // review still fails when the tree moves; a consult has no tree check.
   const codexArgs = engine === "gpt" ? [
     "exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
-    "-s", "read-only", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
+    "-s", "danger-full-access", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
     "--output-last-message", reportPathOf(lane, round), fullBrief,
   ] : undefined;
   return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(supervisor ? { supervisor: true as const } : {}), ...(engine === "gemini" && !opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA } : {}), ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
@@ -6865,16 +6866,6 @@ function installHooks(): boolean {
   return true;
 }
 
-const REVIEW_DENIED_TOOLS = new Set([
-  "write_to_file",
-  "replace_file_content",
-  "multi_replace_file_content",
-  "sed_file",
-  "notebook_edit",
-  "notebook_execution",
-  "delete_knowledge",
-]);
-
 async function hookCommand(argv: string[]): Promise<void> {
   const [subcommand] = argv;
   const isPreTool = subcommand === "pre-tool";
@@ -6895,23 +6886,7 @@ async function hookCommand(argv: string[]): Promise<void> {
       return passThrough();
     }
 
-    if (subcommand === "pre-tool") {
-      const ledger = readLedger();
-      const entry = ledger[lane];
-      if (!entry) return passThrough();
-      const currentRound = process.env.CDX_ROUND;
-      const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
-      const toolName = input.toolCall?.name;
-      if (isReview && toolName && REVIEW_DENIED_TOOLS.has(toolName)) {
-        console.log(JSON.stringify({
-          decision: "deny",
-          reason: "cdx: review lanes are read-only; put findings in the report instead",
-        }));
-        return;
-      }
-      console.log(JSON.stringify({ decision: "allow" }));
-      return;
-    }
+    if (subcommand === "pre-tool") return passThrough();
 
     if (subcommand === "pre-invocation") {
       const ledger = readLedger();

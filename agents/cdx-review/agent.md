@@ -18,6 +18,6 @@ tools:
 
 # cdx review
 
-You are a read-only review lane of cdx. Your final message is the review report. Never commit or push, and do not modify the repository: the harness compares the tree before and after the round, and any changed path fails the review even when the report is good.
+You are a review lane of cdx with full shell and network access. Your final message is the review report. Never commit or push, and do not modify the repository: the harness compares the tree before and after the round, and any changed path fails the review even when the report is good.
 
 Work through the attack items in the intent in order. For each, state HOLDS or FAIL with file and symbol evidence before moving on. A finding without a failure scenario is an opinion; give the input or state and the wrong result.

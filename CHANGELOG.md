@@ -1,3 +1,9 @@
+## 7.7.0
+
+- Owner ruling 2026-09-21: agents are not boxed. Consult and review lanes run with full access on both engines (Codex `danger-full-access`, so Astra has shell writes and network; Gemini consults use the full lane agent). The Gemini pre-tool denial of write tools in review lanes is deleted.
+- A review of either engine still fails its round when the before-and-after tree check finds a change. Consults have no tree check, so a consult can write a map or notes, and a commit by the head in the same checkout no longer fails it (both mapping consults on 2026-09-21 failed that way with `review modified the tree: .`).
+- Unchanged: supervisors drive only their own children, Astra never spawns Astra, review and consult lanes take no steers.
+
 ## 7.4.9
 
 - Gemini standing reads like a Codex account line. `cdx usage` prints `gemini: pro plan, weekly window 17% used (83% left), resets Wed 23 Sep 09:51 in 3.3d, five-hour window 40% used (60% left), resets ...` with the snapshot age, `cdx doctor` prints the same detail, and every Gemini spawn prints `cdx: gemini for this lane: <standing> (checked 4m ago)` from the cached snapshot before the capacity notice. The round finish event carries `gemini=83% weekly left/60% five-hour left` after a fresh agy probe, so the feed shows what each round cost.
