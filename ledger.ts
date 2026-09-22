@@ -1,3 +1,4 @@
+import { failureDigest } from "./gates.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane records, ledger migration and locks, ownership, and the event journal.
 
@@ -55,7 +56,7 @@ export type Effort = string;
 
 export type Engine = "gpt" | "gemini";
 
-type Mode = "spawn" | "resume" | "review-native";
+type Mode = "spawn" | "resume";
 
 export interface GeminiConfig {
   model: string;
@@ -70,6 +71,8 @@ export interface GeminiConfig {
 }
 
 export interface Config {
+  model_auto_compact_token_limit?: number;
+  tool_output_token_limit?: number;
   visibility?: VisibilityConfig;
   model: string;
   models?: Record<string, string>;
@@ -101,6 +104,7 @@ interface GateBaseline {
 export interface GateTree { head: string; tree: string }
 
 export interface GateReceipt {
+  paths?: string[];
   sharedTreeLanes?: string[];
   version: 1;
   round: number;
@@ -137,6 +141,19 @@ export interface LaneOutage {
 }
 
 export interface Lane {
+  queuedUntil?: string;
+  modelCalls?: number;
+  callLimitHit?: boolean;
+  quotaWrapSent?: boolean;
+  touchedPaths?: string[];
+  landedCommit?: string;
+  landingCommit?: string;
+  baseBranch?: string;
+  reviewTree?: GateTree;
+  reviewClosed?: boolean;
+  accountPercentStart?: Record<string, number>;
+  accountPercentEnd?: Record<string, number>;
+  agentLoaded?: boolean;
   work: RoundRecord;
   review?: RoundRecord<ReviewState>;
   engine: Engine;
@@ -209,6 +226,11 @@ export interface Lane {
 }
 
 export interface Spec {
+  promptBytes?: Record<string, number>;
+  model_auto_compact_token_limit?: number;
+  tool_output_token_limit?: number;
+  queuedUntil?: string;
+  reviewTree?: GateTree;
   injectedRules?: string;
   visibility?: VisibilityConfig;
   effort: Effort;
@@ -219,7 +241,6 @@ export interface Spec {
   cwd: string;
   prompt: string;
   model?: string;
-  codexArgs?: string[];
   sourceThreadId?: string;
   additionalDirectories?: string[];
   images?: string[];
@@ -256,6 +277,7 @@ export interface FeedEvent {
   round?: number;
   job?: string;
   message: string;
+  supervisor?: string;
 }
 
 interface SessionDelivery {
@@ -323,11 +345,18 @@ export function readEvents(): FeedEvent[] {
 
 export function renderEvent(event: FeedEvent): string {
   if (event.kind === "message") return safeText(`[cdx] msg to=${event.recipient} from=${event.from}: ${event.message}`);
-  return safeText(`${event.message} owner=${event.owner}`);
+  return safeText(event.message);
 }
 
 export function eventOwned(event: FeedEvent, session: string, state: SessionState): boolean {
+  if (event.supervisor) return false;
   return recipientOf(event.recipient ?? event.owner, event.lane, state) === session;
+}
+
+export function terminalText(message: string, report: string | undefined, failure: string | undefined): string {
+  const body = report && Buffer.byteLength(report) < 10_000 ? `\n\n${report.trim()}` : "";
+  const digest = failure ? `\n\nFailure evidence:\n${failureDigest(failure)}` : "";
+  return safeText(message + body + digest);
 }
 
 export function feedEvent(kind: EventKind, message: string, owner?: string, identity: { lane?: string; round?: number; job?: string; recipient?: string; from?: string } = {}): void {
@@ -337,7 +366,26 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
     state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
     if (kind === "terminal" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
-    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity, message: kind === "progress" ? message.split("\n").map(singleLine).join("\n") : singleLine(message) };
+    const lane = identity.lane ? readLedger()[identity.lane] : undefined;
+    const terminal = kind === "terminal" || kind === "job-exit";
+    const read = (path?: string) => { try { return path && path !== "-" ? readFileSync(path, "utf8") : undefined; } catch { return undefined; } };
+    if (terminal) {
+      const report = read(/(?:^|\s)report=(\S+)/.exec(message)?.[1]);
+      const failed = /state=(failed|gate-invalid)/.test(message);
+      const gateLog = /(?:^|\s)gateLog=(\S+)/.exec(message)?.[1];
+      const log = /(?:^|\s)log=(\S+)/.exec(message)?.[1];
+      message = terminalText(message, report, failed ? read(gateLog !== "-" && gateLog ? gateLog : log) : undefined);
+    }
+    const supervisor = terminal ? lane?.parent : undefined;
+    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity,
+      ...(supervisor ? { supervisor } : {}), message: terminal || kind === "progress" ? safeText(message) : singleLine(message) };
+    if (supervisor && lane?.parentRound) {
+      const parent = readLedger()[supervisor];
+      if (parent && laneRunning(parent) && parent.rounds === lane.parentRound && parent.steerOpen !== false) {
+        mkdirSync(`${ROOT}/control`, { recursive: true });
+        appendFileSync(`${ROOT}/control/${supervisor}-r${lane.parentRound}.jsonl`, `${safeJSON({ text: event.message, sentAt: event.timestamp, from: "cdx" })}\n`);
+      }
+    }
     appendFileSync(`${ROOT}/feed.log`, `${safeJSON(event)}\n`);
   });
 }

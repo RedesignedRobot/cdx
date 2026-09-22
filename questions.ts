@@ -5,10 +5,12 @@ import {
   callerSession, feedEvent, laneRunning, owned, readLedger, recipientOf, requireOwnChild, scopedEvents,
   withLedger,
 } from "./ledger.ts";
-import { controlPathOf } from "./reports.ts";
+import { createHash } from "node:crypto";
+import { readGeminiUsageSnapshot } from "./gemini-usage.ts";
+import { captureRecoveryPartial, logPathOf, controlPathOf } from "./reports.ts";
 import { CmdError, fail, fmtAge, parseArgs, pidAlive, resolveBrief, ROOT, singleLine } from "./runtime.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 const deliveredPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.delivered`;
 
@@ -135,7 +137,6 @@ export async function sendCommand(argv: string[]): Promise<void> {
     requireOwnChild(lane, current);
     if (!current) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
     if (!laneRunning(current) || !pidAlive(current.pid)) throw new CmdError(`lane "${lane}" is not running`);
-    if (current.kind === "review") throw new CmdError(`lane "${lane}" is a review lane; review turns do not accept steering`);
     if (current.steerOpen === false) throw new CmdError(`lane "${lane}" is finishing and no longer accepts steering`);
     writeFileSync(controlPathOf(lane, current.rounds), `${safeJSON(record)}\n`, { flag: "a" });
     return current;
@@ -228,6 +229,7 @@ export async function replyCommand(argv: string[]): Promise<void> {
     writeQuestion(target.path, current);
     return current;
   });
+  feedEvent("progress", `[cdx] answered question=${lane}:r${answered.round}:q${answered.seq} answer=${answer}`, answered.owner, { lane, round: answered.round });
   console.log(`cdx: answered lane=${lane} question #${answered.seq}`);
 }
 
@@ -291,7 +293,36 @@ export async function hookCommand(argv: string[]): Promise<void> {
       return passThrough();
     }
 
-    if (subcommand === "pre-tool") return passThrough();
+    const round = Number(process.env.CDX_ROUND);
+    const entry = readLedger()[lane];
+    if (!entry || entry.rounds !== round || !laneRunning(entry)) return passThrough();
+    if (subcommand === "post-invocation") {
+      const policy = invocationPolicy(entry.modelCalls ?? 0);
+      if (policy.terminationBehavior) {
+        captureRecoveryPartial(lane, round, entry.kind === "review" ? entry.review!.cwd : entry.work.cwd);
+        withLedger((ledger) => { ledger[lane]!.callLimitHit = true; });
+      }
+      console.log(JSON.stringify(policy));
+      return;
+    }
+    if (subcommand === "pre-tool") {
+      const call = input.toolCall;
+      if (/^(view_file|read_file|read)$/.test(call?.name ?? "")) {
+        const args = call.args ?? {};
+        const file = args.AbsolutePath ?? args.TargetFile ?? args.file_path ?? args.path;
+        if (typeof file === "string") {
+          const path = resolve(entry.kind === "review" ? entry.review!.cwd : entry.work.cwd, file);
+          const hash = createHash("sha256").update(readFileSync(path)).digest("hex");
+          const records = readFileSync(logPathOf(lane, round, true), "utf8").split("\n").flatMap((line) => {
+            if (!line.includes('"cdx_tool"')) return [];
+            try { return [JSON.parse(line)]; } catch { return []; }
+          });
+          const reason = unchangedRead(records, path, hash, args.StartLine ?? args.start_line, args.EndLine ?? args.end_line);
+          if (reason) { console.log(JSON.stringify({ decision: "deny", reason })); return; }
+        }
+      }
+      return passThrough();
+    }
 
     if (subcommand === "pre-invocation") {
       const ledger = readLedger();
@@ -299,7 +330,7 @@ export async function hookCommand(argv: string[]): Promise<void> {
       if (!entry) return passThrough();
       const currentRound = process.env.CDX_ROUND;
       const isReview = entry.kind === "review" || (entry.review?.state === "running" && currentRound !== undefined && String(entry.review?.round) === String(currentRound));
-      if (isReview || entry.kind !== "work") {
+      if (entry.kind !== "work" && !isReview) {
         console.log("{}");
         return;
       }
@@ -310,6 +341,16 @@ export async function hookCommand(argv: string[]): Promise<void> {
       }
 
       const injectSteps: Array<{ userMessage: string }> = [];
+      withLedger((ledger) => {
+        const item = ledger[lane]!;
+        item.modelCalls = (item.modelCalls ?? 0) + 1;
+        injectSteps.push(...(invocationPolicy(item.modelCalls).injectSteps ?? []));
+        const snapshot = readGeminiUsageSnapshot();
+        if (!item.quotaWrapSent && snapshot && Date.parse(snapshot.fiveHour.resetsAt) > Date.now() && snapshot.fiveHour.remainingPercent < 10) {
+          item.quotaWrapSent = true;
+          injectSteps.push({ userMessage: "Gemini quota is below 10 percent. Stop editing and write your partial handoff report now." });
+        }
+      });
       withLedger((led) => {
         const item = led[lane];
         if (!item) return;
@@ -355,4 +396,18 @@ export async function hookCommand(argv: string[]): Promise<void> {
   } catch {
     passThrough();
   }
+}
+
+export function unchangedRead(records: any[], path: string, hash: string, start = 1, end = Number.MAX_SAFE_INTEGER): string | undefined {
+  for (const record of records) {
+    if (record.type !== "cdx_tool" || record.toolKind !== "read" || record.failed || record.readFiles?.[path] !== hash || (record.readFilesAfter && record.readFilesAfter[path] !== hash)) continue;
+    const range = record.readRange;
+    if (!range || start < (range.start ?? 1) || end > (range.end ?? Number.MAX_SAFE_INTEGER)) continue;
+    return `unchanged since step ${record.step ?? record.id}; content is already in context`;
+  }
+}
+
+export function invocationPolicy(calls: number): { injectSteps?: Array<{ userMessage: string }>; terminationBehavior?: string } {
+  if (calls >= 250) return { terminationBehavior: "terminate" };
+  return calls === 240 ? { injectSteps: [{ userMessage: "Ten calls remain in this round. Stop editing and write a handoff report now, with completed work, remaining work, and evidence paths." }] } : {};
 }

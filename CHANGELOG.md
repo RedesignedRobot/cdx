@@ -1,3 +1,15 @@
+## 8.0.0
+
+- Lane Codex homes carry short instructions and skip the codegraph prompt hook. Thread overrides disable memories, plugins, apps, the skills catalogue and unused MCP servers. Interactive account files remain intact. `doctor --fix` installs the homes and removes retired config rules.
+- Gemini agents install as real files with tool allowlists. Doctor and spawn check discovery. A default-agent fallback fails the round. Pre-tool hooks refuse unchanged covered reads.
+- Work lanes get one typecheck and one run of each touched spec. A red gate receives one automatic repair turn in the same conversation, then one gate rerun. A moving tree never triggers repair. Receipts cover paths touched by the lane; repository baselines run at the parent.
+- GPT work defaults to 150000 tokens before compaction and 6000 tokens for tool output through two config keys. Reviews, consults and supervisors keep their normal limits. `resume --fix gate|review` requires failed evidence at the same HEAD; new scope requires a fresh lane.
+- Gemini admission projects remaining calls across running lanes, queues excess work until reset, requests a handoff below 10 percent and ends at 250 calls. Process stops preserve a partial report.
+- `land` commits the lane, merges into its recorded base with `--no-ff`, pushes, removes its worktree and branch, and closes. Dirty bases, failed gates and stale receipts refuse admission. Interrupted landings retain commit evidence for retry.
+- Head `ask --cd` answers a code question synchronously through Gemini without a lane. On macOS, sandbox-exec denies writes to the checkout and common Git directory. Child terminal events go only to supervisors and include reports below 10 KB plus up to 40 lines of failure evidence.
+- All GPT rounds use app-server with usage events and steering. Review admission rejects duplicate snapshots, re-reviews receive the fix diff and prior findings, and P3-only verdicts close the loop. Native tools reject missing fields and mark nonzero exits as errors.
+- Round records include account percentages, prompt bytes by source, measured tool output bytes, linked answers, kill reasons and agent-load evidence. Jobs retain before/after Git fingerprints and landed lanes retain the merge commit. Provider-injected prompt size and unavailable output bodies remain explicitly unknown.
+
 ## 7.9.0
 
 - Shared safe-text policy redacts protocol logs, gate and job output, reports, question and ledger text, native results, and terminal/browser output before persistence or display.

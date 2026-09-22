@@ -66,3 +66,25 @@ test("stream redaction holds split assignments and UTF-8 before persistence", as
   for await (const text of safeLines(chunks())) stored += text;
   expect(stored).toBe("é CONTEXT7_API_KEY=[redacted]\nlast TOKEN=[redacted]");
 });
+
+import { installLaneHome, laneHooks, retiredLaneRule } from "./account-sync.ts";
+
+test("lane home installation is idempotent and preserves the interactive instruction source", () => {
+  const home = mkdtempSync(join(tmpdir(), "cdx-lane-home-"));
+  try {
+    writeFileSync(join(home, "AGENTS.md"), "interactive instructions");
+    writeFileSync(join(home, "config.toml"), 'model = "fixture"\n');
+    const original = { hooks: [{ command: "codegraph prompt-hook" }, { command: "unrelated-hook" }] };
+    writeFileSync(join(home, "hooks.json"), JSON.stringify(original));
+    const lane = installLaneHome(home, "lane instructions");
+    expect(installLaneHome(home, "lane instructions")).toBe(lane);
+    expect(readFileSync(join(home, "AGENTS.md"), "utf8")).toBe("interactive instructions");
+    expect(readFileSync(join(lane, "AGENTS.md"), "utf8")).toBe("lane instructions");
+    expect(readFileSync(join(lane, "config.toml"), "utf8")).toBe('model = "fixture"\n');
+    expect(JSON.parse(readFileSync(join(lane, "hooks.json"), "utf8"))).toEqual(laneHooks(original));
+    expect(laneHooks(laneHooks(original))).toEqual(laneHooks(original));
+    expect(laneHooks(original).hooks[0].command).toContain('CDX_LANE');
+    expect(laneHooks(original).hooks[1].command).toBe("unrelated-hook");
+    expect(retiredLaneRule("Read the repository's AGENTS.md and CLAUDE.md before starting")).toBe(true);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});

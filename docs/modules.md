@@ -10,13 +10,13 @@
 | `ledger.ts` | Lane and round types, migration, JSON locks, ownership, and event storage |
 | `usage-store.ts` | Usage snapshots, exhaustion markers, history, and burn projections |
 | `accounts.ts` | Codex probes, account selection, holds, demand sizing, and reset credits |
-| `gemini-usage.ts` | Gemini usage probes and quota blocks |
+| `gemini-usage.ts` | Gemini usage probes, burn projection and quota admission |
 | `engines.ts` | Protocol helpers, token accounting, Gemini retry and report policy, and recovery prompts |
 | `rounds.ts` | Account admission and round reservation under the ledger lock |
 | `runner.ts` | Engine processes, event handling, account failover, gates, and finalization |
 | `round-state.ts` | Failure reconciliation and lane or child termination |
 | `gates.ts` | Gate execution, receipts, review snapshots, and gate commands |
-| `worktrees.ts` | Worktree creation, reuse, stored directories, and cleanup |
+| `worktrees.ts` | Worktree creation, receipt-bound landing and cleanup |
 | `reports.ts` | Captured reports, recovery partials, JSONL framing, and log readers |
 | `questions.ts` | Questions, steering, peer messages, and Gemini hook delivery |
 | `prompts.ts` | Injected rules, review frames, and resume prompts |
@@ -36,4 +36,8 @@ The ledger still accepts unversioned records before the first v5 write. That wri
 
 `hooks/register.ts` invokes `bun <pluginRoot>/cdx.ts`; it does not import these Bun modules. `view.ts` remains beside `assets/`, preserving the dashboard asset URL. The package gate remains `bun run check`, including the single-file `bun build cdx.ts --target=bun` bundle. The lane gate runs it after the worker report.
 
-`hooks/tools.ts` bounds native results at 20 KB and requires retention of the full safe text; `hooks/register.ts` writes it under the cdx logs directory. Directory fallback occurs before launch on a missing cwd, never after an execution error. Gemini transcript reuse belongs to `roundTools`; provider tool execution is unchanged. Gate diagnostics retain the first fatal line and its typed cause. A gate runs once and rejects a moving tree with the changed paths in its receipt. `tui.ts` owns the production text mark and contains no demo graphics or animation.
+`hooks/tools.ts` bounds native results at 20 KB and requires retention of the full safe text; `hooks/register.ts` writes it under the cdx logs directory. Directory fallback occurs before launch on a missing cwd, never after an execution error. Gemini transcript measurements belong to `roundTools`; the pre-tool hook denies successful unchanged covered reads before execution. Gate diagnostics retain the first fatal line and its typed cause. A gate rejects changes to its owned paths. A red exit gets one same-conversation repair and one rerun; a moving tree gets neither. `tui.ts` owns the production text mark and contains no demo graphics or animation.
+
+`account-sync.ts` creates isolated lane homes and guards the codegraph prompt hook. It no longer copies global interactive instructions across account homes. `appThreadParams` owns context overrides and work-only token limits. Every GPT round uses app-server.
+
+`rounds.ts` reserves review snapshots and queued Gemini starts under the ledger lock. `questions.ts` owns invocation counts, quota handoff and unchanged-read denial. `ledger.ts` routes child terminals to supervisor controls and embeds bounded report text. `jobs.ts` records both tree fingerprints. `worktrees.ts` records commit progress before push and cleanup so landing can resume after an interruption.

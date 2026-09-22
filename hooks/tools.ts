@@ -17,6 +17,16 @@ export interface ToolDefinition {
 
 export const TOOLS: ToolDefinition[] = [
   {
+    name: "land", description: "Commit a green lane, merge into its base, push, remove the worktree and branch, and close. Refuses dirty base checkouts and stale or red receipts.",
+    inputSchema: { type: "object", properties: { lane: { type: "string" } }, required: ["lane"] },
+    run: (input) => ({ argv: ["land", String(input.lane)], timeoutMs: 120_000 }),
+  },
+  {
+    name: "ask", description: "Ask Gemini a synchronous read-only code question without creating a lane. Returns file and line evidence within 90 seconds.",
+    inputSchema: { type: "object", properties: { question: { type: "string" }, cd: { type: "string" } }, required: ["question", "cd"] },
+    run: (input) => ({ argv: ["ask", "--cd", String(input.cd), "-"], stdin: String(input.question), timeoutMs: 100_000 }),
+  },
+  {
     name: "spawn",
     description:
       "Spawn a new cdx lane with a brief. The brief is delivered whole through stdin so quotes and newlines are safe; completion arrives as a [cdx] event.",
@@ -66,27 +76,22 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "resume",
-    description: "Resume a finished or stopped lane with a follow-up instruction.",
+    description: "Repair a failed gate or P1/P2 review on the same diff. New scope needs a fresh lane seeded from the report.",
     inputSchema: {
       type: "object",
       properties: {
         lane: { type: "string", description: "Name of the lane to resume" },
-        followUp: { type: "string", description: "Follow-up instructions for the lane" },
+        followUp: { type: "string", description: "Fix instructions for the same diff" },
+        fix: { type: "string", enum: ["gate", "review"], description: "Evidence being repaired" },
         effort: { type: "string", description: "Reasoning effort" },
-        gate: { type: "string", description: "Verification command" },
-        addDirs: { type: "array", items: { type: "string" }, description: "Additional directories retained for work resumes" },
-        pre: { type: "string", description: "Setup command" },
         maxRuntime: { type: "number", description: "Maximum runtime in minutes" },
       },
-      required: ["lane", "followUp"],
+      required: ["lane", "followUp", "fix"],
     },
     run: (input) => {
-      const argv = ["resume", String(input.lane)];
+      const argv = ["resume", String(input.lane), "--fix", String(input.fix)];
       if (input.effort) argv.push("--effort", String(input.effort));
-      if (input.gate) argv.push("--gate", String(input.gate));
-      if (input.pre) argv.push("--pre", String(input.pre));
       if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
-      if (Array.isArray(input.addDirs)) for (const dir of input.addDirs) argv.push("--add-dir", String(dir));
       argv.push("--bg", "-");
       return { argv, stdin: String(input.followUp) };
     },
@@ -122,7 +127,7 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "review",
-    description: "Start an independent code review lane. Two exclusive modes: intent alone reviews the working tree per the intent (exec review, any engine); one of uncommitted, base or commit without intent runs the engine's native review of that target. Passing intent with a target flag is refused.",
+    description: "Start an independent code review lane. Two exclusive modes: intent reviews the working tree; uncommitted, base or commit chooses a Git diff target. Passing intent with a target flag is refused.",
     inputSchema: {
       type: "object",
       properties: {
@@ -425,6 +430,24 @@ export const TOOLS: ToolDefinition[] = [
 
 export const TOOL_NAMES = TOOLS.map((t) => t.name);
 export const CDX_TOOL_PREFIX = "mcp__cdx__";
+
+// Validate before any argv or stdin conversion, including direct table callers.
+export function requiredInput(schema: Record<string, unknown>, input: Record<string, unknown>): void {
+  for (const field of (schema.required as string[] ?? [])) {
+    const value = input[field];
+    if (typeof value !== "string" || !value.trim() || value === "undefined") throw new Error(`missing required field: ${field}`);
+    const property = (schema.properties as Record<string, { enum?: string[] }> | undefined)?.[field];
+    if (property?.enum && !property.enum.includes(value)) throw new Error(`invalid ${field}: expected ${property.enum.join(" or ")}`);
+  }
+}
+for (const tool of TOOLS) {
+  const run = tool.run;
+  tool.run = (input) => { requiredInput(tool.inputSchema, input); return run(input); };
+}
+
+export function nativeToolResult(exitCode: number, result: string) {
+  return exitCode === 0 ? { result } : { result, isError: true as const };
+}
 
 export const TOOLS_BY_NAME = new Map<string, ToolDefinition>(
   TOOLS.map((tool) => [tool.name, tool]),

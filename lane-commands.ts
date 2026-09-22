@@ -1,3 +1,6 @@
+import { fixReviewPrompt } from "./prompts.ts";
+import { retiredLaneRule, installLaneHome } from "./account-sync.ts";
+import { requireGeminiAgent } from "./doctor.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane launch, spawn, resume, review, consult, and cleanup commands.
 
@@ -13,7 +16,7 @@ import {
   CODEX_DISABLE_NATIVE_SUBAGENTS, freshAccountSpec, geminiCapacityNotice, recoveryPrompt,
 } from "./engines.ts";
 import {
-  composeGate, executeGate, finishInvalidBaseline, printGateChange, repositoryGate, runPreCheck,
+  captureGateTree, composeGate, executeGate, finishInvalidBaseline, printGateChange, repositoryGate, runPreCheck,
 } from "./gates.ts";
 import { formatGeminiStanding, readGeminiUsageSnapshot, requireGeminiQuota } from "./gemini-usage.ts";
 import {
@@ -22,7 +25,7 @@ import {
   storedOwnership, supervisorLane, validLane, withEvents, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
-  CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
+  resumeRefusal, CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
   REVIEW_FINDINGS_SCHEMA, reviewFrame,
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
@@ -30,7 +33,7 @@ import { failActiveRound } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
 import { runRound } from "./runner.ts";
 import {
-  color, displayPath, fail, fmtAge, HOME, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
+  color, displayPath, fail, fmtAge, HOME, REPO_ROOT, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -42,10 +45,22 @@ import {
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
   spec.accountHomes = config.accounts;
+  spec.model_auto_compact_token_limit = config.model_auto_compact_token_limit ?? 150_000;
+  spec.tool_output_token_limit = config.tool_output_token_limit ?? 6_000;
   spec.visibility = config.visibility ?? VISIBILITY_DEFAULTS;
   spec.taskPrompt ??= spec.prompt;
   spec.injectedRules ??= promptRules(spec.prompt);
+  const project = `${spec.cwd}/.cdx-rules.md`;
+  const projectRules = existsSync(project) ? readFileSync(project, "utf8").trim() : "";
+  const configured = config.rules.filter((rule) => !retiredLaneRule(rule)).map((rule) => `- ${rule}`).join("\n");
+  const rules = spec.injectedRules && spec.prompt.includes(spec.injectedRules) ? spec.injectedRules : "";
+  const projectBytes = projectRules && rules.includes(projectRules) ? Buffer.byteLength(projectRules) : 0;
+  const configuredBytes = configured && rules.includes(configured) ? Buffer.byteLength(configured) : 0;
+  spec.promptBytes = { taskAndFraming: Buffer.byteLength(spec.prompt) - Buffer.byteLength(rules),
+    repositoryRules: projectBytes, configRules: configuredBytes,
+    laneRules: Math.max(0, Buffer.byteLength(rules) - projectBytes - configuredBytes) };
   const entry = readLane(spec.lane);
+  spec.queuedUntil = entry.queuedUntil;
   if (spec.engine === "gpt") {
     const choice = entry.roundAccount;
     const changedHome = (spec.codexHome ?? defaultCodexHome()) !== (choice?.home ?? defaultCodexHome());
@@ -53,6 +68,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.codexHome = choice?.home;
     spec.model ??= entry.model ?? config.model;
     Object.assign(spec, accountSpec(choice));
+    installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"));
     if (changedHome && (spec.sourceThreadId || spec.mode === "resume")) {
       freshAccountSpec(spec, entry, recoveryPrompt(spec, entry));
       brief = spec.prompt;
@@ -127,8 +143,8 @@ export async function spawnCommand(argv: string[]) {
   const model = existingLane && engine === "gpt" && parsed.flags.model === undefined ? laneModel(existingLane) : modelOf(parsed, engine);
   checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   requireEngineBinary(engine);
-  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
+  if (engine === "gemini") requireGeminiAgent((config.gemini ?? geminiConfig()).agent, parsed.flags.cd ?? process.cwd());
   if (engine === "gemini" && (parsed.lists.image?.length ?? 0) > 0) fail("--image is not supported for gemini");
   const roots = spawnRoots(parsed.flags.cd, existingLane, process.cwd(), existsSync);
   let cwd = roots.cwd;
@@ -148,7 +164,7 @@ export async function spawnCommand(argv: string[]) {
   }
   // A respawn keeps the stored gate and cwd unless the caller passes new ones.
   const gate = parsed.flags.gate ?? existingLane?.gate;
-  const effectiveGate = composeGate(repositoryGate(cwd), gate);
+  const effectiveGate = composeGate(parent ? undefined : repositoryGate(cwd), gate);
   if (parsed.bools.has("gate-baseline-check") && !effectiveGate) fail("--gate-baseline-check requires --gate or .cdx-gate");
   const pre = parsed.flags.pre ?? existingLane?.pre;
   const additionalDirectories = mergeDirectories(storedDirectories(lane, existingLane), (parsed.lists["add-dir"] ?? []).map((dir) => {
@@ -188,7 +204,7 @@ export async function spawnCommand(argv: string[]) {
       withLedger((ledger) => {
         const item = ledger[lane]!;
         item.work.cwd = cwd;
-        Object.assign(item, { worktreePath: worktree!.path, worktreeRepo: worktree!.repo, branch: worktree!.branch });
+        Object.assign(item, { worktreePath: worktree!.path, worktreeRepo: worktree!.repo, branch: worktree!.branch, baseBranch: worktree!.baseBranch });
       });
     } catch (error) {
       withLedger((ledger) => failActiveRound(lane, ledger[lane]!, `worktree setup failed: ${error}`));
@@ -198,7 +214,7 @@ export async function spawnCommand(argv: string[]) {
   if (selection) announceAccountSelection(lane, selection);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
   withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
-  const gateBaselineChecked = Boolean(effectiveGate && parsed.bools.has("gate-baseline-check"));
+  const gateBaselineChecked = Boolean(!parent && effectiveGate && parsed.bools.has("gate-baseline-check"));
   if (gateBaselineChecked) {
     const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
     console.log(`cdx: gate baseline check cwd=${cwd} cmd=${effectiveGate}`);
@@ -229,22 +245,26 @@ export async function spawnCommand(argv: string[]) {
 }
 
 export async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir"]);
+  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir", "fix"]);
   const [lane, followUpArg] = parsed.rest;
-  const usage = 'usage: cdx resume <lane> [--add-dir <dir>]... [--effort <effort>] [--bg] [--max-runtime <min>] [--pre <cmd>] "<follow-up>"';
+  const usage = 'usage: cdx resume <lane> --fix gate|review [--effort <effort>] [--bg] "<fix instructions>"';
   const followUp = await resolveBrief(followUpArg, usage);
   if (!lane || !followUp) fail(usage);
   const before = readLane(lane);
+  const head = Bun.spawnSync({ cmd: ["git", "-C", workCwdOf(before), "rev-parse", "HEAD"] }).stdout.toString().trim();
+  const fixRefusal = resumeRefusal(parsed.flags.fix, before, head);
+  if (fixRefusal) fail(fixRefusal);
+  if (parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate || parsed.lists["add-dir"]?.length || parsed.flags.pre !== undefined && parsed.flags.pre !== before.pre) fail("A fix resume cannot change the gate, setup, or directories; spawn a fresh lane seeded from the report");
   requireOwnChild(lane, before);
   const parent = supervisorLane();
   if (parent && parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate) {
     fail(`supervisor ${parent} may not change a child's gate; ask the liaison if it is wrong`);
   }
   const engine = laneEngine(before);
+  if (engine === "gemini") requireGeminiAgent((config.gemini ?? geminiConfig()).agent, workCwdOf(before));
   checkChildAstraRefusal(Boolean(parent || before.parent), engine, before.model);
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   requireEngineBinary(engine);
-  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gpt") rejectPinnedAccountFlag(lane, before, parsed.flags.account);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
@@ -253,19 +273,14 @@ export async function resumeCommand(argv: string[]) {
   checkRoundCap(lane, engine, workRounds);
   const owner = storedOwnership(before);
   const effort = resolveEffort(engine, laneModel(before), parsed.flags.effort, before.effort);
-  // Resume targets the lane's work thread even when the latest round was a
-  // review; only a lane that never had a work session continues read-only.
+  // Fixes always target the work conversation, never the reviewer.
   const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
-  const reviewResume = workThread === undefined || Boolean(before.consult);
-  const account = engine === "gpt" ? reviewResume ? before.roundAccount ?? laneAccount(before) : laneAccount(before) : undefined;
+  if (!workThread) fail("No work conversation to repair; spawn a fresh lane seeded from the report");
+  const account = engine === "gpt" ? laneAccount(before) : undefined;
   if (engine === "gpt") warnCachedUsageBeforeLaunch(account);
   const cwd = workCwdOf(before);
-  const additionalDirectories = mergeDirectories(storedDirectories(lane, before), (parsed.lists["add-dir"] ?? []).map((dir) => {
-    if (!existsSync(dir) || !statSync(dir).isDirectory()) fail(`--add-dir is not a directory: ${dir}`);
-    return realpathSync(dir);
-  }));
-  if (reviewResume && parsed.lists["add-dir"]?.length) fail("--add-dir is only supported on work resumes");
-  const effectiveGate = composeGate(repositoryGate(cwd), parsed.flags.gate ?? before.gate);
+  const additionalDirectories = storedDirectories(lane, before);
+  const effectiveGate = composeGate(before.parent ? undefined : repositoryGate(cwd), parsed.flags.gate ?? before.gate);
   const pre = parsed.flags.pre ?? before.pre;
   const partialPath = partialReportPathOf(lane, before.rounds);
   const partial = activeStateOf(before) === "failed" && existsSync(partialPath) ? readFileSync(partialPath, "utf8").trim() : "";
@@ -275,7 +290,7 @@ export async function resumeCommand(argv: string[]) {
     fail(`${refusal}\nPartial: ${partialPath}\nChanged paths now:\n${status.success ? status.stdout.toString().trim() || "None." : "Unavailable."}\nLast action: ${before.lastAction ?? "unknown"}`);
   }
   if (pre) runPreCheck(pre, cwd);
-  const { round, sessionId, selection } = await openRound(lane, reviewResume ? "review" : "work", cwd, effort, {
+  const { round, sessionId, selection } = await openRound(lane, "work", cwd, effort, {
     engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", preserveOwner: true,
     preserveGate: parsed.flags.gate === undefined,
     ...(parsed.flags.gate !== undefined ? { gate: parsed.flags.gate } : {}),
@@ -287,19 +302,13 @@ export async function resumeCommand(argv: string[]) {
   if (selection) announceAccountSelection(lane, selection);
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const previousRound = partial ? `\n\nYour previous round ended with this partial report at ${partialPath}; continue from it, do not redo completed work:\n${partial}` : "";
-  const injectedRules = houseRules(cwd, reviewResume, engine, { supervisor: Boolean(before.supervisor) });
-  const prompt = resumePrompt(followUp, injectedRules, conversationRules(lane, before.rounds, sessionId, engine, reviewResume), previousRound.trim());
-  // The resolved effort always travels with the turn: a resumed session would
-  // otherwise keep the effort it was created with, cap or no cap.
-  const codexArgs = reviewResume && engine === "gpt"
-    ? ["exec", "resume", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `model_reasoning_effort=${effort}`, "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"', "--skip-git-repo-check", sessionId!, prompt]
-    : undefined;
+  const injectedRules = houseRules(cwd, false, engine, { supervisor: Boolean(before.supervisor) });
+  const prompt = resumePrompt(followUp, injectedRules, conversationRules(lane, before.rounds, sessionId, engine, false), previousRound.trim());
   return launch({
     effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt, injectedRules,
     ...(before.supervisor ? { supervisor: true as const } : {}),
-    ...(codexArgs ? { codexArgs, reviewDir: cwd } : { sourceThreadId: sessionId }),
-    ...(reviewResume && engine === "gemini" ? { reviewDir: cwd, outputSchema: REVIEW_FINDINGS_SCHEMA } : {}),
-    ...(!reviewResume && effectiveGate ? { gate: effectiveGate } : {}),
+    sourceThreadId: sessionId,
+    ...(effectiveGate ? { gate: effectiveGate } : {}),
     ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
@@ -307,7 +316,7 @@ export async function resumeCommand(argv: string[]) {
 }
 
 // consult: a read-only advisor lane. It runs as a read-only review, framed
-// as an advisor rather than a hostile reviewer, and resumes read-only.
+// as an advisor rather than a hostile reviewer. Further questions use a fresh consult.
 // A head consult may opt into --supervisor to spawn read-only Gemini helpers.
 export async function consultCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
@@ -350,8 +359,8 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
     fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
   }
   requireEngineBinary(engine);
-  requireGeminiQuota(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
+  if (engine === "gemini") requireGeminiAgent((config.gemini ?? geminiConfig()).reviewAgent, parsed.flags.cd ?? process.cwd());
   const existing = readLedger()[lane];
   requireOwnChild(lane, existing);
   if (existing && laneEngine(existing) === "gpt" && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
@@ -370,60 +379,36 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
-  if (targets.length === 1 && intent) fail("native review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
-  if (targets.length === 1 && parsed.flags.scope) fail("--scope only applies to exec review (native review always covers the whole target diff)");
-  if (targets.length === 0 && !intent) fail("exec review needs an intent (or pass a native target flag)");
+  if (targets.length === 1 && intent) fail("review targets (--uncommitted/--base/--commit) cannot carry a custom intent; drop it or drop the target flag");
+  if (targets.length === 1 && parsed.flags.scope) fail("--scope requires an intent without a target flag");
+  if (targets.length === 0 && !intent) fail("review needs an intent or a target flag");
   const preserveAccount = Boolean(existing && (laneEngine(existing) === "gpt" || existing.account || existing.codexHome));
   if (preserveAccount && engine === "gpt") rejectPinnedAccountFlag(lane, existing!, parsed.flags.account);
   const account = engine === "gpt" ? preserveAccount ? laneAccount(existing!) : undefined : undefined;
   if (engine === "gpt" && (preserveAccount || !config.accounts || parsed.flags.account)) warnCachedUsageBeforeLaunch(account);
   const roundAccount = { forcedAccount: parsed.flags.account, ...(engine === "gpt" && !preserveAccount ? { account } : existing ? { preserveAccount: true as const } : {}) };
 
-  if (targets.length === 1) {
-    const owner = callerOwnership();
-    if (engine === "gemini") {
-      const target = parsed.bools.has("uncommitted") ? "HEAD"
-        : parsed.flags.base ? `${parsed.flags.base}...HEAD`
-        : undefined;
-      // git show covers a root commit; <sha>^ has no parent there.
-      const task = target
-        ? `Review the diff shown by \`git diff ${target}\` in this repository.`
-        : `Review the diff shown by \`git show ${parsed.flags.commit}\` in this repository.`;
-      const fullBrief = [reviewFrame(engine), `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${task}`].join("\n\n");
-      const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundParent });
-      return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(supervisor ? { supervisor: true as const } : {}), outputSchema: REVIEW_FINDINGS_SCHEMA, ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
-    }
-    // Native `codex review`: purpose-built diff review. It rejects a custom
-    // prompt alongside a target, so the adversarial frame stays home.
-    const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent });
-    if (selection) announceAccountSelection(lane, selection);
-    const codexArgs = [
-      "review", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "-c", `review_model=${JSON.stringify(model)}`, "-c", `model_reasoning_effort=${effort}`,
-      "-c", 'sandbox_mode="danger-full-access"', "-c", 'approval_policy="never"',
-    ];
-    if (parsed.bools.has("uncommitted")) codexArgs.push("--uncommitted");
-    if (parsed.flags.base) codexArgs.push("--base", parsed.flags.base);
-    if (parsed.flags.commit) codexArgs.push("--commit", parsed.flags.commit);
-    const label = parsed.bools.has("uncommitted") ? "uncommitted changes" : parsed.flags.base ? `diff vs ${parsed.flags.base}` : `commit ${parsed.flags.commit}`;
-    return launch({ effort, engine, model, mode: "review-native", lane, round, cwd, reviewDir: cwd, prompt: `native review of ${label}`, codexArgs, ...(supervisor ? { supervisor: true as const } : {}), ...accountSpec(account), ...ownershipSpec(owner) }, `native review of ${label}`, parsed.bools.has("bg"));
-  }
-
+  const target = parsed.bools.has("uncommitted") ? "Review git diff HEAD."
+    : parsed.flags.base ? `Review git diff ${parsed.flags.base}...HEAD.`
+    : parsed.flags.commit ? `Review git show ${parsed.flags.commit}.` : intent;
+  const reviewTree = !opts.consult ? captureGateTree(cwd) : undefined;
+  if (!opts.consult && !reviewTree) fail("review requires a git tree snapshot");
+  const previous = existing?.reviewTree;
+  let prior = "";
+  if (!opts.consult && existing?.review?.report && existsSync(existing.review.report)) prior = readFileSync(existing.review.report, "utf8");
+  if (prior && existing?.reviewClosed) fail("The previous review has no P1/P2 findings; the review loop is closed");
+  const fix = prior && previous && reviewTree
+    ? fixReviewPrompt(previous, reviewTree, prior) : "";
+  const scope = parsed.flags.scope ? `\nReview only these paths: ${parsed.flags.scope}` : "";
   const owner = callerOwnership();
-  const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent, ...(opts.consult ? { consult: true as const } : {}) });
+  const fullBrief = [opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope,
+    `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${fix || target}`].join("\n\n");
+  const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent,
+    ...(opts.consult ? { consult: true as const } : { reviewTree }) });
   if (selection) announceAccountSelection(lane, selection);
-  const scope = parsed.flags.scope
-    ? `\nScope: review EXACTLY these files, ignore all other dirty files (other lanes own them): ${parsed.flags.scope}`
-    : "";
-  const frame = opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope;
-  const fullBrief = [frame, `Ground rules:\n${houseRules(cwd, true, engine, { supervisor })}`, `Task:\n${intent}`].join("\n\n");
-  // Reviews and consults run with full access (owner ruling 2026-09-21). A
-  // review still fails when the tree moves; a consult has no tree check.
-  const codexArgs = engine === "gpt" ? [
-    "exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", model!, "-c", `model_reasoning_effort=${effort}`,
-    "-s", "danger-full-access", "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", cwd,
-    "--output-last-message", reportPathOf(lane, round), fullBrief,
-  ] : undefined;
-  return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief, ...(supervisor ? { supervisor: true as const } : {}), ...(engine === "gemini" && !opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA } : {}), ...(codexArgs ? { codexArgs } : {}), ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+  return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief,
+    ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
+    ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
 export function cleanCommand(argv: string[]) {
@@ -462,4 +447,31 @@ export function cleanCommand(argv: string[]) {
     });
   });
   console.log(removed.length > 0 ? `cdx: pruned closed lanes older than ${days}d: ${removed.join(", ")}` : `cdx: nothing to prune (closed lanes older than ${days}d)`);
+}
+
+export async function codeQuestionCommand(argv: string[]): Promise<void> {
+  const parsed = parseArgs(argv, ["cd"]);
+  const question = await resolveBrief(parsed.rest.join(" "), "usage: cdx ask --cd <repo> <question>");
+  if (!question || !parsed.flags.cd) fail("usage: cdx ask --cd <repo> <question>");
+  const cwd = realpathSync(parsed.flags.cd);
+  const policy = config.gemini ?? geminiConfig();
+  requireGeminiQuota("gemini");
+  requireGeminiAgent(policy.reviewAgent, cwd);
+  // Keep this request read-only even when its shell tool tries to write.
+  if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
+  const common = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+  const paths = [cwd, ...(common.success ? [common.stdout.toString().trim()] : [])];
+  const profile = `(version 1)(allow default)(deny file-write* ${paths.map((path) => `(subpath ${JSON.stringify(path)})`).join(" ")})`;
+  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", profile, "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
+    "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "90s", "--add-dir", cwd],
+    cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
+  const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);
+  try {
+    const [exitCode, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
+    if (exitCode) fail(safeText(stderr || `Gemini ask exited ${exitCode}`));
+    const value = JSON.parse(stdout);
+    const result = value.result && typeof value.result === "object" ? value.result : value;
+    if (result.error || result.status && result.status !== "SUCCESS" || typeof result.response !== "string" || !result.response.trim()) fail("Gemini ask returned no successful answer");
+    console.log(safeText(result.response));
+  } finally { clearTimeout(timer); }
 }

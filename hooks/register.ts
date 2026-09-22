@@ -14,7 +14,7 @@ import {
 } from "./delivery";
 import {
   CDX_TOOL_PREFIX,
-  formatToolOutput,
+  nativeToolResult, formatToolOutput,
   runFromCwd,
   TOOL_NAMES,
   TOOLS,
@@ -276,7 +276,9 @@ export function register(on: On) {
       return { result: `unknown tool ${e.tool}` };
     }
     const toolInput = (e as { input?: Record<string, unknown> }).input ?? (e as Record<string, unknown>);
-    const runSpec = def.run(toolInput);
+    let runSpec;
+    try { runSpec = def.run(toolInput); }
+    catch (error) { return { isError: true, result: String(error) }; }
     // Tool commands run where the head works, not in the plugin root: a
     // spawn --worktree without cd cuts from the caller's directory, and a
     // relative cd resolves against it.
@@ -304,7 +306,7 @@ export function register(on: On) {
       await $.fs.write(path, content);
       return path;
     });
-    return { result: text };
+    return nativeToolResult(res.exitCode, text);
   });
 
   on("prompt.submit", async ($, e, next) => {

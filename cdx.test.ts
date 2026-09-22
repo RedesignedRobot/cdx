@@ -955,13 +955,10 @@ test("job target must be explicit in CLI and native tool", () => {
   expect(TOOLS_BY_NAME.get("gate-receipt")!.run({ lane: "lane" }).argv).toEqual(["gate-receipt", "lane", "--json"]);
 });
 
-test("resume unions directories and passes repeated add-dir flags", () => {
+test("work directories deduplicate and fix resumes keep the existing scope", () => {
   expect(mergeDirectories(["/one"], ["/two", "/one"])).toEqual(["/one", "/two"]);
-  expect(mergeDirectories()).toEqual([]);
-  const parsed = parseArgs(["lane", "--add-dir", "/one", "--add-dir", "/two", "continue"], ["add-dir"]);
-  expect(parsed.lists["add-dir"]).toEqual(["/one", "/two"]);
-  expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "lane", followUp: "continue", addDirs: ["/one", "/two"] }).argv)
-    .toEqual(["resume", "lane", "--add-dir", "/one", "--add-dir", "/two", "--bg", "-"]);
+  expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "lane", fix: "gate", followUp: "fix failure" }).argv)
+    .toEqual(["resume", "lane", "--fix", "gate", "--bg", "-"]);
 });
 
 test("worktree reuse needs the exact lane branch, repository and clean files", () => {
@@ -1256,4 +1253,81 @@ test("gate notices name only running lanes sharing the same working tree, includ
   const root = (cwd: string) => cwd.startsWith("/repo") ? "/repo" : cwd === "/other-worktree" ? cwd : undefined;
   expect(sharedTreeLanes("self", "/repo", ledger, root)).toEqual(["sibling"]);
   expect(sharedTreeLanes("outside", "/not-git", ledger, root)).toEqual([]);
+});
+
+import { appThreadParams } from "./engines.ts";
+import { resumeRefusal, reviewLoopClosed, reviewerForTree, fixReviewPrompt } from "./prompts.ts";
+import { geminiAdmission } from "./gemini-usage.ts";
+import { landRefusal } from "./worktrees.ts";
+import { terminalText } from "./ledger.ts";
+import { agentDiscovered, desiredHookEntry, hooksCurrent } from "./doctor.ts";
+
+test("only GPT work receives the compaction trial and every GPT thread sheds unused context", () => {
+  const base = { engine: "gpt", mode: "spawn", cwd: "/repo", effort: "medium" } as any;
+  const work = appThreadParams(base).config as any;
+  expect(work).toMatchObject({ model_auto_compact_token_limit: 150000, tool_output_token_limit: 6000,
+    features: { memories: false, plugins: false, apps: false }, skills: { include_instructions: false } });
+  expect(work.mcp_servers.context7.enabled).toBe(false);
+  for (const patch of [{ reviewDir: "/repo" }, { supervisor: true }]) {
+    const options = appThreadParams({ ...base, ...patch }).config as any;
+    expect(options.model_auto_compact_token_limit).toBeUndefined();
+    expect(options.tool_output_token_limit).toBeUndefined();
+  }
+  expect(parseConfig('{"tool_output_token_limit":4321}').tool_output_token_limit).toBe(4321);
+  expect(() => parseConfig('{"model_auto_compact_token_limit":0}')).toThrow();
+  expect(agentDiscovered("Available: cdx-lane-extra", "cdx-lane")).toBe(false);
+  expect(agentDiscovered("Available: cdx-lane\ncdx-review", "cdx-lane")).toBe(true);
+});
+
+test("resume requires failed evidence at the same HEAD and reviews close after P3 only", () => {
+  const entry = { gateReceipt: { head: "head", exitCode: 1 }, reviewTree: { head: "head", tree: "old" }, review: {}, reviewClosed: false } as any;
+  expect(resumeRefusal("gate", entry, "head")).toBeUndefined();
+  expect(resumeRefusal(undefined, entry, "head")).toContain("fresh lane");
+  expect(resumeRefusal("gate", entry, "other")).toContain("HEAD changed");
+  expect(resumeRefusal("gate", { ...entry, gateReceipt: { head: "head", exitCode: 0, valid: true } }, "head")).toContain("no failed gate");
+  expect(resumeRefusal("review", entry, "head")).toBeUndefined();
+  expect(reviewLoopClosed([{ severity: "P3" }])).toBe(true);
+  expect(reviewLoopClosed([{ severity: "P2" }, { severity: "P3" }])).toBe(false);
+  expect(reviewLoopClosed(undefined)).toBe(false);
+  expect(reviewerForTree({ previous: entry }, { head: "head", tree: "old" })).toBe("previous");
+  expect(reviewerForTree({ previous: entry }, { head: "head", tree: "new" })).toBeUndefined();
+  expect(fixReviewPrompt(entry.reviewTree, { head: "head", tree: "new" }, "P2 overflow")).toContain("git diff old new.\nPrevious findings:\nP2 overflow");
+});
+
+test("Gemini admission reserves remaining work across running lanes and queues to reset", () => {
+  const now = Date.parse("2026-09-22T00:00:00Z");
+  const resetsAt = new Date(now + 3_600_000).toISOString();
+  const usage = { fiveHour: { remainingPercent: 15, resetsAt } } as any;
+  const busy = { engine: "gemini", kind: "work", work: { state: "running" }, modelCalls: 100, roundTokens: { input: 2_000_000, output: 0, cached: 0 } } as any;
+  expect(geminiAdmission(usage, {}, now).queuedUntil).toBeUndefined();
+  expect(geminiAdmission(usage, { busy }, now).queuedUntil).toBe(resetsAt);
+  expect(geminiAdmission(usage, { busy: { ...busy, queuedUntil: resetsAt } }, now).queuedUntil).toBeUndefined();
+  expect(geminiAdmission(usage, { busy }, now + 3_600_001).queuedUntil).toBeUndefined();
+});
+
+test("land refuses dirty bases, red receipts, and edits after an interrupted commit", () => {
+  const tree = { head: "h", tree: "t" };
+  const entry = { engine: "gpt", kind: "work", work: { round: 1, state: "done", exitCode: 0 }, worktreePath: "/lane", worktreeRepo: "/repo", branch: "lane/a",
+    gateReceipt: makeGateReceipt(1, "/lane", "check", 0, "now", tree, tree) } as any;
+  expect(landRefusal(entry, false, tree)).toBeUndefined();
+  expect(landRefusal(entry, true, tree)).toContain("dirty");
+  expect(landRefusal({ ...entry, gateReceipt: { ...entry.gateReceipt, exitCode: 1 } }, false, tree)).toBeDefined();
+  expect(landRefusal({ ...entry, landingCommit: "committed" }, false, { head: "committed", tree: "t" })).toBeUndefined();
+  expect(landRefusal({ ...entry, landingCommit: "committed" }, false, { head: "committed", tree: "unverified" })).toBeDefined();
+});
+
+test("terminal events carry small reports and child terminals never wake the head", () => {
+  expect(terminalText("done report=/tmp/a", "Outcome\nfile.ts", undefined)).toContain("Outcome\nfile.ts");
+  expect(terminalText("done", "界".repeat(4000), undefined)).toBe("done");
+  const event = { id: 1, timestamp: "now", kind: "terminal", owner: "head", lane: "claimed", supervisor: "parent", message: "done" };
+  expect(eventOwned(event, "lane-head", state)).toBe(false);
+  expect(eventOwned({ ...event, supervisor: undefined }, "lane-head", state)).toBe(true);
+});
+
+
+test("doctor treats hooks without the call-cap callback as stale", () => {
+  const hooks = desiredHookEntry("bun /cdx.ts");
+  expect(hooksCurrent(hooks, "bun /cdx.ts")).toBe(true);
+  delete hooks.PostInvocation;
+  expect(hooksCurrent(hooks, "bun /cdx.ts")).toBe(false);
 });

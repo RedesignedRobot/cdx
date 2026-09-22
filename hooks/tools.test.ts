@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatToolOutput, TOOLS, TOOLS_BY_NAME } from "./tools";
+import { nativeToolResult, formatToolOutput, TOOLS, TOOLS_BY_NAME } from "./tools";
 
 describe("tool rules", () => {
   test("spawn tool argv ends with --bg - and carries the brief on stdin", () => {
@@ -7,7 +7,7 @@ describe("tool rules", () => {
     expect(spawn).toBeDefined();
 
     const result = spawn!.run({
-      lane: "feature-fix",
+      lane: "feature-fix", cd: "/repo",
       brief: "Fix the memory leak in worker thread",
       engine: "gpt",
       effort: "high",
@@ -18,6 +18,8 @@ describe("tool rules", () => {
       "feature-fix",
       "--engine",
       "gpt",
+      "--cd",
+      "/repo",
       "--effort",
       "high",
       "--bg",
@@ -28,29 +30,32 @@ describe("tool rules", () => {
   });
 
   test("spawn, resume, consult, and review always pass --bg", () => {
-    const spawn = TOOLS_BY_NAME.get("spawn")!.run({ lane: "l1", brief: "b1" });
+    const spawn = TOOLS_BY_NAME.get("spawn")!.run({ cd: "/repo", lane: "l1", brief: "b1" });
     expect(spawn.argv).toContain("--bg");
 
-    const resume = TOOLS_BY_NAME.get("resume")!.run({ lane: "l1", followUp: "f1" });
+    const resume = TOOLS_BY_NAME.get("resume")!.run({ lane: "l1", fix: "gate", followUp: "f1" });
     expect(resume.argv).toContain("--bg");
 
-    const consult = TOOLS_BY_NAME.get("consult")!.run({ lane: "l1", question: "q1" });
+    const consult = TOOLS_BY_NAME.get("consult")!.run({ cd: "/repo", lane: "l1", question: "q1" });
     expect(consult.argv).toContain("--bg");
 
-    const reviewWithoutIntent = TOOLS_BY_NAME.get("review")!.run({ lane: "l1" });
+    const reviewWithoutIntent = TOOLS_BY_NAME.get("review")!.run({ cd: "/repo", lane: "l1" });
     expect(reviewWithoutIntent.argv).toContain("--bg");
 
-    const reviewWithIntent = TOOLS_BY_NAME.get("review")!.run({ lane: "l1", intent: "check security" });
+    const reviewWithIntent = TOOLS_BY_NAME.get("review")!.run({ cd: "/repo", lane: "l1", intent: "check security" });
     expect(reviewWithIntent.argv).toContain("--bg");
 
   });
 
   test("no tool argv contains wait", () => {
     const sampleInputs: Record<string, Record<string, unknown>> = {
-      spawn: { lane: "test-lane", brief: "test brief" },
-      resume: { lane: "test-lane", followUp: "test follow-up" },
-      consult: { lane: "test-lane", question: "test question" },
-      review: { lane: "test-lane", intent: "test review" },
+      land: { lane: "test-lane" },
+      ask: { cd: "/repo", question: "Where is admission?" },
+      "gate-receipt": { lane: "test-lane" },
+      spawn: { cd: "/repo", lane: "test-lane", brief: "test brief" },
+      resume: { lane: "test-lane", fix: "gate", followUp: "test follow-up" },
+      consult: { cd: "/repo", lane: "test-lane", question: "test question" },
+      review: { cd: "/repo", lane: "test-lane", intent: "test review" },
       events: {},
       send: { lane: "test-lane", text: "test text" },
       reply: { lane: "test-lane", answer: "test answer", id: 1 },
@@ -61,7 +66,7 @@ describe("tool rules", () => {
       close: { lane: "test-lane", note: "done" },
       kill: { lane: "test-lane" },
       gate: { lane: "test-lane", clear: true },
-      job: { name: "test-job", cmd: "echo 1" },
+      job: { cd: "/repo", name: "test-job", cmd: "echo 1" },
       msg: { target: "test-lane", text: "hello" },
       inbox: { lines: 5 },
       usage: {},
@@ -161,4 +166,17 @@ test("cwd fallback precedes execution and never retries a thrown command", async
   ran.length = 0;
   await expect(runFromCwd("/work", "/plugin", async () => { throw { code: "EACCES" }; }, execute)).rejects.toEqual({ code: "EACCES" });
   expect(ran).toEqual([]);
+});
+
+
+test("native admission refuses missing fields before argv conversion and reports command errors", () => {
+  const spawn = TOOLS_BY_NAME.get("spawn")!;
+  for (const brief of [undefined, null, "", " ", "undefined"]) {
+    expect(() => spawn.run({ lane: "fix", cd: "/repo", brief })).toThrow("missing required field: brief");
+  }
+  expect(() => TOOLS_BY_NAME.get("resume")!.run({ lane: "fix", fix: "new-work", followUp: "change scope" })).toThrow("invalid fix");
+  expect(nativeToolResult(2, "missing input")).toEqual({ isError: true, result: "missing input" });
+  expect(nativeToolResult(0, "answer")).toEqual({ result: "answer" });
+  expect(TOOLS_BY_NAME.get("ask")!.run({ cd: "/repo", question: "where?" })).toMatchObject({ argv: ["ask", "--cd", "/repo", "-"], stdin: "where?" });
+  expect(TOOLS_BY_NAME.get("land")!.run({ lane: "fix" }).argv).toEqual(["land", "fix"]);
 });

@@ -96,9 +96,9 @@ export function recoveryPartial(transcript: string, status: string, previous = "
   ].join("\n");
 }
 
-export function captureRecoveryPartial(lane: string, round: number, cwd: string): void {
+export function captureRecoveryPartial(lane: string, round: number, cwd: string, force = false): void {
   const full = reportPathOf(lane, round);
-  if (existsSync(full) && readFileSync(full, "utf8").trim()) return;
+  if (!force && existsSync(full) && readFileSync(full, "utf8").trim()) return;
   const transcriptPath = [logPathOf(lane, round, true), logPathOf(lane, round, false)].find(existsSync);
   const transcript = transcriptPath ? readFileSync(transcriptPath, "utf8") : "";
   const status = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--short"] });
