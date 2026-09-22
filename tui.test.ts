@@ -1,10 +1,10 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import { frameOutput, firstExhaustion, inlinePrism, liveKey, liveView, renderStatus, renderUsageTable, renderView, terminal, tuiEnabled, type Terminal } from "./tui.ts";
-import { usageTable } from "./cdx.ts";
+import { usageTable, writeCapturedReport } from "./cdx.ts";
 
 const lane = { name: "portal", active: true, block: "portal  running  r2\n18 steps 4 files" };
 const laneView = { title: "lanes", header: ["lane", "round", "state", "last step", "files", "gate"],
@@ -144,4 +144,20 @@ test("a failed live read restores input and removes its listeners", async () => 
   expect(process.listenerCount("SIGINT")).toBe(signals);
   expect(process.stdout.listenerCount("resize")).toBe(resize);
   expect(process.stdin.listenerCount("keypress")).toBe(keys);
+});
+
+test("a report the lane wrote itself survives the captured final message", () => {
+  const root = mkdtempSync(join(tmpdir(), "cdx-report-"));
+  try {
+    const path = join(root, "lane-r1.md");
+    writeCapturedReport(path, "first draft");
+    expect(readFileSync(path, "utf8")).toBe("first draft\n");
+    writeCapturedReport(path, "second draft");
+    expect(readFileSync(path, "utf8")).toBe("second draft\n");
+    writeFileSync(path, "# Judgement\n\n| a | b |\n");
+    writeCapturedReport(path, "Cycle fails.");
+    expect(readFileSync(path, "utf8")).toBe("# Judgement\n\n| a | b |\n\n## Final message\n\nCycle fails.\n");
+    writeCapturedReport(path, "Cycle fails, restated.");
+    expect(readFileSync(path, "utf8")).toBe("Cycle fails, restated.\n");
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -1292,6 +1292,18 @@ function validLane(lane: string): string {
 }
 
 const reportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.md`;
+// A lane may write its own report file during the round (tables, evidence
+// appended with a heredoc). The captured final message never replaces that
+// text; it lands below it under its own heading.
+const cdxWrittenReports = new Map<string, string>();
+export function writeCapturedReport(reportPath: string, message: string): void {
+  const text = `${message.trim()}\n`;
+  const existing = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
+  const laneWrote = existing.trim() !== "" && existing !== cdxWrittenReports.get(reportPath);
+  const content = laneWrote ? `${existing.trimEnd()}\n\n## Final message\n\n${text}` : text;
+  cdxWrittenReports.set(reportPath, content);
+  writeFileSync(reportPath, content);
+}
 const partialReportPathOf = (lane: string, round: number) => `${ROOT}/reports/${lane}-r${round}.partial.md`;
 
 function recoveryPartial(transcript: string, status: string, previous = ""): string {
@@ -3391,10 +3403,11 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     pollAgyLog();
   };
 
+  const writeReport = (message: string) => writeCapturedReport(reportPath, message);
   const persistCapturedReport = () => {
     const candidate = latestReportCandidate;
     if (!candidate || candidate.order <= writtenReportOrder || !completedTurns.has(candidate.turnId)) return;
-    writeFileSync(reportPath, `${candidate.text.trim()}\n`);
+    writeReport(candidate.text);
     writtenReportOrder = candidate.order;
   };
   const rememberAgentMessage = (item: Record<string, unknown>, turnId: string | undefined) => {
@@ -4106,7 +4119,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     // codex echoes the final message twice in the transcript; collapse exact doubling.
     const doubled = /^([\s\S]+?)\s*\1$/.exec(message);
     if (doubled) message = doubled[1]!;
-    if (message) writeFileSync(reportPath, `${message}\n`);
+    if (message) writeCapturedReport(reportPath, message);
   }
   // Success needs all three gates: exit 0, a nonempty report, and (implicitly)
   // the drained event log. The report is the lane's contract with its caller;
