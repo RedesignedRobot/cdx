@@ -8,6 +8,10 @@
 - Native commands fall back to the plugin directory only after a missing-cwd lookup before launch; errors after launch never retry.
 - Removed the fork CLI, native tool, dispatch, and unused review-exec mode; removed the TUI demo, PNG encoder, animation, and redundant fixture tests.
 
+## 7.8.0
+
+- The built-in `gpt-6-astra` effort cap rises from `medium` to `high` (owner ruling 2026-09-22: design councils run Astra at high reasoning). `xhigh` stays refused, config may still lower the cap, and every clamp path is unchanged.
+
 ## 7.7.3
 
 - The repeated-read alert is deleted. Two threshold bumps did not stop it: Gemini lanes and reviews reread files as routine, review lanes take no steers, and each alert cost the head a turn. Reads stay measured in cdx_tool records. Failed-command and edit-loop alerts are unchanged.
