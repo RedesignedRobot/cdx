@@ -141,6 +141,8 @@ cdx close slow-query "landed in a1b2c3d"
 
 ## How it works
 
+The CLI entrypoint remains `cdx.ts`. The [module map](docs/modules.md) names the files that own state, engine execution, commands, and presentation.
+
 ```mermaid
 flowchart LR
     head["Claude Code head"] -->|"mcp__cdx__* tools"| mod["cdx mod<br/>(function hooks)"]
