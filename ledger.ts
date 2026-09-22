@@ -624,8 +624,11 @@ export function roundReportOf(entry: Lane): string | undefined {
   return entry.kind === "review" ? entry.review?.report : entry.work.report;
 }
 
+// "undefined" and "null" are what a dropped tool field stringifies to; a lane
+// by that name cannot be addressed through the native tools afterwards.
 export function validLane(lane: string): string {
   if (!/^[a-z0-9][a-z0-9._-]*$/i.test(lane)) fail(`lane name "${lane}" must be alphanumeric with . _ - only`);
+  if (lane === "undefined" || lane === "null") fail(`lane name "${lane}" is reserved; name the lane after its work`);
   return lane;
 }
 

@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *), mcp__cdx__*
 ---
 
-# cdx 9.0.0
+# cdx 9.1.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -202,7 +202,7 @@ The dashboard reads discrete `work` and `review` round records. Version 5 remove
 
 Native tool output above 20 KB is retained under the cdx logs directory with bounded excerpts and a path; full safe output stays at the named path. Secret-shaped text is redacted before persistence and presentation. The pre-tool hook denies covered reads when the file has not changed. A moving owned path invalidates the gate receipt. Only a failed exit may receive one automatic repair turn and gate rerun. The terminal uses a small text mark without demo graphics.
 
-## 8.0 operating rules
+## Operating rules
 
 A work lane runs one typecheck and each touched spec once for mutation proof. The lane gate owns the suite and wall. A red gate gets one automatic repair turn before a terminal event; the head does not start a second repair while that turn runs.
 

@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 9.0.0
+# cdx 9.1.0
 
 **A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
@@ -8,7 +8,7 @@ Claude is the head. Astra thinks. Sol executes. cdx keeps the books and wakes th
 
 [![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
 [![Function hooks](https://img.shields.io/badge/function_hooks-native_tools-d97757)](#registered-tools)
-[![Version](https://img.shields.io/badge/version-9.0.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-9.1.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
 [![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
@@ -56,7 +56,7 @@ There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and pe
 
 ## Setup in 60 seconds
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.0.0:
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.1.0:
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx

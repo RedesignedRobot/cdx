@@ -262,7 +262,7 @@ supervisors run gpt-6-astra (alias astra); a child lane never runs Astra.
 For a whole change, use --engine gpt --supervisor: Astra owns the design,
 delegates bounded work to Sol or Gemini children, verifies, and reports.
 Children need one outcome, named files, and an acceptance gate.
---model picks a Codex model alias or id; Sol and Astra stay at effort high or below.`;
+--model picks a Codex model alias or id; Sol and Astra run at effort medium unless --effort high is asked for, and high is the cap.`;
 
 export function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
   const value = parsed.flags.engine;

@@ -17,7 +17,8 @@ import {
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
-import { missingCodexModels } from "./doctor.ts";
+import { missingCodexModels, usageVerdict } from "./doctor.ts";
+import { validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -527,6 +528,21 @@ test("9.0.0: doctor lists catalog gaps for configured Codex models", () => {
   expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-6-astra", "gpt-6-sol"])).toEqual([]);
   expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-7"])).toEqual(["gpt-7"]);
   expect(missingCodexModels(JSON.stringify([{ slug: "gpt-6-sol" }]), ["gpt-6-astra"])).toEqual(["gpt-6-astra"]);
+});
+
+test("9.1.0: projected exhaustion is a doctor caution; only a reached or 95% window blocks", () => {
+  const choice = { name: "codex-1", home: "/h" };
+  const projected = { choice, remainingPercent: 50, reached: false, reason: "", projections: [{ hoursToExhaustion: 20 }] } as never;
+  expect(usageVerdict(projected, 50)).toBe("caution");
+  expect(usageVerdict({ choice, remainingPercent: 0, reached: true, reason: "" }, 40)).toBe("blocked");
+  expect(usageVerdict({ choice, remainingPercent: 4, reached: false, reason: "" }, 96)).toBe("blocked");
+  expect(usageVerdict({ choice, remainingPercent: 70, reached: false, reason: "" }, 30)).toBe("ok");
+});
+
+test("9.1.0: lane names a dropped tool field stringifies to are refused", () => {
+  expect(() => validLane("undefined")).toThrow("reserved");
+  expect(() => validLane("null")).toThrow("reserved");
+  expect(validLane("undefined-fix")).toBe("undefined-fix");
 });
 
 test("fmtTokens and fmtTokensFull format tokens safely without NaN or literal undefined", () => {

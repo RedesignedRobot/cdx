@@ -5,7 +5,7 @@ import { installLaneHome, laneCodexHome, retiredLaneRule } from "./account-sync.
 import {
   accountChoices, adviceLines, cachedAccountStandings, configuredAccountSnapshots, defaultCodexHome,
   exhausting, formatAccountUsage, primaryAccount, refreshUsageSnapshot, resetCreditAlerts, shouldRedeemCredit,
-  standingOf,
+  standingOf, type AccountStanding,
 } from "./accounts.ts";
 import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
 import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
@@ -433,6 +433,14 @@ function checkCodexCatalog(home: string, good: (message: string) => void, bad: (
   good(`codex models: ${[...new Set(wanted)].join(", ")} in the catalog`);
 }
 
+type UsageVerdict = "ok" | "caution" | "blocked";
+
+export function usageVerdict(standing: AccountStanding, usedPercent: number): UsageVerdict {
+  if (standing.reached || usedPercent >= 95) return "blocked";
+  if (exhausting(standing) || usedPercent >= 75) return "caution";
+  return "ok";
+}
+
 export async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -547,6 +555,15 @@ export async function doctorCommand(argv: string[]) {
     catch (error) { bad(`agy agent ${agent}`, String(error), "run cdx doctor --fix"); }
   }
 
+  // Quota is a warning while any account can take work; doctor fails only
+  // when no account can (projected exhaustion used to fail every run).
+  const reportUsage = (indent: string, verdict: UsageVerdict, detail: string, standing: AccountStanding) => {
+    if (verdict === "ok") return good(`${indent}usage: ${detail}`);
+    if (verdict === "caution") return warn(`${indent}usage: ${detail}; caution: 25% or less remains or exhaustion is projected before reset`);
+    console.log(color.red(`${indent}usage: ${detail}`));
+    console.log(color.yellow(`${indent}     remedy: ${shouldRedeemCredit(standing) ? "redeem a reset credit in the codex TUI /usage or wait for reset" : "wait for reset or use another account"}`));
+  };
+  let blocked = 0;
   let loggedIn = false;
   if (config.accounts) {
     const entries = Object.entries(config.accounts);
@@ -573,17 +590,11 @@ export async function doctorCommand(argv: string[]) {
       }
       const formatted = formatAccountUsage(refreshed.usage);
       const standing = standingOf(account, refreshed.snapshot, readUsageHistory());
-      if (standing.reached || exhausting(standing) || formatted.usedPercent >= 95) {
-        failures += 1;
-        console.log(color.red(`  usage: ${formatted.detail}`));
-        console.log(color.yellow(shouldRedeemCredit(standing)
-          ? "       remedy: redeem a reset credit in the codex TUI /usage or wait for reset" : "       remedy: wait for reset or use another account"));
-      } else if (formatted.usedPercent >= 75) {
-        warn(`  usage: ${formatted.detail}; caution: 25% or less remains`);
-      } else {
-        good(`  usage: ${formatted.detail}`);
-      }
+      const verdict = usageVerdict(standing, formatted.usedPercent);
+      if (verdict === "blocked") blocked += 1;
+      reportUsage("  ", verdict, formatted.detail, standing);
     }
+    if (blocked === entries.length) bad("accounts", "no Codex account has usable quota", "redeem a reset credit in the codex TUI /usage or wait for a reset");
     for (const line of adviceLines(cachedAccountStandings())) console.log(color.cyan(line));
     for (const line of resetCreditAlerts(configuredAccountSnapshots())) console.log(color.red(line));
   } else if (version?.success) {
@@ -600,16 +611,9 @@ export async function doctorCommand(argv: string[]) {
     } else {
       const formatted = formatAccountUsage(refreshed.usage);
       const standing = standingOf(accountChoices()[0], refreshed.snapshot, readUsageHistory());
-      if (standing.reached || exhausting(standing) || formatted.usedPercent >= 95) {
-        failures += 1;
-        console.log(color.red(`usage: ${formatted.detail}`));
-        console.log(color.yellow(shouldRedeemCredit(standing)
-          ? "     remedy: redeem a reset credit in the codex TUI /usage or wait for reset" : "     remedy: wait for reset or use another account"));
-      } else if (formatted.usedPercent >= 75) {
-        warn(`usage: ${formatted.detail}; caution: 25% or less remains`);
-      } else {
-        good(`usage: ${formatted.detail}`);
-      }
+      const verdict = usageVerdict(standing, formatted.usedPercent);
+      if (verdict === "blocked") failures += 1;
+      reportUsage("", verdict, formatted.detail, standing);
       for (const line of resetCreditAlerts([{ name: "codex", snapshot: refreshed.snapshot }])) console.log(color.red(line));
     }
   }

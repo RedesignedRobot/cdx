@@ -1,3 +1,9 @@
+## 9.1.0
+
+- Sol and Astra run at effort medium unless `--effort high` is asked for; high stays the cap. The engine picker text says so.
+- `cdx doctor` no longer exits 1 because an account's usage projection runs out before its reset. That is now a caution. An account at its limit or at 95% is blocked, and doctor fails only when every configured account is blocked. Before this, two busy accounts failed every doctor run while four accounts could take work.
+- Lane names `undefined` and `null` are refused. They are what a dropped tool field stringifies to, and the native tools refuse them as missing, so a lane by that name could never be closed. The one legacy lane was retired in the ledger.
+
 ## 9.0.0
 
 - GPT-6 split, owner ruling 2026-09-23: Sol executes, Astra thinks. The config default `model` is `gpt-6-sol`. The new `thinkerModel` key defaults to `gpt-6-astra` and must be a nonempty string. Built-in aliases: `astra` resolves to `gpt-6-astra`, `sol` to `gpt-6-sol`.

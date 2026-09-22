@@ -319,7 +319,7 @@ const USAGE_CACHE_MS = 30 * 60 * 1000;
 
 const DEMAND_LABEL: Record<Demand, string> = { light: "consult/review", work: "work", supervisor: "supervisor" };
 
-interface AccountStanding {
+export interface AccountStanding {
   choice: AccountChoice;
   snapshot?: UsageSnapshot;
   creditSnapshot?: UsageSnapshot;
