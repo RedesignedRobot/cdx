@@ -1,0 +1,30 @@
+  /|
+ / | /
+/__|/__\
+cdx terminal prototype. Sample data.
+
+cdx  4 lanes  2 running
+
++- portal  running  work r2  gpt  supervisor
+|    owner  demo session
+|    lane  /workspace/portal
+|    progress  18 steps 4 files working last 9s
+|    last  Aligning the account page
+|  +- usage  running  work r1  gemini  parent=portal
+|  |    progress  8 steps 2 files working last 3s
+|  |    question  #4 waiting for the reset-window rule
+|  `- routes  done  work r1  gemini  parent=portal
+|       review  pending
+|       last  report /workspace/reports/routes.md
+`- quota  failed  work r1  gemini
+     last  provider unavailable
+     report  /workspace/reports/quota.md
+
+account  window   used   left    resets in  burn/h  at reset  empty in  holds
+-----------------------------------------------------------------------------
+astra-1  weekly  62.4%  37.6%        3d 4h    0.5%      0.0%     75.2h    10%
+gemini   5h          ?      ?  blocked 23m       ?         ?         -     0%
+gemini: usage unknown; quota hold. No values inferred.
+
+Reading the lane report...
+PNG written to /Users/mas/code/wt/cdx-tui/docs/tui-prism.png

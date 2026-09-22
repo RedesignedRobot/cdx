@@ -55,6 +55,7 @@ import { spawn as nodeSpawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { VISIBILITY_DEFAULTS, roundProgress, toolObservation, digestLines, heartbeatDue, type VisibilityConfig, type ProgressSample } from "./visibility.ts";
 import { syncAccountHomes } from "./account-sync.ts";
+import { renderStatus, renderUsageTable, renderNote } from "./tui.ts";
 import { tmpdir } from "node:os";
 import { isatty } from "node:tty";
 import { isAbsolute, join, relative, resolve } from "node:path";
@@ -5253,11 +5254,13 @@ async function statusCommand(argv: string[]) {
     console.log(JSON.stringify(enriched, null, 2));
     return;
   }
+  const tui = process.env.CDX_TUI === "1";
   const quotaState = geminiQuotaState();
   if (quotaState.block) {
-    console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
+    const note = `gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`;
+    console.log(tui ? renderNote(note) : color.yellow(note));
   }
-  if (all.length === 0) { console.log("cdx: no lanes"); printRunningJobs(); return; }
+  if (all.length === 0) { console.log(tui ? renderStatus([]) : "cdx: no lanes"); printRunningJobs(tui); return; }
   // Running lanes first (most recent activity on top), then finished ones
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
@@ -5268,9 +5271,14 @@ async function statusCommand(argv: string[]) {
   const finished = all.filter(([, entry]) => !laneRunning(entry) && (showAll || entry.work.state !== "closed")).sort(byRecency);
   const hidden = showAll ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
   const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
-  console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
-  if (hidden > 0) console.log(`\n${color.dim(`… ${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`)}`);
-  printRunningJobs();
+  console.log(tui ? renderStatus(lanes.map(([name, entry]) => ({
+    name, parent: entry.parent, active: laneRunning(entry), block: renderLaneBlock(name, entry),
+  }))) : lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
+  if (hidden > 0) {
+    const note = `${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`;
+    console.log(`\n${tui ? renderNote(note) : color.dim(`… ${note}`)}`);
+  }
+  printRunningJobs(tui);
 }
 
 async function waitCommand(argv: string[]) {
@@ -6515,7 +6523,7 @@ function geminiUsageRows(snapshot: GeminiUsageSnapshot | undefined, quota: Gemin
   });
 }
 
-function usageTable(rows: UsageRow[], now = Date.now()): string[] {
+function usageTable(rows: UsageRow[], now = Date.now(), tui = false): string[] {
   const percent = (n: number | null) => n === null ? "?" : `${n.toFixed(1)}%`;
   const cells = rows.map((r) => [r.account, r.window, percent(r.usedPercent), percent(r.remainingPercent),
     `${r.blockedUntil ? "blocked " : ""}${fmtUntil(r.blockedUntil ?? r.resetsAt, now)}`,
@@ -6523,6 +6531,7 @@ function usageTable(rows: UsageRow[], now = Date.now()): string[] {
     `${r.heldPercent}%`, r.tokensPerPercent === undefined ? "-" : String(r.tokensPerPercent)]);
   const header = ["account", "window", "used", "left", "resets in", "burn/h", "at reset", "empty in", "holds", "tokens/%"];
   if (!rows.some((r) => r.tokensPerPercent !== undefined)) { header.pop(); cells.forEach((c) => c.pop()); }
+  if (tui) return renderUsageTable(header, cells).split("\n");
   const widths = header.map((h, i) => Math.max(h.length, ...cells.map((c) => c[i].length)));
   return [header, ...cells].map((c) => c.map((v, i) => v.padEnd(widths[i])).join("  ").trimEnd());
 }
@@ -6595,15 +6604,16 @@ async function usageCommand(argv: string[]): Promise<void> {
     console.log(JSON.stringify({ windows, codex, advice, alerts: advice.alerts, gemini: gemini ?? null, geminiLedger: geminiTotals }, null, 2));
     return;
   }
-  usageTable(windows, now).forEach((line, index) => {
+  const tui = process.env.CDX_TUI === "1";
+  usageTable(windows, now, tui).forEach((line, index) => {
     const used = windows[index - 1]?.usedPercent ?? 0;
-    console.log(used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
+    console.log(tui ? line : used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
   });
   const lines = adviceLines(effectiveStandings, now);
   const geminiReason = geminiRows.find((w) => w.blockedUntil)?.reason ?? geminiRows.find((w) => w.reason !== "spend normally")?.reason;
   const geminiNote = geminiReason ? `gemini: ${geminiReason}.` : !gemini ? "gemini: usage unknown; probe failed." : "";
   if (geminiNote) lines[1] = [lines[1], geminiNote].filter(Boolean).join(" ");
-  for (const line of lines) console.log(line);
+  for (const line of lines) console.log(tui ? renderNote(line) : line);
   if (parsed.bools.has("totals")) {
     for (const [account, total] of [...totals, ["gemini", geminiTotals] as const])
       console.log(`${account}: lanes ${total.lanes}, ledger tokens ${fmtTokensFull(total.tokens, total.incomplete)}`);
@@ -7597,10 +7607,11 @@ function settledJob(name: string): Job | undefined {
   });
 }
 
-function printRunningJobs(): void {
+function printRunningJobs(tui = false): void {
   const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job) && owned(job.ownerSession));
   if (running.length === 0) return;
-  console.log(`\njobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`);
+  const text = `jobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`;
+  console.log(`\n${tui ? text.split("\n").map((line) => renderNote(line)).join("\n") : text}`);
 }
 
 function listJobs(): void {
