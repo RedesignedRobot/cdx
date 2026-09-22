@@ -1,3 +1,4 @@
+import { safeText, safeJSON } from "./safe-text.ts";
 // Codex protocol helpers, Gemini result and retry policy, and recovery prompts.
 
 import { config } from "./config.ts";
@@ -174,16 +175,6 @@ function readRolloutSessionMeta(path: string): RolloutSessionMeta | undefined {
   }
 }
 
-// A raw-session fork has no lane to borrow a cwd from; the rollout file named
-// by the UUID holds the session's real workdir.
-export function rolloutCwdForSession(codexHome: string, sessionId: string): string | undefined {
-  let files: string[];
-  try { files = readdirSync(`${codexHome}/sessions`, { recursive: true }) as string[]; } catch { return undefined; }
-  const suffix = `-${sessionId.toLowerCase()}.jsonl`;
-  const match = files.find((file) => file.toLowerCase().endsWith(suffix));
-  return match ? readRolloutSessionMeta(`${codexHome}/sessions/${match}`)?.cwd : undefined;
-}
-
 export function resolveSessionIdFromRollouts(spec: Spec, roundStartedAt?: string): string | undefined {
   if (!roundStartedAt) return undefined;
   const startedMs = Date.parse(roundStartedAt);
@@ -229,7 +220,7 @@ export interface AppTurn {
 }
 
 export function appServerWorkRound(spec: Spec, lane: Lane | undefined): boolean {
-  return lane?.kind === "work" && (spec.mode === "spawn" || spec.mode === "resume" || spec.mode === "fork");
+  return lane?.kind === "work" && (spec.mode === "spawn" || spec.mode === "resume");
 }
 
 export function inputText(text: string): AppInput {
@@ -452,16 +443,16 @@ export async function qualifyGeminiResult({ lane, round, ownerSession, result, f
       feedEvent("progress", `[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, ownerSession, { lane, round });
     }
     const qualified = qualifyGeminiReport(result, finalAgentResponse, isReview);
-    if (qualified.report !== undefined) writeFileSync(reportPath, qualified.report);
+    if (qualified.report !== undefined) writeFileSync(reportPath, safeText(qualified.report));
     if (qualified.findings !== undefined) {
-      writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify({ findings: qualified.findings }, null, 2)}\n`);
+      writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${safeJSON({ findings: qualified.findings }, 2)}\n`);
     }
     turnFailureReason = qualified.failureReason ?? turnFailureReason;
   } else {
     const response = typeof result.response === "string" ? result.response.trim() : "";
     const partial = finalAgentResponse || response;
     if (partial) {
-      writeFileSync(partialReportPathOf(lane, round), `${partial}\n`);
+      writeFileSync(partialReportPathOf(lane, round), safeText(`${partial}\n`));
       feedEvent("partial", `[cdx] lane=${lane} round=${round} partial report=${partialReportPathOf(lane, round)}`, ownerSession, { lane, round });
     }
   }
@@ -538,6 +529,7 @@ function canonicalHash(value: unknown): string {
 // go into cdx_tool, once per completed identity, beside those original events.
 export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null) {
   const progress = roundProgress(cwd, limits);
+  const reads = new Map<string, number>();
   const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
   const completed = new Set<string>();
   let warned = false;
@@ -590,7 +582,18 @@ export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (pat
       ...(start && canonicalHash(readFiles) !== canonicalHash(start.readFiles) ? { readFilesAfter: readFiles } : {}),
       treeBefore: null, treeAfter: null,
       ...(tokenDelta ? { tokenDelta } : {}), inputObservedBefore: Boolean(start) };
-    // Rereads are measured in the record above and never alert: every Gemini lane rereads files as routine.
+    // Collapse only successful, stable Gemini reads; measurements retain original byte counts.
+    if (step && before.kind === "read" && observation.failed !== true && output != null
+      && Object.keys(readFiles).length && Object.values(readFiles).every((hash) => hash !== null)
+      && canonicalHash(readFiles) === canonicalHash(before.readFiles)) {
+      const key = canonicalHash([before.argumentHash, readFiles]);
+      const previous = reads.get(key);
+      if (previous !== undefined) {
+        step.tool_info.output = `unchanged since step ${previous}`;
+        Object.assign(record, { reusedFromStep: previous, storedOutputBytes: Buffer.byteLength(step.tool_info.output) });
+      } else reads.set(key, step.step_index ?? count.steps);
+    }
+    // Repeated reads never alert the head; failed commands and edit loops still do.
     const reason = count.thrash;
     const thrash = !warned ? reason : undefined;
     if (thrash) warned = true;

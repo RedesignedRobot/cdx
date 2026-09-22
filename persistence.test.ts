@@ -1,0 +1,68 @@
+import { expect, test } from "bun:test";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { safeJSON, safeText } from "./safe-text.ts";
+import { executeGate, gateOutputForReport } from "./gates.ts";
+import { writeCapturedReport, writeProtocolEvent } from "./reports.ts";
+
+test("synthetic assignment is redacted in protocol, gate, report, feed, and terminal", () => {
+  const home = mkdtempSync(join(tmpdir(), "cdx-safe-"));
+  const fake = "fixture-value-without-provider-shape";
+  const line = `CONTEXT7_API_KEY=${fake}`;
+  try {
+    const jsonl = join(home, "round.jsonl");
+    writeProtocolEvent({ write: (text) => writeFileSync(jsonl, text), flush() {} },
+      { step_update: { tool_info: { parameters: { CommandLine: line }, output: line } } });
+    expect(JSON.parse(readFileSync(jsonl, "utf8")).step_update.tool_info.output).toBe("CONTEXT7_API_KEY=[redacted]");
+    const gatePath = join(home, "gate.log");
+    const gate = executeGate(`printf '%s\\n' '${line}'`, home, gatePath);
+    expect(gate.exitCode).toBe(0);
+    const report = join(home, "report.md");
+    writeFileSync(report, line);
+    writeCapturedReport(report, `${line}\n${gateOutputForReport(gate.output)}`);
+    const cli = new URL("./cdx.ts", import.meta.url).pathname;
+    const ledger = new URL("./ledger.ts", import.meta.url).pathname;
+    const child = Bun.spawnSync({ cmd: [process.execPath, "--eval",
+      `import { feedEvent } from ${JSON.stringify(ledger)}; feedEvent("message", ${JSON.stringify(line)}, "terminal");`],
+      env: { ...process.env, CDX_HOME: home }, cwd: home });
+    expect(child.exitCode).toBe(0);
+    // CLI error output also crosses the terminal boundary.
+    const terminal = Bun.spawnSync({ cmd: [process.execPath, cli, line], env: { ...process.env, CDX_HOME: home } });
+    const shown = terminal.stdout.toString() + terminal.stderr.toString();
+    expect(shown).not.toContain(fake);
+    for (const path of [jsonl, gatePath, report, join(home, "feed.log")]) {
+      const text = readFileSync(path, "utf8");
+      expect(text).not.toContain(fake);
+      expect(text).toContain("[redacted]");
+    }
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
+test("safe text covers provider shapes, quoted assignments, headers, and known environment secrets", () => {
+  for (const value of ["ctx7sk-" + "x".repeat(36), "sk-proj-" + "x".repeat(32), "sk-ant-" + "x".repeat(32),
+    "AIza" + "x".repeat(35), "ghp_" + "x".repeat(36), "github_pat_" + "x".repeat(40), "npm_" + "x".repeat(36)]) {
+    expect(safeText(`output ${value}`)).toBe("output [redacted]");
+  }
+  for (const assignment of ['KEY="quoted value"', "TOKEN='quoted value'", "MY_API_KEY=unshaped", "NPM_TOKEN=unshaped"]) {
+    expect(safeText(assignment)).toMatch(/=\[redacted\]$/);
+  }
+  expect(safeText("Authorization: Basic abc123\nnext line")).toBe("Authorization: [redacted]\nnext line");
+  const nested = JSON.stringify({ CommandLine: 'CONTEXT7_API_KEY="plain quoted secret"' });
+  expect(safeJSON({ arguments: nested })).not.toContain("plain quoted secret");
+  const key = "CDX_TEST_SECRET";
+  const old = process.env[key];
+  try {
+    process.env[key] = "unshaped-environment-secret";
+    expect(JSON.parse(safeJSON({ result: `before ${process.env[key]} after` })).result).toBe("before [redacted] after");
+  } finally { if (old === undefined) delete process.env[key]; else process.env[key] = old; }
+});
+
+test("stream redaction holds split assignments and UTF-8 before persistence", async () => {
+  const { safeLines } = await import("./safe-lines.ts");
+  const body = Buffer.from("é CONTEXT7_API_KEY=split-value\nlast TOKEN=tail-value");
+  async function* chunks() { for (const byte of body) yield Uint8Array.of(byte); }
+  let stored = "";
+  for await (const text of safeLines(chunks())) stored += text;
+  expect(stored).toBe("é CONTEXT7_API_KEY=[redacted]\nlast TOKEN=[redacted]");
+});

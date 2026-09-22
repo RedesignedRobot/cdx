@@ -1,3 +1,5 @@
+import { safeText } from "./safe-text.ts";
+import { safeLines } from "./safe-lines.ts";
 // Detached shell jobs and their lifecycle.
 
 import { feedEvent, owned, readLedger, withLockedJson } from "./ledger.ts";
@@ -8,7 +10,7 @@ import {
 } from "./runtime.ts";
 import { renderNote } from "./tui.ts";
 import { spawn as nodeSpawn } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export function jobCwd(explicit: string | undefined): string {
@@ -139,7 +141,7 @@ export async function jobCommand(argv: string[]) {
     }
     jobs[name] = { cmd, cwd, log, startedAt, state: "running", pid: process.pid, ...(ownerSession ? { ownerSession } : {}) };
   });
-  writeFileSync(log, `# cdx job ${name}\n# cwd ${cwd}\n# cmd ${cmd}\n# started ${startedAt}\n`);
+  writeFileSync(log, safeText(`# cdx job ${name}\n# cwd ${cwd}\n# cmd ${cmd}\n# started ${startedAt}\n`));
   const runnerLog = openSync(`${ROOT}/logs/job-${name}.runner.log`, "a");
   const child = nodeSpawn(process.execPath, [SELF, "_job", name], {
     detached: true,
@@ -159,10 +161,9 @@ export async function runJob(name: string): Promise<number> {
   if (!cmd || !cwd) fail("internal: _job needs CDX_JOB_CMD and CDX_JOB_CWD");
   const job = readJobs()[name];
   if (!job) fail(`internal: job "${name}" is missing from ${JOBS}`);
-  const log = openSync(job.log, "a");
   const env = { ...process.env };
   for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
-  const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", log, log] });
+  const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   let signal: string | undefined;
   const forward = (sig: NodeJS.Signals) => {
     signal = sig;
@@ -170,11 +171,14 @@ export async function runJob(name: string): Promise<number> {
   };
   process.on("SIGTERM", () => forward("SIGTERM"));
   process.on("SIGINT", () => forward("SIGINT"));
-  const exitCode = await new Promise<number>((resolve) => {
-    child.on("exit", (code, sig) => resolve(code ?? (sig ? SIGNAL_EXIT_CODES[sig] ?? 1 : 1)));
+  const exited = new Promise<number>((resolve) => {
+    child.on("close", (code, sig) => resolve(code ?? (sig ? SIGNAL_EXIT_CODES[sig] ?? 1 : 1)));
     child.on("error", () => resolve(1));
   });
-  closeSync(log);
+  const drain = async (stream: AsyncIterable<Uint8Array>) => {
+    for await (const text of safeLines(stream)) appendFileSync(job.log, text);
+  };
+  const [exitCode] = await Promise.all([exited, drain(child.stdout!), drain(child.stderr!)]);
   const state: JobState = exitCode === 0 ? "done" : "failed";
   const note = signal ? `terminated by ${signal}` : undefined;
   const finished = withJobs((jobs) => {

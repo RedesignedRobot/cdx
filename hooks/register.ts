@@ -15,6 +15,7 @@ import {
 import {
   CDX_TOOL_PREFIX,
   formatToolOutput,
+  runFromCwd,
   TOOL_NAMES,
   TOOLS,
   TOOLS_BY_NAME,
@@ -29,6 +30,7 @@ let surface: RenderSurface | null = null;
 let deliveryState: DeliveryState = initialDeliveryState();
 let pollInFlight = false;
 let pollCount = 0;
+let outputSequence = 0;
 // Each refusal message is logged once; the poll runs every two seconds and
 // a repeated log would flood the transcript.
 const loggedRefusals = new Set<string>();
@@ -123,7 +125,7 @@ function eventsToolResult(exitCode: number, stdout: string, stderr: string): str
       // malformed JSON: report the raw output below
     }
   }
-  if (exitCode !== 0) return formatToolOutput(exitCode, [...buffered, stdout].join("\n"), stderr);
+  if (exitCode !== 0) return [...buffered, stdout].join("\n");
   const lines = [...buffered, ...fresh];
   return lines.length ? lines.join("\n") : "no pending events";
 }
@@ -285,7 +287,7 @@ export function register(on: On) {
       timeoutMs?: number;
     } = {
       env: { CLAUDE_CODE_SESSION_ID: session },
-      cwd: await $.session.cwd().catch(() => root),
+      cwd: await $.session.cwd(),
     };
     if (runSpec.stdin !== undefined) {
       procInit.stdin = runSpec.stdin;
@@ -293,20 +295,15 @@ export function register(on: On) {
     if (runSpec.timeoutMs !== undefined) {
       procInit.timeoutMs = runSpec.timeoutMs;
     }
-    let res: Awaited<ReturnType<typeof $.process.run>>;
-    try {
-      res = await $.process.run(CDX.concat(runSpec.argv), procInit);
-    } catch (error) {
-      // The head's shell directory can be gone (it removed the worktree it
-      // stood in); a thrown hook reads as "no tool.call hook answered" in
-      // Claude Code, so rerun from the plugin root instead.
-      if (procInit.cwd === root) throw error;
-      res = await $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd: root });
-    }
-    if (toolName === "events") {
-      return { result: eventsToolResult(res.exitCode, res.stdout, res.stderr) };
-    }
-    const text = formatToolOutput(res.exitCode, res.stdout, res.stderr);
+    const res = await runFromCwd(procInit.cwd, root, (path) => $.fs.stat(path),
+      (cwd) => $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd }));
+    const stdout = toolName === "events" ? eventsToolResult(res.exitCode, res.stdout, res.stderr) : res.stdout;
+    const text = await formatToolOutput(res.exitCode, stdout, res.stderr, async (content) => {
+      const home = await $.env.get("CDX_HOME") || `${await $.env.get("HOME")}/.cdx`;
+      const path = `${home}/logs/native-${session}-${Date.now()}-${++outputSequence}.log`;
+      await $.fs.write(path, content);
+      return path;
+    });
     return { result: text };
   });
 

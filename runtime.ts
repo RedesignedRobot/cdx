@@ -1,3 +1,4 @@
+import { safeText } from "./safe-text.ts";
 // Process paths, child environments, argument parsing, and terminal text helpers.
 
 import { type Engine, type Tokens } from "./ledger.ts";
@@ -23,7 +24,7 @@ export const SELF = import.meta.path.replace(/\/runtime\.ts$/, "/cdx.ts");
 
 export const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
 
-export const VERSION = "7.7.3";
+export const VERSION = "7.9.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -107,7 +108,7 @@ export function fail(message: string): never {
 }
 
 export function singleLine(text: string): string {
-  return text.replace(/[\r\n]+/g, " ").trim();
+  return safeText(text).replace(/[\r\n]+/g, " ").trim();
 }
 
 export function pidAlive(pid?: number): boolean {
@@ -203,7 +204,7 @@ export function fmtCreated(iso: string): string {
 }
 
 export function statusText(text: string, limit: number): string {
-  const clean = text.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
+  const clean = safeText(text).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim();
   return clean.length <= limit ? clean : `${clean.slice(0, Math.max(0, limit - 3))}...`;
 }
 

@@ -49,7 +49,7 @@ Owned running lanes first (name, stage word, age since `lastActionAt ?? lastEven
 
 ### Free text from stdin everywhere
 
-Every command taking free text accepts `-` as that argument to read stdin: `spawn` and `job` already do; add `resume`, `consult`, `review` (intent), `fork`, `send`, `reply`, `msg`. A `-` with empty stdin fails with the command's usage line.
+Every command taking free text accepts `-` as that argument to read stdin: `spawn` and `job` already do; add `resume`, `consult`, `review` (intent), `send`, `reply`, `msg`. A `-` with empty stdin fails with the command's usage line.
 
 ### Doctor
 
@@ -113,7 +113,6 @@ Table-driven: `{ name, description, inputSchema, run(input) -> { argv, stdin?, t
 | resume | lane, followUp | effort, gate, pre, maxRuntime | `resume <lane> [flags] --bg -` |
 | consult | lane, question | engine, supervisor, model, effort, cd, account | `consult <lane> [flags] --bg -` |
 | review | lane | engine, model, effort, cd, uncommitted, base, commit, scope, intent | `review <lane> [flags] --bg [-]` |
-| fork | lane, source, brief | model, effort, account | `fork <lane> <source> [flags] --bg -` |
 | events | | | `events --json`; the mod answers with its own buffer first, then the feed, and empties the buffer |
 | send | lane, text | | `send <lane> -` |
 | reply | lane, answer | id | `reply <lane> [--id N] -` |

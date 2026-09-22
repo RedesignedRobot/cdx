@@ -1,4 +1,5 @@
-// Lane launch, spawn, resume, fork, review, consult, and cleanup commands.
+import { safeText, safeJSON } from "./safe-text.ts";
+// Lane launch, spawn, resume, review, consult, and cleanup commands.
 
 import {
   accountSpec, announceAccountSelection, defaultCodexHome, laneAccount, primaryAccount,
@@ -10,7 +11,6 @@ import {
 } from "./config.ts";
 import {
   CODEX_DISABLE_NATIVE_SUBAGENTS, freshAccountSpec, geminiCapacityNotice, recoveryPrompt,
-  rolloutCwdForSession,
 } from "./engines.ts";
 import {
   composeGate, executeGate, finishInvalidBaseline, printGateChange, repositoryGate, runPreCheck,
@@ -53,10 +53,8 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.codexHome = choice?.home;
     spec.model ??= entry.model ?? config.model;
     Object.assign(spec, accountSpec(choice));
-    if (changedHome && (spec.sourceThreadId || spec.mode === "resume" || spec.mode === "fork")) {
-      const historyLane = spec.sourceLane ? readLane(spec.sourceLane) : entry;
-      const historySpec = spec.sourceLane ? { ...spec, lane: spec.sourceLane } : spec;
-      freshAccountSpec(spec, entry, recoveryPrompt(historySpec, historyLane));
+    if (changedHome && (spec.sourceThreadId || spec.mode === "resume")) {
+      freshAccountSpec(spec, entry, recoveryPrompt(spec, entry));
       brief = spec.prompt;
     }
   }
@@ -66,8 +64,8 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.agent ??= readLedger()[spec.lane]?.kind === "review" ? policy.reviewAgent : policy.agent;
   }
   spec.startedAt ??= entry.roundStartedAt ?? new Date().toISOString();
-  writeFileSync(specPathOf(spec.lane, spec.round), JSON.stringify(spec, null, 2));
-  writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, brief);
+  writeFileSync(specPathOf(spec.lane, spec.round), safeJSON(spec, 2));
+  writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, safeText(brief));
   feedEvent("started", `[cdx] lane=${spec.lane} round=${spec.round} started report=${reportPathOf(spec.lane, spec.round)}`, spec.ownerSession, { lane: spec.lane, round: spec.round });
   const jsonMode = spec.engine === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
@@ -306,56 +304,6 @@ export async function resumeCommand(argv: string[]) {
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
   }, prompt, parsed.bools.has("bg"));
-}
-
-export async function forkCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "bg", "account", "model"]);
-  const [newLane, source, briefArg] = parsed.rest;
-  const usage = 'usage: cdx fork <newLane> <fromLane|sessionId> [--bg] "<brief>"';
-  const brief = await resolveBrief(briefArg, usage);
-  if (!newLane || !source || !brief) fail(usage);
-  validLane(newLane);
-  const ledger = readLedger();
-  const sourceLane = ledger[source];
-  if (sourceLane && laneEngine(sourceLane) === "gemini") fail("gemini has no headless fork; use cdx resume");
-  if (sourceLane && parsed.flags.model !== undefined) fail(`fork inherits the source lane's model (${laneModel(sourceLane)}); drop --model`);
-  const model = sourceLane ? laneModel(sourceLane) : modelOf(parsed, "gpt")!;
-  const parent = supervisorLane();
-  checkChildAstraRefusal(Boolean(parent), "gpt", model);
-  const sessionId = sourceLane
-    ? sourceLane.workSessionId ?? sourceLane.sessionId ?? source
-    : source;
-  if (!/^[0-9a-f-]{36}$/.test(sessionId)) fail(`"${source}" is neither a lane with a session nor a session UUID`);
-  const effort = resolveEffort("gpt", model, parsed.flags.effort, sourceLane?.effort);
-  let account: AccountChoice | undefined;
-  if (sourceLane) {
-    rejectPinnedAccountFlag(source, sourceLane, parsed.flags.account);
-    account = laneAccount(sourceLane);
-  } else {
-    account = primaryAccount(parsed.flags.account);
-  }
-  warnCachedUsageBeforeLaunch(account);
-  // exec fork keeps the source session's workdir; --cd would be a lie. For a
-  // raw session id the truth lives in the rollout's session_meta.
-  let cwd: string;
-  if (sourceLane) {
-    cwd = workCwdOf(sourceLane);
-  } else {
-    const codexHome = account?.home ?? process.env.CODEX_HOME ?? `${HOME}/.codex`;
-    const sessionCwd = rolloutCwdForSession(codexHome, sessionId);
-    if (!sessionCwd) {
-      console.error(color.yellow(`cdx: warning: could not resolve the session's workdir under ${displayPath(codexHome)}/sessions; recording ${process.cwd()}`));
-    }
-    cwd = sessionCwd ?? process.cwd();
-  }
-  const owner = callerOwnership();
-  const additionalDirectories = storedDirectories(source, sourceLane);
-  const effectiveGate = composeGate(repositoryGate(cwd), sourceLane?.gate);
-  const { round, selection } = await openRound(newLane, "work", cwd, effort, { engine: "gpt", account, owner, model, gate: sourceLane?.gate, forcedAccount: sourceLane ? parsed.flags.account : account?.name });
-  withLedger((ledger) => { ledger[newLane]!.additionalDirectories = additionalDirectories; });
-  const prompt = `Ground rules:\n${houseRules(cwd, false)}\n\nTask:\n${brief}`;
-  return launch({ effort, engine: "gpt", mode: "fork", ...(effectiveGate ? { gate: effectiveGate } : {}),
-    ...(additionalDirectories.length ? { additionalDirectories } : {}), lane: newLane, round, cwd, prompt, ...(sourceLane ? { sourceLane: source } : { model }), sourceThreadId: sessionId, ...accountSpec(account), ...ownershipSpec(owner) }, prompt, parsed.bools.has("bg"));
 }
 
 // consult: a read-only advisor lane. It runs as a read-only review, framed

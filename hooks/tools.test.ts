@@ -27,7 +27,7 @@ describe("tool rules", () => {
     expect(result.stdin).toBe("Fix the memory leak in worker thread");
   });
 
-  test("spawn, resume, consult, review, and fork always pass --bg", () => {
+  test("spawn, resume, consult, and review always pass --bg", () => {
     const spawn = TOOLS_BY_NAME.get("spawn")!.run({ lane: "l1", brief: "b1" });
     expect(spawn.argv).toContain("--bg");
 
@@ -43,8 +43,6 @@ describe("tool rules", () => {
     const reviewWithIntent = TOOLS_BY_NAME.get("review")!.run({ lane: "l1", intent: "check security" });
     expect(reviewWithIntent.argv).toContain("--bg");
 
-    const fork = TOOLS_BY_NAME.get("fork")!.run({ lane: "l2", source: "l1", brief: "b2" });
-    expect(fork.argv).toContain("--bg");
   });
 
   test("no tool argv contains wait", () => {
@@ -53,7 +51,6 @@ describe("tool rules", () => {
       resume: { lane: "test-lane", followUp: "test follow-up" },
       consult: { lane: "test-lane", question: "test question" },
       review: { lane: "test-lane", intent: "test review" },
-      fork: { lane: "test-lane-2", source: "test-lane", brief: "test brief" },
       events: {},
       send: { lane: "test-lane", text: "test text" },
       reply: { lane: "test-lane", answer: "test answer", id: 1 },
@@ -82,14 +79,14 @@ describe("tool rules", () => {
     }
   });
 
-  test("non-zero exits append stderr and the code", () => {
-    expect(formatToolOutput(0, "everything ok", "")).toBe("everything ok");
-    expect(formatToolOutput(1, "some stdout", "some stderr")).toBe(
+  test("non-zero exits append stderr and the code", async () => {
+    expect(await formatToolOutput(0, "everything ok", "")).toBe("everything ok");
+    expect(await formatToolOutput(1, "some stdout", "some stderr")).toBe(
       "some stdout\nsome stderr\nexit 1",
     );
-    expect(formatToolOutput(2, "", "command failed")).toBe("command failed\nexit 2");
-    expect(formatToolOutput(137, "", "")).toBe("exit 137");
-    expect(formatToolOutput(1, "partial stdout", "")).toBe("partial stdout\nexit 1");
+    expect(await formatToolOutput(2, "", "command failed")).toBe("command failed\nexit 2");
+    expect(await formatToolOutput(137, "", "")).toBe("exit 137");
+    expect(await formatToolOutput(1, "partial stdout", "")).toBe("partial stdout\nexit 1");
   });
 
   test("events tool drains the feed; the mod merges its buffer in front", () => {
@@ -124,4 +121,44 @@ describe("tool rules", () => {
     const result = doctor!.run({ probe: true });
     expect(result.timeoutMs).toBe(120000);
   });
+});
+
+// A large result must retain the whole safe body before returning excerpts.
+test("100 KB native output is bounded and names the retained file", async () => {
+  const { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const root = mkdtempSync(`${tmpdir()}/cdx-native-`);
+  const path = `${root}/logs/result.log`;
+  const secret = "not-a-provider-shaped-fixture";
+  const body = `head CONTEXT7_API_KEY=${secret}\n${"é😀".repeat(17000)}\ntail`;
+  try {
+    const output = await formatToolOutput(0, body, "", async (text) => {
+      mkdirSync(`${root}/logs`);
+      writeFileSync(path, text);
+      return path;
+    });
+    expect(Buffer.byteLength(output)).toBeLessThanOrEqual(20_000);
+    expect(output).toContain(path);
+    expect(output).toContain("head");
+    expect(output).toContain("tail");
+    expect(readFileSync(path, "utf8")).toBe(body.replace(secret, "[redacted]"));
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("cwd fallback precedes execution and never retries a thrown command", async () => {
+  const { runFromCwd } = await import("./tools");
+  const ran: string[] = [];
+  const execute = async (cwd: string) => { ran.push(cwd); return "ok"; };
+  const missing = async () => { throw Object.assign(new Error("missing cwd"), { code: "ENOENT" }); };
+  expect(await runFromCwd("/gone", "/plugin", missing, execute)).toBe("ok");
+  expect(ran).toEqual(["/plugin"]);
+  ran.length = 0;
+  await expect(runFromCwd("/work", "/plugin", async () => {}, async (cwd) => {
+    ran.push(cwd);
+    throw Object.assign(new Error("transport died after mutation"), { code: "ENOENT" });
+  })).rejects.toThrow("transport died after mutation");
+  expect(ran).toEqual(["/work"]);
+  ran.length = 0;
+  await expect(runFromCwd("/work", "/plugin", async () => { throw { code: "EACCES" }; }, execute)).rejects.toEqual({ code: "EACCES" });
+  expect(ran).toEqual([]);
 });

@@ -510,7 +510,7 @@ export function usageTable(rows: UsageRow[], now = Date.now(), tui = false): str
   if (tui) {
     return renderUsageTable(header, cells, undefined, firstExhaustion(rows)).split("\n");
   }
-  return renderTable(header, cells, { columns: Number.MAX_SAFE_INTEGER, color: false, unicode: false, graphics: false, motion: false },
+  return renderTable(header, cells, { columns: Number.MAX_SAFE_INTEGER, color: false, unicode: false },
     { legacy: true }).split("\n");
 }
 
@@ -523,7 +523,7 @@ export async function usageCommand(argv: string[]): Promise<void> {
 
   // All-time lane and token totals from the ledger, grouped by account.
   // Tokens only accrue on JSONL rounds (spawn, exec review); text rounds
-  // (resume, fork, native review) report none.
+  // (resume, native review) report none.
   const totals = new Map<string, { lanes: number; tokens: Tokens; incomplete: boolean }>();
   const geminiTotals = { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } as Tokens, incomplete: false };
   for (const entry of Object.values(readLedger())) {

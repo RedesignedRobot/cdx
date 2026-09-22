@@ -1,3 +1,4 @@
+import { safeText, safeJSON } from "./safe-text.ts";
 // Lane records, ledger migration and locks, ownership, and the event journal.
 
 import { CmdError, fail, LEDGER, ROOT, singleLine } from "./runtime.ts";
@@ -54,7 +55,7 @@ export type Effort = string;
 
 export type Engine = "gpt" | "gemini";
 
-type Mode = "spawn" | "resume" | "fork" | "review-exec" | "review-native";
+type Mode = "spawn" | "resume" | "review-native";
 
 export interface GeminiConfig {
   model: string;
@@ -220,7 +221,6 @@ export interface Spec {
   model?: string;
   codexArgs?: string[];
   sourceThreadId?: string;
-  sourceLane?: string;
   additionalDirectories?: string[];
   images?: string[];
   outputSchema?: unknown;
@@ -322,8 +322,8 @@ export function readEvents(): FeedEvent[] {
 }
 
 export function renderEvent(event: FeedEvent): string {
-  if (event.kind === "message") return `[cdx] msg to=${event.recipient} from=${event.from}: ${event.message}`;
-  return `${event.message} owner=${event.owner}`;
+  if (event.kind === "message") return safeText(`[cdx] msg to=${event.recipient} from=${event.from}: ${event.message}`);
+  return safeText(`${event.message} owner=${event.owner}`);
 }
 
 export function eventOwned(event: FeedEvent, session: string, state: SessionState): boolean {
@@ -338,7 +338,7 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
     if (kind === "terminal" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity, message: kind === "progress" ? message.split("\n").map(singleLine).join("\n") : singleLine(message) };
-    appendFileSync(`${ROOT}/feed.log`, `${JSON.stringify(event)}\n`);
+    appendFileSync(`${ROOT}/feed.log`, `${safeJSON(event)}\n`);
   });
 }
 
@@ -500,7 +500,7 @@ export function withLockedJson<S, T>(path: string, lock: string, read: () => S, 
     const state = read();
     const result = mutate(state);
     if (persist) {
-      const serialized = JSON.stringify(state, null, 2);
+      const serialized = safeJSON(state, 2);
       if (!existsSync(path) || readFileSync(path, "utf8") !== serialized) {
         const tmp = `${path}.tmp.${process.pid}`;
         writeFileSync(tmp, serialized);

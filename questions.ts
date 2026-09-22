@@ -1,3 +1,4 @@
+import { safeJSON } from "./safe-text.ts";
 // Questions, steering delivery, peer messages, and the Gemini invocation hook.
 
 import {
@@ -48,7 +49,7 @@ export function notifyParent(lane: string, text: string): void {
   const parentEntry = ledger[parent];
   if (!parentEntry || !laneRunning(parentEntry) || parentEntry.rounds !== parentRound || parentEntry.steerOpen === false) return;
   const record: ControlRecord = { text: singleLine(text), sentAt: new Date().toISOString(), from: "cdx" };
-  withLedger(() => { writeFileSync(controlPathOf(parent, parentRound), `${JSON.stringify(record)}\n`, { flag: "a" }); });
+  withLedger(() => { writeFileSync(controlPathOf(parent, parentRound), `${safeJSON(record)}\n`, { flag: "a" }); });
 }
 
 export interface ControlRecord {
@@ -98,7 +99,7 @@ export function questionFiles(lane?: string): Array<{ path: string; record: Ques
 
 function writeQuestion(path: string, record: QuestionRecord): void {
   const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, `${JSON.stringify(record, null, 2)}\n`);
+  writeFileSync(tmp, `${safeJSON(record, 2)}\n`);
   renameSync(tmp, path);
 }
 
@@ -136,7 +137,7 @@ export async function sendCommand(argv: string[]): Promise<void> {
     if (!laneRunning(current) || !pidAlive(current.pid)) throw new CmdError(`lane "${lane}" is not running`);
     if (current.kind === "review") throw new CmdError(`lane "${lane}" is a review lane; review turns do not accept steering`);
     if (current.steerOpen === false) throw new CmdError(`lane "${lane}" is finishing and no longer accepts steering`);
-    writeFileSync(controlPathOf(lane, current.rounds), `${JSON.stringify(record)}\n`, { flag: "a" });
+    writeFileSync(controlPathOf(lane, current.rounds), `${safeJSON(record)}\n`, { flag: "a" });
     return current;
   });
   console.log(`cdx: lane=${lane} round=${entry.rounds} steer queued`);

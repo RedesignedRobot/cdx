@@ -1,3 +1,5 @@
+import { safeText, safeJSON } from "./safe-text.ts";
+import { safeLines } from "./safe-lines.ts";
 // Round execution, engine event handling, account failover, and finalization.
 
 import { config, geminiConfig } from "./config.ts";
@@ -11,7 +13,7 @@ import {
   shortGeminiReason, shouldRetryGeminiTransport,
 } from "./engines.ts";
 import {
-  captureGateTree, captureReviewTree, changedReviewPath, classifyGateFailure, executeGate, finishGateReceipt,
+  captureGateTree, captureReviewTree, changedReviewPath, gateFailure, executeGate, finishGateReceipt,
   gateAcceptanceFailed, gateOutputForReport, verifyGate,
 } from "./gates.ts";
 import { parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
@@ -26,7 +28,7 @@ import {
 } from "./questions.ts";
 import {
   availableReportPath, captureRecoveryPartial, controlPathOf, excerpt, logPathOf, partialReportPathOf,
-  readJsonLines, renderTail, reportPathOf, specPathOf, writeCapturedReport,
+  readJsonLines, renderTail, reportPathOf, specPathOf, writeCapturedReport, writeProtocolEvent,
 } from "./reports.ts";
 import { failActiveRound, killChildren } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
@@ -37,7 +39,7 @@ import { invalidateAccountUsage, isFiniteCount, readUsageSnapshot, recordCodexEx
 import { toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { createHash } from "node:crypto";
 import {
-  appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, renameSync, statSync,
+  appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync,
   unlinkSync, writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
@@ -94,8 +96,8 @@ export async function runRound(lane: string, round: number): Promise<number> {
           // the head keeps its full resume budget.
           if (item.kind === "work" && item.workRounds) item.workRounds -= 1;
         });
-        writeFileSync(specPathOf(lane, spec.round), JSON.stringify(spec, null, 2));
-        writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, spec.prompt);
+        writeFileSync(specPathOf(lane, spec.round), safeJSON(spec, 2));
+        writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, safeText(spec.prompt));
         const notice = `[cdx] lane=${lane} round=${spec.round} capacity fallback: the 503 ladder on ${previousModel} ran out, this round continues the same conversation on ${policy.outageFallbackModel} (3.8 family, lower reasoning tier); the next resume returns to ${policy.model}; review this round's diff with the tier in mind`;
         feedEvent("outage", notice, spec.ownerSession, { lane, round: spec.round });
         notifyParent(lane, notice);
@@ -129,8 +131,8 @@ export async function runRound(lane: string, round: number): Promise<number> {
       const previousAccount = spec.account ?? "default";
       spec = { ...spec, round: opened.round, account: account?.name, codexHome: account?.home, startedAt: next.roundStartedAt ?? new Date().toISOString() };
       freshAccountSpec(spec, next, prompt);
-      writeFileSync(specPathOf(lane, spec.round), JSON.stringify(spec, null, 2));
-      writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, spec.prompt);
+      writeFileSync(specPathOf(lane, spec.round), safeJSON(spec, 2));
+      writeFileSync(`${ROOT}/briefs/${lane}-r${spec.round}.md`, safeText(spec.prompt));
       feedEvent("account", `[cdx] lane=${lane} round=${spec.round} auto-switch from=${previousAccount} to=${spec.account ?? "default"} reason=quota-exhausted fresh-session=true`, spec.ownerSession, { lane, round: spec.round });
       round = spec.round;
     } catch (error) {
@@ -391,7 +393,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     if (!turnId || item.type !== "agentMessage" || typeof item.text !== "string") return;
     const qualifying = item.phase === "final_answer" || item.phase == null;
     if (!qualifying) {
-      writeFileSync(partialReportPathOf(lane, round), `${item.text.trim()}\n`);
+      writeFileSync(partialReportPathOf(lane, round), safeText(`${item.text.trim()}\n`));
       announcePartial();
       return;
     }
@@ -416,13 +418,13 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const session = event.conversation_id ?? event.params?.thread?.id ?? event.thread_id;
     if (typeof session === "string" && session !== spec.sessionId) {
       spec.sessionId = session;
-      writeFileSync(specPathOf(lane, round), JSON.stringify(spec, null, 2));
+      writeFileSync(specPathOf(lane, round), safeJSON(spec, 2));
     }
     const observation = toolObservation(event);
     if (!observation) return;
     for (const file of observation.files) writtenPaths.add(resolve(spec.cwd, file));
     const progress = trackTools(event, now)!;
-    if (progress.record) { log.write(`${JSON.stringify(progress.record)}\n`); log.flush(); }
+    if (progress.record) { log.write(`${safeJSON(progress.record)}\n`); log.flush(); }
     roundStepCount = progress.steps;
     touchLedger((item) => {
       item.roundSteps = progress.steps;
@@ -586,7 +588,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
             const response = typeof result.response === "string" ? result.response.trim() : "";
             const partial = finalAgentResponse || response;
             if (partial) {
-              writeFileSync(partialReportPathOf(lane, round), `${partial}\n`);
+              writeFileSync(partialReportPathOf(lane, round), safeText(`${partial}\n`));
               announcePartial();
             }
             if (retryDecision.backoffMs > 0) {
@@ -625,12 +627,14 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
   };
 
+  let partialText = "";
   const handleCodexEvent = async (event: any) => {
     noteActivity();
     const now = new Date().toISOString();
     observeTool(event, now);
     if (event.method === "item/agentMessage/delta" && typeof event.params?.delta === "string") {
-      appendFileSync(partialReportPathOf(lane, round), event.params.delta);
+      partialText += event.params.delta;
+      writeFileSync(partialReportPathOf(lane, round), safeText(partialText));
       announcePartial();
     } else if (event.method === "thread/started" && event.params?.thread?.id) {
       touchLedger((item) => { item.sessionId = event.params.thread.id; item.lastEventAt = now; }, true);
@@ -718,13 +722,13 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 
   const pumpJson = async (stream: ReadableStream<Uint8Array>) => {
     for await (const event of readJsonLines(stream, { ignoreMalformed: true })) {
-      log.write(`${JSON.stringify(event)}\n`); log.flush();
       await (gemini ? handleGeminiEvent(event) : handleCodexEvent(event));
+      writeProtocolEvent(log, event);
     }
   };
   const pumpRaw = async (stream: ReadableStream<Uint8Array>, sink: typeof log) => {
-    for await (const chunk of stream) {
-      sink.write(chunk);
+    for await (const text of safeLines(stream)) {
+      sink.write(text);
       sink.flush();
       noteActivity();
       touchLedger((item) => { item.lastEventAt = new Date().toISOString(); });
@@ -836,7 +840,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const notify = (method: string) => writeRpc({ method });
     const pumpRpc = async (stream: ReadableStream<Uint8Array>) => {
       for await (const message of readJsonLines(stream, { ignoreMalformed: true })) {
-        log.write(`${JSON.stringify(message)}\n`); log.flush();
+        writeProtocolEvent(log, message);
         await handleCodexEvent(message);
         if (typeof message.id === "number" && pending.has(message.id)) {
           const waiter = pending.get(message.id)!;
@@ -885,9 +889,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         cwd: spec.cwd,
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" },
-        // A raw-session fork carries the requested model; a lane fork
-        // inherits its source thread's model and sends none.
-        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : spec.mode === "fork" && !spec.sourceLane ? { model: spec.model } : {}),
+        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
         effort: spec.effort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
       });
@@ -965,7 +967,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       });
       notify("initialized");
       const threadParams = appThreadParams(spec);
-      const method = spec.mode === "spawn" ? "thread/start" : spec.mode === "resume" ? "thread/resume" : "thread/fork";
+      const method = spec.mode === "spawn" ? "thread/start" : "thread/resume";
       const sourceThreadId = spec.sourceThreadId;
       if (method !== "thread/start" && !sourceThreadId) throw new Error(`${method} needs a source thread id`);
       const threadResult = await request(method, {
@@ -1145,7 +1147,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     || (!gemini ? resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt) : undefined);
   if (resolvedSessionId && spec.sessionId !== resolvedSessionId) {
     spec.sessionId = resolvedSessionId;
-    writeFileSync(specPathOf(lane, round), JSON.stringify(spec, null, 2));
+    writeFileSync(specPathOf(lane, round), safeJSON(spec, 2));
   }
   // The gate is the harness's own verification: a worker's optimistic done
   // claim cannot finalize green unless the gate command also passes. Work
@@ -1168,12 +1170,8 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       console.error(notice);
       feedEvent("progress", notice, spec.ownerSession, { lane, round });
     }
-    const verified = verifyGate(round, spec.cwd, spec.gate, () => captureGateTree(spec.cwd), (attempt) => {
-      if (attempt) feedEvent("progress", `[cdx] lane=${lane} round=${round} passing gate changed the tree; verifying once on the settled tree`, spec.ownerSession, { lane, round });
-      const path = `${ROOT}/logs/${lane}-r${round}.gate.log`;
-      if (attempt && existsSync(path)) renameSync(path, `${ROOT}/logs/${lane}-r${round}.gate-preparation.log`);
-      return executeGate(spec.gate!, spec.cwd, path);
-    });
+    const verified = verifyGate(round, spec.cwd, spec.gate, () => captureGateTree(spec.cwd),
+      () => executeGate(spec.gate!, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`));
     const { gate } = verified;
     gateReceipt = verified.receipt;
     if (shared.length) gateReceipt.sharedTreeLanes = shared;
@@ -1182,7 +1180,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
     gateTimedOut = gate.timedOut;
     setStage("reporting");
     feedEvent("gate-finished", `[cdx] lane=${lane} round=${round} gate finished exit=${gateExit} receipt=${gateReceipt.valid ? "valid" : "invalid"} log=${ROOT}/logs/${lane}-r${round}.gate.log`, spec.ownerSession, { lane, round });
-    writeFileSync(reportPath, `${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output)}\n\`\`\`\n`);
+    writeFileSync(reportPath, safeText(`${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output, gateExit)}\n\`\`\`\n`));
   }
   if (unchangedWork && existsSync(reportPath)) {
     appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
@@ -1219,11 +1217,12 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       const gateLogPath = `${ROOT}/logs/${lane}-r${round}.gate.log`;
       let gateLogOutput = "";
       try { gateLogOutput = readFileSync(gateLogPath, "utf8"); } catch {}
-      const failureKind = classifyGateFailure(gateExit ?? 1, gateLogOutput);
-      const kindLabel = failureKind === "setup" ? "gate setup failed" : "gate assertion failed";
+      const failure = gateFailure(gateExit ?? 1, gateLogOutput);
+      const kindLabel = `gate ${failure.kind} failed`;
       roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
         ? `${kindLabel} after work; baseline passed (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`
         : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath}); baseline was not checked, use --gate-baseline-check on spawn`;
+      roundNote = `${failure.diagnostic}\n${roundNote}`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (receivedSignal) roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;
     else if (turnFailureReason) {
@@ -1305,7 +1304,7 @@ async function finalizeRound({ spec, lane, round, jsonMode, gemini, logPath, rep
       try {
         const verdict = JSON.parse(blocks[index]![1]!) as { findings?: unknown };
         if (Array.isArray(verdict.findings)) {
-          writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${JSON.stringify(verdict, null, 2)}\n`);
+          writeFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, `${safeJSON(verdict, 2)}\n`);
           break;
         }
       } catch { /* not the verdict block */ }

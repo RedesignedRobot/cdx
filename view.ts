@@ -10,17 +10,11 @@ import { type Cursor, drainCursor, logPathOf, readTailLines } from "./reports.ts
 import { CmdError, parseArgs, ROOT } from "./runtime.ts";
 import { existsSync, readFileSync, statSync } from "node:fs";
 
-// The browser receives only rendered, redacted text. Terminal output stays unchanged.
-function redactViewText(text: string): string {
-  return text
-    .replace(/(CONTEXT7_API_KEY\s*=\s*|--api-key\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s;"']+)/gi, "$1[redacted]")
-    .replace(/ctx7sk[-_A-Za-z0-9]{8,}|sk-[A-Za-z0-9_-]{16,}|Bearer [A-Za-z0-9._-]{16,}|ghp_[A-Za-z0-9]{20,}/g, "[redacted]")
-    .replace(/\b(key|token|secret|password)\b[^\r\n]*/gi, (line) => line.replace(/[A-Za-z0-9+/_-]{32,}={0,2}/g, "[redacted]"))
-    .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "");
-}
+import { safeText } from "./safe-text.ts";
 
 function viewJSON(value: unknown): string {
-  return JSON.stringify(value, (_key, item) => typeof item === "string" ? redactViewText(item) : item);
+  return JSON.stringify(value, (_key, item) => typeof item === "string"
+    ? safeText(item).replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "") : item);
 }
 
 function viewStatusGroup(state: string): "running" | "done" | "failed" | "other" {

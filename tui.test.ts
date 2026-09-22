@@ -3,7 +3,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
-import { frameOutput, firstExhaustion, inlinePrism, liveKey, liveView, renderStatus, renderUsageTable, renderView, terminal, tuiEnabled, type Terminal } from "./tui.ts";
+import { frameOutput, firstExhaustion, liveKey, liveView, renderStatus, renderUsageTable, renderView, terminal, tuiEnabled, type Terminal } from "./tui.ts";
 import { usageTable, writeCapturedReport } from "./cdx.ts";
 
 const lane = { name: "portal", active: true, block: "portal  running  r2\n18 steps 4 files" };
@@ -11,7 +11,7 @@ const laneView = { title: "lanes", header: ["lane", "round", "state", "last step
   rows: [["portal", "2", "running", "edit", "4", "pending"]], progress: "1 running lane" };
 const usageHeader = ["account", "window", "used", "left", "resets in", "burn/h", "at reset", "empty in", "holds"];
 const usageRows = [["astra-1", "weekly", "62%", "38%", "3d", "0.5%", "0%", "76h", "10%"]];
-const plain = (columns: number): Terminal => ({ columns, color: false, unicode: false, graphics: false, motion: false });
+const plain = (columns: number): Terminal => ({ columns, color: false, unicode: false });
 const ansi = (columns: number): Terminal => ({ ...plain(columns), color: true });
 
 for (const columns of [80, 120]) {
@@ -74,13 +74,12 @@ test("narrow tables wrap lane names and preserve quota metrics", () => {
   for (const [index, label] of usageHeader.entries()) expect(quota).toContain(`${label}  ${usageRows[0]![index]}`);
 });
 
-test("NO_COLOR removes every escape, including redraw and image controls", () => {
+test("NO_COLOR removes every escape, including redraw controls", () => {
   const env = { CDX_TUI: "1", TERM: "xterm-ghostty", TERM_PROGRAM: "ghostty", NO_COLOR: "" };
   const term = terminal(env, true);
   const injected = "text\x1b[31mred\x1b[0m\x1b]0;title\x07";
   const outputs = [renderStatus([{ ...lane, block: injected }], term), renderView({ ...laneView, lines: [injected] }, term),
-    renderUsageTable(usageHeader, usageRows, term), inlinePrism(Buffer.alloc(0), term)];
-  expect(term.motion).toBe(false);
+    renderUsageTable(usageHeader, usageRows, term)];
   for (const output of outputs) expect(frameOutput(output, "", term, env)).not.toContain("\x1b");
 });
 

@@ -1,3 +1,4 @@
+import { safeText } from "../safe-text";
 // Table of tools exposed by the cdx mod. Pure definitions and argv builders.
 // Evaluated both in Claude Code hooks and in tests.
 
@@ -154,30 +155,6 @@ export const TOOLS: ToolDefinition[] = [
         return { argv, stdin: String(input.intent) };
       }
       return { argv };
-    },
-  },
-  {
-    name: "fork",
-    description: "Fork an existing lane into a new branch lane with a brief.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        lane: { type: "string", description: "Name for the new lane" },
-        source: { type: "string", description: "Source lane name or session id" },
-        brief: { type: "string", description: "Task brief for the new lane" },
-        model: { type: "string", description: "Model alias or id" },
-        effort: { type: "string", description: "Reasoning effort" },
-        account: { type: "string", description: "Account name" },
-      },
-      required: ["lane", "source", "brief"],
-    },
-    run: (input) => {
-      const argv = ["fork", String(input.lane), String(input.source)];
-      if (input.model) argv.push("--model", String(input.model));
-      if (input.effort) argv.push("--effort", String(input.effort));
-      if (input.account) argv.push("--account", String(input.account));
-      argv.push("--bg", "-");
-      return { argv, stdin: String(input.brief) };
     },
   },
   {
@@ -453,13 +430,30 @@ export const TOOLS_BY_NAME = new Map<string, ToolDefinition>(
   TOOLS.map((tool) => [tool.name, tool]),
 );
 
-export function formatToolOutput(exitCode: number, stdout: string, stderr: string): string {
-  if (exitCode === 0) {
-    return stdout;
+const OUTPUT_LIMIT = 20_000;
+
+const byteLength = (text: string) => new TextEncoder().encode(text).length;
+
+export async function formatToolOutput(exitCode: number, stdout: string, stderr: string,
+  retain?: (text: string) => Promise<string>): Promise<string> {
+  const text = safeText(exitCode === 0 ? stdout : [stdout, stderr, `exit ${exitCode}`].filter((part) => part.trim()).join("\n"));
+  if (byteLength(text) <= OUTPUT_LIMIT) return text;
+  if (!retain) throw new Error("large tool output requires a retained file");
+  const path = await retain(text);
+  const marker = `\n... full output: ${path} ...\n`;
+  // A UTF-16 code unit needs at most three UTF-8 bytes.
+  const size = Math.max(0, Math.floor((OUTPUT_LIMIT - byteLength(marker)) / 6) - 1);
+  if (!size) throw new Error("retained output path exceeds output limit");
+  return text.slice(0, size) + marker + text.slice(-size);
+}
+
+// Only a failed cwd lookup can select the fallback, before any command runs.
+export async function runFromCwd<T>(cwd: string, root: string,
+  stat: (path: string) => Promise<unknown>, run: (cwd: string) => Promise<T>): Promise<T> {
+  try { await stat(cwd); }
+  catch (error) {
+    if (cwd === root || !error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
+    cwd = root;
   }
-  const parts: string[] = [];
-  if (stdout.trim().length > 0) parts.push(stdout);
-  if (stderr.trim().length > 0) parts.push(stderr);
-  parts.push(`exit ${exitCode}`);
-  return parts.join("\n");
+  return run(cwd);
 }

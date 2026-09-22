@@ -9,7 +9,7 @@ import { geminiTranscriptPath } from "./engines.ts";
 import { gateCommand, gateReceiptCommand } from "./gates.ts";
 import { jobCommand, readJobs, runJob } from "./jobs.ts";
 import {
-  cleanCommand, consultCommand, forkCommand, resumeCommand, reviewCommand, spawnCommand,
+  cleanCommand, consultCommand, resumeCommand, reviewCommand, spawnCommand,
 } from "./lane-commands.ts";
 import {
   callerOwnership, laneRunning, readLane, readLedger, requireOwnChild, supervisorLane, validLane, withLedger,
@@ -38,7 +38,6 @@ ${ENGINE_PICKER}
 
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
   resume <lane> [--add-dir D]... [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
-  fork   <newLane> <fromLane|sessionId> [--model M] [--account NAME] [--effort E] [--bg] "<brief>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only gpt advisor; resume for follow-ups
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
@@ -79,7 +78,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "fork", "review", "consult", "adopt",
+  "spawn", "resume", "review", "consult", "adopt",
   "kill", "close", "clean", "gate", "reply", "job", "takeover",
 ]);
 
@@ -101,7 +100,6 @@ switch (command) {
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
-  case "fork": await forkCommand(argv); break;
   case "send": await sendCommand(argv); break;
   case "ask": await askCommand(argv); break;
   case "reply": await replyCommand(argv); break;

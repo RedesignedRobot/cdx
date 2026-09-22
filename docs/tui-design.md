@@ -27,9 +27,7 @@ Redraws use the current terminal width. Unchanged frames produce no output. `NO_
 
 ## Prism and motion
 
-The ArchitectMark paths are `M4 27 16 3 16 19 12 27Z` and `M20 11 28 27H18L20 23Z`. The text mark and generated 128 by 128 PNG use those polygons. The static asset is [tui-prism.png](tui-prism.png). `tui-demo.ts` retains the full mark and bounded lattice animation; production frames use a small text mark.
-
-Known Ghostty and Kitty terminals can show the demo PNG through the Kitty protocol. Pipes, unknown terminals, multiplexers, `NO_COLOR`, and `CDX_TUI_GRAPHICS=0` disable it. Detection remains passive and trusts environment variables. No terminal-response reader is installed for graphics. `CDX_TUI_MOTION=0`, CI, `NO_COLOR`, and insufficient width disable the demo animation.
+Production terminal frames use a small text mark.
 
 ## Gate witnesses
 
@@ -37,4 +35,4 @@ Known Ghostty and Kitty terminals can show the demo PNG through the Kitty protoc
 
 The lane did not run tests, typechecks, builds, terminal captures, or a wall. The gate must run `bun test`. `package.json` has no `typecheck` script. Its `check` script includes TypeScript, a build, and the suite, so do not run both `check` and `bun test` as duplicate suite runs.
 
-API references were read through Context7 `/nodejs/node` for keypress/raw-mode handling and `/oven-sh/bun` for child processes and snapshots. The original graphics references remain [Kitty graphics](https://sw.kovidanal.net/kitty/graphics-protocol/), [Ghostty features](https://ghostty.org/docs/features), and [PNG](https://www.w3.org/TR/png-3/).
+API references were read through Context7 `/nodejs/node` for keypress/raw-mode handling and `/oven-sh/bun` for child processes and snapshots.

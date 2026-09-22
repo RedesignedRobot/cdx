@@ -1,6 +1,6 @@
 ---
 name: cdx
-description: Run OpenAI Codex and Google Antigravity work, review, consult, question, and peer-message lanes through cdx. Use when spawning, resuming, forking, sending, asking, replying, messaging, adopting, reviewing, consulting, reporting, closing, or cleaning lanes from Claude Code.
+description: Run OpenAI Codex and Google Antigravity work, review, consult, question, and peer-message lanes through cdx. Use when spawning, resuming, sending, asking, replying, messaging, adopting, reviewing, consulting, reporting, closing, or cleaning lanes from Claude Code.
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *), mcp__cdx__*
 ---
 
@@ -80,14 +80,13 @@ Resume work with `--add-dir` to extend the stored directories, or native `addDir
 
 ## Commands
 
-Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `fork`, `send`, `reply`, `msg`, `job`, and `close`.
+Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `send`, `reply`, `msg`, `job`, and `close`.
 
 ```bash
 cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] ("<brief>" | -)
 cdx resume  <lane> [--add-dir D]... [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd D] [--bg] [--account NAME] ("<question>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
-cdx fork    <new> <lane|sessionId> [--model M] [--effort E] [--bg] [--account NAME] ("<brief>" | -)
 cdx gate    <lane> ("<cmd>" | --clear)
 cdx gate-receipt <lane> [--json]
 cdx send    <lane> ("<text>" | -)          # steer a running work lane
@@ -115,7 +114,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 
 - One lane: run `mcp__cdx__spawn` (or `cdx spawn ... --bg`).
   Independent lanes: spawn each in background, then let completion events wake the turn. Long liaison
-  commands can use `cdx job` (or `mcp__cdx__job`); supervisors cannot start jobs, fork, adopt, or clean.
+  commands can use `cdx job` (or `mcp__cdx__job`); supervisors cannot start jobs, adopt, or clean.
 - Multi-target `wait` in the CLI prints the target list, then each completion and report
   path as the five-second poll observes it. It ends with a summary and, with
   `--report`, report bodies. JSON output stays unchanged. Consult lanes show
@@ -217,3 +216,5 @@ The default filter shows running lanes and jobs only. Running, Done, Failed, and
 Astra/GPT uses violet orbits, Gemini teal scanlines, and jobs amber tickers. Motion shows running state, not progress. Quiet warnings start after five minutes without a lane event. Reduced motion disables animations. The page has no network fonts or runtime dependencies.
 
 The dashboard reads discrete `work` and `review` round records. Version 5 removes flat `state`, `cwd`, and `reviewState` aliases. Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines because the ledger has no model for that review. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.
+
+Native tool output above 20 KB is retained under the cdx logs directory with bounded excerpts and a path; apply the same bound to shell output. Secret-shaped text is redacted before persistence and presentation. Identical Gemini reads collapse only in cdx transcripts, without waking the head. The gate runs once; a moving tree produces an invalid receipt with changed paths. The terminal uses a small text mark without demo graphics.

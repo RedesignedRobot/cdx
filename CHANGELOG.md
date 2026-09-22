@@ -1,3 +1,13 @@
+## 7.9.0
+
+- Shared safe-text policy redacts protocol logs, gate and job output, reports, question and ledger text, native results, and terminal/browser output before persistence or display.
+- Gate failures retain the first diagnostic and typed cause before the output tail; a changing tree invalidates the receipt with named paths and never triggers an automatic rerun.
+- Native tool output is capped at 20 KB with the full safe text retained under the cdx logs directory.
+- Identical Gemini reads collapse in cdx transcripts and measurements without waking the head; provider context reuse remains outside cdx.
+- Standing rules are shorter, workers cannot delegate, timeouts grant no approval, and the lane agent leaves verification to the gate.
+- Native commands fall back to the plugin directory only after a missing-cwd lookup before launch; errors after launch never retry.
+- Removed the fork CLI, native tool, dispatch, and unused review-exec mode; removed the TUI demo, PNG encoder, animation, and redundant fixture tests.
+
 ## 7.7.3
 
 - The repeated-read alert is deleted. Two threshold bumps did not stop it: Gemini lanes and reviews reread files as routine, review lanes take no steers, and each alert cost the head a turn. Reads stay measured in cdx_tool records. Failed-command and edit-loop alerts are unchanged.

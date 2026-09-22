@@ -1,3 +1,4 @@
+import { safeText, safeJSON } from "./safe-text.ts";
 // Report capture, recovery partials, JSONL framing, and log readers.
 
 import {
@@ -45,7 +46,7 @@ export function writeCapturedReport(reportPath: string, message: string): void {
   const text = `${message.trim()}\n`;
   const existing = existsSync(reportPath) ? readFileSync(reportPath, "utf8") : "";
   const laneWrote = existing.trim() !== "" && existing !== cdxWrittenReports.get(reportPath);
-  const content = laneWrote ? `${existing.trimEnd()}\n\n## Final message\n\n${text}` : text;
+  const content = safeText(laneWrote ? `${existing.trimEnd()}\n\n## Final message\n\n${text}` : text);
   cdxWrittenReports.set(reportPath, content);
   writeFileSync(reportPath, content);
 }
@@ -104,12 +105,17 @@ export function captureRecoveryPartial(lane: string, round: number, cwd: string)
   const path = partialReportPathOf(lane, round);
   const previous = existsSync(path) ? readFileSync(path, "utf8") : "";
   mkdirSync(`${ROOT}/reports`, { recursive: true });
-  writeFileSync(path, recoveryPartial(transcript, status.success ? status.stdout.toString() : "Git status unavailable.", previous));
+  writeFileSync(path, safeText(recoveryPartial(transcript, status.success ? status.stdout.toString() : "Git status unavailable.", previous)));
 }
 
 export function availableReportPath(lane: string, round: number): string | undefined {
   return [reportPathOf(lane, round), partialReportPathOf(lane, round)]
     .find((path) => existsSync(path) && readFileSync(path, "utf8").trim().length > 0);
+}
+
+export function writeProtocolEvent(sink: { write(text: string): unknown; flush(): unknown }, event: unknown): void {
+  sink.write(`${safeJSON(event)}\n`);
+  sink.flush();
 }
 
 export const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;

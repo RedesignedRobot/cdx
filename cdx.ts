@@ -1,6 +1,8 @@
 #!/usr/bin/env bun
 // CLI entrypoint and stable public imports. See docs/modules.md for module ownership.
 
+import { format } from "node:util";
+import { safeText } from "./safe-text.ts";
 import { dispatch } from "./commands.ts";
 import { CmdError, color, ROOT } from "./runtime.ts";
 import { mkdirSync } from "node:fs";
@@ -58,6 +60,14 @@ export {
 } from "./worktrees.ts";
 
 if (import.meta.main) {
+  for (const output of [process.stdout, process.stderr]) {
+    const write: (...args: any[]) => boolean = output.write.bind(output);
+    output.write = ((chunk: any, ...args: any[]) => write(typeof chunk === "string" ? safeText(chunk) : Buffer.from(safeText(Buffer.from(chunk).toString())), ...args)) as typeof output.write;
+  }
+  for (const method of ["log", "error", "warn"] as const) {
+    const print = console[method].bind(console);
+    console[method] = (...args: unknown[]) => print(safeText(format(...args)));
+  }
   const isHookInvocation = process.argv[2] === "hook";
   if (!isHookInvocation && process.argv[2] !== "view" && process.argv[2] !== "status") {
     for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {

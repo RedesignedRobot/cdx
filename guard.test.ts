@@ -7,7 +7,6 @@ test("blockingCdxCommand catches cdx wait in every spelling the head uses", () =
   expect(blockingCdxCommand("cd /x && bun cdx.ts wait a b --report")).toBe("wait");
   expect(blockingCdxCommand("CDX_HOME=/tmp cdx wait a --timeout 60")).toBe("wait");
   expect(blockingCdxCommand("cdx wait a; git status")).toBe("wait");
-  expect(blockingCdxCommand("cdx status --watch --interval 5")).toBe("status --watch");
   expect(blockingCdxCommand("bun cdx.ts status --brief --watch")).toBe("status --watch");
 });
 

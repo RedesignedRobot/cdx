@@ -4,6 +4,7 @@
 
 | File | Responsibility |
 | --- | --- |
+| `safe-text.ts` | Shared secret redaction for storage and presentation |
 | `runtime.ts` | Process paths, child environments, argument parsing, errors, and text formatting |
 | `config.ts` | Config parsing, engine and model selection, effort caps, and round limits |
 | `ledger.ts` | Lane and round types, migration, JSON locks, ownership, and event storage |
@@ -21,7 +22,7 @@
 | `prompts.ts` | Injected rules, review frames, and resume prompts |
 | `jobs.ts` | Detached shell jobs and their lifecycle |
 | `session-commands.ts` | Event delivery, progress digests, takeover, and session briefs |
-| `lane-commands.ts` | Launch, spawn, resume, fork, review, consult, and cleanup |
+| `lane-commands.ts` | Launch, spawn, resume, review, consult, and cleanup |
 | `status.ts` | Status, wait, terminal tail views, and usage presentation |
 | `doctor.ts` | Engine installation, configuration checks, and diagnostic probes |
 | `view.ts` | Browser dashboard and event stream |
@@ -34,3 +35,5 @@ The runner keeps its shared GPT and Gemini event state in one function. Launch c
 The ledger still accepts unversioned records before the first v5 write. That write records `.ledger-version`; later reads reject old shapes. Keep this migration and the rejection together. Session cursor migration is separate and remains in `delivery`.
 
 `hooks/register.ts` invokes `bun <pluginRoot>/cdx.ts`; it does not import these Bun modules. `view.ts` remains beside `assets/`, preserving the dashboard asset URL. The package gate remains `bun run check`, including the single-file `bun build cdx.ts --target=bun` bundle. The lane gate runs it after the worker report.
+
+`hooks/tools.ts` bounds native results at 20 KB and requires retention of the full safe text; `hooks/register.ts` writes it under the cdx logs directory. Directory fallback occurs before launch on a missing cwd, never after an execution error. Gemini transcript reuse belongs to `roundTools`; provider tool execution is unchanged. Gate diagnostics retain the first fatal line and its typed cause. A gate runs once and rejects a moving tree with the changed paths in its receipt. `tui.ts` owns the production text mark and contains no demo graphics or animation.

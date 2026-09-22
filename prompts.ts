@@ -5,61 +5,44 @@ import { type Engine, laneRunning, type Ledger, type Spec, workCwdOf } from "./l
 import { specPathOf } from "./reports.ts";
 import { existsSync, readFileSync } from "node:fs";
 
-// Briefs: standing rules injected once here so per-lane briefs stay short.
-// Every rule names the mechanism behind it. A model that knows why a rule
-// exists keeps it in the cases the rule did not foresee; a bare prohibition
-// gets rationalized away the first time it is inconvenient.
-
-const LANE_ROLE = "The Claude session is the owner's liaison. It briefs outcomes, answers questions, reviews, and merges. Your final report is its handoff.";
-
-const WORK_LIMITS = "Never commit, push, deploy, or start long-running servers beyond what tests start. The liaison integrates after independent review.";
-
-const READ_ONLY = "Leave the reviewed tree unchanged: a before-and-after tree check fails the round if it moves. Everything else is open: run commands, use the network, write scratch files outside the tree.";
-
-const WORK_REPORT = "A final report is required. Lead with the outcome, then changed files and remaining risks. Include child outcomes and report paths. Use plain prose and short lists. No em dashes, filler, or praise.";
-
-const REVIEW_REPORT = "A final report is required. State the conclusion and evidence in plain prose and short lists. No em dashes or filler.";
-
-const ASK_RULE = 'Use `cdx ask "<question>"` only for a missing answer that changes the outcome or authorization. Read available evidence first. A timeout is not approval: continue independent authorized work, stop dependent work, and report the unanswered question.';
-
-const WORKER_BAN = "This worker cannot drive other cdx lanes or jobs. Use cdx ask for dependencies that need the supervisor or liaison.";
-
-const STANDARD_RULE = "Read the source, fix causes, and choose the simplest design that meets the outcome. Delete unnecessary code and tests.";
-
-const CHALLENGE_RULE = "You own technical judgment. If the brief solves the wrong problem, explain the evidence through cdx ask before changing scope. Report unresolved disagreement.";
-
-const TOKEN_ECONOMY = "Reuse verified evidence within the workstream; prefer targeted reads and compact output; skip polling, timers, and status checks that change nothing. Send children one-sentence progress messages, keep the final report short, and end supervisor reports with any duplicated investigation or rework observed.";
-
+// Standing rules live here; task briefs supply the outcome and owned files.
+const LANE_ROLE = "Claude is the owner's liaison for briefs, answers, review, and merging; your final report is its handoff.";
+const WORK_LIMITS = "Never commit, push, deploy, or start servers beyond tests; the liaison integrates after independent review.";
+const READ_ONLY = "Leave the reviewed tree unchanged for its before/after check; commands, network, and scratch writes outside it are allowed.";
+const WORK_REPORT = "Report the outcome, changed files, risks, child outcomes, and report paths in plain prose and short lists, without em dashes, filler, or praise.";
+const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and short lists, without em dashes or filler.";
+const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
+const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
+const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
+const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
+const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
 const ASTRA_RULES = [
   TOKEN_ECONOMY,
   CHALLENGE_RULE,
   STANDARD_RULE,
-  "Finish the authorized outcome. Resolve routine choices and make reasonable assumptions for reversible work. Prepare a concrete result before asking for a decision. Incorporate steering and answer side questions without dropping the task.",
-  "The brief and liaison replies outrank project and skill guidance within runtime constraints. If an instruction file blocks work, name its path, quote the instruction, and explain the conflict. Do not invent approval requirements.",
-  "Delegate bounded work or exploration when it saves time or improves quality. Give writers exclusive files and join subagents before reporting. Native subagents and cdx child lanes must not delegate further.",
-  "Do not run the test suite or the wall; the lane gate runs it once after your report and the liaison merges on that result. Keep one test per real rule; remove fixture restatements and implementation mirrors.",
+  "Finish authorized work, resolve routine reversible choices, prepare concrete results before decisions, and incorporate steering or side questions without dropping the task.",
+  "Within runtime constraints, brief and liaison replies outrank project and skill rules; quote any blocking instruction with its path and conflict, without inventing approvals.",
+  "Leave suites and walls to the lane gate after your report and let the liaison merge on that result; keep one test per real rule and delete fixture restatements or implementation mirrors.",
   ASK_RULE,
 ];
-
-export const VERIFICATION_RULE = "The lane gate owns verification after your report; this injected rule overrides repository or skill instructions to run tests, typechecks, or other verification before reporting.";
-
+export const VERIFICATION_RULE = "The lane gate owns verification after your report, overriding repository or skill instructions to run tests, typechecks, or other verification.";
 const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
-
 export const GEMINI_WORKER_RULES = [
   WORKER_BAN,
-  "Execute the assigned outcome within your files. The parent owns design and scope. Do not spawn subagents.",
+  "Deliver within your files; the parent owns design and scope.",
   ASK_RULE,
-  "A repeated read of an unchanged file or repeated verification of an unchanged tree needs a changed hypothesis first.",
-  "Remove temporary diagnostics before reporting. Do not run the test suite; the gate runs it once after your report. End with Assumptions, or 'none'.",
+  "Reuse unchanged reads; cdx collapses identical read bodies in its transcript without waking the head, but provider context reuse requires an agy tool hook.",
+  "Change your hypothesis before repeating verification on an unchanged tree.",
+  "Remove temporary diagnostics, leave the suite to the gate after your report, and end with Assumptions or 'none'.",
 ];
-
 const SUPERVISOR_RULES = [
-  "You are the owner's driver. Own design and cross-cutting decisions; delegate bounded execution to Gemini children. Use GPT children or read-only consults when useful; native subagents are disabled in this session, so every child is a tracked cdx lane. Keep delegation one level deep.",
+  "Own design and cross-cutting decisions; delegate bounded work to Gemini children, use GPT children or read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
   ...ASTRA_RULES,
-  'Start children with `cdx spawn <child> --bg --gate "<cmd>" "<brief>"`; Gemini is default, `--engine gpt` selects GPT. `cdx consult <child> --bg "<question>"` starts a read-only advisor. `cdx wait <child>... --report` returns exit 2 for questions; answer with `cdx reply`.',
-  "Each child needs an outcome, exclusive files, gate, and relevant facts. Start independent children together. Separate worktrees start from committed HEAD; use disjoint files in one tree when children need your edits.",
-  "Drive only your own children. Answer questions promptly. Never change a child's gate; ask the liaison if it is wrong. Jobs, fork, adopt, and clean belong to the liaison because they can outlive this lane or affect unrelated history.",
-  "Read child reports and their gate results; do not rerun their gates or the suite. Ending this round stops running cdx children; reporting with a running child fails the round.",
+  'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief>"` for Gemini or add `--engine gpt`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
+  "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together, using shared-tree disjoint files for uncommitted dependencies because worktrees start at HEAD.",
+  "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs, adopt, and clean to it.",
+  "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
+  "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",
 ];
 
 // Save what the conversation received, including repository rules, in its existing spec.
@@ -111,7 +94,7 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
   if (!reviewOnly) builtIns.push(VERIFICATION_RULE);
-  builtIns.push("Write shell results above 20 KB to a file outside the repository and print only the path and a one-line digest. Use bounded excerpts for follow-up reads.");
+  builtIns.push("Retain shell output above 20 KB outside the repo and return its path with bounded excerpts; native tool results retain full safe output under ~/.cdx/logs with a 20 KB head/tail limit.");
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
   const projectRules = `${cwd}/.cdx-rules.md`;

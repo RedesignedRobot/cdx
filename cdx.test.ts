@@ -544,55 +544,6 @@ test("Rank 5: qualifyGeminiResult treats SUCCESS with transport words as success
   try { unlinkSync(tmpReport); } catch {}
 });
 
-test("tokensIncomplete is a per-round flag isolated from prior lane tokensIncomplete", () => {
-  const round1Tokens = { input: 100, cached: 0, output: 20 };
-  const round2Tokens = { input: 200, cached: 50, output: 40 };
-
-  const round1Record = { round: 1, tokensIncomplete: true };
-  const round2Record = { round: 2, tokensIncomplete: undefined };
-  const laneRecord = { tokensIncomplete: true };
-
-  // Round 1 displays (incomplete)
-  expect(fmtTokens(round1Tokens, round1Record.tokensIncomplete)).toBe("100in/20out (incomplete)");
-
-  // Round 2 displays clean without (incomplete) despite laneRecord.tokensIncomplete
-  expect(fmtTokens(round2Tokens, round2Record.tokensIncomplete)).toBe("200in/40out");
-
-  // Lane total displays (incomplete) because round 1 was incomplete
-  expect(fmtTokens({ input: 300, cached: 50, output: 60 }, laneRecord.tokensIncomplete)).toBe("300in/60out (incomplete)");
-});
-
-test("usage token accumulation safely handles missing counters without NaN", () => {
-  const totals = { input: 0, cached: 0, output: 0 };
-  const legacyTokens = { input: 100 } as any;
-  totals.input += legacyTokens.input ?? 0;
-  totals.cached += legacyTokens.cached ?? 0;
-  totals.output += legacyTokens.output ?? 0;
-  expect(totals).toEqual({ input: 100, cached: 0, output: 0 });
-  expect(Number.isNaN(totals.cached)).toBe(false);
-  expect(Number.isNaN(totals.output)).toBe(false);
-});
-
-test("cdx usage --json row carries incomplete flag reflecting ledger state", () => {
-  const ledgerTotalsWithIncomplete = { lanes: 2, tokens: { input: 500, cached: 100, output: 50 }, incomplete: true };
-  const rowIncomplete = {
-    account: "work-account",
-    lanes: ledgerTotalsWithIncomplete.lanes,
-    ledgerTokens: ledgerTotalsWithIncomplete.tokens,
-    incomplete: Boolean(ledgerTotalsWithIncomplete.incomplete),
-  };
-  expect(rowIncomplete.incomplete).toBe(true);
-
-  const ledgerTotalsClean = { lanes: 1, tokens: { input: 200, cached: 50, output: 20 }, incomplete: false };
-  const rowClean = {
-    account: "clean-account",
-    lanes: ledgerTotalsClean.lanes,
-    ledgerTokens: ledgerTotalsClean.tokens,
-    incomplete: Boolean(ledgerTotalsClean.incomplete),
-  };
-  expect(rowClean.incomplete).toBe(false);
-});
-
 test("events selection advances cursor to last record read, marks wake events, and peek leaves cursor", () => {
   const session = "current-head";
   const records = [
@@ -953,28 +904,16 @@ test("required gate survives a missing lane gate and isolates shell control comm
   expect(shellQuote("echo 'ok'")).toBe("'echo '\"'\"'ok'\"'\"''");
 });
 
-test("a passing gate may prepare the tree once, but only a settled rerun earns a receipt", () => {
-  for (const finalTree of ["settled", "changed-again"]) {
-    let tree = "initial";
-    const checked: string[] = [];
-    const result = verifyGate(2, "/repo", "check", () => ({ head: "head", tree }), (attempt) => {
-      checked.push(tree);
-      tree = attempt === 0 ? "settled" : finalTree;
-      return { exitCode: 0, output: "", timedOut: false };
-    });
-    expect(checked).toEqual(["initial", "settled"]);
-    expect(result.receipt.tree).toBe(finalTree);
-    expect(result.receipt.valid).toBe(finalTree === "settled");
-    expect(result.receipt.reason).toBe(finalTree === "settled" ? undefined : "tree changed during gate");
-    expect(gateAcceptanceFailed(result.gate.exitCode, result.receipt, result.proofRequired)).toBe(finalTree !== "settled");
-  }
+test("a changing gate runs once and names changed paths in its invalid receipt", () => {
   let runs = 0;
-  const failed = verifyGate(2, "/repo", "check", () => ({ head: "head", tree: String(runs) }), () => {
+  const result = verifyGate(2, "/repo", "check", () => ({ head: "head", tree: String(runs) }), () => {
     runs++;
-    return { exitCode: 1, output: "failure", timedOut: false };
-  });
+    return { exitCode: 0, output: "ok", timedOut: false };
+  }, () => ["generated.ts", "other.ts"]);
   expect(runs).toBe(1);
-  expect(failed.receipt.valid).toBe(false);
+  expect(result.receipt.valid).toBe(false);
+  expect(result.receipt.reason).toBe("tree changed during gate: generated.ts, other.ts");
+  expect(gateAcceptanceFailed(result.gate.exitCode, result.receipt, result.proofRequired)).toBe(true);
 });
 
 test("account model admission refuses only explicit catalog exclusions with the model and account named", () => {
