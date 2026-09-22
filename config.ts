@@ -7,10 +7,18 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 // Codex reasoning efforts from cheapest to most expensive; effortCaps compare
-// against this order.
-const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh"];
+// against this order. Codex 0.156 also offers "ultra", which delegates to
+// native sub-agents; cdx lanes disable those, so ultra is not accepted.
+const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "high" };
+// Owner rulings: Astra runs at high at most (2026-09-22). Sol gets the same
+// ceiling until a ruling raises it; config may lower a cap, never raise one.
+const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "high", "gpt-6-sol": "high" };
+
+// GPT-6 split (owner ruling 2026-09-23): Sol executes work lanes, Astra thinks.
+// Astra runs head-launched consults, reviews and supervisors; children never.
+export const EXECUTOR_MODEL = "gpt-6-sol";
+export const THINKER_MODEL = "gpt-6-astra";
 
 function configError(message: string): never {
   fail(`${CONFIG_PATH}: ${message}`);
@@ -30,12 +38,13 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
+  const allowed = new Set(["model", "thinkerModel", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
   const defaults: Config = {
-    model: "gpt-6-astra",
+    model: EXECUTOR_MODEL,
+    thinkerModel: THINKER_MODEL,
     efforts: ["low", "medium", "high"],
     defaultEffort: "medium",
     rules: [],
@@ -45,6 +54,8 @@ export function parseConfig(text: string): Config {
 
   const model = Object.hasOwn(input, "model") ? input.model : defaults.model;
   if (typeof model !== "string" || model.trim().length === 0) configError("model must be a nonempty string");
+  const thinkerModel = Object.hasOwn(input, "thinkerModel") ? input.thinkerModel : defaults.thinkerModel;
+  if (typeof thinkerModel !== "string" || thinkerModel.trim().length === 0) configError("thinkerModel must be a nonempty string");
 
   let models: Record<string, string> | undefined;
   if (Object.hasOwn(input, "models")) {
@@ -182,14 +193,15 @@ export function parseConfig(text: string): Config {
   }
   return {
     ...limits, visibility,
-    model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
+    model, thinkerModel, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };
 }
 
 function readConfig(skipFile = false): Config {
   const defaults: Config = {
-    model: "gpt-6-astra",
+    model: EXECUTOR_MODEL,
+    thinkerModel: THINKER_MODEL,
     efforts: ["low", "medium", "high"],
     defaultEffort: "medium",
     rules: [],
@@ -244,21 +256,22 @@ function configuredEffort(effort: string): Effort {
   return effort;
 }
 
-export const ENGINE_PICKER = `gemini is the default; pass --engine gpt for design and judgment work.
-For a whole change, use --engine gpt --model gpt-6-astra --supervisor.
-The Astra supervisor owns the design, delegates bounded work, verifies, and reports.
-Gemini children need one outcome, named files, and an acceptance gate.
-Supervisors may also use GPT children and read-only consults, one level deep.
---model picks a Codex model alias or id; Astra effort stays at medium or below.`;
+export const ENGINE_PICKER = `gpt is the default engine; pass --engine gemini for mechanical sweeps.
+gpt work lanes run gpt-6-sol (alias sol). Head-launched reviews, consults and
+supervisors run gpt-6-astra (alias astra); a child lane never runs Astra.
+For a whole change, use --engine gpt --supervisor: Astra owns the design,
+delegates bounded work to Sol or Gemini children, verifies, and reports.
+Children need one outcome, named files, and an acceptance gate.
+--model picks a Codex model alias or id; Sol and Astra stay at effort high or below.`;
 
 export function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
   const value = parsed.flags.engine;
   if (value === undefined) {
-    console.log("cdx: engine gemini (default)");
-    return "gemini";
+    console.log("cdx: engine gpt (default)");
+    return "gpt";
   }
   if (value === "gpt" || value === "gemini") return value;
-  const usage = `usage: cdx ${command} requires --engine gpt|gemini; gemini is the default for fully specified work, gpt for judgment and design-heavy multi-file work`;
+  const usage = `usage: cdx ${command} requires --engine gpt|gemini; gpt is the default (Sol for work, Astra for head-launched thinking), gemini for mechanical sweeps`;
   if (command === "spawn") fail(`${usage}\n\n${ENGINE_PICKER}`);
   fail(usage);
 }
@@ -269,18 +282,22 @@ export function modelAliases(): string {
 }
 
 const DEFAULT_MODEL_ALIASES: Record<string, string> = {
-  astra: "gpt-6-astra",
+  astra: THINKER_MODEL,
+  sol: EXECUTOR_MODEL,
 };
 
 // --model takes an alias from config.models or a raw Codex model id. Gemini
 // lanes have one model and refuse the flag.
-export function modelOf(parsed: Parsed, engine: Engine): string | undefined {
+// Without --model, work lanes run the executor. Head-launched thinking lanes
+// (consult, review, supervisor) run the thinker; a child falls back to the
+// executor because a child never runs Astra.
+export function modelOf(parsed: Parsed, engine: Engine, role: "work" | "think" = "work", isChild = false): string | undefined {
   const value = parsed.flags.model;
   if (engine === "gemini") {
     if (value !== undefined) fail("--model applies to gpt lanes only; gemini always runs the configured gemini model");
     return undefined;
   }
-  if (value === undefined) return config.model;
+  if (value === undefined) return role === "think" && !isChild ? resolveCodexModel(config.thinkerModel ?? THINKER_MODEL) : config.model;
   const resolved = config.models?.[value] ?? DEFAULT_MODEL_ALIASES[value];
   if (resolved) return resolved;
   if (!MODEL_ID.test(value)) {

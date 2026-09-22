@@ -126,7 +126,9 @@ export async function runRound(lane: string, round: number): Promise<number> {
       }
       const prompt = recoveryPrompt(spec, entry);
       const opened = await openRound(lane, entry.kind, spec.cwd, spec.effort, {
-        engine: "gpt", preserveOwner: true, preserveGate: true, model: spec.model, excludedHomes: exhaustedHomes,
+        engine: "gpt", preserveOwner: true, preserveGate: true, excludedHomes: exhaustedHomes,
+        // A review round keeps its own model; the work thread keeps its model.
+        ...(entry.kind === "review" ? { reviewModel: spec.model } : { model: spec.model }),
       });
       const next = readLane(lane);
       const account = next.roundAccount;

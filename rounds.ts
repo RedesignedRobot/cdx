@@ -10,7 +10,7 @@ import { geminiAdmission, readGeminiUsageSnapshot, geminiQuotaState } from "./ge
 import { hookInstallState } from "./doctor.ts";
 import {
   type GateTree, type AccountChoice, type Demand, type Effort, type Engine, hasWorkThread, laneEngine, type LaneOwner,
-  laneRunning, type Lineage, readLedger, requireOwnChild, supervisorLane, withLedger, workCwdOf, workStateOf,
+  laneRunning, type Lane, type Lineage, readLedger, requireOwnChild, supervisorLane, withLedger, workCwdOf, workStateOf,
 } from "./ledger.ts";
 import { CmdError, pidAlive } from "./runtime.ts";
 import { readUsageSnapshot } from "./usage-store.ts";
@@ -18,14 +18,20 @@ import { type WorktreeInfo } from "./worktrees.ts";
 
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 
-export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
+// The Codex model this round runs: a review runs its own model beside the
+// work thread's.
+function roundModelOf(kind: "work" | "review", opts: { model?: string; reviewModel?: string } | undefined, existing: Pick<Lane, "model"> | undefined): string | undefined {
+  return (kind === "review" ? opts?.reviewModel : undefined) ?? opts?.model ?? existing?.model;
+}
+
+export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; reviewModel?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
   const existingBefore = readLedger()[lane];
   const isChildPre = Boolean(opts?.lineage?.parent ?? existingBefore?.parent ?? supervisorLane());
   const roundEnginePre = opts?.preserveEngine || (kind === "review" && existingBefore && hasWorkThread(existingBefore))
     ? laneEngine(existingBefore)
     : opts?.engine ?? (existingBefore ? laneEngine(existingBefore) : engine);
-  const resolvedModelCandidate = roundEnginePre === "gpt" ? opts?.model ?? existingBefore?.model : undefined;
+  const resolvedModelCandidate = roundEnginePre === "gpt" ? roundModelOf(kind, opts, existingBefore) : undefined;
   checkChildAstraRefusal(isChildPre, roundEnginePre, resolvedModelCandidate);
 
   for (;;) {
@@ -58,7 +64,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       const selection = engine === "gpt" ? chooseAccount(cachedAccountStandings(ledger).map((standing) => opts?.excludedHomes?.has(standing.choice.home) ? { ...standing, reached: true, reason: `already exhausted in this run; ${standing.reason}` } : standing), demand, opts?.forcedAccount, preferred) : undefined;
       const activeAccount = selection?.choice;
       if (engine === "gpt" && activeAccount) {
-        const model = resolveCodexModel(opts?.model ?? existing?.model);
+        const model = resolveCodexModel(roundModelOf(kind, opts, existing));
         const models = readUsageSnapshot(activeAccount)?.models;
         requireAccountModel(model, activeAccount.name, models);
       }
@@ -74,7 +80,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         console.error("cdx: agy hooks not installed; steering falls back to follow-up turns (cdx doctor --fix)");
       }
       const isChildCommitted = Boolean(opts?.lineage?.parent ?? existing?.parent ?? supervisorLane());
-      const roundModelCommitted = roundEngineType === "gpt" ? opts?.model ?? existing?.model : undefined;
+      const roundModelCommitted = roundEngineType === "gpt" ? roundModelOf(kind, opts, existing) : undefined;
       checkChildAstraRefusal(isChildCommitted, roundEngineType, roundModelCommitted);
       const queuedUntil = engine === "gemini" ? geminiQuotaState().block?.resetsAt ?? geminiAdmission(readGeminiUsageSnapshot(), ledger, Date.now(), lane).queuedUntil : undefined;
       ledger[lane] = {
@@ -87,6 +93,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         engine: roundEngineType,
         reviewEngine: kind === "review" ? opts?.engine ?? (existing ? laneEngine(existing) : engine) : existing?.reviewEngine,
         model: roundEngineType === "gpt" ? opts?.model ?? existing?.model : existing?.model,
+        reviewModel: kind === "review" ? opts?.reviewModel : existing?.reviewModel,
         // A spawn sets lineage explicitly (a respawn without --supervisor is
         // a plain lane again); every other round keeps what the lane had.
         supervisor: opts?.lineage ? (opts.lineage.supervisor ? true : undefined) : existing?.supervisor,

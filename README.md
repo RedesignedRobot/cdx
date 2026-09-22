@@ -1,14 +1,14 @@
 <div align="center">
 
-# cdx 8.0.0
+# cdx 9.0.0
 
 **A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
-Claude is the head. Astra drives. Gemini executes. cdx keeps the books and wakes the head when a lane needs it.
+Claude is the head. Astra thinks. Sol executes. cdx keeps the books and wakes the head when a lane needs it.
 
 [![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
 [![Function hooks](https://img.shields.io/badge/function_hooks-native_tools-d97757)](#registered-tools)
-[![Version](https://img.shields.io/badge/version-8.0.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-9.0.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
 [![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
@@ -17,7 +17,7 @@ Claude is the head. Astra drives. Gemini executes. cdx keeps the books and wakes
 
 </div>
 
-cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. Claude Code is the owner's liaison. It briefs an outcome to one Astra supervisor, answers questions, arranges independent review, and merges. Astra owns design and implementation and delegates bounded work to Gemini. cdx records lane state, reports, questions, logs, and token use.
+cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. Claude Code is the owner's liaison. It briefs an outcome to one Astra supervisor, answers questions, arranges independent review, and merges. Astra (`gpt-6-astra`) owns design and delegates bounded work to Sol (`gpt-6-sol`) children, or to Gemini for mechanical sweeps. cdx records lane state, reports, questions, logs, and token use.
 
 ## Native in Claude Code
 
@@ -52,11 +52,11 @@ sequenceDiagram
 | `/lanes` | Lane status, or any read-only cdx command, from the prompt. |
 | Status line | Running lanes, open questions, and quota, refreshed every ten seconds. |
 
-There is no wait tool by design. The CLI keeps `cdx wait` for Astra, Gemini, and people at a terminal.
+There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and people at a terminal.
 
 ## Setup in 60 seconds
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.154+ for `--engine gpt`, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 8.0.0:
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.0.0:
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
@@ -69,7 +69,7 @@ cdx doctor --fix
 cdx doctor --probe
 ```
 
-`doctor` checks engine binaries, login and usage, configuration, function hooks, mod polling, and stale ledger entries. For Antigravity it also checks agent files, loaded hooks, and model availability. `--fix` installs the shipped Antigravity agents and hooks and repairs stale rounds. `--probe` runs a short request through each installed engine. Missing `agy` is a warning unless the config enables Gemini.
+`doctor` checks engine binaries, login and usage, configuration, function hooks, mod polling, and stale ledger entries. For Codex it reads `<primary Codex home>/models_cache.json` and fails `codex models` when `model`, `thinkerModel` or an alias target is missing from the catalog; run `codex update`, then `codex debug models`. For Antigravity it also checks agent files, loaded hooks, and model availability. `--fix` installs the shipped Antigravity agents and hooks and repairs stale rounds. `--probe` runs a short request through each installed engine. Missing `agy` is a warning unless the config enables Gemini.
 
 `cdx doctor --fix` creates `<account-home>/cdx-lane` with short lane instructions and guarded hooks. It shares account auth, config and session paths without rewriting the interactive home. It installs real Gemini agent files under `~/.gemini/config/agents/`, removes retired cdx rules, and stores the work-lane defaults. Doctor checks `agy agents`; missing agents or hooks refuse new Gemini launches. Existing processes continue unchanged. New rounds use the new profile. Reload the Claude plugin after updating cdx to expose new native tools.
 
@@ -85,15 +85,15 @@ The page opens on running lanes and jobs. Running, Done, Failed, and All filters
 
 Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up.
 
-Violet orbits mark Astra/GPT, teal scanlines mark Gemini, and amber tickers mark jobs. These show running state, not measured progress. A lane with no events for five minutes gets a quiet warning. New rounds enter once; new transcript lines fade in. The page respects reduced motion, works offline, and follows the system light or dark theme. It uses system fonts and no dependencies.
+Violet orbits mark GPT, teal scanlines mark Gemini, and amber tickers mark jobs. These show running state, not measured progress. A lane with no events for five minutes gets a quiet warning. New rounds enter once; new transcript lines fade in. The page respects reduced motion, works offline, and follows the system light or dark theme. It uses system fonts and no dependencies.
 
 ## Two engines
 
-`--engine` is optional on spawn, review, and adopt and defaults to `gemini`. `--engine gpt` is explicit. Resume inherits the lane engine. Gemini always runs `gemini-3.8-flash-high`; cdx ignores `--effort` for Gemini with a note. A Gemini lane gets a 90-minute `--max-runtime` unless the flag says otherwise (`gemini.maxRuntimeMins` in the config); Codex lanes have no default cap.
+`--engine` is optional on spawn, review, and adopt and defaults to `gpt`; omitting it prints `cdx: engine gpt (default)`. `--engine gemini` is the opt-in engine for mechanical sweeps. Resume inherits the lane engine. Gemini always runs `gemini-3.8-flash-high`; cdx ignores `--effort` for Gemini with a note. A Gemini lane gets a 90-minute `--max-runtime` unless the flag says otherwise (`gemini.maxRuntimeMins` in the config); Codex lanes have no default cap.
 
-`--model M` picks the Codex model for a gpt lane: an alias from the `models` config map (`astra` for `gpt-6-astra`, say) or a raw model id. The lane keeps its model across resume, and review, and status shows it. The built-in `gpt-6-astra` effort cap is `high`. A child lane can never run `gpt-6-astra`. The refusal is checked on the resolved model (explicit `--model`, alias such as `astra`, config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog. Account probes request `model/list` with hidden models included and retain the complete catalog. Admission refuses only when a complete cached catalog excludes the resolved model, with the model and account named. A missing catalog admits the lane without a fallback probe. Account selection and sizing stay unchanged. The protocol is documented in [OpenAI's app-server model listing](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
+Without `--model`, a gpt work lane runs the config `model`, default `gpt-6-sol`. Head-launched thinking lanes (review, consult, and `spawn --supervisor`) run `thinkerModel`, default `gpt-6-astra`. `--model M` overrides either with an alias or a raw model id. The built-in aliases are `astra` for `gpt-6-astra` and `sol` for `gpt-6-sol`; the `models` config map adds more. The lane keeps its work model across resume, and status shows it. A review round runs Astra unless `--model` says otherwise and records `reviewModel` beside the lane's `model`, which stays the work thread's model; status shows the review round's model. A child lane can never run `gpt-6-astra` and falls back to Sol. The refusal is checked on the resolved model (explicit `--model`, alias such as `astra`, config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog. Account probes request `model/list` with hidden models included and retain the complete catalog. Admission refuses only when a complete cached catalog excludes the resolved model, with the model and account named. A missing catalog admits the lane without a fallback probe. Account selection and sizing stay unchanged. The protocol is documented in [OpenAI's app-server model listing](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
 
-`--supervisor` lets a GPT lane drive its own children through spawn, resume, review, consult, send, reply, kill, and close. Gemini is the default child engine; GPT children and read-only consults are also available. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate.
+`--supervisor` lets a GPT lane drive its own children through spawn, resume, review, consult, send, reply, kill, and close. Children run Sol on the default gpt engine, or Gemini for mechanical sweeps; read-only consults are also available. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate.
 
 Limits retained in 7.0.0:
 
@@ -108,18 +108,18 @@ Limits retained in 7.0.0:
 
 ```bash
 # Default path for a whole change
-cdx spawn search-fix --engine gpt --model gpt-6-astra --supervisor --bg \
+cdx spawn search-fix --supervisor --bg \
   --cd ~/code/myapp --gate "bun run check" "Fix the search timeout and verify the affected flows."
 cdx wait search-fix --report
 
-# A bounded task can go directly to Gemini
-cdx spawn fix-flaky-test --engine gemini --cd ~/code/myapp "The test in auth.test.ts fails
+# A bounded task goes straight to a Sol work lane
+cdx spawn fix-flaky-test --cd ~/code/myapp "The test in auth.test.ts fails
 intermittently. Find the race, fix it, and add a deterministic regression test."
 
 # Three workers in parallel, detached, each in its own git worktree
 cdx spawn api-docs   --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-docs --bg "Document every public endpoint in openapi.yaml."
 cdx spawn dead-code  --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-dead --bg "Find and delete unreachable code. List every deletion."
-cdx spawn slow-query --engine gpt --cd ~/code/myapp --worktree ~/code/myapp-perf --bg "Profile the /search endpoint and fix the N+1."
+cdx spawn slow-query --cd ~/code/myapp --worktree ~/code/myapp-perf --bg "Profile the /search endpoint and fix the N+1."
 cdx wait api-docs dead-code slow-query
 
 # Follow a worker thinking, live
@@ -131,8 +131,8 @@ cdx send slow-query "The slow path is /search/export, not /search."
 # Continue a thread with its context intact
 cdx resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] ("<fix instructions>" | -)
 
-# Review a worker's diff in a fresh, read-only session
-cdx review slow-query-review --engine gemini --cd ~/code/myapp-perf --uncommitted
+# Review a worker's diff in a fresh Astra session
+cdx review slow-query-review --cd ~/code/myapp-perf --uncommitted
 
 # Finish
 cdx report slow-query
@@ -149,7 +149,7 @@ flowchart LR
     mod -->|argv and stdin| cdx["cdx CLI"]
     cdx -->|supervisor lane| astra["Astra driver"]
     astra -->|delegate and verify| cdx
-    cdx -->|bounded tasks| children["Gemini or GPT children"]
+    cdx -->|bounded tasks| children["Sol or Gemini children"]
     children -->|reports and questions| cdx
     cdx -->|"feed, polled every 2 s"| mod
     mod -->|"[cdx] prompt or tool context"| head
@@ -313,9 +313,9 @@ Lane completion events include state, engine exit, `verdict`, log path, report p
 
 **Steer or resume.** `send` corrects a running lane via in-turn steering or a follow-up turn. `resume --fix gate|review` repairs failed evidence in the work conversation at the same HEAD.
 
-**Consult when the design is open.** `cdx consult design --engine gpt --model astra "<question>"` runs a read-only Codex lane framed as a senior advisor to the caller (either the Astra driver or the owner's liaison) with full freedom to challenge the premise, scope, and technical direction: ranked recommendation, rejected alternatives, evidence from the tree, and a closing "Decisions for the caller" list. `cdx consult helper --engine gemini "<question>"` runs a read-only Gemini helper. Adding `--supervisor` lets the consult start owned read-only Gemini helpers only. `cdx resume design "<follow-up>"` keeps the conversation going, still read-only. Status shows it as `consult`. A consult lane needs a fresh name and can never be respawned as a work lane, so its resume stays read-only. Skip the consult when the caller already has a settled design.
+**Consult when the design is open.** `cdx consult design "<question>"` runs a read-only Astra lane framed as a senior advisor to the caller (either the Astra driver or the owner's liaison) with full freedom to challenge the premise, scope, and technical direction: ranked recommendation, rejected alternatives, evidence from the tree, and a closing "Decisions for the caller" list. `cdx consult helper --engine gemini "<question>"` runs a read-only Gemini helper. Adding `--supervisor` lets the consult start owned read-only Gemini helpers only. `cdx resume design "<follow-up>"` keeps the conversation going, still read-only. Status shows it as `consult`. A consult lane needs a fresh name and can never be respawned as a work lane, so its resume stays read-only. Skip the consult when the caller already has a settled design.
 
-**Supervisor tree.** `cdx spawn plan --engine gpt --model astra --supervisor "<brief>"` hands one Codex lane a multi-part change. It briefs bounded parts to Gemini children with `cdx spawn --bg`, waits with `cdx wait --report`, reviews with `cdx review`, and reports once. The liaison sees the children under `parent=plan` in `cdx status` and kills the whole tree with `cdx kill plan`.
+**Supervisor tree.** `cdx spawn plan --supervisor "<brief>"` hands one Astra lane a multi-part change. It briefs bounded parts to Sol children, or Gemini children for mechanical sweeps, with `cdx spawn --bg`, waits with `cdx wait --report`, reviews with `cdx review`, and reports once. The liaison sees the children under `parent=plan` in `cdx status` and kills the whole tree with `cdx kill plan`.
 
 **Retest briefs and pass claims.** A verification brief requires candidate identity, item IDs under test, success or refusal obligation per item, one observable assertion per item, currently closed findings that could reopen, and an owned evidence directory. The completion report maps each pass to the new attempt and captured result. A refusal under a success obligation is failed or blocked, never passed. Old evidence may guide procedure, but it cannot establish a fresh attempt. Re-evaluate a closed finding against the current candidate before blocking on it. The liaison reads the actual result body before accepting a pass; schema validation proves register consistency, not fulfillment. Example:
 
@@ -329,7 +329,7 @@ Items under test:
 
 **Candidate preparation and proof.** The liaison finishes generation, packaging, and integration before naming the release candidate. No concurrent writer may touch the worktree during the proof run. If a fix changes the candidate, run fresh proof on the new commit and record why the previous proof no longer applies. A cancelled wall is not a green result. The liaison names one candidate, one gate result, and any later invalidating change. Production actions end at the owner.
 
-**Narrow briefs and one review.** A brief needs the outcome, consumer, exclusive files, prohibited actions, candidate and inputs, exact gate, and the specific assertion separating success from an attractive wrong answer. Send evidence and unresolved decisions, not transcripts or keystrokes. A lane with a settled edit is Gemini work, not an Astra supervisor holding one Gemini child. Briefs longer than 1,500 words trigger a harness warning. Conduct one independent review per consequential diff, covering affected callers and contracts. Ask for severity, trigger, file location, and failure mechanism. Separate accepted defects, disputed findings, integration hygiene, and unverified candidates. A clean review is a result, not a reason for another review; a changed commit or a failed review justifies one more. The reviewer reads the recorded gate result and never runs the test suite.
+**Narrow briefs and one review.** A brief needs the outcome, consumer, exclusive files, prohibited actions, candidate and inputs, exact gate, and the specific assertion separating success from an attractive wrong answer. Send evidence and unresolved decisions, not transcripts or keystrokes. A lane with a settled edit is a direct Sol lane, or Gemini for a mechanical sweep, not an Astra supervisor holding one child. Briefs longer than 1,500 words trigger a harness warning. Conduct one independent review per consequential diff, covering affected callers and contracts. Ask for severity, trigger, file location, and failure mechanism. Separate accepted defects, disputed findings, integration hygiene, and unverified candidates. A clean review is a result, not a reason for another review; a changed commit or a failed review justifies one more. The reviewer reads the recorded gate result and never runs the test suite.
 
 ## Claude Code integration
 
@@ -388,7 +388,7 @@ The mod registers native tools under the prefix `mcp__cdx__`:
 Owner ruling, 2026-09-15: the head never blocks on a lane.
 There is no `mcp__cdx__wait` tool.
 The head spawns a lane, keeps working or ends its turn, and the mod wakes it when events occur.
-`cdx wait` stays in the CLI for Astra, Gemini, and terminal operators.
+`cdx wait` stays in the CLI for supervisors and terminal operators.
 Mid-turn checks use `mcp__cdx__events` or `mcp__cdx__status`.
 The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, a `while`/`until`/`for` loop polling cdx, a sleep chain polling cdx, or follow-tail on cdx logs is denied with the same guidance, the way raw `codex` and `agy` calls are. Spawn `--bg` and `job` output tells the head to end its turn; inside a lane the same lines still point at `cdx wait`.
 
@@ -454,11 +454,12 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 
 ```json
 {
-  "model": "gpt-6-astra",
-  "models": { "astra": "gpt-6-astra" },
-  "efforts": ["low", "medium"],
+  "model": "gpt-6-sol",
+  "thinkerModel": "gpt-6-astra",
+  "models": { "astra": "gpt-6-astra", "sol": "gpt-6-sol" },
+  "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
-  "effortCaps": { "gpt-6-astra": "medium" },
+  "effortCaps": { "gpt-6-astra": "high", "gpt-6-sol": "high" },
   "rules": [],
   "worktreeSetup": "bun install",
   "gemini": {
@@ -476,11 +477,11 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
 }
 ```
 
-That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the Astra cap below, no aliases (so `--model astra` needs the `models` entry above), no rules, and the Gemini and visibility values shown.
+That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-sol`, thinkerModel `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the caps below, the built-in `astra` and `sol` aliases, no rules, and the Gemini and visibility values shown.
 
-- Existing top-level keys configure GPT. `model` is the default Codex model. `models` maps `--model` aliases to model ids (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
-- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, review, consult, and the doctor probe after alias resolution. The built-in value caps `gpt-6-astra` at `high`, so Astra runs `low`, `medium` or `high`; an explicit `--effort xhigh` fails with the allowed list. Any other source above the cap (the config `defaultEffort`, a lane recorded before the cap, a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note, and the clamped value travels with every turn, including review turns over app-server. Config may add caps for other models or lower a built-in cap; raising `gpt-6-astra` above `high` is a config error. `efforts` must stay within `minimal`, `low`, `medium`, `high`, `xhigh`.
-- `gemini` is optional. Its shown values are the defaults. `gemini.maxRounds` sets the round cap for Gemini lanes, default 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. Astra and GPT lanes are not capped. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
+- Existing top-level keys configure GPT. `model` is the Codex model for work lanes. `thinkerModel` is the model for head-launched review, consult and supervisor lanes; it must be a nonempty string. `models` maps `--model` aliases to model ids on top of the built-in `astra` and `sol` (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
+- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, review, consult, and the doctor probe after alias resolution. The built-in values cap `gpt-6-astra` and `gpt-6-sol` at `high`, so both run `low`, `medium` or `high`; an explicit `--effort xhigh` fails with the allowed list. Any other source above the cap (the config `defaultEffort`, a lane recorded before the cap, a Gemini review round that stored `high` on a gpt lane) clamps to the cap with a note, and the clamped value travels with every turn, including review turns over app-server. Config may add caps for other models or lower a built-in cap; raising a built-in cap is a config error. `efforts` must stay within the ladder `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex 0.156 also offers `ultra`, which delegates through native sub-agents; cdx disables those, so it refuses `ultra`.
+- `gemini` is optional. Its shown values are the defaults. `gemini.maxRounds` sets the round cap for Gemini lanes, default 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. GPT lanes are not capped. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
 - `visibility` is optional. Its shown values are the defaults. `heartbeatMinutes` must be a positive finite number defaulting to 10; it sets the interval for quiet progress digests when owned work runs. `failureRepeats` must be a positive integer defaulting to 5; it sets consecutive identical command failures before a thrash wake. `fileEdits` must be a positive integer defaulting to 20; it sets the maximum edits to the same file in a round before a thrash wake. A second matching read with unchanged observed file content also triggers the same wake and supervisor `CDX NOTICE`. All triggers share one notice per round and never terminate the worker. Reads use file content hashes. Tools do not take Git snapshots; unchanged-tree command repetition is not inferred from unavailable measurements. Missing hashes or start events cannot prove repetition. Gemini rules require a changed hypothesis before repeating either operation.
 - `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
 - `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
@@ -542,7 +543,7 @@ If `config.json` is absent, the defaults above apply. Malformed JSON or an incon
 <details>
 <summary><b>What the harness injects</b></summary>
 
-cdx injects the role, report contract, and engine rules. Gemini reads files under 800 lines whole once and uses shell codegraph. Native tool output retains the 20 KB transport bound; there is no shell-output prose rule. These built-in rules are followed by `config.json` rules and `.cdx-rules.md`. Astra resolves routine choices, follows steering, and carries authorized work through verification. It may delegate useful bounded work or exploration. Gemini executes a precise assignment without further delegation.
+cdx injects the role, report contract, and engine rules. Gemini reads files under 800 lines whole once and uses shell codegraph. Native tool output retains the 20 KB transport bound; there is no shell-output prose rule. These built-in rules are followed by `config.json` rules and `.cdx-rules.md`. GPT lanes resolve routine choices, follow steering, and carry authorized work through verification. Only an Astra supervisor delegates, to Sol or Gemini children; workers on either engine execute without further delegation.
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. A blocking instruction must be named and quoted. Questions are for missing decisions that affect outcome or authorization; timeout is not approval. Workers continue independent work and report unresolved dependencies.
 

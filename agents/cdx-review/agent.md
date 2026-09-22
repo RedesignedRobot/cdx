@@ -4,14 +4,13 @@ description: Review a cdx lane with read and shell tools only.
 mainAgent: true
 inheritMcp: false
 excludeDefaultComponents: true
-commandExecutionPolicy: unrestricted
+commandExecutionPolicy: eager
 tools:
   - view_file
   - find_by_name
   - list_dir
   - run_command
-  - command_status
-  - send_command_input
+  - manage_task
   - finish
 ---
 

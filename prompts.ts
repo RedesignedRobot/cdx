@@ -17,7 +17,7 @@ const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; a
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
 const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
-const ASTRA_RULES = [
+const GPT_RULES = [
   TOKEN_ECONOMY,
   CHALLENGE_RULE,
   STANDARD_RULE,
@@ -27,7 +27,7 @@ const ASTRA_RULES = [
   ASK_RULE,
 ];
 export const VERIFICATION_RULE = "Run one typecheck before the report, using vp check --no-fmt or the repository equivalent named in .cdx-rules.md, and each touched spec once for mutation proof. Never run the suite or the wall; the lane gate owns those.";
-const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
+const GPT_WORKER_RULES = [WORKER_BAN, ...GPT_RULES];
 export const GEMINI_WORKER_RULES = [
   WORKER_BAN,
   "Deliver within your files; the parent owns design and scope.",
@@ -36,9 +36,9 @@ export const GEMINI_WORKER_RULES = [
   "Remove temporary diagnostics and report commands and scope separately from the gate verdict. End with Assumptions or 'none'.",
 ];
 const SUPERVISOR_RULES = [
-  "Own design and cross-cutting decisions; delegate bounded work to Gemini children, use GPT children or read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
-  ...ASTRA_RULES,
-  'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief>"` for Gemini or add `--engine gpt`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
+  "Own design and cross-cutting decisions; delegate bounded work to Sol children (the default engine) or Gemini children for mechanical sweeps, use read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
+  ...GPT_RULES,
+  'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief>"` for Sol or add `--engine gemini`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
   "Never edit child-owned files. Put shared findings in a file referenced by child briefs and batch corrections into one send per child per review pass.",
   "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together, using shared-tree disjoint files for uncommitted dependencies because worktrees start at HEAD.",
   "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs, adopt, and clean to it.",
@@ -135,7 +135,7 @@ export function reviewFrame(_engine: Engine): string {
   return `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 }
 
-export const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You have full access: run commands, use the network, and write notes or maps where the caller asks. Edit tracked source only when the question asks for it. End with Decisions for the caller, limited to choices that need the caller or owner.`;
+export const CONSULT_FRAME = `CONSULT. Advise the supervisor or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You have full access: run commands, use the network, and write notes or maps where the caller asks. Edit tracked source only when the question asks for it. End with Decisions for the caller, limited to choices that need the caller or owner.`;
 
 export function resumeRefusal(kind: string | undefined, lane: import("./ledger.ts").Lane, head: string): string | undefined {
   const fresh = "New scope requires a fresh lane seeded from the report. Resume accepts only --fix gate or --fix review on the same diff.";

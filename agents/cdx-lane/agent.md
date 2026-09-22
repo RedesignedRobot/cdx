@@ -4,14 +4,13 @@ description: Work on a bounded cdx lane.
 mainAgent: true
 inheritMcp: false
 excludeDefaultComponents: true
-commandExecutionPolicy: unrestricted
+commandExecutionPolicy: eager
 tools:
   - view_file
   - find_by_name
   - list_dir
   - run_command
-  - command_status
-  - send_command_input
+  - manage_task
   - write_to_file
   - replace_file_content
   - multi_replace_file_content

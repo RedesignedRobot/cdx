@@ -7,7 +7,7 @@ import {
   exhausting, formatAccountUsage, primaryAccount, refreshUsageSnapshot, resetCreditAlerts, shouldRedeemCredit,
   standingOf,
 } from "./accounts.ts";
-import { config, geminiConfig, resolveEffort } from "./config.ts";
+import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
 import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
 import { formatGeminiStanding, geminiQuotaState, readGeminiUsageSnapshot, refreshGeminiUsage } from "./gemini-usage.ts";
 import { type AccountChoice, callerSession, laneRunning, readLedger, readSessions, withLedger } from "./ledger.ts";
@@ -171,13 +171,20 @@ function installAgentLink(name: string, sourceName: "cdx-lane" | "cdx-review"): 
   renameSync(`${state.target}.tmp.${process.pid}`, state.target);
 }
 
+// agy drops an agent whose frontmatter it rejects without an error (1.2.8
+// refused commandExecutionPolicy "unrestricted"), so launch asks agy itself.
 export function agentDiscovered(output: string, name: string): boolean {
-  return output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").split(/[^a-zA-Z0-9_-]+/).includes(name);
+  try {
+    const agents = JSON.parse(output.slice(output.indexOf("{")))?.command?.data?.agents;
+    return Array.isArray(agents) && agents.includes(name);
+  } catch {
+    return false;
+  }
 }
 
 export function requireGeminiAgent(name: string, cwd: string): void {
   if (hookInstallState().state !== "current") throw new Error("Gemini lane hooks are missing or stale; run cdx doctor --fix");
-  const result = Bun.spawnSync({ cmd: ["agy", "agents"], cwd, env: uncoloredChildEnv(), stdin: "ignore", timeout: 10_000 });
+  const result = Bun.spawnSync({ cmd: ["agy", "--output-format", "json", "agents"], cwd, env: uncoloredChildEnv(), stdin: "ignore", timeout: 10_000 });
   if (!result.success || !agentDiscovered(result.stdout.toString(), name)) {
     throw new Error(`agy agents did not discover ${name} in ${cwd}; run cdx doctor --fix`);
   }
@@ -401,6 +408,31 @@ async function checkDoctorAgyHooks(
 // differences without printing values that might contain server credentials.
 
 
+// Codex refreshes models_cache.json from the server catalog; a model id that
+// is not there fails every round that names it, so doctor checks the
+// executor, the thinker and every alias before a lane pays for the refusal.
+export function missingCodexModels(cacheText: string, wanted: readonly string[]): string[] {
+  const parsed = JSON.parse(cacheText) as { models?: Array<{ slug?: string }> } | Array<{ slug?: string }>;
+  const models = Array.isArray(parsed) ? parsed : parsed.models ?? [];
+  const known = new Set(models.map((model) => model.slug));
+  return [...new Set(wanted)].filter((id) => !known.has(id));
+}
+
+function checkCodexCatalog(home: string, good: (message: string) => void, bad: (label: string, detail: string, remedy: string) => void): void {
+  const cachePath = `${home}/models_cache.json`;
+  const wanted = [config.model, config.thinkerModel ?? THINKER_MODEL, ...Object.values(config.models ?? {})].map((id) => resolveCodexModel(id));
+  const remedy = "run `codex update`, then `codex debug models` to refresh the catalog";
+  if (!existsSync(cachePath)) return bad("codex models", `${cachePath} missing`, remedy);
+  let missing: string[];
+  try {
+    missing = missingCodexModels(readFileSync(cachePath, "utf8"), wanted);
+  } catch (error) {
+    return bad("codex models", `${cachePath} unreadable: ${error instanceof Error ? error.message : String(error)}`, remedy);
+  }
+  if (missing.length > 0) return bad("codex models", `not in the Codex catalog: ${missing.join(", ")}`, remedy);
+  good(`codex models: ${[...new Set(wanted)].join(", ")} in the catalog`);
+}
+
 export async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
   let failures = 0;
@@ -591,6 +623,7 @@ export async function doctorCommand(argv: string[]) {
   } else {
     warn(`config: warning: ${configPath} missing; cdx uses model ${config.model} and effort ${config.defaultEffort} from cdx policy`);
   }
+  checkCodexCatalog(primaryHome, good, bad);
 
   if (!Bun.which("cdx")) bad("path", "cdx not on PATH", `ln -s ${SELF} ~/.local/bin/cdx`);
 

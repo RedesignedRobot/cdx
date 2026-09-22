@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *), mcp__cdx__*
 ---
 
-# cdx 7.0.0
+# cdx 9.0.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -13,21 +13,21 @@ cases are in `README.md` next to it; read that when a command surprises you.
 
 ## The execution loop
 
-Owner rulings, 2026-09-07 to 2026-09-15: Astra thinks, Gemini works. The head briefs outcomes, answers questions, arranges independent review, and merges. It challenges decisions with evidence and does not prescribe the implementation.
+Owner rulings, 2026-09-07 to 2026-09-23: Astra thinks, Sol executes. The head briefs outcomes, answers questions, arranges independent review, and merges. It challenges decisions with evidence and does not prescribe the implementation.
 
-Use the native tools: `mcp__cdx__spawn` with the brief as a field, `mcp__cdx__reply`, `mcp__cdx__send`, `mcp__cdx__status`, `mcp__cdx__report`, and `mcp__cdx__close`. There is no `mcp__cdx__wait` tool. The head never blocks on a lane (owner ruling 2026-09-15). End your turn after spawning. Completion, questions, stalls, outages, and peer messages arrive as `[cdx]` events: as an automatic prompt when idle, or as context on the next tool result mid-turn. To check in mid-turn, call `mcp__cdx__events` or `mcp__cdx__status`. `cdx wait` stays in the CLI for Astra, Gemini, and terminal operators; from the head, the mod denies `cdx wait`, `cdx status --watch`, and shell loops polling cdx. If nothing else is pending after a spawn or job, ending the turn is the correct move. Inside Claude Code the mod denies a shell `cdx <subcommand>` that has a native tool (owner ruling 2026-09-17: the head calls cdx natively; the shell form is for lanes and terminals outside Claude Code). The Bash form `bun /Users/mas/code/cdx/cdx.ts ...` stays only for commands without a tool (brief, clean, feed, log, adopt). `mcp__cdx__spawn`, `consult` and `review` require `cd`, the absolute repository path, because the session directory follows the last shell `cd`.
+Use the native tools: `mcp__cdx__spawn` with the brief as a field, `mcp__cdx__reply`, `mcp__cdx__send`, `mcp__cdx__status`, `mcp__cdx__report`, and `mcp__cdx__close`. There is no `mcp__cdx__wait` tool. The head never blocks on a lane (owner ruling 2026-09-15). End your turn after spawning. Completion, questions, stalls, outages, and peer messages arrive as `[cdx]` events: as an automatic prompt when idle, or as context on the next tool result mid-turn. To check in mid-turn, call `mcp__cdx__events` or `mcp__cdx__status`. `cdx wait` stays in the CLI for supervisors and terminal operators; from the head, the mod denies `cdx wait`, `cdx status --watch`, and shell loops polling cdx. If nothing else is pending after a spawn or job, ending the turn is the correct move. Inside Claude Code the mod denies a shell `cdx <subcommand>` that has a native tool (owner ruling 2026-09-17: the head calls cdx natively; the shell form is for lanes and terminals outside Claude Code). The Bash form `bun /Users/mas/code/cdx/cdx.ts ...` stays only for commands without a tool (brief, clean, feed, log, adopt). `mcp__cdx__spawn`, `consult` and `review` require `cd`, the absolute repository path, because the session directory follows the last shell `cd`.
 
-Delegation tree: the head creates Astra lanes; Astra may spawn Gemini helpers through its own cdx. A child lane can never run gpt-6-astra. The refusal is checked on the resolved model (explicit `--model`, alias such as "astra", config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Gemini children never delegate. Gemini lanes always run `--effort high` (spawn, resume, review). Astra runs at effort medium by default and high when the head asks for it (owner ruling 2026-09-22); xhigh stays refused.
+Delegation tree: the head creates Astra lanes; Astra may spawn Sol or Gemini children through its own cdx. Astra never spawns Astra: a child lane can never run gpt-6-astra and falls back to Sol. The refusal is checked on the resolved model (explicit `--model`, alias such as "astra", config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Children never delegate. Sol and Astra run at effort medium by default; ask for high on deep design work (owner ruling 2026-09-22). Both are capped at high, so xhigh and max are refused. Gemini lanes always run `--effort high` (spawn, resume, review).
 
-One Astra lane per backlog, never one per finding. Give Astra the whole open set at once (every finding with full detail, every audit report, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Gemini lanes from that split, one worktree each off the integration branch. When the root cause is already known, skip Astra and brief Gemini directly with named files and a gate. When no account has supervisor headroom, a work-tier Astra lane still writes the plan and the head spawns the Geminis.
+One Astra lane per backlog, never one per finding. Give Astra the whole open set at once (every finding with full detail, every audit report, copied untracked into the worktree) and ask for one unified design: shared root causes, a disposition row per item, and a lane split with exclusive files, targeted gates and order. Then spawn the Sol lanes from that split, one worktree each off the integration branch, with Gemini for any mechanical sweep. When the root cause is already known, skip Astra and brief a Sol lane directly with named files and a gate. When no account has supervisor headroom, a work-tier lane with `--model astra` still writes the plan and the head spawns the workers.
 
 1. Hand a whole change to one supervisor with an acceptance gate using `mcp__cdx__spawn`:
-   `lane`: name, `engine`: `gpt`, `model`: `gpt-6-astra`, `supervisor`: true, `gate`: `<cmd>`, `brief`: `<text>`.
-   The brief is delivered whole through stdin, so quotes and newlines are safe. Astra owns the design and delegates bounded execution to tracked cdx child lanes or read-only consults. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate. End your turn after spawning.
+   `lane`: name, `supervisor`: true, `gate`: `<cmd>`, `brief`: `<text>`. The default gpt engine runs a supervisor on Astra.
+   The brief is delivered whole through stdin, so quotes and newlines are safe. Astra owns the design and delegates bounded execution to tracked Sol or Gemini child lanes or read-only consults. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate. End your turn after spawning.
 2. When a question arrives in a `[cdx]` prompt or context, answer with `mcp__cdx__reply`. Use `mcp__cdx__send` for corrections without dropping the task.
-3. When completion arrives, read the report (`mcp__cdx__report`) and gate result, arrange one read-only Gemini review (`mcp__cdx__review`), then call `mcp__cdx__land` for a managed worktree. Lanes must not commit, push, or deploy.
+3. When completion arrives, read the report (`mcp__cdx__report`) and gate result, arrange one independent review (`mcp__cdx__review`, Astra by default), then call `mcp__cdx__land` for a managed worktree. Lanes must not commit, push, or deploy.
 
-The CLI defaults to Gemini (`gemini-3.8-flash-high`). Astra requires `--engine gpt --model gpt-6-astra`; its effort cap is `high`. `cdx consult` accepts `--engine gpt|gemini` and `--supervisor`. A Gemini consult is a read-only helper. A consult with `--supervisor` may start only owned read-only Gemini consult helpers; it cannot spawn writable workers, GPT children, or grandchildren. Review hooks and fingerprints are accidental-write controls, not a security sandbox; the head copies artifacts out of the report. Every Bash call from the head starts with an absolute `cd` and invokes `bun /Users/mas/code/cdx/cdx.ts`, because batched calls share one cwd.
+The CLI defaults to the gpt engine. Work lanes run the config `model`, `gpt-6-sol`. Head-launched review, consult and `--supervisor` lanes run `thinkerModel`, `gpt-6-astra`. `--model astra` or `--model sol` overrides either. Use `--engine gemini --effort high` (`gemini-3.8-flash-high`) for mechanical sweeps: renames, bumps, doc sweeps, test fixes with a named cause. A review records its model as `reviewModel`; the lane's `model` stays the work model. If `cdx doctor` fails `codex models`, run `codex update`, then `codex debug models`. `cdx consult` accepts `--engine gpt|gemini` and `--supervisor`. A Gemini consult is a read-only helper. A consult with `--supervisor` may start only owned read-only Gemini consult helpers; it cannot spawn writable workers, GPT children, or grandchildren. Review hooks and fingerprints are accidental-write controls, not a security sandbox; the head copies artifacts out of the report. Every Bash call from the head starts with an absolute `cd` and invokes `bun /Users/mas/code/cdx/cdx.ts`, because batched calls share one cwd.
 
 ### Candidate preparation and proof
 
@@ -35,8 +35,8 @@ The head finishes code generation, packaging, and integration before naming the 
 
 ## Briefing
 
-State the outcome, constraints, acceptance command, and facts the lane would otherwise rediscover. Give Gemini exclusive files and a brief under a page. Let Astra choose the design and division of work. Free-text commands accept `-` to read stdin:
-`cdx spawn big --engine gpt --supervisor --bg --gate "<cmd>" - < /tmp/brief.md`.
+State the outcome, constraints, acceptance command, and facts the lane would otherwise rediscover. Give Sol and Gemini workers exclusive files and a brief under a page. Let Astra choose the design and division of work. Free-text commands accept `-` to read stdin:
+`cdx spawn big --supervisor --bg --gate "<cmd>" - < /tmp/brief.md`.
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. If a file blocks work, the lane must name its path, quote the instruction, and explain the conflict. Resolve routine choices without asking. Ask only for missing decisions about outcome or authorization. A timeout is not approval; continue independent work and report the unresolved dependency.
 
@@ -66,7 +66,7 @@ Items under test:
 
 ### Narrow briefs and independent review
 
-A brief requires seven elements: outcome, consumer, exclusive files, prohibited actions, candidate identity and inputs, exact gate command, and the specific assertion separating success from an attractive wrong answer. Send verified evidence and unresolved decisions, not transcripts or keystrokes. A task with a settled edit belongs to a direct Gemini lane, not an Astra supervisor holding a single Gemini child. Briefs longer than 1,500 words trigger a harness warning; keep briefs compact by referencing repository rules instead of copying them.
+A brief requires seven elements: outcome, consumer, exclusive files, prohibited actions, candidate identity and inputs, exact gate command, and the specific assertion separating success from an attractive wrong answer. Send verified evidence and unresolved decisions, not transcripts or keystrokes. A task with a settled edit belongs to a direct Sol lane, or Gemini for a mechanical sweep, not an Astra supervisor holding a single child. Briefs longer than 1,500 words trigger a harness warning; keep briefs compact by referencing repository rules instead of copying them.
 
 Order one independent review per consequential diff, covering affected callers and contracts. Ask the reviewer for severity, trigger, file location, and failure mechanism. Classify review output into accepted defects, disputed findings, integration hygiene, and unverified candidates. Do not treat untracked file hygiene as a runtime defect. A clean review is a result, not a reason for another review; a changed commit or a failed review justifies one more. The reviewer reads the recorded gate result and never runs the test suite.
 
@@ -144,7 +144,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   Intended use: `--pre "bun qa.ts readiness-check --release <sha>"` before any
   register cell lane.
 - Lanes touching the same repository get `--worktree`, or disjoint files in
-  one tree with no other writer. Never run a Gemini review against a tree
+  one tree with no other writer. Never run a review against a tree
   another lane is editing; its write protection is detection after the fact.
 - Supervisors own only the children they spawned, cannot change a child gate
   through `cdx gate`, `resume --gate`, or respawn (omitting `--gate` on
@@ -177,7 +177,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   a merged, clean worktree and its branch; otherwise it refuses. Use
   `close --keep-worktree` to close without cleanup and print manual commands.
 - Gemini's five-hour window drains under heavy fan-out; cdx refuses Gemini
-  spawns while `gemini-quota.json` says so. Wait or use `--engine gpt`.
+  spawns while `gemini-quota.json` says so. Wait or drop `--engine gemini`.
 
 ## Claude Code integration
 
@@ -196,9 +196,9 @@ Run `cdx doctor` to verify that the mod is polling and live.
 
 The default filter shows running lanes and jobs only. Running, Done, Failed, and All remember the last selection in the browser. All lists running work first, then finished work, each by latest activity. Failed includes invalid gates. Closed and adopted lanes appear only in All. Completed consults appear in Done. Parent names identify children without pulling finished lanes ahead of running work. Expand Feed for recent entries.
 
-Astra/GPT uses violet orbits, Gemini teal scanlines, and jobs amber tickers. Motion shows running state, not progress. Quiet warnings start after five minutes without a lane event. Reduced motion disables animations. The page has no network fonts or runtime dependencies.
+GPT uses violet orbits, Gemini teal scanlines, and jobs amber tickers. Motion shows running state, not progress. Quiet warnings start after five minutes without a lane event. Reduced motion disables animations. The page has no network fonts or runtime dependencies.
 
-The dashboard reads discrete `work` and `review` round records. Version 5 removes flat `state`, `cwd`, and `reviewState` aliases. Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines because the ledger has no model for that review. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.
+The dashboard reads discrete `work` and `review` round records. Version 5 removes flat `state`, `cwd`, and `reviewState` aliases. Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.
 
 Native tool output above 20 KB is retained under the cdx logs directory with bounded excerpts and a path; full safe output stays at the named path. Secret-shaped text is redacted before persistence and presentation. The pre-tool hook denies covered reads when the file has not changed. A moving owned path invalidates the gate receipt. Only a failed exit may receive one automatic repair turn and gate rerun. The terminal uses a small text mark without demo graphics.
 

@@ -109,7 +109,7 @@ function renderRow(item, key) {
   row.dataset.engine = item.engine; row.dataset.group = item.statusGroup;
   const signal = row.querySelector('.signal'), shape = job ? 'ticker' : item.engine === 'gemini' ? 'scan' : 'orbit';
   signal.className = 'signal ' + shape + (running ? ' live' : ' idle'); signal.textContent = job ? '' : item.engine === 'gemini' ? '⌁' : '✧';
-  row.querySelector('.lane-sub').textContent = job ? 'job · ' + item.cmd : [item.supervisor ? 'supervisor' : item.consult ? 'consult' : item.kind, item.engine === 'gpt' ? 'Astra / GPT' : 'Gemini', item.model, 'r' + item.rounds, item.parent ? '↳ ' + item.parent : ''].filter(Boolean).join(' · ');
+  row.querySelector('.lane-sub').textContent = job ? 'job · ' + item.cmd : [item.supervisor ? 'supervisor' : item.consult ? 'consult' : item.kind, item.engine === 'gpt' ? 'GPT' : 'Gemini', item.model, 'r' + item.rounds, item.parent ? '↳ ' + item.parent : ''].filter(Boolean).join(' · ');
   const action = row.querySelector('.last-action'); action.textContent = item.lastAction || ''; action.title = item.lastAction || ''; action.hidden = !item.lastAction;
   const state = job ? item.state : activeState(item), stateKey = state + ':' + Boolean(item.stalled);
   const cell = row.querySelector('.status-cell');

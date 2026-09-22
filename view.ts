@@ -33,7 +33,7 @@ function viewLaneSummary(name: string, entry: Lane) {
   const lastActivityAt = [startedAt, entry.updatedAt, entry.lastEventAt, entry.review?.updatedAt]
     .filter((value): value is string => Boolean(value)).sort((a, b) => Date.parse(b) - Date.parse(a))[0]!;
   return { ...entry, name, engine: roundEngine(entry), startedAt, lastActivityAt, statusGroup,
-    model: roundEngine(entry) === laneEngine(entry) ? entry.model : undefined,
+    model: entry.kind === "review" && entry.reviewModel ? entry.reviewModel : roundEngine(entry) === laneEngine(entry) ? entry.model : undefined,
     stalled: statusGroup === "running" && Date.now() - Date.parse(entry.lastEventAt ?? startedAt) >= 300_000,
   };
 }

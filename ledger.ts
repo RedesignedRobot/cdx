@@ -74,14 +74,17 @@ export interface Config {
   model_auto_compact_token_limit?: number;
   tool_output_token_limit?: number;
   visibility?: VisibilityConfig;
+  // Codex model for work lanes (the executor).
   model: string;
+  // Codex model for head-launched consults, reviews and supervisors.
+  thinkerModel?: string;
   models?: Record<string, string>;
   efforts: string[];
   defaultEffort: string;
   rules: string[];
   accounts?: Record<string, string>;
-  // Highest effort a Codex model may run at, by model id. Astra is capped at
-  // medium by default because high and above burn the weekly window on churn.
+  // Highest effort a Codex model may run at, by model id. Astra and Sol are
+  // capped at high by default because higher efforts burn the weekly window.
   effortCaps: Record<string, string>;
   worktreeSetup?: string;
   gemini?: GeminiConfig;
@@ -176,6 +179,9 @@ export interface Lane {
   workSessionId?: string;
   transcriptPath?: string;
   reviewEngine?: Engine;
+  // Codex model of the latest review or consult round. It never replaces
+  // model, so a Sol work thread keeps Sol when it resumes after an Astra review.
+  reviewModel?: string;
   effort: Effort;
   roundAccount?: AccountChoice & { demand: Demand };
   quotaFailure?: string;

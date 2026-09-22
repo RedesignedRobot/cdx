@@ -79,7 +79,8 @@ function renderLaneBlock(lane: string, entry: Lane): string {
     : "";
   const steerDetail = entry.kind === "work" && active ? `  steers=${entry.steers ?? 0}` : "";
   const continueDetail = (entry.continuations ?? 0) > 0 ? `  auto-continued ${entry.continuations}x` : "";
-  const modelDetail = engine === "gpt" && entry.model ? `  model=${entry.model}`
+  const roundModel = entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.model;
+  const modelDetail = engine === "gpt" && roundModel ? `  model=${roundModel}`
     : engine === "gemini" && active && entry.fallbackModel ? `  model=${entry.fallbackModel} (capacity fallback)` : "";
   const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
   const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.consult ? "consult" : "work"}${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;

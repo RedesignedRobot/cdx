@@ -223,13 +223,28 @@ export function inputText(text: string): AppInput {
   return { type: "text", text };
 }
 
+// Lanes keep only codegraph. Codex 0.156 rejects an override for a server the
+// account does not define (no transport), so cdx disables what config.toml names.
+const LANE_MCP_SERVERS = new Set(["codegraph"]);
+
+export function configuredMcpServers(configText: string): string[] {
+  const parsed = Bun.TOML.parse(configText) as { mcp_servers?: Record<string, unknown> };
+  return Object.keys(parsed.mcp_servers ?? {});
+}
+
+function unusedMcpServers(codexHome: string): Record<string, { enabled: false }> {
+  const configPath = `${codexHome}/config.toml`;
+  const names = existsSync(configPath) ? configuredMcpServers(readFileSync(configPath, "utf8")) : [];
+  return Object.fromEntries(names.filter((name) => !LANE_MCP_SERVERS.has(name)).map((name) => [name, { enabled: false }]));
+}
+
 export function appThreadParams(spec: Spec): Record<string, unknown> {
   const configOverrides: Record<string, unknown> = {
     agents: { enabled: false },
     features: { multi_agent: false, multi_agent_v2: false, memories: false, plugins: false, apps: false },
     memories: { use_memories: false, generate_memories: false },
     skills: { include_instructions: false },
-    mcp_servers: Object.fromEntries(["computer-use", "node_repl", "context7", "codex_apps", "codex-security"].map((name) => [name, { enabled: false }])),
+    mcp_servers: unusedMcpServers(spec.codexHome || process.env.CODEX_HOME || `${HOME}/.codex`),
     service_tier: "default",
   };
   if (!spec.reviewDir && !spec.supervisor) {

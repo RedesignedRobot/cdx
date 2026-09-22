@@ -16,6 +16,8 @@ import {
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
+import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
+import { missingCodexModels } from "./doctor.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
@@ -368,11 +370,10 @@ test("Rank 3: child Astra is refused across all resolution routes while head Ast
     "child lane cannot run gpt-6-astra; gpt-6-astra is reserved for head-launched lanes"
   );
 
-  // Child Astra is refused when model is omitted and defaults to astra
-  expect(resolveCodexModel(undefined)).toBe("gpt-6-astra");
-  expect(() => checkChildAstraRefusal(true, "gpt", resolveCodexModel(undefined))).toThrow(
-    "child lane cannot run gpt-6-astra; gpt-6-astra is reserved for head-launched lanes"
-  );
+  // An omitted model resolves to the Sol executor, which children may run
+  expect(resolveCodexModel(undefined, { model: EXECUTOR_MODEL })).toBe("gpt-6-sol");
+  expect(resolveCodexModel("sol")).toBe("gpt-6-sol");
+  expect(() => checkChildAstraRefusal(true, "gpt", undefined, { model: EXECUTOR_MODEL })).not.toThrow();
 
   // Child Astra is refused when config.model is an alias ("astra" -> "gpt-6-astra")
   const aliasCfg = { model: "astra" };
@@ -496,6 +497,36 @@ test("cappedEffort resolves model aliases and clamps Astra to the configured cap
   expect(() => cappedEffort("gpt-6-astra", "xhigh", true, builtIn)).toThrow("exceeds the cap for gpt-6-astra (max high)");
   expect(() => parseConfig('{"effortCaps":{"gpt-6-astra":"xhigh"}}')).toThrow("cannot exceed the built-in cap high");
   expect(parseConfig('{"effortCaps":{"gpt-6-astra":"medium"}}').effortCaps["gpt-6-astra"]).toBe("medium");
+
+  // Sol carries the same built-in ceiling; max and ultra sit above it
+  expect(cappedEffort("sol", "high", true, builtIn)).toBe("high");
+  expect(cappedEffort("gpt-6-sol", "max", false, builtIn)).toBe("high");
+  expect(() => cappedEffort("gpt-6-sol", "xhigh", true, builtIn)).toThrow("exceeds the cap for gpt-6-sol (max high)");
+  expect(() => parseConfig('{"effortCaps":{"gpt-6-sol":"max"}}')).toThrow("cannot exceed the built-in cap high");
+});
+
+test("9.0.0: the GPT-6 split defaults work to Sol and head-launched thinking to Astra", () => {
+  const cfg = parseConfig("{}");
+  expect(cfg.model).toBe(EXECUTOR_MODEL);
+  expect(cfg.thinkerModel).toBe(THINKER_MODEL);
+  expect(parseConfig('{"thinkerModel":"gpt-6-sol"}').thinkerModel).toBe("gpt-6-sol");
+  expect(() => parseConfig('{"thinkerModel":""}')).toThrow();
+
+  const flags = (model?: string) => parseArgs(model ? ["--model", model] : [], ["model"]);
+  expect(modelOf(flags(), "gpt", "think", false)).toBe(resolveCodexModel(config.thinkerModel ?? THINKER_MODEL));
+  // A child thinking lane never gets Astra by default
+  expect(modelOf(flags(), "gpt", "think", true)).toBe(config.model);
+  expect(modelOf(flags(), "gpt", "work", false)).toBe(config.model);
+  expect(modelOf(flags("sol"), "gpt", "think", false)).toBe("gpt-6-sol");
+  expect(modelOf(flags("astra"), "gpt", "work", false)).toBe("gpt-6-astra");
+  expect(modelOf(flags(), "gemini", "think", false)).toBeUndefined();
+});
+
+test("9.0.0: doctor lists catalog gaps for configured Codex models", () => {
+  const cache = JSON.stringify({ models: [{ slug: "gpt-6-astra" }, { slug: "gpt-6-sol" }] });
+  expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-6-astra", "gpt-6-sol"])).toEqual([]);
+  expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-7"])).toEqual(["gpt-7"]);
+  expect(missingCodexModels(JSON.stringify([{ slug: "gpt-6-sol" }]), ["gpt-6-astra"])).toEqual(["gpt-6-astra"]);
 });
 
 test("fmtTokens and fmtTokensFull format tokens safely without NaN or literal undefined", () => {
@@ -1261,10 +1292,19 @@ import { geminiAdmission } from "./gemini-usage.ts";
 import { landRefusal } from "./worktrees.ts";
 import { terminalText } from "./ledger.ts";
 import { agentDiscovered, desiredHookEntry, hooksCurrent } from "./doctor.ts";
+import { configuredMcpServers } from "./engines.ts";
+import { mkdtempSync, readFileSync as readText, writeFileSync as writeText } from "node:fs";
+import { tmpdir } from "node:os";
 
 test("only GPT work receives the compaction trial and every GPT thread sheds unused context", () => {
-  const base = { engine: "gpt", mode: "spawn", cwd: "/repo", effort: "medium" } as any;
+  const codexHome = mkdtempSync(`${tmpdir()}/cdx-home-`);
+  writeText(`${codexHome}/config.toml`, '[mcp_servers.context7]\nurl = "x"\n[mcp_servers.context7.env_http_headers]\n[mcp_servers.codegraph]\ncommand = "codegraph"\n[mcp_servers."computer-use"]\n');
+  const base = { engine: "gpt", mode: "spawn", cwd: "/repo", effort: "medium", codexHome } as any;
   const work = appThreadParams(base).config as any;
+  // Codex 0.156 refuses overrides for undefined servers, so only configured ones are disabled
+  expect(work.mcp_servers).toEqual({ context7: { enabled: false }, "computer-use": { enabled: false } });
+  expect(configuredMcpServers("[mcp_servers.a]\n[mcp_servers.a.env]\n[other]\n")).toEqual(["a"]);
+  expect(configuredMcpServers('[mcp_servers]\nb = { url = "x" }\n  [mcp_servers.c]\n')).toEqual(["b", "c"]);
   expect(work).toMatchObject({ model_auto_compact_token_limit: 150000, tool_output_token_limit: 6000,
     features: { memories: false, plugins: false, apps: false }, skills: { include_instructions: false } });
   expect(work.mcp_servers.context7.enabled).toBe(false);
@@ -1275,8 +1315,14 @@ test("only GPT work receives the compaction trial and every GPT thread sheds unu
   }
   expect(parseConfig('{"tool_output_token_limit":4321}').tool_output_token_limit).toBe(4321);
   expect(() => parseConfig('{"model_auto_compact_token_limit":0}')).toThrow();
-  expect(agentDiscovered("Available: cdx-lane-extra", "cdx-lane")).toBe(false);
-  expect(agentDiscovered("Available: cdx-lane\ncdx-review", "cdx-lane")).toBe(true);
+  expect(agentDiscovered('{"command":{"name":"agents","data":{"agents":["cdx-lane"]}}}', "cdx-lane")).toBe(true);
+  expect(agentDiscovered('{"command":{"name":"agents","data":{"agents":["cdx-lane-extra"]}}}', "cdx-lane")).toBe(false);
+  expect(agentDiscovered("", "cdx-lane")).toBe(false);
+  // agy 1.2.8 silently drops an agent whose policy is outside this set
+  for (const name of ["cdx-lane", "cdx-review"]) {
+    const policy = readText(`${import.meta.dir}/agents/${name}/agent.md`, "utf8").match(/^commandExecutionPolicy: (\S+)$/m)?.[1];
+    expect(["auto", "eager", "off", "sandbox"]).toContain(policy!);
+  }
 });
 
 test("resume requires failed evidence at the same HEAD and reviews close after P3 only", () => {

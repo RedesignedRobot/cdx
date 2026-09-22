@@ -140,7 +140,7 @@ export async function spawnCommand(argv: string[]) {
   }
   // A respawn without --model keeps the lane's model; the config default is
   // for new lanes only.
-  const model = existingLane && engine === "gpt" && parsed.flags.model === undefined ? laneModel(existingLane) : modelOf(parsed, engine);
+  const model = existingLane && engine === "gpt" && parsed.flags.model === undefined ? laneModel(existingLane) : modelOf(parsed, engine, supervisor ? "think" : "work", Boolean(parent));
   checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   requireEngineBinary(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
@@ -363,13 +363,15 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   if (engine === "gemini") requireGeminiAgent((config.gemini ?? geminiConfig()).reviewAgent, parsed.flags.cd ?? process.cwd());
   const existing = readLedger()[lane];
   requireOwnChild(lane, existing);
-  if (existing && laneEngine(existing) === "gpt" && parsed.flags.model !== undefined) fail(`review of an existing lane uses its model (${laneModel(existing)}); drop --model`);
   // A consult lane must never acquire a work thread: resume would then pick
   // the writable session over the read-only one. Fresh names only.
   if (opts.consult && existing && !existing.consult) fail(`lane "${lane}" has work history; consult needs a fresh name so its resume stays read-only`);
-  const model = engine === "gpt" ? existing && laneEngine(existing) === "gpt" ? laneModel(existing) : modelOf(parsed, "gpt")! : undefined;
+  // Reviews and consults think: they default to the thinker model whatever
+  // model wrote the work. The round records it as reviewModel, so the work
+  // thread keeps its own model; a lane without one adopts it as its model.
+  const model = engine === "gpt" ? modelOf(parsed, "gpt", "think", Boolean(parent || existing?.parent))! : undefined;
   checkChildAstraRefusal(Boolean(parent || existing?.parent), engine, model);
-  const roundModel = model && (!existing || parsed.flags.model !== undefined || !existing.model) ? { model } : {};
+  const roundModel = model ? { reviewModel: model, ...(!existing?.model ? { model } : {}) } : {};
   const roundParent = !existing ? { lineage: callerLineage(supervisor) } : {};
   if (existing && laneEngine(existing) === "gemini" && engine === "gemini") {
     console.log(color.yellow("cdx: gemini reviewing a gemini lane; give the intent explicit attack items"));

@@ -1,3 +1,16 @@
+## 9.0.0
+
+- GPT-6 split, owner ruling 2026-09-23: Sol executes, Astra thinks. The config default `model` is `gpt-6-sol`. The new `thinkerModel` key defaults to `gpt-6-astra` and must be a nonempty string. Built-in aliases: `astra` resolves to `gpt-6-astra`, `sol` to `gpt-6-sol`.
+- The default engine is `gpt`, not `gemini`. Omitting `--engine` prints `cdx: engine gpt (default)`. `--engine gemini` stays available for mechanical sweeps.
+- Without `--model`, work lanes run `model` (Sol). Head-launched review, consult and `--supervisor` spawn lanes run `thinkerModel` (Astra). A child lane falls back to Sol; the child-Astra refusal is unchanged.
+- Review of an existing lane accepts `--model` and no longer reuses the work model. The review round runs Astra by default and records `reviewModel` beside the lane's `model`, which stays the work thread's model. Status shows the review round's model, and an account failover during a review keeps the work model.
+- The effort ladder is `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex 0.156 `ultra` delegates through native sub-agents, which cdx disables, so cdx refuses it. Built-in caps: `gpt-6-astra` high, `gpt-6-sol` high. Config may lower a cap, never raise it.
+- `cdx doctor` reads `<primary Codex home>/models_cache.json` and fails `codex models` when `model`, `thinkerModel` or an alias target is missing. Remedy: `codex update`, then `codex debug models`.
+- Supervisor rules delegate bounded work to Sol children, or Gemini children for mechanical sweeps. The viewer label "Astra / GPT" is now "GPT".
+- Codex 0.156 refuses an `mcp_servers` override for a server the account does not define, which failed every GPT thread on `codex_apps`. Lanes now disable the servers the account `config.toml` names, except codegraph.
+- agy 1.2.8 drops an agent whose `commandExecutionPolicy` is not `auto`, `eager`, `off` or `sandbox`, without an error, and every Gemini round fell back to the default agent. The shipped agents use `eager`, a test pins the accepted values, and launch reads discovery from `agy --output-format json agents`. agy 1.2.8 also retired `command_status` and `send_command_input`, which failed executor construction; the agents list `manage_task` instead. The browser view shows a review round's `reviewModel`.
+- Verified against Codex CLI 0.156.0 (catalog lists gpt-6-astra, gpt-6-sol and gpt-6-luna, 272k context) and agy 1.2.8. Sol costs about a third of Astra's Codex allowance; API price per 1M tokens in/out is $2/$10 for Sol and $10/$50 for Astra. cdx ignores Luna. Codex 0.156 removed `thread/rollback`, which cdx never called. Gemini stays on `gemini-3.8-flash-high`.
+
 ## 8.0.0
 
 - Lane Codex homes carry short instructions and skip the codegraph prompt hook. Thread overrides disable memories, plugins, apps, the skills catalogue and unused MCP servers. Interactive account files remain intact. `doctor --fix` installs the homes and removes retired config rules.
