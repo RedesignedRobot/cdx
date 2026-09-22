@@ -1,3 +1,17 @@
+# Current native contract, 8.0
+
+The historical 7.0 design below explains the module boundary. These changes govern current callers.
+
+| Tool | Required input | Behavior |
+| --- | --- | --- |
+| `land` | `lane` | Receipt-bound commit, merge, push, worktree and branch removal, close; head only |
+| `ask` | `question`, `cd` | Synchronous read-only Gemini answer, no ledger lane, 90-second limit, macOS sandbox-exec required |
+| `resume` | `lane`, `followUp`, `fix` | `fix` is `gate` or `review`; same HEAD and failed evidence required |
+
+All required fields are validated before argv conversion. Missing values cannot become the string `undefined`. Nonzero command exits return `isError: true`. GPT review turns accept steering through app-server. Child terminal events reach the supervisor control stream only. Terminal text includes reports below 10000 bytes and up to 40 failure lines; native outputs retain the 7.9 safe-text retention and 20 KB bound.
+
+Reload the Claude plugin after updating to register the new tools. Existing lane processes keep the code and account configuration they started with.
+
 # cdx 7.0: native Claude Code integration
 
 Design contract for the 7.0 rebuild. Two lanes implement it against disjoint files; this file is the shared truth. Written 2026-09-15 from the Claude Mods documentation (function hooks, Claude Code 2.1.270 behind `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`).
@@ -110,7 +124,7 @@ Table-driven: `{ name, description, inputSchema, run(input) -> { argv, stdin?, t
 | name | required | optional | argv |
 | --- | --- | --- | --- |
 | spawn | lane, brief | engine, model, supervisor, cd, worktree, gate, pre, effort, maxRuntime, account, addDirs[], schema, images[] | `spawn <lane> [flags] --bg -` |
-| resume | lane, followUp | effort, gate, pre, maxRuntime | `resume <lane> [flags] --bg -` |
+| resume | lane, followUp, fix | effort, maxRuntime | `resume <lane> [flags] --bg -` |
 | consult | lane, question | engine, supervisor, model, effort, cd, account | `consult <lane> [flags] --bg -` |
 | review | lane | engine, model, effort, cd, uncommitted, base, commit, scope, intent | `review <lane> [flags] --bg [-]` |
 | events | | | `events --json`; the mod answers with its own buffer first, then the feed, and empties the buffer |

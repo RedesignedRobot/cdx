@@ -1,3 +1,4 @@
+import { reviewerForTree } from "./prompts.ts";
 // Round admission and ledger reservation.
 
 import {
@@ -5,9 +6,10 @@ import {
   reconcileAccountHolds, requireAccountModel,
 } from "./accounts.ts";
 import { checkChildAstraRefusal, resolveCodexModel } from "./config.ts";
+import { geminiAdmission, readGeminiUsageSnapshot, geminiQuotaState } from "./gemini-usage.ts";
 import { hookInstallState } from "./doctor.ts";
 import {
-  type AccountChoice, type Demand, type Effort, type Engine, hasWorkThread, laneEngine, type LaneOwner,
+  type GateTree, type AccountChoice, type Demand, type Effort, type Engine, hasWorkThread, laneEngine, type LaneOwner,
   laneRunning, type Lineage, readLedger, requireOwnChild, supervisorLane, withLedger, workCwdOf, workStateOf,
 } from "./ledger.ts";
 import { CmdError, pidAlive } from "./runtime.ts";
@@ -16,7 +18,7 @@ import { type WorktreeInfo } from "./worktrees.ts";
 
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 
-export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
+export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
   const existingBefore = readLedger()[lane];
   const isChildPre = Boolean(opts?.lineage?.parent ?? existingBefore?.parent ?? supervisorLane());
@@ -44,6 +46,10 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
       }
       if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
+      if (opts?.reviewTree) {
+        const duplicate = reviewerForTree(ledger, opts.reviewTree);
+        if (duplicate) throw new CmdError(`SHA ${opts.reviewTree.tree} already has reviewer ${duplicate}; reuse its report`);
+      }
       const rounds = (existing?.rounds ?? 0) + 1;
       const existingWorkRounds = existing?.workRounds ?? existing?.rounds ?? 0;
       const workRounds = kind === "work" ? existingWorkRounds + 1 : existingWorkRounds;
@@ -70,8 +76,11 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       const isChildCommitted = Boolean(opts?.lineage?.parent ?? existing?.parent ?? supervisorLane());
       const roundModelCommitted = roundEngineType === "gpt" ? opts?.model ?? existing?.model : undefined;
       checkChildAstraRefusal(isChildCommitted, roundEngineType, roundModelCommitted);
+      const queuedUntil = engine === "gemini" ? geminiQuotaState().block?.resetsAt ?? geminiAdmission(readGeminiUsageSnapshot(), ledger, Date.now(), lane).queuedUntil : undefined;
       ledger[lane] = {
         ...(existing ?? {}),
+        queuedUntil, modelCalls: 0, callLimitHit: false, quotaWrapSent: false,
+        accountPercentStart: undefined, accountPercentEnd: undefined, agentLoaded: undefined,
         // The work engine belongs to the work thread. A review round on an
         // existing lane records its own engine beside it, so a later resume
         // still reattaches to the right runtime.
@@ -84,7 +93,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         parent: opts?.lineage ? opts.lineage.parent : existing?.parent,
         parentRound: opts?.lineage ? opts.lineage.parentRound : existing?.parentRound,
         consult: opts?.consult ?? existing?.consult,
-        ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch } : {}),
+        ...(opts?.worktree ? { worktreePath: opts.worktree.path, worktreeRepo: opts.worktree.repo, branch: opts.worktree.branch, baseBranch: opts.worktree.baseBranch } : {}),
         account,
         codexHome,
         roundAccount: activeAccount ? { ...activeAccount, demand } : undefined,
@@ -93,6 +102,9 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         ownerCwd,
         sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
         transcriptPath: undefined,
+        reviewTree: opts?.reviewTree ?? existing?.reviewTree,
+        reviewClosed: kind === "review" ? undefined : existing?.reviewClosed,
+        touchedPaths: [],
         workSessionId: kind === "review"
           ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
           : existing?.workSessionId,
@@ -116,7 +128,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         roundTokens: undefined,
         roundSteps: 0, stage: "working", stageStartedAt: now, lastActionAt: undefined,
         steers: 0,
-        steerOpen: kind === "work",
+        steerOpen: true,
         continuations: 0,
         ...(hooksActive ? { hooksActive: true } : {}),
         quotaFailure: undefined,

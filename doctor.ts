@@ -1,6 +1,7 @@
+import { isDeepStrictEqual } from "node:util";
 // Engine installation, account configuration checks, and diagnostic probes.
 
-import { syncAccountHomes } from "./account-sync.ts";
+import { installLaneHome, laneCodexHome, retiredLaneRule } from "./account-sync.ts";
 import {
   accountChoices, adviceLines, cachedAccountStandings, configuredAccountSnapshots, defaultCodexHome,
   exhausting, formatAccountUsage, primaryAccount, refreshUsageSnapshot, resetCreditAlerts, shouldRedeemCredit,
@@ -19,7 +20,7 @@ import {
 import { readUsageHistory } from "./usage-store.ts";
 import {
   existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync,
-  writeFileSync,
+  writeFileSync, renameSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -155,12 +156,8 @@ function agentLinkState(name: string, sourceName: "cdx-lane" | "cdx-review"): { 
   const target = `${HOME}/.gemini/config/agents/${name}/agent.md`;
   if (!existsSync(source)) return { source, target, current: false, detail: `source missing: ${source}` };
   try {
-    if (!lstatSync(target).isSymbolicLink()) return { source, target, current: false, detail: `stale copy at ${target}` };
-    const linked = readlinkSync(target);
-    const resolved = realpathSync(linked.startsWith("/") ? linked : join(target, "..", linked));
-    return resolved === realpathSync(source)
-      ? { source, target, current: true, detail: target }
-      : { source, target, current: false, detail: `stale link at ${target}` };
+    if (!lstatSync(target).isSymbolicLink()) return { source, target, current: readFileSync(source, "utf8") === readFileSync(target, "utf8"), detail: target };
+    return { source, target, current: false, detail: `replace agent symlink with a file: ${target}` };
   } catch {
     return { source, target, current: false, detail: `missing: ${target}` };
   }
@@ -170,8 +167,20 @@ function installAgentLink(name: string, sourceName: "cdx-lane" | "cdx-review"): 
   const state = agentLinkState(name, sourceName);
   if (!existsSync(state.source)) return;
   mkdirSync(join(state.target, ".."), { recursive: true });
-  try { unlinkSync(state.target); } catch { /* missing */ }
-  symlinkSync(state.source, state.target);
+  writeFileSync(`${state.target}.tmp.${process.pid}`, readFileSync(state.source, "utf8"));
+  renameSync(`${state.target}.tmp.${process.pid}`, state.target);
+}
+
+export function agentDiscovered(output: string, name: string): boolean {
+  return output.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, "").split(/[^a-zA-Z0-9_-]+/).includes(name);
+}
+
+export function requireGeminiAgent(name: string, cwd: string): void {
+  if (hookInstallState().state !== "current") throw new Error("Gemini lane hooks are missing or stale; run cdx doctor --fix");
+  const result = Bun.spawnSync({ cmd: ["agy", "agents"], cwd, env: uncoloredChildEnv(), stdin: "ignore", timeout: 10_000 });
+  if (!result.success || !agentDiscovered(result.stdout.toString(), name)) {
+    throw new Error(`agy agents did not discover ${name} in ${cwd}; run cdx doctor --fix`);
+  }
 }
 
 function agyConfigHome(): string {
@@ -182,8 +191,7 @@ function hooksJsonPath(): string {
   return join(agyConfigHome(), "hooks.json");
 }
 
-function desiredHookEntry(): Record<string, unknown> {
-  const cmd = `${process.execPath} ${realpathSync(SELF)}`;
+export function desiredHookEntry(cmd = `${process.execPath} ${realpathSync(SELF)}`): Record<string, unknown> {
   return {
     enabled: true,
     PreToolUse: [
@@ -198,6 +206,7 @@ function desiredHookEntry(): Record<string, unknown> {
         ],
       },
     ],
+    PostInvocation: [{ type: "command", command: `${cmd} hook post-invocation`, timeout: 10 }],
     PreInvocation: [
       {
         type: "command",
@@ -206,6 +215,10 @@ function desiredHookEntry(): Record<string, unknown> {
       },
     ],
   };
+}
+
+export function hooksCurrent(entry: unknown, cmd = `${process.execPath} ${realpathSync(SELF)}`): boolean {
+  return isDeepStrictEqual(entry, desiredHookEntry(cmd));
 }
 
 export function hookInstallState(): { path: string; state: "missing" | "stale" | "corrupt" | "current"; detail: string } {
@@ -224,28 +237,7 @@ export function hookInstallState(): { path: string; state: "missing" | "stale" |
   if (!cdxEntry || typeof cdxEntry !== "object") {
     return { path, state: "missing", detail: `entry "cdx" missing in ${path}` };
   }
-  const cmd = `${process.execPath} ${realpathSync(SELF)}`;
-  const desiredPreToolCmd = `${cmd} hook pre-tool`;
-  const desiredPreInvocationCmd = `${cmd} hook pre-invocation`;
-
-  const preToolHook = cdxEntry.PreToolUse?.[0]?.hooks?.[0];
-  const preInvocationHook = cdxEntry.PreInvocation?.[0];
-
-  const current =
-    cdxEntry.enabled === true &&
-    Array.isArray(cdxEntry.PreToolUse) &&
-    cdxEntry.PreToolUse.length === 1 &&
-    cdxEntry.PreToolUse[0]?.matcher === "*" &&
-    Array.isArray(cdxEntry.PreToolUse[0]?.hooks) &&
-    cdxEntry.PreToolUse[0]?.hooks.length === 1 &&
-    preToolHook?.type === "command" &&
-    preToolHook?.command === desiredPreToolCmd &&
-    preToolHook?.timeout === 10 &&
-    Array.isArray(cdxEntry.PreInvocation) &&
-    cdxEntry.PreInvocation.length === 1 &&
-    preInvocationHook?.type === "command" &&
-    preInvocationHook?.command === desiredPreInvocationCmd &&
-    preInvocationHook?.timeout === 10;
+  const current = hooksCurrent(cdxEntry);
 
   return current
     ? { path, state: "current", detail: path }
@@ -269,7 +261,8 @@ function installHooks(): boolean {
     existing = parsed as Record<string, unknown>;
   }
   existing.cdx = desiredHookEntry();
-  writeFileSync(path, `${JSON.stringify(existing, null, 2)}\n`);
+  writeFileSync(`${path}.tmp.${process.pid}`, `${JSON.stringify(existing, null, 2)}\n`);
+  renameSync(`${path}.tmp.${process.pid}`, path);
   return true;
 }
 
@@ -406,9 +399,7 @@ async function checkDoctorAgyHooks(
 
 // Account homes share directives and tools, not credentials. Report config
 // differences without printing values that might contain server credentials.
-function checkDoctorAccountHomes(fix: boolean, good: (message: string) => void, bad: (label: string, detail: string, remedy: string) => void): void {
-  syncAccountHomes(config.accounts ?? { default: defaultCodexHome() }, fix, good, bad);
-}
+
 
 export async function doctorCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["fix", "probe"]);
@@ -503,7 +494,26 @@ export async function doctorCommand(argv: string[]) {
     }
   }
 
-  checkDoctorAccountHomes(parsed.bools.has("fix"), good, bad);
+  const laneInstructions = readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8");
+  for (const [name, home] of Object.entries(config.accounts ?? { default: defaultCodexHome() })) {
+    try {
+      if (parsed.bools.has("fix")) installLaneHome(home, laneInstructions);
+      if (readFileSync(`${laneCodexHome(home)}/AGENTS.md`, "utf8") !== laneInstructions) throw new Error("stale lane instructions");
+      good(`${name}: lane home ${laneCodexHome(home)}`);
+    } catch (error) { bad(name, String(error), "run cdx doctor --fix"); }
+  }
+  if (parsed.bools.has("fix")) {
+    const stored = existsSync(CONFIG_PATH) ? JSON.parse(readFileSync(CONFIG_PATH, "utf8")) : {};
+    stored.rules = (stored.rules ?? []).filter((rule: string) => !retiredLaneRule(rule));
+    stored.model_auto_compact_token_limit ??= 150_000;
+    stored.tool_output_token_limit ??= 6_000;
+    writeFileSync(`${CONFIG_PATH}.tmp.${process.pid}`, JSON.stringify(stored, null, 2) + "\n");
+    renameSync(`${CONFIG_PATH}.tmp.${process.pid}`, CONFIG_PATH);
+  }
+  if (agyVersion?.success) for (const agent of [geminiPolicy.agent, geminiPolicy.reviewAgent]) {
+    try { requireGeminiAgent(agent, process.cwd()); good(`agy agents: ${agent} discovered`); }
+    catch (error) { bad(`agy agent ${agent}`, String(error), "run cdx doctor --fix"); }
+  }
 
   let loggedIn = false;
   if (config.accounts) {

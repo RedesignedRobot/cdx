@@ -9,7 +9,7 @@ import { geminiTranscriptPath } from "./engines.ts";
 import { gateCommand, gateReceiptCommand } from "./gates.ts";
 import { jobCommand, readJobs, runJob } from "./jobs.ts";
 import {
-  cleanCommand, consultCommand, resumeCommand, reviewCommand, spawnCommand,
+  codeQuestionCommand, cleanCommand, consultCommand, resumeCommand, reviewCommand, spawnCommand,
 } from "./lane-commands.ts";
 import {
   callerOwnership, laneRunning, readLane, readLedger, requireOwnChild, supervisorLane, validLane, withLedger,
@@ -27,7 +27,7 @@ import { briefCommand, eventsCommand, feedCommand, takeoverCommand } from "./ses
 import { statusCommand, tailView, targetView, usageCommand, waitCommand } from "./status.ts";
 import { renderView, tuiEnabled } from "./tui.ts";
 import { viewCommand } from "./view.ts";
-import { closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
+import { landCommand, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
 import { existsSync, readFileSync } from "node:fs";
 
 const USAGE = `cdx tracks Codex and Gemini execution lanes
@@ -36,17 +36,19 @@ cdx policy: model ${config.model}${modelAliases() ? ` (aliases ${modelAliases()}
 Engines:
 ${ENGINE_PICKER}
 
+  land <lane>                              Commit, merge, push, remove worktree and branch, close
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
-  resume <lane> [--add-dir D]... [--effort E] [--gate CMD] [--bg] [--max-runtime MIN] "<follow-up>"
+  resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
-  consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only gpt advisor; resume for follow-ups
+  consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only advisor
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
   --supervisor (gpt only) lets the lane drive GPT or Gemini children and consults
   through cdx, one level deep; killing the supervisor kills its children.
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
-  ask    [--timeout MIN] "<question>"  # work-lane command; default 30 minutes
+  ask    [--timeout MIN] "<question>"  # inside a lane: liaison
+  ask    --cd /repo "<question>"       # head: synchronous Gemini
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   takeover <lane|full-session-id> # explicitly connect ownership to this head
@@ -78,7 +80,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "review", "consult", "adopt",
+  "spawn", "resume", "review", "consult", "adopt", "land",
   "kill", "close", "clean", "gate", "reply", "job", "takeover",
 ]);
 
@@ -101,7 +103,7 @@ switch (command) {
   case "consult": await consultCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "send": await sendCommand(argv); break;
-  case "ask": await askCommand(argv); break;
+  case "ask": await (process.env.CDX_LANE ? askCommand(argv) : codeQuestionCommand(argv)); break;
   case "reply": await replyCommand(argv); break;
   case "questions": questionsCommand(argv); break;
   case "msg": await msgCommand(argv); break;
@@ -240,6 +242,7 @@ switch (command) {
     console.log(latestRoundLog(lane));
     break;
   }
+  case "land": landCommand(argv); break;
   case "close": {
     const parsed = parseArgs(argv, ["remove-worktree", "keep-worktree"]);
     const keepWorktree = closeKeepsWorktree(parsed.bools);

@@ -30,7 +30,7 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility"]);
+  const allowed = new Set(["model", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -174,8 +174,14 @@ export function parseConfig(text: string): Config {
     }
   }
 
+  const limits = { model_auto_compact_token_limit: 150_000, tool_output_token_limit: 6_000 };
+  for (const key of Object.keys(limits) as Array<keyof typeof limits>) {
+    if (!Object.hasOwn(input, key)) continue;
+    if (!Number.isSafeInteger(input[key]) || Number(input[key]) <= 0) configError(`${key} must be a positive integer`);
+    limits[key] = Number(input[key]);
+  }
   return {
-    visibility,
+    ...limits, visibility,
     model, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };

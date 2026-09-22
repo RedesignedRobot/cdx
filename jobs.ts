@@ -1,3 +1,4 @@
+import { captureGateTree } from "./gates.ts";
 import { safeText } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 // Detached shell jobs and their lifecycle.
@@ -33,6 +34,8 @@ export function summaryJobs(jobs: Jobs, finishedShown = FINISHED_SHOWN, maxFinis
 type JobState = "running" | "done" | "failed";
 
 export interface Job {
+  treeStart?: import("./ledger.ts").GateTree;
+  treeEnd?: import("./ledger.ts").GateTree;
   cmd?: string;
   cwd?: string;
   exitCode?: number;
@@ -155,6 +158,10 @@ export async function jobCommand(argv: string[]) {
   process.exit(0);
 }
 
+function jobTree(cwd: string): import("./ledger.ts").GateTree | undefined {
+  try { return captureGateTree(cwd); } catch { return undefined; }
+}
+
 export async function runJob(name: string): Promise<number> {
   const cmd = process.env.CDX_JOB_CMD;
   const cwd = process.env.CDX_JOB_CWD;
@@ -163,6 +170,7 @@ export async function runJob(name: string): Promise<number> {
   if (!job) fail(`internal: job "${name}" is missing from ${JOBS}`);
   const env = { ...process.env };
   for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
+  withJobs((jobs) => { jobs[name]!.treeStart = jobTree(cwd); });
   const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   let signal: string | undefined;
   const forward = (sig: NodeJS.Signals) => {
@@ -183,6 +191,7 @@ export async function runJob(name: string): Promise<number> {
   const note = signal ? `terminated by ${signal}` : undefined;
   const finished = withJobs((jobs) => {
     const entry = jobs[name]!;
+    entry.treeEnd = jobTree(cwd);
     entry.exitCode = exitCode;
     entry.finishedAt = new Date().toISOString();
     entry.state = state;

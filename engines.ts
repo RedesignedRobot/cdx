@@ -219,10 +219,6 @@ export interface AppTurn {
   error?: { message?: string } | null;
 }
 
-export function appServerWorkRound(spec: Spec, lane: Lane | undefined): boolean {
-  return lane?.kind === "work" && (spec.mode === "spawn" || spec.mode === "resume");
-}
-
 export function inputText(text: string): AppInput {
   return { type: "text", text };
 }
@@ -230,9 +226,16 @@ export function inputText(text: string): AppInput {
 export function appThreadParams(spec: Spec): Record<string, unknown> {
   const configOverrides: Record<string, unknown> = {
     agents: { enabled: false },
-    features: { multi_agent: false, multi_agent_v2: false },
+    features: { multi_agent: false, multi_agent_v2: false, memories: false, plugins: false, apps: false },
+    memories: { use_memories: false, generate_memories: false },
+    skills: { include_instructions: false },
+    mcp_servers: Object.fromEntries(["computer-use", "node_repl", "context7", "codex_apps", "codex-security"].map((name) => [name, { enabled: false }])),
     service_tier: "default",
   };
+  if (!spec.reviewDir && !spec.supervisor) {
+    configOverrides.model_auto_compact_token_limit = spec.model_auto_compact_token_limit ?? 150_000;
+    configOverrides.tool_output_token_limit = spec.tool_output_token_limit ?? 6_000;
+  }
   if (spec.additionalDirectories?.length) {
     configOverrides.sandbox_workspace_write = { writable_roots: spec.additionalDirectories };
   }
@@ -276,29 +279,14 @@ ${latestEvidence}` : "No report survived; use the round logs and current tree.",
 
 export function freshAccountSpec(spec: Spec, entry: Lane, prompt: string): void {
   const readOnly = entry.kind === "review" || Boolean(entry.consult);
-  if (spec.mode === "review-native") {
-    const args = spec.codexArgs ?? [];
-    const base = args.indexOf("--base");
-    const commit = args.indexOf("--commit");
-    const target = args.includes("--uncommitted") ? "\nReview uncommitted changes with git diff HEAD."
-      : base >= 0 ? `\nReview git diff ${args[base + 1]}...HEAD.`
-      : commit >= 0 ? `\nReview git show ${args[commit + 1]}.` : "";
-    spec.taskPrompt = (spec.taskPrompt ?? spec.prompt) + target;
-    prompt += target;
-  }
   spec.mode = "spawn";
   spec.sourceThreadId = undefined;
   spec.prompt = prompt;
   if (readOnly) {
     spec.reviewDir = spec.cwd;
     spec.gate = undefined;
-    spec.codexArgs = ["exec", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--json", "-m", spec.model ?? config.model,
-      "-c", `model_reasoning_effort=${spec.effort}`, "-s", "danger-full-access",
-      "-c", 'approval_policy="never"', "--skip-git-repo-check", "--cd", spec.cwd,
-      "--output-last-message", reportPathOf(spec.lane, spec.round), prompt];
-  } else {
-    spec.codexArgs = undefined;
   }
+
   withLedger((ledger) => {
     const item = ledger[spec.lane]!;
     item.sessionId = undefined;
@@ -576,6 +564,9 @@ export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (pat
       ? { input: usage.input_tokens, cached: usage.cache_read_tokens, output: usage.output_tokens } : undefined;
     const record = { type: "cdx_tool", id, timestamp, toolKind: before.kind, argumentHash: before.argumentHash,
       ...(Object.keys(before.readFiles).length ? { readFiles: before.readFiles } : {}),
+      step: step?.step_index, failed: observation.failed === true,
+      ...(before.kind === "read" ? { readRange: { start: args?.startLine ?? 1, end: args?.endLine ?? null } } : {}),
+      modelVisibleOutputBytes: summaryBytes === undefined && output != null ? Buffer.byteLength(typeof output === "string" ? output : JSON.stringify(output)) : null,
       outputBytes: summaryBytes !== undefined ? Number(summaryBytes.replaceAll(",", ""))
         : output == null ? null : Buffer.byteLength(typeof output === "string" ? output : JSON.stringify(output)),
       outputBytesSource: summaryBytes !== undefined ? "engine-summary" : output == null ? "unavailable" : "captured-output",

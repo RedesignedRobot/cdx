@@ -25,7 +25,7 @@ One Astra lane per backlog, never one per finding. Give Astra the whole open set
    `lane`: name, `engine`: `gpt`, `model`: `gpt-6-astra`, `supervisor`: true, `gate`: `<cmd>`, `brief`: `<text>`.
    The brief is delivered whole through stdin, so quotes and newlines are safe. Astra owns the design and delegates bounded execution to tracked cdx child lanes or read-only consults. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate. End your turn after spawning.
 2. When a question arrives in a `[cdx]` prompt or context, answer with `mcp__cdx__reply`. Use `mcp__cdx__send` for corrections without dropping the task.
-3. When completion arrives, read the report (`mcp__cdx__report`) and gate result, arrange one read-only Gemini review (`mcp__cdx__review`), and merge. Close the lane with `mcp__cdx__close`. Lanes must not commit, push, or deploy.
+3. When completion arrives, read the report (`mcp__cdx__report`) and gate result, arrange one read-only Gemini review (`mcp__cdx__review`), then call `mcp__cdx__land` for a managed worktree. Lanes must not commit, push, or deploy.
 
 The CLI defaults to Gemini (`gemini-3.8-flash-high`). Astra requires `--engine gpt --model gpt-6-astra`; its effort cap is `high`. `cdx consult` accepts `--engine gpt|gemini` and `--supervisor`. A Gemini consult is a read-only helper. A consult with `--supervisor` may start only owned read-only Gemini consult helpers; it cannot spawn writable workers, GPT children, or grandchildren. Review hooks and fingerprints are accidental-write controls, not a security sandbox; the head copies artifacts out of the report. Every Bash call from the head starts with an absolute `cd` and invokes `bun /Users/mas/code/cdx/cdx.ts`, because batched calls share one cwd.
 
@@ -72,11 +72,11 @@ Order one independent review per consequential diff, covering affected callers a
 
 ## Gate and lifecycle playbook
 
-Before spawning, put the repository's mandatory checks in `.cdx-gate` in its primary checkout. cdx pins that baseline and adds any lane-specific gate. `--gate-baseline-check` only diagnoses an already broken checkout and runs the gate twice; leave it off for ordinary work. Gates must leave source bytes unchanged. After completion and independent review, read `cdx gate-receipt <lane> --json`. Land only the exact tree it proves. Ledger v5 remains readable; old rows without a receipt need a fresh gated work round.
+Before spawning, put the repository's mandatory checks in `.cdx-gate` in its primary checkout. cdx runs that baseline at the parent and uses lane-specific gates for children. `--gate-baseline-check` only diagnoses an already broken checkout and runs the gate twice; leave it off for ordinary work. Gates must leave source bytes unchanged. After completion and independent review, read `cdx gate-receipt <lane> --json`. Use native `land` to commit, merge, push and remove only the tree it proves. Ledger v5 remains readable; old rows without a receipt need a fresh gated work round.
 
 Start jobs with `cdx job <name> --cd /absolute/repo "<command>"`; the native job tool requires `cd`. End the head turn and use the completion event's verdict, report, log and gate exit. Read the report once to review it. Keep finite status, question and tail reads for diagnosis. Do not poll with sleep chains, shell loops, follow-tail or watch commands.
 
-Resume work with `--add-dir` to extend the stored directories, or native `addDirs`. A respawn can reuse an existing clean worktree on the expected lane branch in the same repository. After landing, `cdx close <lane>` removes the clean worktree and branch only when the branch is merged into local `main`. `--remove-worktree` remains accepted. Dirty, switched or unmerged worktrees refuse default cleanup. To abandon a lane, use `cdx close <lane> --keep-worktree` or native `keepWorktree: true`; it closes only the ledger entry and prints manual cleanup commands. Do not combine it with `--remove-worktree`. Default cleanup checks ancestry against local main before deleting the branch with `-D`, independent of primary HEAD or upstream.
+Resume only with `--fix gate|review` for failed evidence at the same HEAD. New scope needs a fresh lane seeded from the report. Fix resumes preserve directories and gate commands. A respawn can reuse an existing clean worktree on the expected lane branch in the same repository. After landing, `cdx close <lane>` removes the clean worktree and branch only when the branch is merged into local `main`. `--remove-worktree` remains accepted. Dirty, switched or unmerged worktrees refuse default cleanup. To abandon a lane, use `cdx close <lane> --keep-worktree` or native `keepWorktree: true`; it closes only the ledger entry and prints manual cleanup commands. Do not combine it with `--remove-worktree`. Default cleanup checks ancestry against local main before deleting the branch with `-D`, independent of primary HEAD or upstream.
 
 ## Commands
 
@@ -84,13 +84,15 @@ Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`
 
 ```bash
 cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--effort E] [--cd D] [--worktree P] [--bg] [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] [--add-dir D]... [--schema F] [--image F]... [--account NAME] ("<brief>" | -)
-cdx resume  <lane> [--add-dir D]... [--effort E] [--bg] [--gate "<cmd>"] [--pre "<cmd>"] [--max-runtime MIN] ("<follow-up>" | -)
+cdx resume  <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] ("<fix instructions>" | -)
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd D] [--bg] [--account NAME] ("<question>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
 cdx gate    <lane> ("<cmd>" | --clear)
 cdx gate-receipt <lane> [--json]
 cdx send    <lane> ("<text>" | -)          # steer a running work lane
-cdx ask     [--timeout MIN] "<question>"   # inside a lane only
+cdx ask     [--timeout MIN] "<question>"   # inside a lane: liaison
+cdx ask     --cd /repo "<question>"       # synchronous Gemini, no lane
+cdx land    <lane>
 cdx reply   <lane> [--id SEQ] ("<answer>" | -)
 cdx questions [lane]
 cdx events  [--json] [--peek]              # unread feed events; --peek leaves cursor unadvanced
@@ -124,27 +126,8 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   `mcp__cdx__reply` (or `cdx reply`). An unanswered question times out after 30 minutes. Timeout is
   not approval; the worker reports the unresolved dependency and stops only
   dependent work without guessing, continuing independent authorized work.
-- Calling `cdx resume` on an active running lane is refused by the harness;
-  wait for the active round to settle before resuming. `gemini.maxRounds`
-  (default 2) sets the round cap on Gemini lanes. `cdx resume` on a Gemini lane
-  whose work rounds already equal the cap fails with:
-  `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`.
-  Review rounds do not count toward the cap.
-  Astra and GPT lanes are not capped. Failed rounds expose a partial report
-  path when no full report exists. `resume` feeds that partial back to either
-  engine with an instruction to continue without redoing work. Gemini errors
-  are classified from the result error only, never from the model's response text.
-  Transport failures (interrupted stream, broken pipe, timeout, transient network)
-  get one automatic retry when no new step completed since the last one; a completed
-  step resets that counter. A 503 is a service outage: the live process is kept and
-  cdx retries up to six times with waits of 30 s, 1, 2, 4, 5 and 5 minutes. The first
-  503 wakes the head (event kind outage) and posts a CDX NOTICE into the supervising
-  lane; neither should resume or respawn a lane that is only waiting. Past the ladder
-  the round fails with a note that names cdx resume <lane> and keeps the partial.
-  If the agy process dies, the round fails with the note "transport death; cdx resume continues from the partial"
-  and the partial report is kept for cdx resume. Quota refusals, malformed tool calls,
-  cancellations, and failed gates never retry. The round runtime cap always applies.
-  Failure notes keep markdown in the file.
+- Resume requires `--fix gate|review`, failed evidence, a work conversation and the same HEAD. New scope needs a fresh lane seeded from the report. Gemini work rounds retain their configured round cap. A live round cannot resume. Partial reports preserve work after quota, transport and runtime failures; start a fresh lane when no gate or review failure authorizes resume.
+- Gemini retries a transport failure once and capacity outages through its six-step backoff, then may use one configured fallback round. Quota refusals and cancellations do not retry. A gate failure gets one automatic fix turn. Do not intervene while that turn is running.
 - The gate is the verdict. The gate runs with `<cwd>/node_modules/.bin`
   prepended to PATH, retaining the original PATH. Nested packages still need
   their own script or explicit runner. A gate failure is classified as a setup
@@ -157,7 +140,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
 - `--pre "<cmd>"` on spawn and resume runs `<cmd>` in the lane's cwd before
   opening the round. A nonzero exit refuses the launch, prints the last 20
   lines of output, and records nothing in the ledger. The pre-check persists on
-  the lane like the gate so resume reuses it unless a new `--pre` is given.
+  the lane like the gate; a fix resume cannot replace it.
   Intended use: `--pre "bun qa.ts readiness-check --release <sha>"` before any
   register cell lane.
 - Lanes touching the same repository get `--worktree`, or disjoint files in
@@ -171,7 +154,7 @@ cdx clean   [--days N] | cdx doctor [--fix] [--probe] | cdx brief
   ran shows `supervisor ended with running children`. `cdx kill <supervisor>`
   stops the tree.
 - A consult lane keeps its name for consults only; spawning work under it is
-  refused so its resume stays read-only.
+  refused; follow-up questions use a fresh consult.
 - Events reach only their owning full session id. Another head must run
   `cdx takeover <lane|full-session-id>` before mutating that owner's work.
   A lane target claims that lane and its supervisor children, whoever owned
@@ -217,4 +200,14 @@ Astra/GPT uses violet orbits, Gemini teal scanlines, and jobs amber tickers. Mot
 
 The dashboard reads discrete `work` and `review` round records. Version 5 removes flat `state`, `cwd`, and `reviewState` aliases. Keep row elements across SSE updates so one-second polling does not restart animations or drop keyboard focus. Use the active round engine and state for reviews. The work engine can differ. The view omits the model when a review switches engines because the ledger has no model for that review. `/api/state` and lane details expose `engine`, `startedAt`, `lastActivityAt`, `statusGroup`, and lane `stalled`. Job activity includes log modification time. The view never changes ledger state.
 
-Native tool output above 20 KB is retained under the cdx logs directory with bounded excerpts and a path; apply the same bound to shell output. Secret-shaped text is redacted before persistence and presentation. Identical Gemini reads collapse only in cdx transcripts, without waking the head. The gate runs once; a moving tree produces an invalid receipt with changed paths. The terminal uses a small text mark without demo graphics.
+Native tool output above 20 KB is retained under the cdx logs directory with bounded excerpts and a path; full safe output stays at the named path. Secret-shaped text is redacted before persistence and presentation. The pre-tool hook denies covered reads when the file has not changed. A moving owned path invalidates the gate receipt. Only a failed exit may receive one automatic repair turn and gate rerun. The terminal uses a small text mark without demo graphics.
+
+## 8.0 operating rules
+
+A work lane runs one typecheck and each touched spec once for mutation proof. The lane gate owns the suite and wall. A red gate gets one automatic repair turn before a terminal event; the head does not start a second repair while that turn runs.
+
+Use `doctor --fix` after updating. It installs isolated Codex lane homes and real Gemini agent files without changing open engine sessions. Reload the Claude plugin for native `land` and `ask`. Missing agents or hooks refuse a Gemini launch. Gemini rounds queue when projected burn exceeds available quota and stop at 250 calls with a handoff.
+
+Order one review per HEAD and tree. Reuse its report; after fixes, re-review only the fix diff against its prior findings. P3-only findings close the loop. GPT reviews accept `send` and publish per-call usage. Child terminals stay with the supervisor, which reports the combined outcome to the head.
+
+`ask` from the head is a synchronous read-only Gemini question and requires a repository path. It creates no lane and requires macOS sandbox-exec. Native required fields must be nonempty; nonzero command exits are tool errors. `land` refuses dirty bases, red receipts and edits made after the receipt. Resolve merge conflicts in the base checkout and retry; never bypass a stale receipt.

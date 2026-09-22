@@ -1,5 +1,6 @@
 // Standing lane rules, review frames, and resume prompt construction.
 
+import { retiredLaneRule } from "./account-sync.ts";
 import { config } from "./config.ts";
 import { type Engine, laneRunning, type Ledger, type Spec, workCwdOf } from "./ledger.ts";
 import { specPathOf } from "./reports.ts";
@@ -22,23 +23,23 @@ const ASTRA_RULES = [
   STANDARD_RULE,
   "Finish authorized work, resolve routine reversible choices, prepare concrete results before decisions, and incorporate steering or side questions without dropping the task.",
   "Within runtime constraints, brief and liaison replies outrank project and skill rules; quote any blocking instruction with its path and conflict, without inventing approvals.",
-  "Leave suites and walls to the lane gate after your report and let the liaison merge on that result; keep one test per real rule and delete fixture restatements or implementation mirrors.",
+  "Keep one test per real rule and delete fixture restatements or implementation mirrors.",
   ASK_RULE,
 ];
-export const VERIFICATION_RULE = "The lane gate owns verification after your report, overriding repository or skill instructions to run tests, typechecks, or other verification.";
+export const VERIFICATION_RULE = "Run one typecheck before the report, using vp check --no-fmt or the repository equivalent named in .cdx-rules.md, and each touched spec once for mutation proof. Never run the suite or the wall; the lane gate owns those.";
 const GPT_WORKER_RULES = [WORKER_BAN, ...ASTRA_RULES];
 export const GEMINI_WORKER_RULES = [
   WORKER_BAN,
   "Deliver within your files; the parent owns design and scope.",
   ASK_RULE,
-  "Reuse unchanged reads; cdx collapses identical read bodies in its transcript without waking the head, but provider context reuse requires an agy tool hook.",
-  "Change your hypothesis before repeating verification on an unchanged tree.",
-  "Remove temporary diagnostics, leave the suite to the gate after your report, and end with Assumptions or 'none'.",
+  "Read files under 800 lines whole once; reread only after they change. Batch independent reads. Use shell codegraph explore, not the MCP transport.",
+  "Remove temporary diagnostics and report commands and scope separately from the gate verdict. End with Assumptions or 'none'.",
 ];
 const SUPERVISOR_RULES = [
   "Own design and cross-cutting decisions; delegate bounded work to Gemini children, use GPT children or read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
   ...ASTRA_RULES,
   'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief>"` for Gemini or add `--engine gpt`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
+  "Never edit child-owned files. Put shared findings in a file referenced by child briefs and batch corrections into one send per child per review pass.",
   "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together, using shared-tree disjoint files for uncommitted dependencies because worktrees start at HEAD.",
   "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs, adopt, and clean to it.",
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
@@ -94,9 +95,8 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
   if (!reviewOnly) builtIns.push(VERIFICATION_RULE);
-  builtIns.push("Retain shell output above 20 KB outside the repo and return its path with bounded excerpts; native tool results retain full safe output under ~/.cdx/logs with a 20 KB head/tail limit.");
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
-  if (config.rules.length > 0) sections.push(config.rules.map((rule) => `- ${rule}`).join("\n"));
+  if (config.rules.length > 0) sections.push(config.rules.filter((rule) => !retiredLaneRule(rule)).map((rule) => `- ${rule}`).join("\n"));
   const projectRules = `${cwd}/.cdx-rules.md`;
   if (existsSync(projectRules)) {
     const text = readFileSync(projectRules, "utf8").trim();
@@ -108,6 +108,7 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
 export const REVIEW_FINDINGS_SCHEMA = {
   type: "object",
   required: ["report", "findings"],
+  additionalProperties: false,
   properties: {
     report: { type: "string", description: "the full markdown review report" },
     findings: {
@@ -115,6 +116,7 @@ export const REVIEW_FINDINGS_SCHEMA = {
       items: {
         type: "object",
         required: ["severity", "confidence", "file", "line", "summary"],
+        additionalProperties: false,
         properties: {
           severity: { type: "string", enum: ["P1", "P2", "P3"] },
           confidence: { type: "string", enum: ["CONFIRMED", "PLAUSIBLE"] },
@@ -129,12 +131,29 @@ export const REVIEW_FINDINGS_SCHEMA = {
 
 const REVIEW_FRAME_BASE = "ADVERSARIAL REVIEW. Find defects in behavior, contracts, data handling, or verification. For each finding give severity, file and line, and the input or state that produces the wrong result. P1 breaks users or data; P2 fails under realistic conditions; P3 is a smaller defect. Mark traced paths CONFIRMED and unverified paths PLAUSIBLE. Rank findings by severity. If clean, say so in one line. Omit praise and style remarks. Do not run the test suite; the lane gate already ran it and its result is in the report.";
 
-const REVIEW_FRAME_GPT = `${REVIEW_FRAME_BASE} End with fenced JSON: {"findings":[{"severity":"P1|P2|P3","confidence":"CONFIRMED|PLAUSIBLE","file":"...","line":0,"summary":"..."}]}. Use an empty findings array when clean.`;
-
-const REVIEW_FRAME_GEMINI = `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
-
-export function reviewFrame(engine: Engine): string {
-  return engine === "gemini" ? REVIEW_FRAME_GEMINI : REVIEW_FRAME_GPT;
+export function reviewFrame(_engine: Engine): string {
+  return `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 }
 
 export const CONSULT_FRAME = `CONSULT. Advise the Astra driver or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You have full access: run commands, use the network, and write notes or maps where the caller asks. Edit tracked source only when the question asks for it. End with Decisions for the caller, limited to choices that need the caller or owner.`;
+
+export function resumeRefusal(kind: string | undefined, lane: import("./ledger.ts").Lane, head: string): string | undefined {
+  const fresh = "New scope requires a fresh lane seeded from the report. Resume accepts only --fix gate or --fix review on the same diff.";
+  if (lane.consult || !["gate", "review"].includes(kind ?? "")) return fresh;
+  const previous = kind === "gate" ? lane.gateReceipt : lane.reviewTree;
+  if (!previous?.head || previous.head !== head) return `The diff HEAD changed. ${fresh}`;
+  if (kind === "gate" && (!lane.gateReceipt || lane.gateReceipt.exitCode === 0 && lane.gateReceipt.valid)) return `There is no failed gate to fix. ${fresh}`;
+  if (kind === "review" && (!lane.review || lane.reviewClosed !== false)) return `There are no blocking review findings to fix. ${fresh}`;
+}
+
+export function reviewLoopClosed(findings: unknown): boolean {
+  return Array.isArray(findings) && findings.every((item) => item && item.severity === "P3");
+}
+
+export function reviewerForTree(ledger: Ledger, tree: import("./ledger.ts").GateTree): string | undefined {
+  return Object.entries(ledger).find(([, item]) => item.reviewTree?.tree === tree.tree && item.reviewTree.head === tree.head)?.[0];
+}
+
+export function fixReviewPrompt(previous: import("./ledger.ts").GateTree, current: import("./ledger.ts").GateTree, report: string): string {
+  return `Check only the fix diff against the earlier findings and regressions introduced by those fixes. Use git diff ${previous.tree} ${current.tree}.\nPrevious findings:\n${report}`;
+}

@@ -39,3 +39,21 @@ test("identical Gemini reads collapse in stored transcripts without a head wake"
   roundTools("/repo", VISIBILITY_DEFAULTS, () => hash)(nextRound, "now");
   expect(nextRound.step_update.tool_info.output).toBe("original body");
 });
+
+import { unchangedRead, invocationPolicy } from "./questions.ts";
+
+test("a pre-tool read is denied only for covered content from a successful unchanged read", () => {
+  const record = { type: "cdx_tool", toolKind: "read", step: 7, readFiles: { "/repo/a.ts": "hash" }, readRange: { start: 1, end: 30 } };
+  expect(unchangedRead([record], "/repo/a.ts", "hash", 10, 20)).toContain("unchanged since step 7");
+  expect(unchangedRead([record], "/repo/a.ts", "edited", 10, 20)).toBeUndefined();
+  expect(unchangedRead([record], "/repo/a.ts", "hash", 10, 31)).toBeUndefined();
+  expect(unchangedRead([{ ...record, failed: true }], "/repo/a.ts", "hash", 10, 20)).toBeUndefined();
+  expect(unchangedRead([{ ...record, readFilesAfter: { "/repo/a.ts": "changed" } }], "/repo/a.ts", "hash", 10, 20)).toBeUndefined();
+});
+
+test("Gemini requests a handoff before terminating at 250 calls", () => {
+  expect(invocationPolicy(239)).toEqual({});
+  expect(invocationPolicy(240).injectSteps?.[0]?.userMessage).toContain("handoff report");
+  expect(invocationPolicy(249).terminationBehavior).toBeUndefined();
+  expect(invocationPolicy(250).terminationBehavior).toBe("terminate");
+});

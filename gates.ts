@@ -69,16 +69,16 @@ export function repositoryGate(cwd: string): string | undefined {
   return command;
 }
 
-export function gateTreeFromGit(root: string, git: (cwd: string, ...args: string[]) => string): GateTree {
+export function gateTreeFromGit(root: string, git: (cwd: string, ...args: string[]) => string, paths?: string[]): GateTree {
   const head = git(root, "rev-parse", "HEAD");
   git(root, "read-tree", head);
-  git(root, "add", "--all", "--", ".");
+  if (paths === undefined || paths.length) git(root, "add", "--all", "--", ...(paths ?? ["."]));
   // Inspect the whole repository even when the lane works in a subdirectory.
   if (/^160000 /m.test(git(root, "ls-files", "--stage"))) throw new CmdError("gate receipts do not support submodules or embedded repositories");
   return { head, tree: git(root, "write-tree") };
 }
 
-export function captureGateTree(cwd: string): GateTree | undefined {
+export function captureGateTree(cwd: string, paths?: string[]): GateTree | undefined {
   const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
   if (!top.success) return undefined;
   const root = top.stdout.toString().trim();
@@ -91,7 +91,8 @@ export function captureGateTree(cwd: string): GateTree | undefined {
     return result.stdout.toString().trim();
   };
   try {
-    return gateTreeFromGit(root, git);
+    const included = paths?.filter((path) => existsSync(join(root, path)) || git(root, "ls-files", "--", path));
+    return gateTreeFromGit(root, git, included);
   } finally {
     for (const file of [index, `${index}.lock`]) { if (existsSync(file)) unlinkSync(file); }
     rmdirSync(scratch);
@@ -193,7 +194,7 @@ export function executeGate(command: string, cwd: string, logPath: string): Gate
 export function gateOutputForReport(output: string, exitCode = 0): string {
   const trimmed = safeText(output).trim();
   const tail = trimmed.length > 4000 ? `...${trimmed.slice(-4000)}` : trimmed;
-  if (!exitCode) return tail;
+  if (!exitCode) return "Gate exited 0.";
   const failure = gateFailure(exitCode, output);
   return `gate ${failure.kind} failed\n${failure.diagnostic}\n\n${tail}`;
 }
@@ -382,4 +383,22 @@ export function gateCommand(argv: string[]): void {
     item.updatedAt = new Date().toISOString();
   });
   printGateChange(lane, before.gate, next);
+}
+
+export function failureDigest(output: string): string {
+  const lines = safeText(output).split(/\r?\n/);
+  const first = lines.findIndex((line) => fatalDiagnostics.some(([, pattern]) => pattern.test(line)));
+  return lines.slice(first < 0 ? Math.max(0, lines.length - 40) : first, first < 0 ? undefined : first + 40).join("\n").slice(0, 10_000);
+}
+
+export async function repairGateOnce<T extends { gate: { exitCode: number; output: string }; receipt: GateReceipt }>(run: () => T, repair: (prompt: string) => Promise<boolean>): Promise<T> {
+  const first = run();
+  if (first.gate.exitCode === 0 || first.receipt.reason?.startsWith("tree changed")) return first;
+  const tail = first.gate.output.trimEnd().split(/\r?\n/).slice(-60).join("\n");
+  if (!await repair(`Gate fix on the same diff. Correct only the failure below and write the updated report. Do not rerun the suite or wall; cdx runs the gate once after your fix.\n\n${tail}`)) return first;
+  return run();
+}
+
+export function changedPaths(before: ReviewTreeSnapshot, after: ReviewTreeSnapshot): string[] {
+  return [...new Set([...before.paths, ...after.paths])].filter((path) => before.pathFingerprints[path] !== after.pathFingerprints[path]).sort();
 }
