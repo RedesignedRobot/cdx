@@ -463,7 +463,7 @@ test("Rank 2: gateEnv prepends local bin to PATH and classifyGateFailure disting
   expect(classifyGateFailure(1, "user not found in database")).toBe("assertion");
 });
 
-test("cappedEffort resolves model aliases and clamps Astra to medium cap", () => {
+test("cappedEffort resolves model aliases and clamps Astra to the configured cap", () => {
   const cfg = {
     models: { astra: "gpt-6-astra" },
     effortCaps: { "gpt-6-astra": "medium" },
@@ -488,6 +488,14 @@ test("cappedEffort resolves model aliases and clamps Astra to medium cap", () =>
 
   // Uncapped model returns requested effort
   expect(cappedEffort("gpt-5-codex", "high", true, cfg)).toBe("high");
+
+  // The built-in Astra cap is high: high passes, xhigh fails or clamps
+  const builtIn = parseConfig("{}");
+  expect(cappedEffort("gpt-6-astra", "high", true, builtIn)).toBe("high");
+  expect(cappedEffort("gpt-6-astra", "xhigh", false, builtIn)).toBe("high");
+  expect(() => cappedEffort("gpt-6-astra", "xhigh", true, builtIn)).toThrow("exceeds the cap for gpt-6-astra (max high)");
+  expect(() => parseConfig('{"effortCaps":{"gpt-6-astra":"xhigh"}}')).toThrow("cannot exceed the built-in cap high");
+  expect(parseConfig('{"effortCaps":{"gpt-6-astra":"medium"}}').effortCaps["gpt-6-astra"]).toBe("medium");
 });
 
 test("fmtTokens and fmtTokensFull format tokens safely without NaN or literal undefined", () => {

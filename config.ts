@@ -10,7 +10,7 @@ import { isAbsolute, resolve } from "node:path";
 // against this order.
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh"];
 
-const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium" };
+const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "high" };
 
 function configError(message: string): never {
   fail(`${CONFIG_PATH}: ${message}`);
@@ -316,7 +316,7 @@ export function resolveEffort(engine: Engine, model: string | undefined, explici
 // explicit --effort above the cap is refused. Any other source above it (the
 // config default, a lane recorded before the cap, a gemini review round that
 // stored "high" on a gpt lane) clamps to the cap with a note, so nothing runs
-// Astra above medium by accident and nothing blocks a resume over bookkeeping.
+// Astra above high by accident and nothing blocks a resume over bookkeeping.
 // Every caller must send the returned effort to Codex; a session's stored
 // effort is never trusted.
 export function cappedEffort(model: string | undefined, effort: Effort, explicit = true, cfg?: { model?: string; models?: Record<string, string>; effortCaps?: Record<string, string>; efforts?: string[] }): Effort {
