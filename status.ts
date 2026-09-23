@@ -523,11 +523,11 @@ function fmtSpan(ms: number): string {
 }
 
 // 256-color codes shared with cca's row: a solid chip per row led by a Nerd
-// Font logo (codicon OpenAI U+EC81, Material four-point star U+F0AE2 for
+// Font 3.5+ logo (codicon OpenAI U+EC81, Material four-point star U+F0AE2 for
 // Gemini), near-white names, green for the account the next work lane gets.
-// Color carries two signals and nothing else: usage stays grey until 50%, then runs yellow to
-// red, bold red once spent; a reset timer starts muted, turns bluer as it
-// nears, and goes green in its last day.
+// Color carries two signals and nothing else: usage stays grey until 50%,
+// then runs yellow to red, bold red once spent; a reset timer starts muted,
+// turns bluer as it nears, and goes green in its last day.
 const LINE = {
   codex: "1;38;5;16;48;5;110", gemini: "1;38;5;16;48;5;105", text: "38;5;253", sub: "38;5;246", rule: "38;5;240",
   next: "1;38;5;120",
@@ -569,10 +569,10 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
   const rule = sgr(LINE.rule, "│");
-  const rows = [`${chip(LINE.codex, "\u{ec81}", "codex")} ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
+  const rows = [`${chip(LINE.codex, "\u{ec81}", "Codex")} ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
   if (gemini) {
     const [week] = geminiWindows(gemini);
-    rows.push(`${chip(LINE.gemini, "\u{f0ae2}", "gemini")} ${cell("week", week, LINE.sub)}`);
+    rows.push(`${chip(LINE.gemini, "\u{f0ae2}", "Gemini")} ${cell("week", week, LINE.sub)}`);
   }
   return rows.join("\n");
 }

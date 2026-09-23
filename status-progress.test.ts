@@ -60,7 +60,7 @@ test("usage line shows each Codex account's weekly window, then a Gemini weekly 
     { name: "codex-3" },
   ], { checkedAt: "2026-09-11T12:00:00Z", weekly: { remainingPercent: 20, resetsAt: new Date(now + 30 * 60_000).toISOString() }, fiveHour: { remainingPercent: 90, resetsAt: new Date(now).toISOString() } }, "codex-1", now, false);
   const [codex, gemini] = line.split("\n").map((row) => row.split("│"));
-  expect(codex.map((c) => c.trimEnd())).toEqual([" \u{ec81} codex    → codex-1  52% ↻3d5h", "   codex-2   0%", "   codex-3 ?"]);
-  expect(gemini.map((c) => c.trimEnd())).toEqual([" \u{f0ae2} gemini     week  80% ↻30m"]);
+  expect(codex.map((c) => c.trimEnd())).toEqual([" \u{ec81} Codex    → codex-1  52% ↻3d5h", "   codex-2   0%", "   codex-3 ?"]);
+  expect(gemini.map((c) => c.trimEnd())).toEqual([" \u{f0ae2} Gemini     week  80% ↻30m"]);
   expect(codex.slice(1).map((c) => c.length)).toEqual([36, 36]);
 });
