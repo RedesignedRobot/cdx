@@ -245,14 +245,18 @@ export async function spawnCommand(argv: string[]) {
 }
 
 export async function resumeCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir", "fix"]);
+  // --fix is a switch for doctor, so parseArgs would drop the word after it;
+  // resume takes that word (gate or review) out before parsing.
+  const fixAt = argv.indexOf("--fix");
+  const fix = fixAt < 0 ? undefined : argv[fixAt + 1];
+  const parsed = parseArgs(fixAt < 0 ? argv : argv.toSpliced(fixAt, 2), ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir"]);
   const [lane, followUpArg] = parsed.rest;
   const usage = 'usage: cdx resume <lane> --fix gate|review [--effort <effort>] [--bg] "<fix instructions>"';
   const followUp = await resolveBrief(followUpArg, usage);
   if (!lane || !followUp) fail(usage);
   const before = readLane(lane);
   const head = Bun.spawnSync({ cmd: ["git", "-C", workCwdOf(before), "rev-parse", "HEAD"] }).stdout.toString().trim();
-  const fixRefusal = resumeRefusal(parsed.flags.fix, before, head);
+  const fixRefusal = resumeRefusal(fix, before, head);
   if (fixRefusal) fail(fixRefusal);
   if (parsed.flags.gate !== undefined && parsed.flags.gate !== before.gate || parsed.lists["add-dir"]?.length || parsed.flags.pre !== undefined && parsed.flags.pre !== before.pre) fail("A fix resume cannot change the gate, setup, or directories; spawn a fresh lane seeded from the report");
   requireOwnChild(lane, before);
