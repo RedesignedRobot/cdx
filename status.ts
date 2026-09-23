@@ -523,17 +523,26 @@ function fmtSpan(ms: number): string {
 }
 
 // 256-color codes shared with cca's row: a solid chip per row, near-white
-// names, green for the account the next work lane gets, soft green for healthy
-// numbers, amber at 75%, red at 95%, bright sky blue for reset timers and a
-// yellow chip for a reset under a day away.
+// names, green for the account the next work lane gets. Color carries two
+// signals and nothing else: usage stays grey until 50%, then runs yellow to
+// red, bold red once spent; a reset timer starts muted, turns bluer as it
+// nears, and goes green in its last day.
 const LINE = {
   codex: "1;38;5;16;48;5;110", gemini: "1;38;5;16;48;5;105", text: "38;5;253", sub: "38;5;246", rule: "38;5;240",
-  next: "1;38;5;120", ok: "38;5;151", warn: "38;5;214", crit: "1;38;5;203", timer: "1;38;5;117", soon: "1;38;5;16;48;5;220",
+  next: "1;38;5;120",
 };
-const SOON_MS = 24 * 3_600_000;
+const USAGE_RAMP: [number, string][] = [
+  [95, "1;38;5;196"], [85, "38;5;202"], [75, "38;5;208"], [60, "38;5;214"], [50, "38;5;220"], [0, "38;5;250"],
+];
+const HOUR_MS = 3_600_000;
+const DAY_MS = 24 * HOUR_MS;
+const RESET_RAMP: [number, string][] = [
+  [3 * HOUR_MS, "1;38;5;46"], [8 * HOUR_MS, "1;38;5;48"], [DAY_MS, "38;5;50"], [2 * DAY_MS, "38;5;45"],
+  [3 * DAY_MS, "38;5;39"], [5 * DAY_MS, "38;5;33"], [Infinity, "38;5;61"],
+];
 
 // Status line rows from the stored snapshots: one for the Codex accounts'
-// weekly windows, one for Gemini's weekly and five-hour windows. No probe and
+// weekly windows, one for Gemini's weekly window. No probe and
 // no network, so a status line can run it on every render. Status lines read
 // ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set. `pick`
 // is the account cdx would give the next work lane, marked with a green arrow.
@@ -541,13 +550,13 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
   pick: string | null = null, now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
   const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
   const chip = (code: string, text: string) => sgr(code, ` ${text.padEnd(6)} `);
-  const timer = (ms: number) => (ms < SOON_MS ? sgr(LINE.soon, ` ↻${fmtSpan(ms)} `) : sgr(LINE.timer, `↻${fmtSpan(ms)}`));
+  const timer = (ms: number) => sgr(RESET_RAMP.find(([max]) => ms < max)![1], `↻${fmtSpan(ms)}`);
   const cell = (name: string, window?: { usedPercent: number; resetsAt: number }, labelCode = LINE.text) => {
     const label = name === pick ? `${sgr(LINE.next, "→")} ${sgr(LINE.next, name)}` : sgr(labelCode, name);
     if (!window) return `${label} ${sgr(LINE.sub, "?")}`;
-    if (window.resetsAt * 1000 <= now) return `${label} ${sgr(LINE.ok, "0%")}`;
-    const used = Math.round(window.usedPercent);
-    return `${label} ${sgr(used >= 95 ? LINE.crit : used >= 75 ? LINE.warn : LINE.ok, `${used}%`)} ${timer(window.resetsAt * 1000 - now)}`;
+    const pct = (used: number) => sgr(USAGE_RAMP.find(([min]) => used >= min)![1], `${used}%`);
+    if (window.resetsAt * 1000 <= now) return `${label} ${pct(0)}`;
+    return `${label} ${pct(Math.round(window.usedPercent))} ${timer(window.resetsAt * 1000 - now)}`;
   };
   const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
@@ -555,8 +564,8 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
   const rule = sgr(LINE.rule, "  │  ");
   const rows = [`${chip(LINE.codex, "codex")}  ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
   if (gemini) {
-    const [week, fiveHour] = geminiWindows(gemini);
-    rows.push(`${chip(LINE.gemini, "gemini")}  ${cell("week", week, LINE.sub)}${rule}${cell("5h", fiveHour, LINE.sub)}`);
+    const [week] = geminiWindows(gemini);
+    rows.push(`${chip(LINE.gemini, "gemini")}  ${cell("week", week, LINE.sub)}`);
   }
   return rows.join("\n");
 }

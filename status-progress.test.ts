@@ -48,7 +48,7 @@ test("brief includes all running lanes but only owned running jobs, with bounded
   expect(statusBrief({}, {}, { files: () => 0, phase: () => "", ownsJob: () => true, now })).toBe("");
 });
 
-test("usage line shows each Codex account's weekly window, then a Gemini row, from stored snapshots", () => {
+test("usage line shows each Codex account's weekly window, then a Gemini weekly row, from stored snapshots", () => {
   const snapshot = (windows: { usedPercent: number; windowDurationMins: number; resetsAt: number }[]) => ({
     checkedAt: "2026-09-11T12:00:00Z", usedPercent: 0, windowDurationMins: 10080, resetsAt: 0, planType: "pro",
     resetCreditsAvailable: 0, reached: false, windows,
@@ -59,5 +59,5 @@ test("usage line shows each Codex account's weekly window, then a Gemini row, fr
     { name: "codex-2", snapshot: snapshot([{ usedPercent: 97, windowDurationMins: 10080, resetsAt: at(-1) }]) },
     { name: "codex-3" },
   ], { checkedAt: "2026-09-11T12:00:00Z", weekly: { remainingPercent: 20, resetsAt: new Date(now + 30 * 60_000).toISOString() }, fiveHour: { remainingPercent: 90, resetsAt: new Date(now).toISOString() } }, "codex-1", now, false);
-  expect(line).toBe(" codex    → codex-1 52% ↻3d5h  │  codex-2 0%  │  codex-3 ?\n gemini   week 80%  ↻30m   │  5h 0%");
+  expect(line).toBe(" codex    → codex-1 52% ↻3d5h  │  codex-2 0%  │  codex-3 ?\n gemini   week 80% ↻30m");
 });
