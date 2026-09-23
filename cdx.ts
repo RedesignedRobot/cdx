@@ -49,7 +49,7 @@ export {
 } from "./runtime.ts";
 export {
   changedFileCount, laneProgress, porcelainFileCount, statusBrief, statusLine, geminiUsageRows, usageTable,
-  outageText,
+  outageText, usageLine,
 } from "./status.ts";
 export {
   parseAccountUsage, publishUsageSnapshot, projectWindow, mergeUsageHistory,

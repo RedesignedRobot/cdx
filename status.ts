@@ -27,7 +27,7 @@ import {
   firstExhaustion, liveView, renderNote, renderStatus, renderTable, renderUsageTable, tuiEnabled, type View,
 } from "./tui.ts";
 import {
-  projectWindow, readUsageHistory, readUsageSnapshot, type UsageReading, type WindowProjection,
+  projectWindow, readUsageHistory, readUsageSnapshot, type UsageReading, type UsageSnapshot, type WindowProjection,
 } from "./usage-store.ts";
 import { readFileSync } from "node:fs";
 
@@ -515,12 +515,43 @@ export function usageTable(rows: UsageRow[], now = Date.now(), tui = false): str
     { legacy: true }).split("\n");
 }
 
+function fmtSpan(ms: number): string {
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
+  return `${Math.floor(minutes / 1440)}d${Math.floor((minutes % 1440) / 60)}h`;
+}
+
+// Status line row: every account's weekly window from the stored snapshots.
+// No probe and no network, so a status line can run it on every render. Status
+// lines read ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set.
+export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[], gemini: GeminiUsageSnapshot | undefined,
+  now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
+  const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
+  const cell = (name: string, window?: { usedPercent: number; resetsAt: number }) => {
+    if (!window) return `${name} ?`;
+    if (window.resetsAt * 1000 <= now) return `${name} ${sgr("32", "0%")}`;
+    const used = Math.round(window.usedPercent);
+    return `${name} ${sgr(used >= 95 ? "31" : used >= 75 ? "33" : "32", `${used}%`)} ${sgr("34", `↻${fmtSpan(window.resetsAt * 1000 - now)}`)}`;
+  };
+  const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
+    ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
+    : undefined;
+  const cells = accounts.map((a) => cell(a.name, weekly(a.snapshot)));
+  if (gemini) cells.push(cell("gemini", geminiWindows(gemini)[0]));
+  return `${sgr("1;36", "cdx")}     ${cells.join("   ")}`;
+}
+
 export async function usageCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["json", "totals"]);
+  const parsed = parseArgs(argv, ["json", "totals", "line"]);
   const json = parsed.bools.has("json");
   const accounts: (AccountChoice | undefined)[] = config.accounts
     ? Object.entries(config.accounts).map(([name, home]) => ({ name, home }))
     : [undefined];
+  if (parsed.bools.has("line")) {
+    console.log(usageLine(accounts.map((account) => ({ name: account?.name ?? "codex", snapshot: readUsageSnapshot(account) })), readGeminiUsageSnapshot()));
+    return;
+  }
 
   // All-time lane and token totals from the ledger, grouped by account.
   // Tokens only accrue on JSONL rounds (spawn, exec review); text rounds

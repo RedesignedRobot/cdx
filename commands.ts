@@ -57,6 +57,7 @@ ${ENGINE_PICKER}
   status [--all | --json | --brief | --line | --watch [--interval S]]
   wait <lane>... [--timeout S] [--json] [--report]
   usage  [--json] [--totals] # quota windows, observed burn, account picks
+  usage  --line            # weekly windows from stored snapshots, for status lines
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes
   view   [--port N] [--open] # local browser view; Ctrl-C stops it
   feed   [-n N]           # replay recent completion/stall lines

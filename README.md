@@ -188,6 +188,7 @@ flowchart LR
 | `cdx consult <lane> [--engine gpt\|gemini] [--supervisor]` | Run a read-only advisory consult or supervisor helper |
 | `cdx status` | Show lane state, tool steps, dirty file count, stage, timing, and last action; `--line` renders a 100-character status line |
 | `cdx usage` | Codex and Gemini quota table, observed burn, projections and account picks; --totals adds ledger totals |
+| `cdx usage --line` | One status line row: each account's weekly used percent and time to reset, from stored readings |
 | `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
 | `cdx job <name> --cd /repo "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
 | `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
@@ -224,6 +225,7 @@ cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME]
 cdx view [--port N] [--open]
 cdx status [--all] [--json | --brief | --line | --watch [--interval S]]
 cdx usage  [--json] [--totals]
+cdx usage  --line
 cdx wait   <lane>... [--timeout S] [--json] [--report]
 cdx tail   <lane> [-n N]
 cdx tail   -f [lane]
@@ -516,6 +518,8 @@ Snapshot thresholds and demand holds guide placement and concurrency control. Th
 Usage readings cache for 30 minutes unless a window has reset or the reading lacks per-window data. Failed probes cache for 5 minutes. A failed probe with no usable reading leaves capacity unknown. Exhaustion markers carry provenance (recorded time, window length, reason) and reconcile against fresh usage probes; a marker clears only when no window of that account is exhausted, while a live block on any window stays. `cdx usage` advice reads the reconciled standings.
 
 `usage` prints one row per Codex or Gemini window: account, window, used, left, resets in, burn/h, at reset, empty in, and holds. `left` is the last observed remaining percentage; admission subtracts holds from the smallest live window. `at reset` is the percentage projected to be forfeited at the observed burn. `empty in` appears only when exhaustion precedes reset. Gemini's five-hour quota block replaces its reset countdown while blocked; the blocked row remains with unknown percentages when no usage snapshot exists. Red starts at 95% used and yellow at 75%. Two lines below the table show GPT picks and account exceptions. `--totals` adds all-time ledger totals; JSON always includes them.
+
+`usage --line` prints one row for a Claude Code status line: `cdx`, then each Codex account's weekly window as used percent and time to reset (`codex-1 52% ↻3d3h`), then Gemini's weekly window. It reads only the stored snapshots, never probes, and takes about 30ms, so a status line can call it on every render. A window past its reset shows `0%`, and an account with no reading shows `?`. It prints ANSI colors into a pipe, because status lines read them that way, unless `NO_COLOR` is set. The colors match the table: green, yellow from 75%, red from 95%.
 
 Each successful probe writes one reading per window to `~/.cdx/usage-history.json`, capped at 2,048 readings under a shared lock. Cached and failed probes add nothing. Burn is the percentage-point increase per hour between the earliest and latest readings within the last four hours, for the same account, window length and reset instant. A percentage decrease starts a new segment. Fewer than two distinct timestamps, an expired window or an old sample means no burn estimate, shown as `?`. Zero observed growth is zero burn. Projections include time elapsed since the latest reading; they assume that observed burn continues.
 

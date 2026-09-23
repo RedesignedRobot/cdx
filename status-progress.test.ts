@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { jobPhaseText, laneProgress, porcelainFileCount, statusBrief } from "./cdx.ts";
+import { jobPhaseText, laneProgress, porcelainFileCount, statusBrief, usageLine } from "./cdx.ts";
 
 const now = Date.parse("2026-09-11T12:10:00Z");
 const lane = (patch: Record<string, unknown> = {}) => ({
@@ -46,4 +46,18 @@ test("brief includes all running lanes but only owned running jobs, with bounded
   expect(filesRead).toEqual(["/work", "/review"]);
   expect(phasesRead).toEqual(["/job.log"]);
   expect(statusBrief({}, {}, { files: () => 0, phase: () => "", ownsJob: () => true, now })).toBe("");
+});
+
+test("usage line shows each account's weekly window and time to reset from stored snapshots", () => {
+  const snapshot = (windows: { usedPercent: number; windowDurationMins: number; resetsAt: number }[]) => ({
+    checkedAt: "2026-09-11T12:00:00Z", usedPercent: 0, windowDurationMins: 10080, resetsAt: 0, planType: "pro",
+    resetCreditsAvailable: 0, reached: false, windows,
+  });
+  const at = (hours: number) => (now + hours * 3_600_000) / 1000;
+  const line = usageLine([
+    { name: "codex-1", snapshot: snapshot([{ usedPercent: 10, windowDurationMins: 300, resetsAt: at(1) }, { usedPercent: 52, windowDurationMins: 10080, resetsAt: at(77) }]) },
+    { name: "codex-2", snapshot: snapshot([{ usedPercent: 97, windowDurationMins: 10080, resetsAt: at(-1) }]) },
+    { name: "codex-3" },
+  ], { checkedAt: "2026-09-11T12:00:00Z", weekly: { remainingPercent: 20, resetsAt: new Date(now + 30 * 60_000).toISOString() }, fiveHour: { remainingPercent: 90, resetsAt: new Date(now).toISOString() } }, now, false);
+  expect(line).toBe("cdx     codex-1 52% ↻3d5h   codex-2 0%   codex-3 ?   gemini 80% ↻30m");
 });
