@@ -37,6 +37,15 @@ describe("delivery rules", () => {
     expect(afterToolCall(outcome.state).context).toContain(event.text);
   });
 
+  test("lifecycle notices stay in the band and out of head context", () => {
+    const quiet = [
+      ...["started", "partial", "report-written", "gate-started", "active"].map((kind) => ({ kind, text: `[cdx] lane=alpha round=1 ${kind}`, wake: false })),
+      { kind: "progress", text: "[cdx] lane=alpha round=1 steer delivered mode=steered: fix it", wake: false },
+    ];
+    expect(headEvents(quiet)).toEqual([]);
+    expect(afterToolCall(afterPoll(initialDeliveryState(), quiet).state).context).toBeUndefined();
+  });
+
   test("a rejected steer notice reaches the head", () => {
     const event = { kind: "progress", text: "[cdx] lane=alpha round=1 steer rejected and retained: turn closed", wake: false };
     expect(headEvents([event])).toEqual([event]);

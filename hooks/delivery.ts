@@ -14,8 +14,17 @@ function routineProgress(event: PendingEvent): boolean {
   return event.kind === "progress" && (event.text === "[cdx] progress" || event.text.startsWith("[cdx] progress\n"));
 }
 
+// Lifecycle notices the band and /lanes already show. The head only needs
+// what it must act on: terminals, questions, stalls, rejections, messages.
+const LIFECYCLE_KINDS: ReadonlySet<string> = new Set(["started", "partial", "report-written", "gate-started", "active"]);
+
+function lifecycleNotice(event: PendingEvent): boolean {
+  if (event.kind && LIFECYCLE_KINDS.has(event.kind)) return true;
+  return event.kind === "progress" && / steer delivered mode=/.test(event.text);
+}
+
 export function headEvents(events: readonly PendingEvent[]): PendingEvent[] {
-  return events.filter((event) => !routineProgress(event));
+  return events.filter((event) => !routineProgress(event) && !lifecycleNotice(event));
 }
 
 function elapsed(startedAt: string, now: number): string {
