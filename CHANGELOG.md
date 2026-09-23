@@ -1,3 +1,9 @@
+## 9.2.0
+
+- The Claude Code mod draws running lanes and jobs above the prompt on terminal and desktop, with children under supervisors, stage, round elapsed time, steps, files, and current action. `/lanes` opens a live Pane with recent transcript lines on every surface that accepts panes, including mobile and VS Code.
+- One `cdx events --json --snapshot` call per poll supplies events and display state. The pinned status line now shows round elapsed time and action. Progress events stay available on demand and no longer wake or enter the head's context; actionable events keep their delivery rules.
+- Regenerated the early access hook types with Claude Code 2.1.281.
+
 ## 9.1.0
 
 - Sol and Astra run at effort medium unless `--effort high` is asked for; high stays the cap. The engine picker text says so.
