@@ -525,21 +525,26 @@ function fmtSpan(ms: number): string {
 // Status line row: every account's weekly window from the stored snapshots.
 // No probe and no network, so a status line can run it on every render. Status
 // lines read ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set.
+// 256-color codes shared with cca's row: near-white values, grey labels and
+// timers, color on a number only at 75% (amber) and 95% (red).
+const LINE = { text: "38;5;253", sub: "38;5;246", warn: "38;5;214", crit: "1;38;5;203" };
+
 export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[], gemini: GeminiUsageSnapshot | undefined,
   now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
   const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
   const cell = (name: string, window?: { usedPercent: number; resetsAt: number }) => {
-    if (!window) return `${name} ?`;
-    if (window.resetsAt * 1000 <= now) return `${name} ${sgr("32", "0%")}`;
+    const label = sgr(LINE.text, name);
+    if (!window) return `${label} ${sgr(LINE.sub, "?")}`;
+    if (window.resetsAt * 1000 <= now) return `${label} ${sgr(LINE.text, "0%")}`;
     const used = Math.round(window.usedPercent);
-    return `${name} ${sgr(used >= 95 ? "31" : used >= 75 ? "33" : "32", `${used}%`)} ${sgr("34", `↻${fmtSpan(window.resetsAt * 1000 - now)}`)}`;
+    return `${label} ${sgr(used >= 95 ? LINE.crit : used >= 75 ? LINE.warn : LINE.text, `${used}%`)} ${sgr(LINE.sub, `↻${fmtSpan(window.resetsAt * 1000 - now)}`)}`;
   };
   const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
   const cells = accounts.map((a) => cell(a.name, weekly(a.snapshot)));
   if (gemini) cells.push(cell("gemini", geminiWindows(gemini)[0]));
-  return `${sgr("1;36", "cdx")}     ${cells.join("   ")}`;
+  return `${sgr(LINE.sub, "cdx")}     ${cells.join(sgr(LINE.sub, "  │  "))}`;
 }
 
 export async function usageCommand(argv: string[]): Promise<void> {
