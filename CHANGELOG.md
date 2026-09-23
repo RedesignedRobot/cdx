@@ -1,3 +1,8 @@
+## 9.2.1
+
+- `resume --fix gate|review` works again. `--fix` is a switch for `doctor --fix`, so the argument parser dropped the kind and every fix resume was refused as new scope.
+- A lane can land after a fix round. Fix, review and continuation rounds now carry the lane's touched paths forward, so the gate receipt covers files earlier rounds changed. Before this, `land` refused with "lane has changes outside its gate receipt paths".
+
 ## 9.2.0
 
 - The Claude Code mod draws running lanes and jobs above the prompt on terminal and desktop, with children under supervisors, stage, round elapsed time, steps, files, and current action. `/lanes` opens a live Pane with recent transcript lines on every surface that accepts panes, including mobile and VS Code.

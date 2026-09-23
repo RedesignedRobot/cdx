@@ -467,7 +467,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const siblings = siblingPaths();
     const changed = workTreeStartSnapshot && after ? changedPaths(workTreeStartSnapshot, after).map((path) => resolve(treeCwd, path)) : [];
     const children = startingLane?.supervisor ? Object.values(readLedger()).filter((item) => item.parent === lane && item.parentRound === round).flatMap((item) => item.touchedPaths ?? []) : [];
-    const paths = [...new Set([...writtenPaths, ...children, ...changed.filter((path) => !siblings.has(path))])];
+    const paths = [...new Set([...(startingLane?.touchedPaths ?? []), ...writtenPaths, ...children, ...changed.filter((path) => !siblings.has(path))])];
     withLedger((ledger) => { ledger[lane]!.touchedPaths = paths; });
     const root = Bun.spawnSync({ cmd: ["git", "-C", spec.cwd, "rev-parse", "--show-toplevel"] }).stdout.toString().trim();
     return paths.map((path) => relative(root || spec.cwd, path)).filter((path) => path && !path.startsWith("../"));
@@ -521,7 +521,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
         commandTrees.delete(observation.id);
       }
     }
-    if (writtenPaths.size) touchLedger((item) => { item.touchedPaths = [...writtenPaths]; });
+    if (writtenPaths.size) touchLedger((item) => { item.touchedPaths = [...new Set([...(startingLane?.touchedPaths ?? []), ...writtenPaths])]; });
     const progress = trackTools(event, now)!;
     if (progress.record) { log.write(`${safeJSON(progress.record)}\n`); log.flush(); }
     roundStepCount = progress.steps;

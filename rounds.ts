@@ -111,7 +111,9 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         transcriptPath: undefined,
         reviewTree: opts?.reviewTree ?? existing?.reviewTree,
         reviewClosed: kind === "review" ? undefined : existing?.reviewClosed,
-        touchedPaths: [],
+        // Fix, review and continuation rounds work on the same diff, so the
+        // gate receipt must still cover files earlier rounds touched.
+        touchedPaths: opts?.preserveGate ? existing?.touchedPaths ?? [] : [],
         workSessionId: kind === "review"
           ? existing?.workSessionId ?? (existing?.kind === "work" ? existing.sessionId : undefined)
           : existing?.workSessionId,
