@@ -122,7 +122,7 @@ const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base"
 
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "tools", "supervisor", "open", "brief", "watch", "line", "peek"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "tools", "supervisor", "open", "brief", "watch", "line", "peek", "snapshot"]);
 
 export interface Parsed { flags: Record<string, string>; lists: Record<string, string[]>; bools: Set<string>; rest: string[] }
 

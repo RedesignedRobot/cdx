@@ -705,6 +705,8 @@ test("free text from stdin accepts '-' and empty stdin fails with command usage 
 
 test("events and status accept their boolean flags at the command line", () => {
   expect(parseArgs(["--json", "--peek"], ["json", "peek"]).bools).toEqual(new Set(["json", "peek"]));
+  // The plugin polls with exactly these flags every two seconds; a refusal blanks /lanes and stops lane wakes.
+  expect(parseArgs(["--json", "--snapshot"], ["json", "peek", "watch", "snapshot"]).bools).toEqual(new Set(["json", "snapshot"]));
   expect(parseArgs(["--line"], ["json", "all", "brief", "line", "watch", "interval"]).bools).toEqual(new Set(["line"]));
 });
 
