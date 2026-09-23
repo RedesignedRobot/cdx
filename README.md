@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 9.1.0
+# cdx 9.2.0
 
 **A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
@@ -8,7 +8,7 @@ Claude is the head. Astra thinks. Sol executes. cdx keeps the books and wakes th
 
 [![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
 [![Function hooks](https://img.shields.io/badge/function_hooks-native_tools-d97757)](#registered-tools)
-[![Version](https://img.shields.io/badge/version-9.1.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-9.2.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
 [![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
@@ -21,7 +21,7 @@ cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone C
 
 ## Native in Claude Code
 
-cdx 7.0 runs inside Claude Code as a [function hooks](#claude-code-integration) module, not as a shell wrapper. When a session starts, the mod registers tools under `mcp__cdx__`, the `/lanes` command, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. Nothing blocks. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
+cdx runs inside Claude Code as a [function hooks](#claude-code-integration) module. When a session starts, the mod registers tools under `mcp__cdx__`, the `/lanes` command, a live band, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
 
 ```mermaid
 sequenceDiagram
@@ -34,7 +34,7 @@ sequenceDiagram
     CLI->>Lane: detached round starts
     Note over Head: turn ends, nothing waits
     loop every 2 s
-        Mod->>CLI: cdx events --json
+        Mod->>CLI: cdx events --json --snapshot
     end
     Lane-->>CLI: question, report, stall, 503
     CLI-->>Mod: wake event
@@ -49,14 +49,15 @@ sequenceDiagram
 | `mcp__cdx__status`, `events`, `report`, `tail`, `questions`, `usage` | Check in without waiting. |
 | `mcp__cdx__close`, `kill`, `gate`, `job`, `takeover`, `doctor` | Finish, stop, gate, run detached jobs, claim work, diagnose. |
 | `[cdx]` prompts and toasts | Wake events arrive as a prompt when the head is idle and as context on the next tool result mid-turn. |
-| `/lanes` | Lane status, or any read-only cdx command, from the prompt. |
-| Status line | Running lanes, open questions, and quota, refreshed every ten seconds. |
+| `/lanes` | Opens a live Pane with lane details and recent transcript lines. Arguments forward to cdx. |
+| Live band | Running lanes and jobs, stage, elapsed round time, steps, files, and current action above the prompt on terminal and desktop. |
+| Status line | Lane count, busiest stage, elapsed round time, and current action, refreshed every two seconds. |
 
 There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and people at a terminal.
 
 ## Setup in 60 seconds
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.1.0:
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.2.0:
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
@@ -397,21 +398,20 @@ The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, a `while
 ### Slash command
 
 The mod registers the `/lanes` slash command in Claude Code.
-Running `/lanes` without arguments displays current lane status.
+Running `/lanes` without arguments opens a live Pane with each running lane or job and recent transcript lines. The Pane works on terminal, desktop, mobile, and VS Code surfaces when the surface accepts it.
 Running `/lanes <args>` passes the arguments directly to the cdx CLI.
 The `/cdx` slash command remains the user skill that loads `SKILL.md`.
 
 ### Status line and toasts
 
-The mod starts a background timer polling `cdx events --json` every 2 seconds.
-Every fifth poll (every 10 seconds), it runs `cdx status --line` and updates `$.ui.status`.
-When all work finishes and no questions remain, the status line clears.
+The mod polls `cdx events --json --snapshot` every 2 seconds. One cdx process returns session events and a snapshot of all running lanes and jobs. The snapshot updates the live band and `$.ui.status`. The band groups supervisor children under their parent and clears when work ends. Claude Code 2.1.281 raises `AbovePrompt` on terminal and desktop; use `/lanes` to open the Pane on mobile or VS Code. The status line shows the lane count, busiest stage, elapsed round time, and current action. It clears when work ends.
 For each new event marked `wake: true`, the mod displays an 8-second toast notification through `$.ui.toast`.
 When running in headless mode (`surface === null`), UI status, toasts, and UI logs are skipped while background polling, prompt submission, and context attachment proceed.
 
 ### Event delivery
 
 Events flow into Claude Code through two delivery paths:
+- Progress events remain available through `mcp__cdx__events`. They do not wake the head or enter its context. Questions, terminal events, stalls, thrash, outages, failures, and peer messages still reach the head.
 - Idle wake: when no turn is running and the pending buffer contains at least one wake event, the mod holds it for 15 seconds so a burst of lane events costs one prompt, then drains the buffer into `$.prompt.submit`. The prompt starts with `[cdx]` followed by the event lines.
 - Prompt budget: Claude Code refuses a plugin's `$.prompt.submit` after 50 in one session. On that refusal the mod stops submitting for the session, logs one notice, keeps the events for the next tool result or typed prompt, puts each fresh wake into the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. A new session restores wakes. Any other refusal is retried after the coalesce window and logged once per message.
 - Mid-turn context: when a turn is active, pending events stay buffered. After each non-subagent tool call completes without a denial, the mod drains the buffer into additional context under `[cdx] events`. User prompt submissions also receive pending buffered events as context.

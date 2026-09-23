@@ -4,7 +4,7 @@ description: Run OpenAI Codex and Google Antigravity work, review, consult, ques
 allowed-tools: Bash(cdx *), Bash(${CLAUDE_SKILL_DIR}/cdx.ts *), mcp__cdx__*
 ---
 
-# cdx 9.1.0
+# cdx 9.2.0
 
 You are the owner's liaison. cdx is how you delegate: each lane is one engine process with
 a brief, a ledger row, a captured report, and policy from `config.json`.
@@ -185,9 +185,9 @@ cdx loads as a native mod through `~/.claude/skills/cdx`.
 `hooks/hooks.json` declares `modules: ["./register.ts"]`.
 The integration requires `"env": { "CLAUDE_CODE_ENABLE_FUNCTION_HOOKS": "1" }` in `~/.claude/settings.json`.
 The mod registers native `mcp__cdx__*` tools directly inside Claude Code runtime.
-The `/lanes` command provides quick CLI access: `/lanes` runs status, while `/lanes <args>` forwards arguments to cdx.
+The `/lanes` command opens a live Pane with per-lane details and recent transcript lines. `/lanes <args>` forwards arguments to cdx. The live band above the prompt shows running lanes and jobs on terminal and desktop. Use the Pane on mobile or VS Code.
 The `/cdx` command remains the skill that loads this document.
-The mod polls events every 2 seconds, updates the status line every 10 seconds, and delivers wake events as prompts when idle (held 15 seconds so a burst costs one prompt) and as context mid-turn. Claude Code allows a plugin 50 prompts per session; once spent, the status line reads `wakes off`, events still land on the next tool result or typed prompt, fresh wakes appear as a Tab suggestion in the prompt box, and a new session restores wakes.
+The mod polls events and the lane snapshot in one cdx call every 2 seconds. The band and status line show round elapsed time and the current action. Progress events stay out of the head's context but remain available through `mcp__cdx__events`. Actionable wake events become prompts when idle (held 15 seconds so a burst costs one prompt) and context mid-turn. Claude Code allows a plugin 50 prompts per session; once spent, the status line reads `wakes off`, actionable events still land on the next tool result or typed prompt, fresh wakes appear as a Tab suggestion in the prompt box, and a new session restores wakes.
 Run `cdx doctor` to verify that the mod is polling and live.
 
 ## Browser view

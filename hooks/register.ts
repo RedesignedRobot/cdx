@@ -11,6 +11,11 @@ import {
   onTurnStart,
   type DeliveryState,
   type PendingEvent,
+  type LiveSnapshot,
+  bandRow,
+  headEvents,
+  orderedRows,
+  pinnedLine,
 } from "./delivery";
 import {
   CDX_TOOL_PREFIX,
@@ -29,8 +34,8 @@ let CDX: string[] = [];
 let surface: RenderSurface | null = null;
 let deliveryState: DeliveryState = initialDeliveryState();
 let pollInFlight = false;
-let pollCount = 0;
 let outputSequence = 0;
+const liveRef = { plugin: "cdx", key: "live" } as const;
 // Each refusal message is logged once; the poll runs every two seconds and
 // a repeated log would flood the transcript.
 const loggedRefusals = new Set<string>();
@@ -45,41 +50,36 @@ async function poll($: EngineInterface) {
   }
   pollInFlight = true;
   try {
-    const eventsResult = await $.process.run(CDX.concat(["events", "--json"]), {
+    const eventsResult = await $.process.run(CDX.concat(["events", "--json", "--snapshot"]), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
     });
 
-    pollCount += 1;
-    if (pollCount % 5 === 0) {
-      const statusResult = await $.process.run(CDX.concat(["status", "--line"]), {
-        env: { CLAUDE_CODE_SESSION_ID: session },
-        cwd: root,
-      });
-      const line = statusResult.stdout.trim();
-      if (surface !== null) {
-        const shown = deliveryState.budgetSpent ? `wakes off${line ? ` · ${line}` : ""}` : line;
-        await $.ui.status(shown || undefined);
-      }
-    }
-
     let incomingEvents: PendingEvent[] = [];
+    let snapshot: LiveSnapshot | undefined;
     if (eventsResult.exitCode === 0 && eventsResult.stdout.trim()) {
       try {
         const parsed = JSON.parse(eventsResult.stdout);
         if (parsed && Array.isArray(parsed.events)) {
           incomingEvents = parsed.events;
         }
+        if (parsed && Array.isArray(parsed.rows) && typeof parsed.now === "number") {
+          snapshot = { rows: parsed.rows, now: parsed.now };
+        }
       } catch {
         // ignore malformed JSON
       }
+    }
+    if (snapshot) {
+      await $.state.set(liveRef, snapshot);
+      if (surface !== null) await $.ui.status(pinnedLine(snapshot.rows, snapshot.now, deliveryState.budgetSpent) || undefined);
     }
 
     // Everything the submit would carry, kept so a refused submit can put it
     // back. The submit is issued before any await so no turn can start in
     // between; it is not awaited because the prompt runs when the session is
     // idle and the poll must not wait for that.
-    const drained = [...deliveryState.pending, ...incomingEvents];
+    const drained = [...deliveryState.pending, ...headEvents(incomingEvents)];
     const outcome = afterPoll(deliveryState, incomingEvents);
     deliveryState = outcome.state;
 
@@ -114,7 +114,7 @@ async function poll($: EngineInterface) {
 // answers with the buffer first, then whatever the feed still held, and
 // empties the buffer so the after-hook does not deliver it a second time.
 function eventsToolResult(exitCode: number, stdout: string, stderr: string): string {
-  const buffered = deliveryState.pending.map((e) => e.text);
+  const buffered = [...deliveryState.pending, ...deliveryState.progress].map((e) => e.text);
   deliveryState = clearBuffer(deliveryState);
   let fresh: string[] = [];
   if (exitCode === 0 && stdout.trim()) {
@@ -131,6 +131,28 @@ function eventsToolResult(exitCode: number, stdout: string, stderr: string): str
 }
 
 export function register(on: On) {
+  on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
+    const { value } = await $.state.get(liveRef);
+    if (!value?.rows.length || e.props.hasSurvey) return next(e);
+    const { Box, Text } = $.ui.resolve(e);
+    return Box({ flexDirection: "column", children: orderedRows(value.rows).map((row) =>
+      Text({ ...(row.question || row.stage === "stalled" ? { color: "yellow" } : row.stage === "outage" ? { color: "red" } : {}),
+        wrap: "truncate", children: bandRow(row, value.now, e.props.bodyColumns) })) });
+  });
+
+  on("ui.render", { component: "Pane" }, async ($, e, next) => {
+    if (e.requestId !== "cdx-lanes") return next(e);
+    const { value } = await $.state.get(liveRef);
+    const { Box, Text } = $.ui.resolve(e);
+    const rows = value?.rows ?? [];
+    return Box({ flexDirection: "column", children: rows.length ? orderedRows(rows).flatMap((row) => [
+      Text({ ...(row.question || row.stage === "stalled" ? { color: "yellow" } : row.stage === "outage" ? { color: "red" } : {}),
+        bold: true, wrap: "truncate", children: bandRow(row, value?.now ?? Date.now(), e.props.bodyColumns) }),
+      ...(row.transcript ?? []).map((line) => Text({ dimColor: true, wrap: "truncate",
+        children: `  ${Array.from(line).slice(0, Math.max(0, e.props.bodyColumns - 3)).join("")}` })),
+    ]) : [Text({ children: "No running lanes or jobs" })] });
+  });
+
   on("session.start", async ($, e, next) => {
     session = await $.session.id();
     root = $.plugin.root;
@@ -150,7 +172,7 @@ export function register(on: On) {
     try {
       await $.command.register({
         name: "lanes",
-        description: "cdx lanes: status, or any read-only cdx command",
+        description: "Open live lanes, or forward arguments to cdx",
       });
     } catch (error) {
       await $.ui.log(`cdx: /lanes not registered: ${error instanceof Error ? error.message : String(error)}`);
@@ -191,7 +213,11 @@ export function register(on: On) {
   });
 
   on("command.run", { command: "lanes" }, async ($, e) => {
-    const args = e.args.trim().length > 0 ? e.args.trim().split(/\s+/) : ["status"];
+    if (!e.args.trim()) {
+      const opened = await $.ui.open({ id: "cdx-lanes", title: "Lanes", focus: true });
+      return { text: opened.isPlaced ? "Lanes pane opened" : `Lanes pane unavailable: ${opened.reason ?? "surface refused"}` };
+    }
+    const args = e.args.trim().split(/\s+/);
     const res = await $.process.run(CDX.concat(args), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
@@ -266,7 +292,7 @@ export function register(on: On) {
 
   on(
     "tool.call",
-    { tool: TOOL_NAMES.map((name) => `${CDX_TOOL_PREFIX}${name}` as `mcp__cdx__${string}`) },
+    { tool: /^mcp__cdx__/ },
     async ($, e) => {
     const toolName = e.tool.startsWith(CDX_TOOL_PREFIX)
       ? e.tool.slice(CDX_TOOL_PREFIX.length)

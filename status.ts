@@ -18,7 +18,8 @@ import {
   roundReportOf, type Tokens, workCwdOf,
 } from "./ledger.ts";
 import { questionFiles, questionOpen, type QuestionRecord } from "./questions.ts";
-import { availableReportPath, jobPhase, openCursor, readTailLines, renderEventLine } from "./reports.ts";
+import { availableReportPath, jobPhase, logPathOf, openCursor, readTailLines, renderEventLine } from "./reports.ts";
+import { safeText } from "./safe-text.ts";
 import {
   color, coloredState, displayPath, fail, FINISHED_SHOWN, fmtAge, fmtCreated, fmtTokens, fmtTokensFull,
   fmtUntil, HOME, LEDGER, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText,
@@ -29,7 +30,7 @@ import {
 import {
   projectWindow, readUsageHistory, readUsageSnapshot, type UsageReading, type UsageSnapshot, type WindowProjection,
 } from "./usage-store.ts";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 export function porcelainFileCount(output: string): number {
   const records = output.split("\0");
@@ -43,12 +44,67 @@ export function porcelainFileCount(output: string): number {
   return count;
 }
 
-export function changedFileCount(cwd: string): number | undefined {
+export function changedFileCount(cwd: string, timeoutMs = 1000): number | undefined {
   try {
     const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, "status", "--porcelain=v1", "-z", "--untracked-files=all"],
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stderr: "ignore", timeout: 1000, killSignal: "SIGKILL", maxBuffer: 1_048_576 });
+      env: { ...process.env, GIT_OPTIONAL_LOCKS: "0" }, stdin: "ignore", stderr: "ignore", timeout: timeoutMs, killSignal: "SIGKILL", maxBuffer: 1_048_576 });
     return result.success ? porcelainFileCount(result.stdout.toString()) : undefined;
   } catch { return undefined; }
+}
+
+export interface LiveRow {
+  name: string;
+  parent?: string;
+  kind: "lane" | "job";
+  engine: string;
+  model?: string;
+  stage: string;
+  startedAt: string;
+  steps: number;
+  files?: number;
+  action: string;
+  question?: string;
+  transcript?: string[];
+}
+
+function recentTranscript(name: string, round: number): string[] {
+  try {
+    const log = [true, false].map((json) => logPathOf(name, round, json)).find(existsSync);
+    if (!log) return [];
+    return readTailLines(log, 80).map((line) => log.endsWith(".jsonl") ? renderEventLine(line) : line)
+      .filter((line): line is string => Boolean(line)).slice(-3)
+      .map((line) => Array.from(safeText(line).replace(/\s+/g, " ")).slice(0, 160).join(""));
+  } catch { return []; }
+}
+
+export function liveRows(now = Date.now()): LiveRow[] {
+  const detailDeadline = Date.now() + 200;
+  const files = new Map<string, number | undefined>();
+  const rows: LiveRow[] = [];
+  const ledger = readLedger();
+  const questions = questionFiles();
+  for (const [name, entry] of Object.entries(ledger)) {
+    if (!laneRunning(entry)) continue;
+    const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
+    if (!files.has(cwd)) {
+      const remaining = detailDeadline - Date.now();
+      files.set(cwd, remaining > 0 ? changedFileCount(cwd, Math.min(remaining, 75)) : undefined);
+    }
+    const question = questions.find(({ record }) => record.lane === name && record.round === entry.rounds && questionOpen(record));
+    rows.push({ name, parent: entry.parent, kind: "lane", engine: roundEngine(entry),
+      model: entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.fallbackModel ?? entry.model,
+      stage: question ? "question" : entry.outage ? "outage" : entry.queuedUntil && Date.parse(entry.queuedUntil) > now ? "queued"
+        : now - Date.parse(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt) >= 300_000 ? "stalled" : entry.stage ?? "working",
+      startedAt: entry.roundStartedAt ?? entry.createdAt, steps: entry.roundSteps ?? 0,
+      files: files.get(cwd), action: entry.lastAction ?? "", question: question?.record.question,
+      transcript: Date.now() < detailDeadline ? recentTranscript(name, entry.rounds) : [] });
+  }
+  for (const [name, job] of Object.entries(readJobs())) {
+    if (!jobRunning(job)) continue;
+    rows.push({ name, kind: "job", engine: "job", stage: "working", startedAt: job.startedAt,
+      steps: 0, action: Date.now() < detailDeadline ? jobPhase(job.log) || "running" : "running" });
+  }
+  return rows;
 }
 
 export function outageText(outage: LaneOutage, agyRetries: number | undefined, now = Date.now()): string {

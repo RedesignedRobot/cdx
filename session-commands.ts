@@ -10,15 +10,15 @@ import {
 import { questionFiles, questionOpen } from "./questions.ts";
 import { jobPhase } from "./reports.ts";
 import { fail, parseArgs, ROOT, singleLine, statusAge, statusText } from "./runtime.ts";
-import { changedFileCount } from "./status.ts";
+import { changedFileCount, liveRows } from "./status.ts";
 import { liveView, renderView, tuiEnabled } from "./tui.ts";
 import { digestLines, heartbeatDue, type ProgressSample, VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { createHash } from "node:crypto";
 import { appendFileSync } from "node:fs";
 
 export async function eventsCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["json", "peek", "watch"]);
-  if (parsed.rest.length) fail("usage: cdx events [--json] [--peek] [--watch]");
+  const parsed = parseArgs(argv, ["json", "peek", "watch", "snapshot"]);
+  if (parsed.rest.length || (parsed.bools.has("snapshot") && !parsed.bools.has("json"))) fail("usage: cdx events [--json] [--peek] [--watch] [--snapshot with --json]");
   const session = callerSession();
   if (!session || session === "terminal") fail("cdx events needs a Claude session");
   const json = parsed.bools.has("json");
@@ -63,7 +63,8 @@ export async function eventsCommand(argv: string[]): Promise<void> {
         current.progress = [];
       } else if (heartbeatDue(now, Date.parse(current.digestAt), visibilityCfg.heartbeatMinutes)) {
         current.digestAt = new Date(now).toISOString();
-        const samples = sessionProgress(session, now);
+        let samples: ProgressSample[] = [];
+        try { samples = sessionProgress(session, now); } catch { /* Digest detail cannot block events. */ }
         if (samples.length) {
           const records = readEvents();
           state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
@@ -84,7 +85,11 @@ export async function eventsCommand(argv: string[]): Promise<void> {
     const records = readEvents();
     const { events } = selectEvents(records, session, state, { peek: true });
     if (json) {
-      console.log(JSON.stringify({ session, events }));
+      let rows: ReturnType<typeof liveRows> | undefined;
+      if (parsed.bools.has("snapshot")) {
+        try { rows = liveRows(now); } catch { /* Events still return when display state is unavailable. */ }
+      }
+      console.log(JSON.stringify({ session, events, ...(rows ? { rows, now } : {}) }));
     } else if (events.length > 0) {
       console.log(tuiEnabled() ? renderView({ title: "events", lines: events.map((e) => e.text), progress: `${events.length} events` }, undefined, 0, Number.MAX_SAFE_INTEGER) : events.map((e) => e.text).join("\n"));
     }
@@ -94,13 +99,17 @@ export async function eventsCommand(argv: string[]): Promise<void> {
 }
 
 function sessionProgress(session: string, now: number): ProgressSample[] {
+  const detailDeadline = Date.now() + 100;
   const state = readSessions();
   const samples: ProgressSample[] = [];
   const files = new Map<string, number | undefined>();
   for (const [name, entry] of Object.entries(readLedger())) {
     if (!laneRunning(entry) || !owned(entry.ownerSession, name, session, state)) continue;
     const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
-    if (!files.has(cwd)) files.set(cwd, changedFileCount(cwd));
+    if (!files.has(cwd)) {
+      const remaining = detailDeadline - Date.now();
+      files.set(cwd, remaining > 0 ? changedFileCount(cwd, Math.min(remaining, 50)) : undefined);
+    }
     const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
     const gateAge = stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)} ` : "";
     samples.push({ key: `lane=${name}`, round: entry.rounds, steps: entry.roundSteps ?? 0, files: files.get(cwd), stage,

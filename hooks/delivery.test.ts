@@ -9,9 +9,53 @@ import {
   onTurnComplete,
   onTurnStart,
   WAKE_COALESCE_MS,
+  bandRow,
+  headEvents,
+  orderedRows,
+  pinnedLine,
 } from "./delivery";
 
 describe("delivery rules", () => {
+  test("progress stays available on demand but cannot wake or enter head context", () => {
+    const events = [
+      { kind: "progress", text: "[cdx] progress", wake: true },
+      ...["question", "terminal", "stalled", "thrash", "outage", "message", "job-exit"].map((kind) =>
+        ({ kind, text: `[cdx] ${kind}`, wake: true })),
+    ];
+    expect(headEvents(events).map((event) => event.kind)).toEqual(events.slice(1).map((event) => event.kind));
+    const outcome = afterPoll(initialDeliveryState(), events, 1000);
+    expect(outcome.state.pending).toEqual(events.slice(1));
+    expect(outcome.state.progress).toEqual(events.slice(0, 1));
+    expect(outcome.toasts).toHaveLength(7);
+    expect(afterToolCall(outcome.state).context).not.toContain("progress");
+  });
+
+  test("an answered question notice reaches the head", () => {
+    const event = { kind: "progress", text: "[cdx] answered question=alpha:r1:q2 answer=yes", wake: false };
+    expect(headEvents([event])).toEqual([event]);
+    const outcome = afterPoll(initialDeliveryState(), [event]);
+    expect(afterToolCall(outcome.state).context).toContain(event.text);
+  });
+
+  test("a rejected steer notice reaches the head", () => {
+    const event = { kind: "progress", text: "[cdx] lane=alpha round=1 steer rejected and retained: turn closed", wake: false };
+    expect(headEvents([event])).toEqual([event]);
+    const outcome = afterPoll(initialDeliveryState(), [event]);
+    expect(afterToolCall(outcome.state).context).toContain(event.text);
+  });
+
+  test("band rows show hierarchy, elapsed round time, and questions within width", () => {
+    const now = Date.parse("2026-09-24T12:02:03Z");
+    const startedAt = "2026-09-24T12:00:00Z";
+    const parent = { name: "parent", kind: "lane" as const, engine: "gpt", model: "sol", stage: "gate", startedAt,
+      steps: 12, files: 3, action: "bun test hooks/delivery.test.ts" };
+    const child = { ...parent, name: "child", parent: "parent", stage: "question", question: "Which branch?" };
+    expect(orderedRows([child, parent]).map((row) => row.name)).toEqual(["parent", "child"]);
+    expect(bandRow(parent, now, 120)).toContain("gate 2m3s 12 steps 3 files running bun test");
+    expect(bandRow(child, now, 120)).toContain("  ? child");
+    expect(bandRow(child, now, 50)).toHaveLength(50);
+    expect(pinnedLine([parent, child], now)).toContain("2m3s");
+  });
   test("a wake event submits a prompt only when no turn runs, after the coalesce window", () => {
     const idleState = initialDeliveryState();
     const event = { text: "[cdx] lane=alpha round=1 started", wake: true };
