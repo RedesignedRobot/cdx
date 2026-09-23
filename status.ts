@@ -525,16 +525,24 @@ function fmtSpan(ms: number): string {
 // Status line row: every account's weekly window from the stored snapshots.
 // No probe and no network, so a status line can run it on every render. Status
 // lines read ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set.
-// 256-color codes shared with cca's row: a solid label chip, near-white
+// 256-color codes shared with cca's row: a solid chip per row, near-white
 // names, soft green for healthy numbers, amber at 75%, red at 95%, soft blue
 // for reset timers.
-const LINE = { chip: "1;38;5;16;48;5;110", text: "38;5;253", sub: "38;5;246", rule: "38;5;240", ok: "38;5;151", warn: "38;5;214", crit: "1;38;5;203", timer: "38;5;110" };
+const LINE = {
+  codex: "1;38;5;16;48;5;110", gemini: "1;38;5;16;48;5;105", text: "38;5;253", sub: "38;5;246", rule: "38;5;240",
+  ok: "38;5;151", warn: "38;5;214", crit: "1;38;5;203", timer: "38;5;110",
+};
 
+// Status line rows from the stored snapshots: one for the Codex accounts'
+// weekly windows, one for Gemini's weekly and five-hour windows. No probe and
+// no network, so a status line can run it on every render. Status lines read
+// ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set.
 export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[], gemini: GeminiUsageSnapshot | undefined,
   now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
   const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
-  const cell = (name: string, window?: { usedPercent: number; resetsAt: number }) => {
-    const label = sgr(LINE.text, name);
+  const chip = (code: string, text: string) => sgr(code, ` ${text.padEnd(6)} `);
+  const cell = (name: string, window?: { usedPercent: number; resetsAt: number }, labelCode = LINE.text) => {
+    const label = sgr(labelCode, name);
     if (!window) return `${label} ${sgr(LINE.sub, "?")}`;
     if (window.resetsAt * 1000 <= now) return `${label} ${sgr(LINE.ok, "0%")}`;
     const used = Math.round(window.usedPercent);
@@ -543,9 +551,13 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
   const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
-  const cells = accounts.map((a) => cell(a.name, weekly(a.snapshot)));
-  if (gemini) cells.push(cell("gemini", geminiWindows(gemini)[0]));
-  return `${sgr(LINE.chip, "  cdx   ")}  ${cells.join(sgr(LINE.rule, "  │  "))}`;
+  const rule = sgr(LINE.rule, "  │  ");
+  const rows = [`${chip(LINE.codex, "codex")}  ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
+  if (gemini) {
+    const [week, fiveHour] = geminiWindows(gemini);
+    rows.push(`${chip(LINE.gemini, "gemini")}  ${cell("week", week, LINE.sub)}${rule}${cell("5h", fiveHour, LINE.sub)}`);
+  }
+  return rows.join("\n");
 }
 
 export async function usageCommand(argv: string[]): Promise<void> {
