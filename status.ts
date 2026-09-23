@@ -525,9 +525,10 @@ function fmtSpan(ms: number): string {
 // Status line row: every account's weekly window from the stored snapshots.
 // No probe and no network, so a status line can run it on every render. Status
 // lines read ANSI from a pipe, so it colors without a TTY unless NO_COLOR is set.
-// 256-color codes shared with cca's row: near-white values, grey labels and
-// timers, color on a number only at 75% (amber) and 95% (red).
-const LINE = { text: "38;5;253", sub: "38;5;246", warn: "38;5;214", crit: "1;38;5;203" };
+// 256-color codes shared with cca's row: a solid label chip, near-white
+// names, soft green for healthy numbers, amber at 75%, red at 95%, soft blue
+// for reset timers.
+const LINE = { chip: "1;38;5;16;48;5;110", text: "38;5;253", sub: "38;5;246", rule: "38;5;240", ok: "38;5;151", warn: "38;5;214", crit: "1;38;5;203", timer: "38;5;110" };
 
 export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[], gemini: GeminiUsageSnapshot | undefined,
   now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
@@ -535,16 +536,16 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
   const cell = (name: string, window?: { usedPercent: number; resetsAt: number }) => {
     const label = sgr(LINE.text, name);
     if (!window) return `${label} ${sgr(LINE.sub, "?")}`;
-    if (window.resetsAt * 1000 <= now) return `${label} ${sgr(LINE.text, "0%")}`;
+    if (window.resetsAt * 1000 <= now) return `${label} ${sgr(LINE.ok, "0%")}`;
     const used = Math.round(window.usedPercent);
-    return `${label} ${sgr(used >= 95 ? LINE.crit : used >= 75 ? LINE.warn : LINE.text, `${used}%`)} ${sgr(LINE.sub, `↻${fmtSpan(window.resetsAt * 1000 - now)}`)}`;
+    return `${label} ${sgr(used >= 95 ? LINE.crit : used >= 75 ? LINE.warn : LINE.ok, `${used}%`)} ${sgr(LINE.timer, `↻${fmtSpan(window.resetsAt * 1000 - now)}`)}`;
   };
   const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
   const cells = accounts.map((a) => cell(a.name, weekly(a.snapshot)));
   if (gemini) cells.push(cell("gemini", geminiWindows(gemini)[0]));
-  return `${sgr(LINE.sub, "cdx")}     ${cells.join(sgr(LINE.sub, "  │  "))}`;
+  return `${sgr(LINE.chip, "  cdx   ")}  ${cells.join(sgr(LINE.rule, "  │  "))}`;
 }
 
 export async function usageCommand(argv: string[]): Promise<void> {

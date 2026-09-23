@@ -59,5 +59,5 @@ test("usage line shows each account's weekly window and time to reset from store
     { name: "codex-2", snapshot: snapshot([{ usedPercent: 97, windowDurationMins: 10080, resetsAt: at(-1) }]) },
     { name: "codex-3" },
   ], { checkedAt: "2026-09-11T12:00:00Z", weekly: { remainingPercent: 20, resetsAt: new Date(now + 30 * 60_000).toISOString() }, fiveHour: { remainingPercent: 90, resetsAt: new Date(now).toISOString() } }, now, false);
-  expect(line).toBe("cdx     codex-1 52% ↻3d5h  │  codex-2 0%  │  codex-3 ?  │  gemini 80% ↻30m");
+  expect(line).toBe("  cdx     codex-1 52% ↻3d5h  │  codex-2 0%  │  codex-3 ?  │  gemini 80% ↻30m");
 });
