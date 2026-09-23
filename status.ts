@@ -522,9 +522,10 @@ function fmtSpan(ms: number): string {
   return `${Math.floor(minutes / 1440)}d${Math.floor((minutes % 1440) / 60)}h`;
 }
 
-// 256-color codes shared with cca's row: a solid chip per row, near-white
-// names, green for the account the next work lane gets. Color carries two
-// signals and nothing else: usage stays grey until 50%, then runs yellow to
+// 256-color codes shared with cca's row: a solid chip per row led by a Nerd
+// Font logo (codicon OpenAI U+EC81, Material four-point star U+F0AE2 for
+// Gemini), near-white names, green for the account the next work lane gets.
+// Color carries two signals and nothing else: usage stays grey until 50%, then runs yellow to
 // red, bold red once spent; a reset timer starts muted, turns bluer as it
 // nears, and goes green in its last day.
 const LINE = {
@@ -553,7 +554,7 @@ const ANSI = /\x1b\[[0-9;]*m/g;
 export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[], gemini: GeminiUsageSnapshot | undefined,
   pick: string | null = null, now = Date.now(), colored = process.env.NO_COLOR === undefined): string {
   const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
-  const chip = (code: string, text: string) => sgr(code, ` ${text.padEnd(6)} `);
+  const chip = (code: string, logo: string, text: string) => sgr(code, ` ${logo} ${text.padEnd(6)} `);
   const timer = (ms: number) => sgr(RESET_RAMP.find(([max]) => ms < max)![1], `↻${fmtSpan(ms)}`);
   const pct = (used: number) => sgr(USAGE_RAMP.find(([min]) => used >= min)![1], `${used}%`.padStart(4));
   const cell = (name: string, window?: { usedPercent: number; resetsAt: number }, labelCode = LINE.text) => {
@@ -568,10 +569,10 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
   const rule = sgr(LINE.rule, "│");
-  const rows = [`${chip(LINE.codex, "codex")} ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
+  const rows = [`${chip(LINE.codex, "\u{ec81}", "codex")} ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
   if (gemini) {
     const [week] = geminiWindows(gemini);
-    rows.push(`${chip(LINE.gemini, "gemini")} ${cell("week", week, LINE.sub)}`);
+    rows.push(`${chip(LINE.gemini, "\u{f0ae2}", "gemini")} ${cell("week", week, LINE.sub)}`);
   }
   return rows.join("\n");
 }
