@@ -540,6 +540,10 @@ const RESET_RAMP: [number, string][] = [
   [3 * HOUR_MS, "1;38;5;46"], [8 * HOUR_MS, "1;38;5;48"], [DAY_MS, "38;5;50"], [2 * DAY_MS, "38;5;45"],
   [3 * DAY_MS, "38;5;39"], [5 * DAY_MS, "38;5;33"], [Infinity, "38;5;61"],
 ];
+// Every cell pads to this many columns, the same as cca's claude row, so the
+// claude, codex and gemini rows share one column grid.
+const CELL_WIDTH = 34;
+const ANSI = /\x1b\[[0-9;]*m/g;
 
 // Status line rows from the stored snapshots: one for the Codex accounts'
 // weekly windows, one for Gemini's weekly window. No probe and
@@ -551,21 +555,23 @@ export function usageLine(accounts: { name: string; snapshot?: UsageSnapshot }[]
   const sgr = (code: string, text: string) => (colored ? `\x1b[${code}m${text}\x1b[0m` : text);
   const chip = (code: string, text: string) => sgr(code, ` ${text.padEnd(6)} `);
   const timer = (ms: number) => sgr(RESET_RAMP.find(([max]) => ms < max)![1], `↻${fmtSpan(ms)}`);
+  const pct = (used: number) => sgr(USAGE_RAMP.find(([min]) => used >= min)![1], `${used}%`.padStart(4));
   const cell = (name: string, window?: { usedPercent: number; resetsAt: number }, labelCode = LINE.text) => {
-    const label = name === pick ? `${sgr(LINE.next, "→")} ${sgr(LINE.next, name)}` : sgr(labelCode, name);
-    if (!window) return `${label} ${sgr(LINE.sub, "?")}`;
-    const pct = (used: number) => sgr(USAGE_RAMP.find(([min]) => used >= min)![1], `${used}%`);
-    if (window.resetsAt * 1000 <= now) return `${label} ${pct(0)}`;
-    return `${label} ${pct(Math.round(window.usedPercent))} ${timer(window.resetsAt * 1000 - now)}`;
+    const fields = [name === pick ? sgr(LINE.next, `→ ${name}`) : sgr(labelCode, `  ${name}`)];
+    if (!window) fields.push(sgr(LINE.sub, "?"));
+    else if (window.resetsAt * 1000 <= now) fields.push(pct(0));
+    else fields.push(pct(Math.round(window.usedPercent)), timer(window.resetsAt * 1000 - now));
+    const content = fields.join(" ");
+    return ` ${content}${" ".repeat(Math.max(0, CELL_WIDTH - content.replace(ANSI, "").length))} `;
   };
   const weekly = (snapshot?: UsageSnapshot) => snapshot?.windows?.length
     ? snapshot.windows.reduce((longest, w) => (w.windowDurationMins > longest.windowDurationMins ? w : longest))
     : undefined;
-  const rule = sgr(LINE.rule, "  │  ");
-  const rows = [`${chip(LINE.codex, "codex")}  ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
+  const rule = sgr(LINE.rule, "│");
+  const rows = [`${chip(LINE.codex, "codex")} ${accounts.map((a) => cell(a.name, weekly(a.snapshot))).join(rule)}`];
   if (gemini) {
     const [week] = geminiWindows(gemini);
-    rows.push(`${chip(LINE.gemini, "gemini")}  ${cell("week", week, LINE.sub)}`);
+    rows.push(`${chip(LINE.gemini, "gemini")} ${cell("week", week, LINE.sub)}`);
   }
   return rows.join("\n");
 }

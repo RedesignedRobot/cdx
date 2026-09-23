@@ -59,5 +59,8 @@ test("usage line shows each Codex account's weekly window, then a Gemini weekly 
     { name: "codex-2", snapshot: snapshot([{ usedPercent: 97, windowDurationMins: 10080, resetsAt: at(-1) }]) },
     { name: "codex-3" },
   ], { checkedAt: "2026-09-11T12:00:00Z", weekly: { remainingPercent: 20, resetsAt: new Date(now + 30 * 60_000).toISOString() }, fiveHour: { remainingPercent: 90, resetsAt: new Date(now).toISOString() } }, "codex-1", now, false);
-  expect(line).toBe(" codex    → codex-1 52% ↻3d5h  │  codex-2 0%  │  codex-3 ?\n gemini   week 80% ↻30m");
+  const [codex, gemini] = line.split("\n").map((row) => row.split("│"));
+  expect(codex.map((c) => c.trimEnd())).toEqual([" codex    → codex-1  52% ↻3d5h", "   codex-2   0%", "   codex-3 ?"]);
+  expect(gemini.map((c) => c.trimEnd())).toEqual([" gemini     week  80% ↻30m"]);
+  expect(codex.slice(1).map((c) => c.length)).toEqual([36, 36]);
 });
