@@ -6,7 +6,7 @@ import {
   verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
   checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
-  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
+  parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, claudeUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
@@ -873,6 +873,16 @@ test("history publication failure leaves the old snapshot visible", () => {
   expect(state.usedPercent).toBe(50);
   publishUsageSnapshot(state, after, undefined, () => { expect(state.usedPercent).toBe(50); });
   expect(state.usedPercent).toBe(80);
+});
+
+test("Claude seats from cca show weekly limits only", () => {
+  const week = new Date(usageNow + 86400000).toISOString();
+  const rows = claudeUsageRows({ accounts: [{ name: "xa", active: true, limits: [
+    { label: "5h", percent: 40, resetsAt: week }, { label: "week", percent: 31, resetsAt: week }, { label: "Fable wk", percent: 4, resetsAt: null },
+  ] }] }, usageNow);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({ account: "claude xa*", window: "weekly", usedPercent: 31, remainingPercent: 69 });
+  expect(claudeUsageRows(undefined, usageNow)).toEqual([]);
 });
 
 test("Gemini quota evidence survives missing and stale probes", () => {

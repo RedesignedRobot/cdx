@@ -1,3 +1,8 @@
+## 9.3.0
+
+- `usage` shows the head's Claude seats from `cca status --json` beside the Codex and Gemini lanes, one row per weekly limit (`claude <name>`, `*` marks the live login), plus cca's pick. `--json` carries the cca status under `claude`.
+- The usage table hides five-hour windows and sorts every row by reset time, so the first row is the next weekly reset. Gemini five-hour blocks still show in the note line and still gate launches.
+
 ## 9.2.1
 
 - `resume --fix gate|review` works again. `--fix` is a switch for `doctor --fix`, so the argument parser dropped the kind and every fix resume was refused as new scope.

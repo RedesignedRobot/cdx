@@ -22,7 +22,7 @@ import { availableReportPath, jobPhase, logPathOf, openCursor, readTailLines, re
 import { safeText } from "./safe-text.ts";
 import {
   color, coloredState, displayPath, fail, FINISHED_SHOWN, fmtAge, fmtCreated, fmtTokens, fmtTokensFull,
-  fmtUntil, HOME, LEDGER, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText,
+  fmtUntil, HOME, LEDGER, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText, uncoloredChildEnv,
 } from "./runtime.ts";
 import {
   firstExhaustion, liveView, renderNote, renderStatus, renderTable, renderUsageTable, tuiEnabled, type View,
@@ -556,6 +556,38 @@ export function geminiUsageRows(snapshot: GeminiUsageSnapshot | undefined, quota
   });
 }
 
+interface CcaLimit { label: string; percent: number; resetsAt: string | null }
+export interface CcaStatus {
+  advice?: { reason?: string };
+  accounts: Array<{ name: string; active?: boolean; checkedAt?: string; limits: CcaLimit[] }>;
+}
+
+// The head's own Claude seats from cca (~/code/claude-accounts), so one table
+// shows every weekly reset. cca refreshes each account at most every 15 minutes.
+async function readCcaStatus(): Promise<CcaStatus | undefined> {
+  const cca = Bun.which("cca");
+  if (!cca) return undefined;
+  const proc = Bun.spawn([cca, "status", "--json"], { env: uncoloredChildEnv(), stdout: "pipe", stderr: "ignore" });
+  const timeout = setTimeout(() => { try { proc.kill("SIGKILL"); } catch { /* already exited */ } }, 20_000);
+  try {
+    const [exitCode, text] = await Promise.all([proc.exited, new Response(proc.stdout).text()]);
+    const value = exitCode === 0 ? JSON.parse(text) : undefined;
+    return Array.isArray(value?.accounts) ? value : undefined;
+  } catch { return undefined; } finally { clearTimeout(timeout); }
+}
+
+// Weekly limits only: the five-hour window is too small to plan around.
+export function claudeUsageRows(status: CcaStatus | undefined, now: number): UsageRow[] {
+  return (status?.accounts ?? []).flatMap((account) => account.limits
+    .filter((limit) => limit.label !== "5h" && limit.resetsAt && Number.isFinite(Date.parse(limit.resetsAt)))
+    .map((limit) => ({
+      ...projectWindow(`claude ${account.name}${account.active ? "*" : ""}`,
+        { usedPercent: limit.percent, windowDurationMins: 10_080, resetsAt: Date.parse(limit.resetsAt!) / 1000 },
+        account.checkedAt ?? new Date(now).toISOString(), [], now),
+      window: limit.label === "week" ? "weekly" : limit.label.toLowerCase(),
+    })));
+}
+
 export function usageTable(rows: UsageRow[], now = Date.now(), tui = false): string[] {
   const percent = (n: number | null) => n === null ? "?" : `${n.toFixed(1)}%`;
   const cells = rows.map((r) => [r.account, r.window, percent(r.usedPercent), percent(r.remainingPercent),
@@ -673,9 +705,10 @@ export async function usageCommand(argv: string[]): Promise<void> {
     totals.set(key, bucket);
   }
 
-  const [refreshed, geminiUsage] = await Promise.all([
+  const [refreshed, geminiUsage, cca] = await Promise.all([
     Promise.all(accounts.map((account) => refreshUsageSnapshot({ account }))),
     refreshGeminiUsage(),
+    readCcaStatus(),
   ]);
   const now = Date.now(), history = readUsageHistory(), ledger = readLedger();
   const effectiveStandings = withAccountHolds(accounts.map((account, index) =>
@@ -703,18 +736,22 @@ export async function usageCommand(argv: string[]): Promise<void> {
         resetsAt: snapshot ? new Date(snapshot.resetsAt * 1000).toISOString() : null,
         lanes: total?.lanes ?? 0, ledgerTokens: total?.tokens ?? null, incomplete: Boolean(total?.incomplete) };
     });
-    console.log(JSON.stringify({ windows, codex, advice, alerts: advice.alerts, gemini: gemini ?? null, geminiLedger: geminiTotals }, null, 2));
+    console.log(JSON.stringify({ windows, codex, advice, alerts: advice.alerts, gemini: gemini ?? null, geminiLedger: geminiTotals,
+      claude: cca ?? null }, null, 2));
     return;
   }
   const tui = tuiEnabled();
-  usageTable(windows, now, tui).forEach((line, index) => {
-    const used = windows[index - 1]?.usedPercent ?? 0;
+  const shown = [...windows.filter((w) => w.window !== "5h"), ...claudeUsageRows(cca, now)].sort((a, b) => Math.round(a.resetsAt / 60) - Math.round(b.resetsAt / 60));
+  usageTable(shown, now, tui).forEach((line, index) => {
+    const used = shown[index - 1]?.usedPercent ?? 0;
     console.log(tui ? line : used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
   });
   const lines = adviceLines(effectiveStandings, now);
   const geminiReason = geminiRows.find((w) => w.blockedUntil)?.reason ?? geminiRows.find((w) => w.reason !== "spend normally")?.reason;
   const geminiNote = geminiReason ? `gemini: ${geminiReason}.` : !gemini ? "gemini: usage unknown; probe failed." : "";
   if (geminiNote) lines[1] = [lines[1], geminiNote].filter(Boolean).join(" ");
+  const claudeNote = cca?.advice?.reason ? `claude: ${cca.advice.reason}` : !cca ? "claude: usage unknown; cca status failed." : "";
+  if (claudeNote) lines.push(claudeNote);
   for (const line of lines) console.log(tui ? renderNote(line) : line);
   if (parsed.bools.has("totals")) {
     for (const [account, total] of [...totals, ["gemini", geminiTotals] as const])
