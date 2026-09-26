@@ -125,6 +125,8 @@ test("duration estimates use recent completed history and explicit expectations 
   expect(historyMinutes([{ startedAt: start, finishedAt: "2026-09-11T12:12:00Z" },
     { startedAt: start, finishedAt: "2026-09-11T12:20:00Z" }, { startedAt: start }], 15)).toBe(20);
   expect(historyMinutes([], 15)).toBe(15);
+  expect(historyMinutes([{ startedAt: start, finishedAt: "2026-09-11T12:03:00Z" }, { startedAt: start, finishedAt: "2026-09-11T12:04:00Z" }], 15)).toBe(15);
+  expect(overrunNotice(start, 3.6920166, Date.parse(start) + 240_000)).toStartWith("expected 3.7m,");
   expect(expectMinutes("7.5", 15)).toBe(7.5);
   expect(() => expectMinutes("0", 15)).toThrow("--expect");
   expect(overrunNotice(start, 15, Date.parse(start) + 899_999)).toBeUndefined();

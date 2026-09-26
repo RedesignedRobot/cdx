@@ -8,12 +8,15 @@ export function expectMinutes(raw: string | undefined, fallback: number): number
   return minutes;
 }
 
-export function historyMinutes(records: { startedAt?: string; finishedAt?: string }[], fallback: number): number {
+// History can raise the estimate above the configured floor, never lower it:
+// most lanes finish in minutes, so a bare median made every ordinary lane
+// "overrun" at about 4 minutes and woke the head for each supervisor child.
+export function historyMinutes(records: { startedAt?: string; finishedAt?: string }[], floor: number): number {
   const values = records.filter(({ startedAt, finishedAt }) => Number.isFinite(Date.parse(startedAt ?? "")) && Number.isFinite(Date.parse(finishedAt ?? "")))
     .sort((a, b) => Date.parse(b.finishedAt!) - Date.parse(a.finishedAt!)).slice(0, 20)
     .map(({ startedAt, finishedAt }) => Date.parse(finishedAt ?? "") - Date.parse(startedAt ?? ""))
     .filter((ms) => Number.isFinite(ms) && ms > 0).map((ms) => ms / 60_000).sort((a, b) => a - b);
-  return values.length ? values[Math.floor(values.length / 2)]! : fallback;
+  return Math.max(floor, values[Math.floor(values.length / 2)] ?? 0);
 }
 
 export function overrunNotice(startedAt: string, expectedMinutes: number, now: number, lastActivity?: string, lastLog?: string, lastActivityAt?: string): string | undefined {
@@ -24,7 +27,7 @@ export function overrunNotice(startedAt: string, expectedMinutes: number, now: n
   const activityTime = lastActivityAt && Number.isFinite(Date.parse(lastActivityAt))
     ? ` lastActivityAt=${lastActivityAt} age=${Math.max(0, Math.floor((now - Date.parse(lastActivityAt)) / 60_000))}m` : "";
   const log = lastLog ? ` log=${lastLog.replace(/[\r\n]/g, " ")}` : "";
-  return `expected ${expectedMinutes}m, elapsed ${elapsed}m;${activity}${activityTime}${log}`;
+  return `expected ${Math.round(expectedMinutes * 10) / 10}m, elapsed ${elapsed}m;${activity}${activityTime}${log}`;
 }
 
 export function markOverrun(record: { overrunSent?: boolean }, startedAt: string, expectedMinutes: number, now: number,
