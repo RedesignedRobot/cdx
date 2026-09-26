@@ -35,7 +35,7 @@ import {
 } from "./questions.ts";
 import {
   availableReportPath, captureRecoveryPartial, controlPathOf, excerpt, logPathOf, partialReportPathOf,
-  readJsonLines, renderTail, reportPathOf, logProgress, specPathOf, writeCapturedReport, writeProtocolEvent,
+  readJsonLines, renderTail, reportPathOf, logProgress, progressLogPathOf, specPathOf, writeCapturedReport, writeProtocolEvent,
 } from "./reports.ts";
 import { failActiveRound, killChildren } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
@@ -245,7 +245,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   ];
   const proc = Bun.spawn({
     cmd: gemini
-      ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round)]), ...geminiArgs]
+      ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round), progressLogPathOf(lane, round)]), ...geminiArgs]
       : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
     env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), Boolean(spec.supervisor)), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),

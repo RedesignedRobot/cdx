@@ -8,7 +8,9 @@ import { basename, dirname, join } from "node:path";
 import { HOME, ROOT } from "./runtime.ts";
 import type { Spec } from "./ledger.ts";
 
-// Lane-side cdx writes (cdx ask, Gemini hooks) land only in these directories.
+// Lane-side cdx writes (cdx ask, Gemini hooks) land in these directories.
+// Gemini hooks also write the round's partial report and progress log, which
+// the runner names as files. Supervisors' cdx calls run outside the sandbox.
 export const CLI_STATE_DIRS = [join(ROOT, "state"), join(ROOT, "control")];
 export const AGY_HOME = join(HOME, ".gemini", "antigravity-cli");
 
@@ -42,7 +44,7 @@ export function codexSandbox(spec: SandboxSpec) {
     excludeTmpdirEnvVar: false, excludeSlashTmp: false } } as const;
 }
 
-// agy writes its home, TMPDIR, and the files named by the caller (its log).
+// agy writes its home, TMPDIR, and the files named by the caller.
 // Gemini hooks run inside agy and write cdx state and spilled output, so
 // read-only lanes keep those too; only work lanes get the checkout and /tmp.
 export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
