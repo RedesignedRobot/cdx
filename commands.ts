@@ -84,7 +84,7 @@ const REFUSED_INSIDE_LANE = new Set([
 ]);
 
 // A supervisor drives its children with these; each mutation checks ownership.
-const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "kill", "close", "gate", "reply"]);
+const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "land", "kill", "close", "gate", "reply"]);
 
 export async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
