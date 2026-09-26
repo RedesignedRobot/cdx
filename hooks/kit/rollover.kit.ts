@@ -17,7 +17,7 @@ function engine(on: On, settingsStop: () => { block?: string }) {
   on("classic.Stop", settingsStop);
 }
 
-test("the Stop after the second head compaction blocks once with the hand-off line", async ($, on) => {
+test("the Stop after the third head compaction blocks once with the hand-off line", async ($, on) => {
   engine(on, () => ({}));
   await $.session.start({ cwd: "/tmp", surface: null, isInteractive: false });
   const stop = () => $.classic.Stop({ stop_hook_active: false } as never);
@@ -29,6 +29,8 @@ test("the Stop after the second head compaction blocks once with the hand-off li
   await compact({ trigger: "auto", agentId: "subagent" });
   expect(await stop()).toEqual({});
   await compact({ trigger: "manual" });
+  expect(await stop()).toEqual({});
+  await compact({ trigger: "auto" });
   const blocked = await stop();
   expect(blocked.block).toContain("BATCH.md under ~/.cdx/reports/");
   expect(blocked.block).toContain('push the owner "roll session"');
@@ -41,7 +43,8 @@ test("a settings Stop hook beneath still runs and its block travels with the rol
   await $.session.start({ cwd: "/tmp", surface: null, isInteractive: false });
   await $.session.compact({ trigger: "auto", messages: SUMMARY } as never);
   await $.session.compact({ trigger: "auto", messages: SUMMARY } as never);
+  await $.session.compact({ trigger: "auto", messages: SUMMARY } as never);
   const blocked = await $.classic.Stop({ stop_hook_active: false } as never);
-  expect(blocked.block).toStartWith("push guard 1\n\ncdx: this session has compacted 2 times");
+  expect(blocked.block).toStartWith("push guard 1\n\ncdx: this session has compacted 3 times");
   expect(await $.classic.Stop({ stop_hook_active: true } as never)).toEqual({ block: "push guard 2" });
 });
