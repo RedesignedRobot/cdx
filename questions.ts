@@ -257,11 +257,12 @@ export async function msgCommand(argv: string[]): Promise<void> {
   if (!target || !message) fail(usage);
   const caller = process.env.CDX_LANE?.trim() || callerSession();
   if (caller === "terminal") fail("cdx msg needs a Claude session or a lane");
-  // A lane name addresses the head, the one owner of every lane.
-  const recipient = findLane(target) ? undefined : target;
+  // A lane name addresses the session that owns the lane, or the head.
+  const lane = findLane(target);
+  const recipient = lane ? undefined : target;
   if (recipient !== undefined && recipient.length <= 8) fail("message target must be a lane name or full session id");
-  feedEvent("message", message, caller, { ...(recipient ? { recipient } : {}), from: caller });
-  console.log(`cdx: message sent to=${recipient ?? "head"} from=${caller}`);
+  feedEvent("message", message, lane ? lane.ownerSession : caller, { ...(recipient ? { recipient } : {}), from: caller });
+  console.log(`cdx: message sent to=${recipient ?? lane?.ownerSession ?? "head"} from=${caller}`);
 }
 
 export function inboxCommand(argv: string[]): void {

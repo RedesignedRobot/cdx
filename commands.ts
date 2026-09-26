@@ -8,7 +8,7 @@ import { jobCommand, runJob } from "./jobs.ts";
 import {
   codeQuestionCommand, cleanCommand, consultCommand, resumeCommand, reviewCommand, spawnCommand,
 } from "./lane-commands.ts";
-import { callerSession, laneRunning, markDriver, readLane, requireOwnChild, supervisorLane, withLedger } from "./ledger.ts";
+import { allowTakeover, callerSession, laneRunning, markDriver, readLane, requireOwnChild, supervisorLane, withLedger } from "./ledger.ts";
 import {
   askCommand, hookCommand, inboxCommand, msgCommand, questionsCommand, replyCommand, sendCommand,
 } from "./questions.ts";
@@ -78,7 +78,11 @@ A no-op gate such as true is refused when the repository has .cdx-gate.
 --scope-policy (default extend) tells a work lane what to do when the outcome
 needs files outside its brief: extend edits them and lists them under
 "## Scope extensions" in the report, stop ends the round, ask asks the head.
---max-runtime MIN kills the round past the cap and marks it failed.`;
+--max-runtime MIN kills the round past the cap and marks it failed.
+A lane belongs to the Claude session that opened its latest round, and its
+events go to that session while it is live. Another live session is refused
+on spawn, resume, review, consult, send, reply, land, close, kill and gate
+unless it passes --force; the next round it opens makes it the owner.`;
 
 const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "review", "consult", "panel", "context", "shots", "land",
@@ -92,7 +96,19 @@ const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "pa
 // receives wakes. Commands from inside a lane leave the head as it is.
 const DRIVING_COMMANDS = new Set(["spawn", "resume", "review", "consult", "panel", "send", "reply", "land"]);
 
+// Commands that drive or answer one lane, and so run requireOwnChild. They
+// take --force, which dispatch removes before the command parses its args.
+const LANE_COMMANDS = new Set(["spawn", "resume", "review", "consult", "send", "reply", "land", "close", "kill", "gate"]);
+
 export async function dispatch(command: string | undefined, argv: string[]) {
+  const flagsEnd = argv.indexOf("--");
+  const force = argv.indexOf("--force");
+  if (command && LANE_COMMANDS.has(command) && force >= 0 && (flagsEnd < 0 || force < flagsEnd)) {
+    argv = argv.toSpliced(force, 1);
+    allowTakeover();
+  }
+  // The land command that detached this job already passed the owner check.
+  if (command === "_land") allowTakeover();
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
     const supervisor = supervisorLane();
     if (supervisor && !SUPERVISOR_COMMANDS.has(command)) {

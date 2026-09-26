@@ -5,10 +5,11 @@ The historical 7.0 design below explains the module boundary between `cdx.ts` an
 ## Delivery
 
 - Events are rows in the `events` table of `state/cdx.db` (bun:sqlite, WAL). The CLI, runners and the mod open the database directly; there is no feed file and no daemon.
-- A Claude session is a delivery cursor, not an owner. Every lane belongs to the one owner, and any session may act on any lane.
+- A lane belongs to the Claude session that opened its latest round (`ownerSession`); a supervisor's children belong to the supervisor's owner, and a round opened from a plain terminal keeps the owner. Jobs and panels belong to the session that started them. Another live session is refused on spawn, resume, review, consult, send, reply, land, close, kill and gate unless it passes `--force` (`force: true` on the tool). A session whose owner is gone may drive the lane, and the next round it opens makes it the owner.
 - `cdx brief` registers the calling session. The mod runs `cdx brief --head` at an interactive session start and after `/clear` and `/resume`, and plain `cdx brief` at a headless start. It writes a session row with the session's own cursor at the newest event.
 - The head is the session, among those that polled within 30 seconds, that most recently drove cdx: spawn, resume, send, review, consult, panel, reply, land, or `cdx brief --head`. With no active driver there is no head and events wait. A headless session that only started and polled never takes the wakes; Agent-tool subagents and in-process teammates fire no session start of their own.
-- Owner events have one cursor, `owner_cursor` in the meta table, which moves only after a head received them. When the head changes, the new head picks up every owner event no head has received. Each session's own cursor covers only messages addressed to its full session id. `cdx feed` shows every event to any session.
+- An event owned by a known session (one with a sessions row) goes to that session past its own cursor while it polled within 30 seconds. Once it has not, the head receives the event and rewrites the event's owner to itself, so the old owner never receives it after a `/resume` with the same id. Events owned by `terminal` or by a session that never polled go to the head.
+- The head reads past `owner_cursor` in the meta table, which moves only after a head received its events and stops before the first event still due to another live session. When the head changes, the new head picks up every event no head has received; when an owner dies before its next poll, the head picks up its events. Messages addressed to a full session id go to that session only. `cdx feed` shows every event to any session.
 - Only actionable kinds reach a session: `question`, `stalled`, `terminal`, `job-exit`, `message`, `thrash`, `overrun`, `outage`, `panel`. Lifecycle kinds stay in the table for `cdx feed` and never wake a head. There is no heartbeat event; round progress goes to `logs/<lane>-r<round>.progress.log`.
 - A terminal event carries at most 5 lines of 200 characters plus the report path, never the report body. A child's terminal goes to its supervisor, not the head.
 - The cursor advances after the events print, so a crash replays events and never drops them. `--peek` leaves the cursor alone.
@@ -58,7 +59,7 @@ Keep `msg`, `inbox`, `brief`, `status --brief`, `status --watch`, the feed, `WAK
 
 ### Add `cdx events [--json] [--peek]`
 
-For the caller session (`callerSession()`): every owned feed event with `id > cursor`, then the cursor advances to the last record id read (not with `--peek`). Records `polledAt` on the session each call. 10.0 replaces ownership with the head rule and drops the heartbeat; see Delivery at the top.
+For the caller session (`callerSession()`): every owned feed event with `id > cursor`, then the cursor advances to the last record id read (not with `--peek`). Records `polledAt` on the session each call. 10.0 dropped the heartbeat, and 10.0.3 routes owned events to their owner session; see Delivery at the top.
 
 JSON output, one object:
 

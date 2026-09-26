@@ -84,7 +84,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       }
       const account = kind === "review" && existing ? existing.account : activeAccount?.name;
       const codexHome = kind === "review" && existing ? existing.codexHome : activeAccount?.home;
-      const ownerSession = existing ? existing.ownerSession : opts?.owner?.ownerSession;
+      const ownerSession = opts?.owner?.ownerSession ?? existing?.ownerSession;
       const ownerCwd = opts?.preserveOwner ? existing?.ownerCwd : opts?.owner?.ownerCwd;
       const workCwd = kind === "work" ? cwd : existing ? workCwdOf(existing) : cwd;
       const workState = kind === "work" ? "running" : existing ? workStateOf(existing) : "adopted";

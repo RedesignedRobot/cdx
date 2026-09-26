@@ -299,7 +299,9 @@ export async function resumeCommand(argv: string[]) {
   if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
   const workRounds = before.workRounds ?? before.rounds;
   checkRoundCap(lane, engine, workRounds);
-  const owner = storedOwnership(before);
+  const claimed = callerOwnership().ownerSession;
+  const stored = storedOwnership(before);
+  const owner = stored && claimed ? { ...stored, ownerSession: claimed } : stored;
   const effort = resolveEffort(engine, laneModel(before), parsed.flags.effort, before.effort);
   // Fixes always target the work conversation, never the reviewer.
   const workThread = before.workSessionId ?? (before.kind === "work" ? before.sessionId : undefined);
@@ -319,7 +321,7 @@ export async function resumeCommand(argv: string[]) {
   }
   if (pre) runPreCheck(pre, cwd);
   const { round, sessionId, selection } = await openRound(lane, "work", cwd, effort, {
-    engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", preserveOwner: true,
+    engine, account, preserveEngine: true, requireSession: true, preserveAccount: engine === "gpt", owner, preserveOwner: true,
     preserveGate: parsed.flags.gate === undefined,
     ...(parsed.flags.gate !== undefined ? { gate: parsed.flags.gate } : {}),
     preservePre: parsed.flags.pre === undefined,

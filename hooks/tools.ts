@@ -483,9 +483,20 @@ export function requiredInput(schema: Record<string, unknown>, input: Record<str
     if (property?.enum && !property.enum.includes(value)) throw new Error(`invalid ${field}: expected ${property.enum.join(" or ")}`);
   }
 }
+// Tools that drive one lane. cdx refuses them on a lane another live Claude
+// session owns unless force is set.
+const LANE_TOOLS = new Set(["land", "spawn", "resume", "consult", "review", "send", "reply", "close", "kill", "gate"]);
+
 for (const tool of TOOLS) {
   const run = tool.run;
-  tool.run = (input) => { requiredInput(tool.inputSchema, input); return run(input); };
+  const lane = LANE_TOOLS.has(tool.name);
+  if (lane) (tool.inputSchema.properties as Record<string, unknown>).force = { type: "boolean", description: "Take over a lane another live Claude session owns" };
+  tool.run = (input) => {
+    requiredInput(tool.inputSchema, input);
+    const result = run(input);
+    if (lane && input.force === true) result.argv.push("--force");
+    return result;
+  };
 }
 
 export function nativeToolResult(exitCode: number, result: string) {

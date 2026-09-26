@@ -30,11 +30,24 @@ export function supervisorLane(): string | undefined {
   return supervisor;
 }
 
-// A supervisor may drive only lanes it spawned. The head is the one owner
-// and may drive any lane.
+let takeover = false;
+
+// --force on a lane command, and the detached land that command started.
+export function allowTakeover(allow = true): void {
+  takeover = allow;
+}
+
+// A supervisor may drive only lanes it spawned. A Claude session may drive a
+// lane only while it owns it or the owner session is gone; --force takes it
+// over. The terminal and the shells inside lanes pass.
 export function requireOwnChild(lane: string, entry: Lane | undefined): void {
   const supervisor = supervisorLane();
   if (entry && supervisor && entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
+  const owner = entry?.ownerSession;
+  if (!owner || takeover || process.env.CDX_LANE) return;
+  const caller = callerSession();
+  if (caller === "terminal" || caller === owner || !sessionLive(readSession(owner), Date.now())) return;
+  fail(`lane "${lane}" belongs to live Claude session ${owner}; drive it from that session, or pass --force (force: true on the tool) to take it over`);
 }
 
 export interface Lineage { supervisor: boolean; parent?: string; parentRound?: number }
@@ -418,20 +431,17 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
   });
 }
 
-// A Claude session is a delivery cursor, not an owner: every lane belongs to
-// the one owner. The head is the active session (polled within
-// ACTIVE_SESSION_MS) that most recently drove cdx: spawned, resumed, sent,
-// reviewed, consulted, replied, landed, or ran cdx brief --head. The mod
-// runs brief --head when a session starts with a person at the prompt, so a
-// fresh interactive session beside an older idle one takes the wakes at
-// once. A session that starts without a person (a headless claude -p, the
-// SDK) never drives by starting, and with no active driver there is no head:
-// events wait for one rather than wake a session nobody reads. Agent-tool
-// subagents and in-process teammates share their parent's process and
-// session id and fire no session.start of their own. Owner events have one
-// cursor in meta, advanced only after a head received them, so a change of
-// head never skips an event; each session's own cursor covers messages
-// addressed to it.
+// A Claude session is live while it polled within ACTIVE_SESSION_MS. The
+// head is the live session that most recently drove cdx: spawned, resumed,
+// sent, reviewed, consulted, replied, landed, or ran cdx brief --head. It
+// receives the events no live session owns (see eventTarget). The mod runs
+// brief --head when a session starts with a person at the prompt, so a fresh
+// interactive session beside an older idle one takes the wakes at once. A
+// session that starts without a person (a headless claude -p, the SDK) never
+// drives by starting, and with no active driver there is no head: events
+// wait for one rather than wake a session nobody reads. Agent-tool subagents
+// and in-process teammates share their parent's process and session id and
+// fire no session.start of their own.
 const ACTIVE_SESSION_MS = 30_000;
 
 // An idle poll with nothing new skips the write until its liveness mark is
@@ -444,15 +454,24 @@ export function readSession(session: string): SessionRow | undefined {
   return db().query<SessionRow, [string]>("SELECT * FROM sessions WHERE session = ?").get(session) ?? undefined;
 }
 
+export function sessionLive(row: SessionRow | undefined, now: number): boolean {
+  return row !== undefined && Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS;
+}
+
 // A new session's own cursor starts at the newest event: what happened
-// before it is the brief's job, not a replay. started_at marks the start of
-// the current live stretch: a row not polled within ACTIVE_SESSION_MS
-// belongs to no running process, so the next start or poll restarts it.
+// before it is the brief's job, not a replay. The exception is an event the
+// session already owns that no head has taken: a lane it spawned before its
+// first poll. started_at marks the start of the current live stretch: a row
+// not polled within ACTIVE_SESSION_MS belongs to no running process, so the
+// next start or poll restarts it.
 function touchSession(session: string, now: number): SessionRow {
   const at = new Date(now).toISOString();
   const row = readSession(session);
-  if (!row) db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, latestEventId(), at, at);
-  else db().query("UPDATE sessions SET polled_at = ?, started_at = ? WHERE session = ?")
+  if (!row) {
+    const owned = db().query<{ id: number | null }, [string, number]>("SELECT MIN(id) AS id FROM events WHERE owner = ? AND recipient IS NULL AND id > ?")
+      .get(session, ownerCursor())?.id;
+    db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, owned ? owned - 1 : latestEventId(), at, at);
+  } else db().query("UPDATE sessions SET polled_at = ?, started_at = ? WHERE session = ?")
     .run(at, Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS ? row.started_at : at, session);
   return readSession(session)!;
 }
@@ -498,12 +517,8 @@ export function acknowledgeOwnerEvents(id: number): void {
 }
 
 export function electHead(sessions: readonly SessionRow[], now: number): string | undefined {
-  return sessions.filter((row) => row.drove_at && Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS)
+  return sessions.filter((row) => row.drove_at && sessionLive(row, now))
     .sort((a, b) => b.drove_at!.localeCompare(a.drove_at!))[0]?.session;
-}
-
-export function deliveryHead(now = Date.now()): string | undefined {
-  return electHead(db().query<SessionRow, []>("SELECT * FROM sessions").all(), now);
 }
 
 export interface EventsRecord {
@@ -518,13 +533,41 @@ export interface EventsRecord {
   recipient?: string;
 }
 
+const HEAD = Symbol("head");
+
+// Who receives an event now. An addressed message goes to its recipient. An
+// event whose owner is a known session (one with a sessions row) goes to that
+// session while it is live, and to the head once it is not; the owner's
+// cursor at or past the event means the owner already has it. Everything
+// else (owner "terminal", or a session that never polled) goes to the head.
+// Each session reads past its own cursor and the head also past the owner
+// cursor in meta. Three rules keep an event from reaching two sessions or
+// none, and polls are serialized by the store's write lock:
+// - The head claims an owned event it receives by rewriting the event's owner
+//   to itself, so the old owner never receives it after a /resume with the
+//   same id.
+// - The owner cursor stops before the first event still due to another live
+//   session, so the head sees it again if that session dies before its poll.
+// - A session's own cursor passes only events it received or never owned,
+//   because a polling session is live and so receives all it owns.
+function eventTarget(event: FeedEvent, sessions: ReadonlyMap<string, SessionRow>, now: number): string | typeof HEAD | undefined {
+  if (event.recipient) return event.recipient;
+  const owner = sessions.get(event.owner);
+  if (!owner) return HEAD;
+  if (event.id <= owner.cursor) return undefined;
+  return sessionLive(owner, now) ? owner.session : HEAD;
+}
+
 // Which events reach a session: actionable kinds only, never a child's
-// terminal routed to its supervisor. An addressed message goes to its
-// session past that session's cursor; everything else goes to the head past
-// the owner cursor. A session that is not the head passes no owner cursor.
-export function selectEvents(records: readonly FeedEvent[], session: string, cursor: number, owner?: number): EventsRecord[] {
-  return records.filter((event) => WAKE_EVENTS.has(event.kind) && !event.supervisor
-    && (event.recipient ? event.recipient === session && event.id > cursor : owner !== undefined && event.id > owner)).map((event) => {
+// terminal routed to its supervisor, and only the ones eventTarget gives it.
+// A session that is not the head passes no owner cursor.
+export function selectEvents(records: readonly FeedEvent[], session: string, cursor: number, owner?: number,
+  sessions: ReadonlyMap<string, SessionRow> = new Map(), now = Date.now()): EventsRecord[] {
+  return records.filter((event) => {
+    if (!WAKE_EVENTS.has(event.kind) || event.supervisor) return false;
+    const target = eventTarget(event, sessions, now);
+    return target === HEAD ? owner !== undefined && event.id > owner : target === session && event.id > cursor;
+  }).map((event) => {
     const record: EventsRecord = { id: event.id, kind: event.kind, wake: true, text: renderEvent(event) };
     if (event.lane !== undefined) record.lane = event.lane;
     if (event.round !== undefined) record.round = event.round;
@@ -537,18 +580,29 @@ export function selectEvents(records: readonly FeedEvent[], session: string, cur
 
 // Hands the session its events and advances the cursors only after emit
 // returns: a crash in between replays events, never drops them. Only the
-// head moves the owner cursor.
+// head moves the owner cursor and claims events (see eventTarget).
 export function deliverEvents(session: string, now: number, peek: boolean, emit: (events: EventsRecord[]) => void): void {
   const current = readSession(session);
   if (current && latestEventId() <= Math.min(current.cursor, ownerCursor()) && now - Date.parse(current.polled_at) < POLL_MARK_MS) { emit([]); return; }
   write(() => {
     const cursor = touchSession(session, now).cursor;
-    const owner = deliveryHead(now) === session ? ownerCursor() : undefined;
+    const rows = db().query<SessionRow, []>("SELECT * FROM sessions").all();
+    const sessions = new Map(rows.map((row) => [row.session, row]));
+    const owner = electHead(rows, now) === session ? ownerCursor() : undefined;
     const records = eventsAfter(Math.min(cursor, owner ?? cursor));
-    emit(selectEvents(records, session, cursor, owner));
+    const events = selectEvents(records, session, cursor, owner, sessions, now);
+    emit(events);
     if (peek || !records.length) return;
     acknowledgeEvents(session, records.at(-1)!.id);
-    if (owner !== undefined) acknowledgeOwnerEvents(records.at(-1)!.id);
+    if (owner === undefined) return;
+    const received = new Set(events.map((event) => event.id));
+    const claim = db().query("UPDATE events SET owner = ? WHERE id = ?");
+    for (const event of records) {
+      if (received.has(event.id) && !event.recipient && event.owner !== session && event.owner !== "terminal") claim.run(session, event.id);
+    }
+    const due = records.find((event) => event.id > owner && WAKE_EVENTS.has(event.kind) && !event.supervisor && !event.recipient
+      && typeof eventTarget(event, sessions, now) === "string" && event.owner !== session);
+    acknowledgeOwnerEvents(due ? due.id - 1 : records.at(-1)!.id);
   });
 }
 
@@ -759,7 +813,10 @@ export interface AccountChoice { name: string; home: string }
 
 export interface LaneOwner { ownerSession?: string; ownerCwd: string }
 
-// The session that started a lane, kept as provenance. It routes nothing.
+// The session that opens a lane's round owns the lane: the lane's events go
+// to it while it is live (eventTarget), and other live sessions need --force
+// to drive the lane (requireOwnChild). A supervisor's children belong to the
+// supervisor's owner.
 export function callerOwnership(): LaneOwner {
   const parent = supervisorLane();
   const ownerSession = parent ? findLane(parent)?.ownerSession : process.env.CLAUDE_CODE_SESSION_ID?.trim();

@@ -1,3 +1,16 @@
+## 10.0.3 (2026-09-26)
+
+### Delivery
+
+- Events go to the Claude session that owns their lane, job or panel. Before, every event without a recipient went to the one elected head, so two heads on one machine took each other's wakes: a question from one head's lane reached the other head, which answered it. The owner is the session that opened the lane's latest round (`ownerSession`, which supervisor children inherit), or the session that started the job or panel.
+- The elected head now receives only the events no live session owns: those owned by `terminal`, by a session that never polled, or by an owner that has not polled for 30 s. The head rewrites such an event's owner to itself, so a `/resume` of the old session with the same id never receives it twice. The head's cursor stops before an event still due to another live session, so an owner that dies before its next poll loses nothing.
+- `cdx msg <lane>` addresses the session that owns the lane instead of the head.
+
+### Ownership
+
+- spawn, resume, review and consult on an existing lane, send, reply, land, close, kill and gate refuse when the caller is a Claude session other than the lane's owner and the owner session is live. The refusal names the owner. `--force` (MCP `force: true`) overrides it. The terminal, lane shells and a session whose lane owner is gone (a restart with a new id) pass. Supervisor rules are unchanged.
+- The session that opens a lane's round becomes its owner. Before, a respawn or review kept the first spawner as owner on the lane while the round's runner events went to the new caller.
+
 ## 10.0.2 (2026-09-26)
 
 ### Panel
