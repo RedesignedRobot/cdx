@@ -42,11 +42,11 @@ const GPT_WORKER_RULES = [WORKER_BAN, ...GPT_RULES];
 const SUPERVISOR_RULES = [
   "Own design and cross-cutting decisions; delegate bounded work to Sol children (the default engine) or Gemini children for mechanical sweeps, use read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
   ...GPT_RULES,
-  'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief with the four headings>"` for Sol or add `--engine gemini`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
+  "Use `cdx spawn <child> --bg --gate '<cmd>' '<brief with the four headings>'` for Sol or add `--engine gemini`; `cdx consult <child> --bg '<question>'` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.",
   "Never edit child-owned files. Put shared findings in a file referenced by child briefs and batch corrections into one send per child per review pass.",
   "Give writers exclusive files and each child a gate and relevant facts. cdx refuses a child brief unless it has these markdown headings, each on its own line with text under it: `## Outcome`, `## Files` (the child's exclusive files), `## Acceptance` and `## Out of scope`. Start independent children together. Every writer child gets its own worktree branched from your branch head at spawn, so children never share a tree.",
   "Merge green children into your branch with `cdx land <child>` or `cdx land --batch <child>...`; land a child whose work another child needs before spawning the dependent child, and land every green child before your report.",
-  "Run each cdx command as a plain call with no redirect, pipe, env prefix, $(...) or wildcard, because only plain calls leave the sandbox; never run git writes yourself, cdx does them.",
+  "Run each cdx command as a plain call, because only plain calls leave the sandbox: wrap every brief, gate and question in single quotes and keep apostrophes out of them (write do not, it is). Double quotes expand backticks and $, and a '\\'' splice is not plain, so either keeps the call sandboxed. Use no redirect, pipe, env prefix, $(...) or wildcard, and never run git writes yourself; cdx does them.",
   "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs and clean to it.",
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
   "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",

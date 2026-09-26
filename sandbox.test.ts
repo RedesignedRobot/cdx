@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { capNotice, CAP_BYTES, cappedCommand, codexPreTool, geminiOverwrite, invokesCdx, utf8Boundary } from "./cap.ts";
 import { codexSandbox, geminiProfile, laneCodegraphRoot, resolvedPath, spillDirOf } from "./sandbox.ts";
-import { houseRules } from "./prompts.ts";
+import { houseRules, laneInstructions } from "./prompts.ts";
 import { ROOT } from "./runtime.ts";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -50,6 +50,10 @@ test("a worktree lane queries its primary checkout's index, which it may write",
     expect(laneCodegraphRoot({ cwd: lane, reviewDir: lane, engine: "gpt" })(lane)).toBeUndefined();
     expect(laneCodegraphRoot({ cwd: lane, reviewDir: lane, engine: "gemini" })(lane)).toBe(primary);
   } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("supervisor cdx calls are single-quoted so the exec-policy rule matches", () => {
+  expect(laneInstructions({ supervisor: true })).toContain("cdx spawn <child> --bg --gate '<cmd>' '<brief with the four headings>'");
 });
 
 test("the cap wraps lane shell commands except cdx calls", () => {
