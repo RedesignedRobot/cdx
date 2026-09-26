@@ -21,6 +21,8 @@ import { CONFIG_PATH, fail, parseArgs, pidAlive, resolveBrief, singleLine } from
 import { briefCommand, eventsCommand, feedCommand } from "./session-commands.ts";
 import { migrateCommand } from "./migrate.ts";
 import { statusCommand, usageCommand, waitCommand } from "./status.ts";
+import { contextCommand } from "./context.ts";
+import { shotsCommand } from "./shots.ts";
 import { landCommand, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -34,7 +36,9 @@ ${ENGINE_PICKER}
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--scope-policy ask|extend|stop] [--max-runtime MIN] "<brief>"
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
-  consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only advisor
+  consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... "<question>"  # read-only advisor
+  context <repo> [--model M]             # build the repo's context digest for HEAD with one read-only consult
+  shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]  # verdict.json; prints failed screens only
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
   --supervisor (gpt only) lets the lane drive GPT or Gemini children and consults
@@ -75,7 +79,7 @@ needs files outside its brief: extend edits them and lists them under
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "review", "consult", "land",
+  "spawn", "resume", "review", "consult", "context", "shots", "land",
   "kill", "close", "clean", "gate", "reply", "job", "migrate",
 ]);
 
@@ -96,6 +100,8 @@ switch (command) {
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
+  case "context": await contextCommand(argv); break;
+  case "shots": await shotsCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "send": await sendCommand(argv); break;
   case "ask": await (process.env.CDX_LANE ? askCommand(argv) : codeQuestionCommand(argv)); break;

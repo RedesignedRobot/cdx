@@ -1,22 +1,27 @@
 // Standing lane rules, review frames, and resume prompt construction.
 
-import { retiredLaneRule } from "./account-sync.ts";
+import { type LaneRole, retiredLaneRule } from "./account-sync.ts";
 import { config } from "./config.ts";
+import { CODEGRAPH_EXPLORE } from "./codegraph-policy.ts";
+import { contextDigest, digestLine } from "./context.ts";
 import { type Engine, laneRunning, type Ledger, type Spec, workCwdOf } from "./ledger.ts";
 import { specPathOf } from "./reports.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { existsSync, readFileSync } from "node:fs";
 
-// Standing rules live here; task briefs supply the outcome and owned files.
+// Standing rules live in the lane home: Codex loads $CODEX_HOME/AGENTS.md into
+// every thread and agy loads the agent file, so the brief carries only a pointer
+// and the facts that differ per lane. Task briefs supply the outcome and owned files.
 const LANE_ROLE = "Claude is the owner's liaison for briefs, answers, review, and merging; your final report is its handoff.";
 const WORK_LIMITS = "Never commit, push, deploy, or start servers beyond tests; the liaison integrates after independent review.";
 const READ_ONLY = "The sandbox makes this lane read-only: commands and network work, but every file write fails, scratch files in /tmp included.";
 const WORK_REPORT = "Report the outcome, changed files, risks, child outcomes, and report paths in plain prose and short lists, without em dashes, filler, or praise.";
 const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and short lists, without em dashes or filler.";
+const SECRETS_RULE = "Never print or inline secrets; use environment lookups.";
 const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
-const CODEGRAPH_RULE = "In a repository with .codegraph/, codegraph explore (CLI) or codegraph_explore (MCP) is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph fails, report the failure and resolve availability before continuing the code question.";
+export const CODEGRAPH_RULE = `In a repository with .codegraph/, \`${CODEGRAPH_EXPLORE} "<question>"\` is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph is missing, the repository is unindexed, or the call times out (exit 142) or fails, fall back to rg and file reads and note it in the report.`;
 const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
 const GPT_RULES = [
@@ -30,13 +35,6 @@ const GPT_RULES = [
 ];
 export const VERIFICATION_RULE = "Run one typecheck before the report, using vp check --no-fmt or the repository equivalent named in .cdx-rules.md, and each touched spec once for mutation proof. Never run the suite or the wall; the lane gate owns those.";
 const GPT_WORKER_RULES = [WORKER_BAN, ...GPT_RULES];
-export const GEMINI_WORKER_RULES = [
-  WORKER_BAN,
-  "Deliver within your files; the parent owns design and scope.",
-  ASK_RULE,
-  "Use shell codegraph explore for code questions. Batch independent queries. For permitted non-code reads, read files under 800 lines whole once; reread only after they change.",
-  "Remove temporary diagnostics and report commands and scope separately from the gate verdict. End with Assumptions or 'none'.",
-];
 const SUPERVISOR_RULES = [
   "Own design and cross-cutting decisions; delegate bounded work to Sol children (the default engine) or Gemini children for mechanical sweeps, use read-only consults when useful, and keep delegation one level deep with native subagents disabled.",
   ...GPT_RULES,
@@ -49,6 +47,20 @@ const SUPERVISOR_RULES = [
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
   "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",
 ];
+
+const roleTitle = (role: LaneRole) => role.review ? "review lane" : role.supervisor ? "supervisor lane" : "work lane";
+const testRunRule = () => `Keep test invocations within ${config.visibility?.testRuns ?? VISIBILITY_DEFAULTS.testRuns} this round, including the lane gate. Run each touched spec once; ask the supervisor if the gate needs more.`;
+const ownerRules = () => config.rules.filter((rule) => !retiredLaneRule(rule));
+
+// The AGENTS.md cdx writes into each role's Codex lane home.
+export function laneInstructions(role: LaneRole = {}): string {
+  const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_RULE]
+    : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
+      VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule()])];
+  const owner = ownerRules();
+  return [`# cdx ${roleTitle(role)}`, "", "These are your standing rules as a cdx lane. The brief carries the task and the facts for this lane.", "",
+    ...rules.map((rule) => `- ${rule}`), ...(owner.length ? ["", "## Owner rules", "", ...owner.map((rule) => `- ${rule}`)] : [])].join("\n") + "\n";
+}
 
 // Save what the conversation received, including repository rules, in its existing spec.
 export function promptRules(prompt: string): string | undefined {
@@ -93,22 +105,16 @@ export function sharedTreeLanes(lane: string, cwd: string, ledger: Ledger, treeR
 }
 
 export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
-  const builtIns = reviewOnly ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT] : [LANE_ROLE, WORK_LIMITS, WORK_REPORT];
-  builtIns.push(CODEGRAPH_RULE);
-  if (!reviewOnly) {
-    if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
-    else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
-  }
-  if (!reviewOnly) builtIns.push(VERIFICATION_RULE);
-  if (!reviewOnly && !opts.supervisor) builtIns.push(`Keep test invocations within ${config.visibility?.testRuns ?? VISIBILITY_DEFAULTS.testRuns} this round, including the lane gate. Run each touched spec once; ask the supervisor if the gate needs more.`);
-  const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
-  if (config.rules.length > 0) sections.push(config.rules.filter((rule) => !retiredLaneRule(rule)).map((rule) => `- ${rule}`).join("\n"));
+  const role = { review: reviewOnly, supervisor: Boolean(opts.supervisor) && engine === "gpt" };
+  const facts = [engine === "gpt"
+    ? `Standing rules: the "cdx ${roleTitle(role)}" AGENTS.md from your lane home.`
+    : `Standing rules: your cdx agent file.`];
+  if (engine !== "gpt") facts.push(...ownerRules(), ...(reviewOnly ? [] : [testRunRule()]));
   const projectRules = `${cwd}/.cdx-rules.md`;
-  if (existsSync(projectRules)) {
-    const text = readFileSync(projectRules, "utf8").trim();
-    if (text) sections.push(text);
-  }
-  return sections.join("\n");
+  if (existsSync(projectRules) && readFileSync(projectRules, "utf8").trim()) facts.push(`Project rules: read ${projectRules} before starting.`);
+  const digest = digestLine(contextDigest(cwd));
+  if (digest) facts.push(digest);
+  return facts.map((fact) => `- ${fact}`).join("\n");
 }
 
 export const REVIEW_FINDINGS_SCHEMA = {
@@ -141,7 +147,7 @@ export function reviewFrame(_engine: Engine): string {
   return `${REVIEW_FRAME_BASE} Your final answer is captured as structured output: put the complete markdown report in the report field and every finding in the findings array (empty when clean).`;
 }
 
-export const CONSULT_FRAME = `CONSULT. Advise the supervisor or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You have full access: run commands, use the network, and write notes or maps where the caller asks. Edit tracked source only when the question asks for it. End with Decisions for the caller, limited to choices that need the caller or owner.`;
+export const CONSULT_FRAME = `CONSULT. Advise the supervisor or the owner's liaison. Challenge the premise when evidence supports a better approach. ${STANDARD_RULE} Ground recommendations in the tree; separate verified facts from inference. Recommend one approach and explain rejected alternatives. You run read-only: commands and the network work, file writes fail, so everything the caller needs goes in your final message. End with Decisions for the caller, limited to choices that need the caller or owner.`;
 
 export function resumeRefusal(kind: string | undefined, lane: import("./ledger.ts").Lane, head: string): string | undefined {
   const fresh = "New scope requires a fresh lane seeded from the report. Resume accepts only --fix gate or --fix review on the same diff.";

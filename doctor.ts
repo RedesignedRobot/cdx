@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 // Engine installation, account configuration checks, and diagnostic probes.
 
 import { installLaneHome, laneCodexHome, retiredLaneRule } from "./account-sync.ts";
+import { laneInstructions } from "./prompts.ts";
 import {
   accountChoices, adviceLines, cachedAccountStandings, configuredAccountSnapshots, defaultCodexHome,
   exhausting, formatAccountUsage, primaryAccount, refreshUsageSnapshot, resetCreditAlerts, shouldRedeemCredit,
@@ -537,11 +538,11 @@ export async function doctorCommand(argv: string[]) {
     }
   }
 
-  const laneInstructions = readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8");
+  const instructions = laneInstructions();
   for (const [name, home] of Object.entries(config.accounts ?? { default: defaultCodexHome() })) {
     try {
-      if (parsed.bools.has("fix")) installLaneHome(home, laneInstructions);
-      if (readFileSync(`${laneCodexHome(home)}/AGENTS.md`, "utf8") !== laneInstructions) throw new Error("stale lane instructions");
+      if (parsed.bools.has("fix")) installLaneHome(home, instructions);
+      if (readFileSync(`${laneCodexHome(home)}/AGENTS.md`, "utf8") !== instructions) throw new Error("stale lane instructions");
       good(`${name}: lane home ${laneCodexHome(home)}`);
     } catch (error) { bad(name, String(error), "run cdx doctor --fix"); }
   }

@@ -41,7 +41,7 @@ import {
 import { failActiveRound, killChildren } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
 import {
-  CmdError, color, coloredState, completionVerdict, fmtTokens, laneChildEnv, REPO_ROOT, ROOT, singleLine, VERSION,
+  CmdError, color, coloredState, completionVerdict, fmtTokens, laneChildEnv, ROOT, singleLine, VERSION,
 } from "./runtime.ts";
 import { invalidateAccountUsage, isFiniteCount, readUsageSnapshot, recordCodexExhaustion } from "./usage-store.ts";
 import { toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -204,7 +204,9 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   const engine = spec.engine;
   const gemini = engine === "gemini";
   const jsonMode = true;
-  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"), Boolean(spec.supervisor));
+  const role = { review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) };
+  if (!gemini && spec.laneInstructions === undefined) throw new CmdError("round spec has no lane instructions; start a new round with cdx 10");
+  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), spec.laneInstructions!, role);
   prepareSandboxDirs(spec);
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
@@ -249,7 +251,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round), progressLogPathOf(lane, round)]), ...geminiArgs]
       : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
-    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), Boolean(spec.supervisor)), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
+    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

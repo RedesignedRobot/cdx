@@ -1,6 +1,6 @@
 import { fixReviewPrompt } from "./prompts.ts";
 import { briefContractRefusal, isNoOpGate, SCOPE_POLICIES, type ScopePolicy, scopeRule } from "./brief-contract.ts";
-import { retiredLaneRule, installLaneHome } from "./account-sync.ts";
+import { retiredLaneRule } from "./account-sync.ts";
 import { requireGeminiAgent } from "./doctor.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane launch, spawn, resume, review, consult, and cleanup commands.
@@ -23,7 +23,7 @@ import {
   storedOwnership, supervisorLane, validLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
-  resumeRefusal, CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
+  resumeRefusal, CODEGRAPH_RULE, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
   REVIEW_FINDINGS_SCHEMA, reviewFrame,
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
@@ -34,7 +34,7 @@ import { openRound } from "./rounds.ts";
 import { chooseSpawnModel } from "./repo-routing.ts";
 import { runRound } from "./runner.ts";
 import {
-  color, fail, fmtAge, REPO_ROOT, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
+  color, fail, fmtAge, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -91,7 +91,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.codexHome = choice?.home;
     spec.model ??= entry.model ?? config.model;
     Object.assign(spec, accountSpec(choice));
-    installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"));
+    spec.laneInstructions = laneInstructions({ review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) });
     if (changedHome && (spec.sourceThreadId || spec.mode === "resume")) {
       freshAccountSpec(spec, entry, recoveryPrompt(spec, entry));
       brief = spec.prompt;
@@ -346,7 +346,7 @@ export async function resumeCommand(argv: string[]) {
 // as an advisor rather than a hostile reviewer. Further questions use a fresh consult.
 // A head consult may opt into --supervisor to spawn read-only Gemini helpers.
 export async function consultCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor", "image"]);
   const [lane, questionArg] = parsed.rest;
   const usage = 'usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"';
   const question = await resolveBrief(questionArg, usage);
@@ -371,7 +371,7 @@ export function reviewBaseTarget(cwd: string, base: string, run = (cwd: string, 
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor", "image"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const usage = 'usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]';
@@ -414,6 +414,8 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   }
   const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
+  if (engine !== "gpt" && parsed.lists.image) fail("--image needs --engine gpt; agy takes no image attachments");
+  const images = (parsed.lists.image ?? []).map((image) => existsSync(image) ? realpathSync(image) : fail(`--image does not exist: ${image}`));
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
@@ -446,6 +448,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   if (selection) announceAccountSelection(lane, selection);
   return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief,
     ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
+    ...(images.length ? { images } : {}),
     ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
@@ -492,7 +495,7 @@ export async function codeQuestionCommand(argv: string[]): Promise<void> {
   requireGeminiAgent(policy.reviewAgent, cwd);
   // Keep this request read-only even when its shell tool tries to write.
   if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
-  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
+  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. ${CODEGRAPH_RULE}\n${question}`,
     "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--print-timeout", "90s", "--add-dir", cwd],
     cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);

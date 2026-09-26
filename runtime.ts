@@ -131,11 +131,11 @@ export function pidAlive(pid?: number): boolean {
 
 // Flag parsing
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect", "scope-policy"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect", "scope-policy", "rubric"]);
 
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "transcript", "tools", "supervisor", "brief", "watch", "line", "peek", "snapshot", "totals"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "transcript", "tools", "supervisor", "brief", "watch", "line", "peek", "snapshot", "totals", "downscale"]);
 
 // A flag missing from these sets fails as "unknown flag" even when the
 // command allows it; cdx.test.ts checks every parseArgs allow-list.

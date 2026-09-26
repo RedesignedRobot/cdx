@@ -35,7 +35,7 @@ export {
   WAKE_EVENTS, callerLineage, selectEvents, spawnRoots,
 } from "./ledger.ts";
 export {
-  resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES,
+  resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE,
 } from "./prompts.ts";
 export {
   controlText,

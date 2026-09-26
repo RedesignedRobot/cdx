@@ -15,6 +15,8 @@ export interface LiveRow {
 
 export interface LiveSnapshot { rows: LiveRow[]; now: number }
 
+export interface RolloverState { session: string; compactions: number; blocked: boolean }
+
 declare module "claude-code" {
-  interface PluginState { cdx: { live: LiveSnapshot } }
+  interface PluginState { cdx: { live: LiveSnapshot; rollover: RolloverState } }
 }

@@ -251,6 +251,8 @@ export interface Spec {
   queuedUntil?: string;
   reviewTree?: GateTree;
   injectedRules?: string;
+  // The Codex lane home AGENTS.md, rendered where config is loaded; the runner reads defaults.
+  laneInstructions?: string;
   visibility?: VisibilityConfig;
   effort: Effort;
   engine: Engine;

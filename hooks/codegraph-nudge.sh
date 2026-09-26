@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Conservative Codegraph-first PreToolUse hook for Bash searches."""
+"""Conservative Codegraph-first PreToolUse hook for Bash searches.
+
+Blocks one semantic source search per turn in an indexed repo. Never blocks when
+codegraph is not installed, the repo is unindexed, or an explore already ran this
+turn, including one that failed or hit its 60 s deadline."""
 
 import hashlib
 import json
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -18,6 +23,9 @@ SEMANTIC_WORDS = re.compile(r"\b(function|class|interface|type|enum|struct|def|i
 SYMBOL = re.compile(r"^[A-Za-z_$][A-Za-z_$0-9]*$")
 VALUE_OPTIONS = {"-e", "--regexp", "-g", "--glob", "-t", "--type", "-f", "--file", "--exclude", "--include", "--exclude-dir"}
 FILTER_OPTIONS = {"-g", "--glob", "-t", "--type", "--include"}
+# cdx runs codegraph as `perl -e 'alarm 60; exec @ARGV' codegraph explore ...`.
+DEADLINE = re.compile(r"""\bperl -e (['"])alarm \d+; ?exec @ARGV\1 """)
+EXPLORE = "perl -e 'alarm 60; exec @ARGV' codegraph explore"
 
 
 def obscured_shell_syntax(command):
@@ -40,6 +48,7 @@ def obscured_shell_syntax(command):
 
 
 def shell_segments(command):
+    command = DEADLINE.sub("", command)
     if "<<" in command or "$" in command or "`" in command or obscured_shell_syntax(command):
         return []
     try:
@@ -192,7 +201,7 @@ def actual_user(content):
 
 
 def completed_explore(records, cwd, search_root):
-    """Return (last real turn marker, completed explore in that turn)."""
+    """Return (last real turn marker, explore finished in that turn, failed or not)."""
     turn = None
     after = []
     for record in records:
@@ -238,7 +247,7 @@ def completed_explore(records, cwd, search_root):
                 if same_root:
                     calls[block.get("id")] = True
             elif role == "user" and block.get("type") == "tool_result":
-                if block.get("tool_use_id") in calls and not block.get("is_error", block.get("isError", False)):
+                if block.get("tool_use_id") in calls:
                     return turn, True
     return turn, False
 
@@ -296,7 +305,7 @@ def decision(payload, records):
         return False, None
     command = payload.get("tool_input", {}).get("command") if isinstance(payload.get("tool_input"), dict) else None
     cwd = payload.get("cwd")
-    if not isinstance(command, str) or not isinstance(cwd, str):
+    if not isinstance(command, str) or not isinstance(cwd, str) or shutil.which("codegraph") is None:
         return False, None
     search_root = search_root_for(command, cwd)
     if search_root is None:
@@ -320,7 +329,7 @@ def main():
         return
     should_block, turn = decision(payload, read_transcript(transcript))
     if should_block and first_denial(session, transcript, turn):
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "Owner Codegraph-first rule: use codegraph explore before a semantic source search in this indexed repo. Retry after explore, or proceed with an explicit literal sweep, log/non-code search, or file existence/listing command."}}))
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": f"Owner Codegraph-first rule: run `{EXPLORE} '<question>'` before a semantic source search in this indexed repo. If it times out or fails, this search is allowed on retry; so is a literal sweep, a log or non-code search, or a file listing."}}))
 
 
 if __name__ == "__main__":
