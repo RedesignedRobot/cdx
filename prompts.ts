@@ -42,7 +42,8 @@ const SUPERVISOR_RULES = [
   ...GPT_RULES,
   'Use `cdx spawn <child> --bg --gate "<cmd>" "<brief>"` for Sol or add `--engine gemini`; `cdx consult <child> --bg "<question>"` starts an advisor, and `cdx wait <child>... --report` returns 2 for questions answered through `cdx reply`.',
   "Never edit child-owned files. Put shared findings in a file referenced by child briefs and batch corrections into one send per child per review pass.",
-  "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together, using shared-tree disjoint files for uncommitted dependencies because worktrees start at HEAD.",
+  "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together. Every writer child gets its own worktree branched from your branch head at spawn, so children never share a tree.",
+  "Merge green children into your branch with `cdx land <child>` or `cdx land --batch <child>...`; land a child whose work another child needs before spawning the dependent child, and land every green child before your report.",
   "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs, adopt, and clean to it.",
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
   "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",
@@ -144,11 +145,12 @@ export const CONSULT_FRAME = `CONSULT. Advise the supervisor or the owner's liai
 export function resumeRefusal(kind: string | undefined, lane: import("./ledger.ts").Lane, head: string): string | undefined {
   const fresh = "New scope requires a fresh lane seeded from the report. Resume accepts only --fix gate or --fix review on the same diff.";
   if (lane.consult || !["gate", "review"].includes(kind ?? "")) return fresh;
-  const previous = kind === "gate" ? lane.gateReceipt : lane.reviewTree;
-  if (kind === "review" && !previous?.head) return "Review must run on the work lane itself; a separate named review is not attached to this lane.";
+  const review = lane.reviewAttestations?.at(-1);
+  const previous = kind === "gate" ? lane.gateReceipt : review;
+  if (kind === "review" && !review) return "No review is attached to this lane; review its tree with any review lane first.";
   if (!previous?.head || previous.head !== head) return `The diff HEAD changed. ${fresh}`;
   if (kind === "gate" && (!lane.gateReceipt || lane.gateReceipt.exitCode === 0 && lane.gateReceipt.valid)) return `There is no failed gate to fix. ${fresh}`;
-  if (kind === "review" && (!lane.review || lane.reviewClosed !== false)) return `There are no blocking review findings to fix. ${fresh}`;
+  if (kind === "review" && review!.closed) return `There are no blocking review findings to fix. ${fresh}`;
 }
 
 export function reviewLoopClosed(findings: unknown): boolean {

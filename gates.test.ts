@@ -25,7 +25,7 @@ for (const [kind, diagnostic] of Object.entries(diagnostics) as Array<[GateFailu
 }
 
 import { gateTreeFromGit, makeGateReceipt, repairGateOnce, failureDigest } from "./gates.ts";
-import { refreshChangedLandReceipt, resolveWorktreeTarget } from "./worktrees.ts";
+import { resolveWorktreeTarget } from "./worktrees.ts";
 import { linkIgnoredEntries, materializeGitTree, runFrozenGate, staleReviewSnapshots, SNAPSHOT_ROOT } from "./snapshots.ts";
 import type { GateTree, Lane } from "./ledger.ts";
 import { join } from "node:path";
@@ -94,20 +94,6 @@ test("doctor discovers dead and incomplete snapshots", () => {
   expect(stale).toEqual([join(SNAPSHOT_ROOT, "dead", "tree"), join(SNAPSHOT_ROOT, "incomplete", "tree")]);
 });
 
-test("land reruns one gate for a changed green tree and refuses red", () => {
-  const receipt = makeGateReceipt(1, "/work", "check", 0, "now", { head: "h", tree: "old" }, { head: "h", tree: "old" });
-  const entry = { worktreePath: "/work", worktreeRepo: "/base", branch: "lane/x", work: { state: "done", round: 1, exitCode: 0 }, gateReceipt: receipt } as Lane;
-  let runs = 0;
-  const run = (exitCode: number) => refreshChangedLandReceipt(entry, false, { head: "h", tree: "new" },
-    () => { runs++; return makeGateReceipt(1, "/work", "check", exitCode, "now", { head: "h", tree: "new" }, { head: "h", tree: "new" }); },
-    () => {}, () => ({ head: "h", tree: "new" }));
-  expect(run(0).refusal).toBeUndefined();
-  expect(runs).toBe(1);
-  entry.gateReceipt = receipt;
-  expect(run(1).refusal).toBe("gate failed");
-  expect(runs).toBe(2);
-});
-
 test("gate receipts prove the full tree even when paths are supplied", () => {
   let owned = "original", sibling = "before";
   const snapshot = (paths?: string[]) => {
@@ -164,23 +150,6 @@ test("ignored dependency roots stay linked so nested CLI symlinks retain package
   expect(excludes).toEqual(["/node_modules", "/generated"]);
 });
 
-test("a refreshed land receipt clears prior landing commits in memory and persistence", () => {
-  const old = { head: "C1", tree: "T1" }, fresh = { head: "C1", tree: "T2" };
-  const entry = { worktreePath: "/work", worktreeRepo: "/base", branch: "lane/x",
-    work: { state: "done", round: 1, exitCode: 0 }, landingCommit: "C1", landedCommit: "old-merge",
-    gateReceipt: makeGateReceipt(1, "/work", "check", 0, "before", old, old) } as Lane;
-  const stored = { ...entry };
-  const green = makeGateReceipt(1, "/work", "check", 0, "after", fresh, fresh);
-  const result = refreshChangedLandReceipt(entry, false, fresh, () => green,
-    (update) => { Object.assign(stored, update); }, () => fresh);
-  expect(result.refusal).toBeUndefined();
-  for (const state of [entry, stored]) {
-    expect(state.gateReceipt).toEqual(green);
-    expect(state.landingCommit).toBeUndefined();
-    expect(state.landedCommit).toBeUndefined();
-  }
-});
-
 test("review bases resolve in the source repo before the snapshot prompt is built", () => {
   const commit = "a".repeat(40);
   const target = reviewBaseTarget("/source/feature", "review-base", (cwd, ...args) => {
@@ -190,4 +159,65 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
   });
   expect(target).toBe(`Review git diff ${commit}...HEAD.`);
   expect(target).not.toContain("review-base");
+});
+
+import { attestReview, reviewRefusal } from "./gates.ts";
+import { childWorktreeTarget, firstRedPrefix, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths } from "./worktrees.ts";
+import { houseRules, resumeRefusal } from "./prompts.ts";
+
+test("a review by any lane name attests to the tree it saw and gates land by content", () => {
+  const work = { work: { state: "done" }, worktreePath: "/wt/feature", gateReceipt: { tree: "gated" } } as Lane;
+  const ledger = { feature: work, other: { work: { state: "done" }, worktreePath: "/wt/other" } as Lane,
+    "feature-audit": { work: { state: "adopted" }, reviewTree: { head: "h", tree: "gated" } } as Lane };
+  attestReview(ledger, "feature-audit", false, "/r.md", "/wt/feature", (path) => path);
+  expect(ledger.other.reviewAttestations).toBeUndefined();
+  expect(reviewRefusal(work.reviewAttestations, ["edited", "gated"])).toContain("feature-audit has unresolved P1/P2");
+  expect(resumeRefusal("review", work, "h")).toBeUndefined();
+  ledger["feature-audit"]!.reviewTree = { head: "h", tree: "gated" };
+  attestReview(ledger, "feature-audit", true, undefined, undefined, () => undefined);
+  // Head edits after the gate keep the closed review of the gated tree.
+  expect(reviewRefusal(work.reviewAttestations, ["edited", "gated"])).toBeUndefined();
+  expect(reviewRefusal(work.reviewAttestations, ["worker-fix"])).toContain("not at its current or gated tree");
+  expect(reviewRefusal(undefined, ["any"])).toBeUndefined();
+});
+
+test("land gates only a merge result that no green receipt already proves", () => {
+  const lane = { entry: { gateReceipt: { tree: "gated" } } as Lane };
+  expect(receiptProves([lane], "gated")).toBe(true);
+  expect(receiptProves([lane], "head-edited")).toBe(false);
+  expect(receiptProves([lane, lane], "gated")).toBe(false);
+});
+
+test("a dirty base blocks land only where the merge touches the same files", () => {
+  const dirty = statusPaths(" M notes.md\0R  new.ts\0old.ts\0?? scratch.txt\0");
+  expect(dirty).toEqual(["notes.md", "new.ts", "old.ts", "scratch.txt"]);
+  expect(overlappingPaths(dirty, ["src/app.ts"])).toEqual([]);
+  expect(overlappingPaths(dirty, ["old.ts", "src/app.ts"])).toEqual(["old.ts"]);
+});
+
+test("a red batch names the first breaking lane within log2 extra gates", () => {
+  for (const [count, culprit] of [[8, 5], [8, 1], [8, 8], [5, 3]] as const) {
+    let gates = 0;
+    expect(firstRedPrefix(count, (prefix) => { gates++; return prefix < culprit; })).toBe(culprit);
+    expect(gates).toBeLessThanOrEqual(Math.ceil(Math.log2(count)));
+  }
+});
+
+test("supervisor children get their own worktree and land into the parent branch", () => {
+  expect(childWorktreeTarget("child", undefined, "parent", false)).toBe("child");
+  expect(childWorktreeTarget("child", "custom", "parent", false)).toBe("custom");
+  expect(childWorktreeTarget("child", undefined, "parent", true)).toBeUndefined();
+  expect(childWorktreeTarget("lane", undefined, undefined, false)).toBeUndefined();
+  const rules = houseRules("/nonexistent", false, "gpt", { supervisor: true });
+  expect(rules).toContain("cdx land <child>");
+  expect(rules).not.toContain("shared-tree");
+});
+
+test("doctor removes merged worktrees and keeps unmerged branches of abandoned lanes", () => {
+  const old = { running: false, closed: true, merged: true, ageDays: 9 };
+  expect(staleWorktreeAction(old, 7)).toBe("remove");
+  expect(staleWorktreeAction({ ...old, merged: false }, 7)).toBe("remove-worktree");
+  expect(staleWorktreeAction({ ...old, merged: false, closed: false }, 7)).toBeUndefined();
+  expect(staleWorktreeAction({ ...old, running: true }, 7)).toBeUndefined();
+  expect(staleWorktreeAction({ ...old, ageDays: 2 }, 7)).toBeUndefined();
 });

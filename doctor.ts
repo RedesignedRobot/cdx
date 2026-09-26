@@ -19,6 +19,7 @@ import {
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
 import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
+import { removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
 import {
   existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync,
   writeFileSync, renameSync,
@@ -443,7 +444,7 @@ export function usageVerdict(standing: AccountStanding, usedPercent: number): Us
 }
 
 export async function doctorCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["fix", "probe"]);
+  const parsed = parseArgs(argv, ["fix", "probe", "days"]);
   let failures = 0;
   const good = (message: string) => console.log(color.green(message));
   const warn = (message: string) => console.log(color.yellow(message));
@@ -699,6 +700,14 @@ export async function doctorCommand(argv: string[]) {
     }
   }
   if (staleSnapshots.length && !parsed.bools.has("fix")) warn("run `cdx doctor --fix` to remove stale review snapshots");
+  const worktreeDays = Number(parsed.flags.days ?? 7);
+  const staleTrees = staleWorktrees(readLedger(), worktreeDays);
+  for (const item of staleTrees) {
+    warn(`worktree: ${item.action === "remove" ? "merged" : "abandoned"} ${item.branch} at ${displayPath(item.path)}, idle ${Math.floor(item.ageDays)}d`);
+    if (!parsed.bools.has("fix")) continue;
+    try { good(`fixed: ${removeStaleWorktree(item)}`); } catch (error) { warn(String(error instanceof Error ? error.message : error)); }
+  }
+  if (staleTrees.length && !parsed.bools.has("fix")) warn(`run \`cdx doctor --fix\` to remove cdx worktrees idle over ${worktreeDays} days (--days N)`);
   if (existsSync(`${ROOT}/.lock`)) warn("warning: ledger lock present (breaks automatically after 30s if stale)");
   const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {

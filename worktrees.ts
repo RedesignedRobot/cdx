@@ -1,9 +1,9 @@
 // Worktree creation, reuse, directory persistence, and cleanup.
 
 import { config } from "./config.ts";
-import { readLane, requireOwnChild, withLedger, laneRunning, type Lane, type Spec } from "./ledger.ts";
-import { captureGateTree, receiptRefusal } from "./gates.ts";
-import { runFrozenGate } from "./snapshots.ts";
+import { readLane, requireOwnChild, supervisorLane, withLedger, laneRunning, type Lane, type Ledger, type Spec } from "./ledger.ts";
+import { captureGateTree, gateFailure, receiptRefusal, reviewRefusal } from "./gates.ts";
+import { createReviewSnapshot, runFrozenGate } from "./snapshots.ts";
 import { specPathOf } from "./reports.ts";
 import { CmdError, displayPath, fail, HOME, ROOT, shellQuote, uncoloredChildEnv } from "./runtime.ts";
 import { existsSync, mkdirSync, rmdirSync, readFileSync, realpathSync, statSync } from "node:fs";
@@ -32,12 +32,6 @@ export function worktreeReuseRefusal(expectedBranch: string, actualBranch: strin
   if (!sameRepo) return "target is not a worktree of this repository";
   if (actualBranch !== expectedBranch) return `target must be on ${expectedBranch}`;
   if (!clean) return "target worktree has uncommitted changes";
-}
-
-export function cleanupRefusal(branch: string | undefined, currentBranch: string, merged: boolean, clean: boolean): string | undefined {
-  if (!branch || branch === "main" || currentBranch !== branch) return "worktree is not on its recorded lane branch";
-  if (!merged) return `branch ${branch} is not merged into local main`;
-  if (!clean) return "worktree has uncommitted changes";
 }
 
 export interface WorktreeInfo { path: string; repo: string; branch: string; baseBranch?: string }
@@ -98,7 +92,13 @@ export function createWorktree(repo: string, target: string, lane: string): Work
   return { path, repo: repoRoot, branch, baseBranch };
 }
 
-type WorktreeRecord = Pick<Lane, "worktreeRepo" | "worktreePath" | "branch">;
+// A supervisor's writers never share a tree: each child gets a worktree cut
+// from the checkout the supervisor runs in, which is its own lane branch.
+export function childWorktreeTarget(lane: string, requested: string | undefined, parent: string | undefined, respawn: boolean): string | undefined {
+  return requested ?? (parent && !respawn ? lane : undefined);
+}
+
+type WorktreeRecord = Pick<Lane, "worktreeRepo" | "worktreePath" | "branch" | "baseBranch">;
 
 type GitProbe = (cwd: string, args: string[]) => { success: boolean; stdout: { toString(): string }; stderr: { toString(): string } };
 
@@ -112,11 +112,17 @@ export function worktreeCleanupCommands(entry: WorktreeRecord): string[] {
   const git = `git -C ${shellQuote(entry.worktreeRepo ?? entry.worktreePath)}`;
   return [
     `${git} worktree remove ${shellQuote(entry.worktreePath)}`,
-    ...(entry.branch ? [`${git} merge-base --is-ancestor ${shellQuote(`refs/heads/${entry.branch}`)} refs/heads/main && ${git} branch -D ${shellQuote(entry.branch)}`] : []),
+    ...(entry.branch ? [`${git} merge-base --is-ancestor ${shellQuote(`refs/heads/${entry.branch}`)} ${shellQuote(`refs/heads/${entry.baseBranch ?? "main"}`)} && ${git} branch -D ${shellQuote(entry.branch)}`] : []),
   ];
 }
 
-// main owns merge admission; branch -d would apply another check against HEAD or upstream.
+export function cleanupRefusal(branch: string | undefined, currentBranch: string, clean: boolean): string | undefined {
+  if (!branch || branch === "main" || currentBranch !== branch) return "worktree is not on its recorded lane branch";
+  if (!clean) return "worktree has uncommitted changes";
+}
+
+// The base branch owns merge admission; branch -d would apply another check
+// against HEAD or upstream. An unmerged branch survives so commits are kept.
 export function removeWorktree(entry: WorktreeRecord,
   run: GitProbe = (cwd, args) => Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] }),
   log: (message: string) => void = console.log) {
@@ -124,100 +130,278 @@ export function removeWorktree(entry: WorktreeRecord,
   const probe = (...args: string[]) => run(repo, args);
   const current = run(entry.worktreePath!, ["symbolic-ref", "--short", "HEAD"]);
   const status = run(entry.worktreePath!, ["status", "--porcelain", "--untracked-files=all"]);
-  const merged = entry.branch ? probe("merge-base", "--is-ancestor", `refs/heads/${entry.branch}`, "refs/heads/main").success : false;
-  const reason = cleanupRefusal(entry.branch, current.stdout.toString().trim(), merged, status.success && !status.stdout.toString().trim());
+  const reason = cleanupRefusal(entry.branch, current.stdout.toString().trim(), status.success && !status.stdout.toString().trim());
   if (reason) fail(`not removing worktree: ${reason}`);
+  const merged = probe("merge-base", "--is-ancestor", `refs/heads/${entry.branch}`, `refs/heads/${entry.baseBranch ?? "main"}`).success;
   const remove = probe("worktree", "remove", entry.worktreePath!);
   if (!remove.success) fail(`git worktree remove failed: ${remove.stderr.toString().trim()}`);
+  if (!merged) {
+    log(`cdx: removed worktree ${displayPath(entry.worktreePath!)}; kept unmerged branch ${entry.branch}`);
+    return;
+  }
   const del = probe("branch", "-D", entry.branch!);
   if (!del.success) fail(`worktree removed but branch retained: ${del.stderr.toString().trim()}`);
   log(`cdx: removed worktree ${displayPath(entry.worktreePath!)} and branch ${entry.branch}`);
 }
 
-export function landRefusal(entry: Lane, baseDirty: boolean, current?: import("./ledger.ts").GateTree): string | undefined {
-  if (laneRunning(entry)) return "lane is still running";
-  if (!entry.worktreePath || !entry.worktreeRepo || !entry.branch) return "lane has no managed worktree";
-  if (baseDirty) return "base checkout is dirty";
-  const receipt = receiptRefusal(entry.gateReceipt, entry.work);
-  if (receipt) return receipt;
-  if (entry.reviewClosed === false) return "review has unresolved P1/P2 findings";
-  if (!current) return "worktree snapshot unavailable";
-  if (entry.landingCommit && current.head === entry.landingCommit && current.tree === entry.gateReceipt!.tree) return;
-  if (current.head !== entry.gateReceipt!.head || current.tree !== entry.gateReceipt!.tree) return "worktree differs from its green receipt";
+function gitRaw(cwd: string, ...args: string[]): string {
+  const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
+  if (!result.success) throw new CmdError(`git ${args[0]} failed: ${result.stderr.toString().trim()}`);
+  return result.stdout.toString();
 }
 
-export function refreshChangedLandReceipt(entry: Lane, baseDirty: boolean, current: import("./ledger.ts").GateTree | undefined,
-  run: () => import("./ledger.ts").GateReceipt, save: (update: Pick<Lane, "gateReceipt" | "landingCommit" | "landedCommit">) => void,
-  capture: () => import("./ledger.ts").GateTree | undefined): { refusal?: string; current?: import("./ledger.ts").GateTree } {
-  let refusal = landRefusal(entry, baseDirty, current);
-  if (refusal !== "worktree differs from its green receipt") return { refusal, current };
-  const receipt = run();
-  const update = { gateReceipt: receipt, landingCommit: undefined, landedCommit: undefined };
-  Object.assign(entry, update);
-  save(update);
-  current = capture();
-  refusal = landRefusal(entry, baseDirty, current);
-  return { refusal, current };
+function git(cwd: string, ...args: string[]): string {
+  return gitRaw(cwd, ...args).trim();
+}
+
+function gitOk(cwd: string, ...args: string[]): boolean {
+  return Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] }).success;
+}
+
+export function landRefusal(entry: Lane): string | undefined {
+  if (laneRunning(entry)) return "lane is still running";
+  if (!entry.worktreePath || !entry.worktreeRepo || !entry.branch) return "lane has no managed worktree";
+  return receiptRefusal(entry.gateReceipt, entry.work);
+}
+
+// Prefix gates are assumed monotonic: once a merge breaks the gate, longer
+// prefixes stay red. The caller knows the full prefix is red.
+export function firstRedPrefix(count: number, green: (prefix: number) => boolean): number {
+  let low = 1, high = count;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (green(middle)) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+export function statusPaths(porcelainZ: string): string[] {
+  const records = porcelainZ.split("\0").filter(Boolean);
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index]!;
+    paths.push(record.slice(3));
+    if (/[RC]/.test(record.slice(0, 2)) && records[index + 1]) paths.push(records[++index]!);
+  }
+  return paths;
+}
+
+export function overlappingPaths(dirty: string[], changed: string[]): string[] {
+  const touched = new Set(changed);
+  return [...new Set(dirty.filter((path) => touched.has(path)))].sort();
+}
+
+interface LandLane { lane: string; entry: Lane; commit: string; tree: string }
+
+// Commits the lane checkout so the merge carries exactly the tree its receipt
+// and reviews saw. Undefined means the lane is already in the base branch.
+function prepareLane(lane: string, entry: Lane, repo: string, baseRef: string): LandLane | undefined {
+  const work = entry.worktreePath;
+  if (laneRunning(entry)) fail(`cannot land ${lane}: lane is still running`);
+  if (!work || !entry.branch) fail(`cannot land ${lane}: lane has no managed worktree`);
+  if (!existsSync(work)) {
+    if (entry.landedCommit && gitOk(repo, "merge-base", "--is-ancestor", entry.landedCommit, baseRef)) return;
+    fail(`cannot land ${lane}: worktree ${displayPath(work)} is missing`);
+  }
+  if (git(work, "symbolic-ref", "--short", "HEAD") !== entry.branch) fail(`cannot land ${lane}: checkout is not on ${entry.branch}`);
+  const current = captureGateTree(work);
+  if (!current) fail(`cannot land ${lane}: worktree snapshot unavailable`);
+  const clean = () => !git(work, "status", "--porcelain", "--untracked-files=all");
+  if (clean() && gitOk(repo, "merge-base", "--is-ancestor", current.head, baseRef)) return;
+  const refusal = landRefusal(entry) ?? reviewRefusal(entry.reviewAttestations, [current.tree, entry.gateReceipt!.tree!]);
+  if (refusal) fail(`cannot land ${lane}: ${refusal}`);
+  if (!clean()) {
+    git(work, "add", "--all");
+    git(work, "commit", "--quiet", "-m", `Land ${lane}`);
+  }
+  const commit = git(work, "rev-parse", "HEAD");
+  const tree = git(work, "rev-parse", "HEAD^{tree}");
+  if (tree !== current.tree || !clean()) fail(`cannot land ${lane}: commit hooks changed the lane tree; check the change and land again`);
+  return { lane, entry, commit, tree };
+}
+
+function mergeCandidate(repo: string, base: string, target: LandLane): string {
+  if (gitOk(repo, "merge-base", "--is-ancestor", target.commit, base)) return base;
+  const merge = Bun.spawnSync({ cmd: ["git", "-C", repo, "merge-tree", "--write-tree", "--name-only", "--no-messages", base, target.commit] });
+  const [tree, ...conflicts] = merge.stdout.toString().trim().split("\n");
+  if (merge.exitCode === 1) fail(`cannot land ${target.lane}: it conflicts with the base in ${[...new Set(conflicts.filter(Boolean))].join(", ")}; rebase the lane branch`);
+  if (!merge.success || !tree) fail(`git merge-tree failed: ${merge.stderr.toString().trim()}`);
+  return git(repo, "commit-tree", tree, "-p", base, "-p", target.commit, "-m", `Merge ${target.lane}`);
+}
+
+function mergeGateCommand(targets: LandLane[]): string {
+  const commands = [...new Set(targets.map((target) => target.entry.gateReceipt!.command))];
+  return commands.length === 1 ? commands[0]! : commands.map((command) => `(/bin/sh -lc ${shellQuote(command)})`).join(" && ");
+}
+
+// A tree with a green receipt for its own lane needs no gate; any other merge
+// result, head edits included, runs the gate once in a frozen snapshot.
+export function receiptProves(targets: Array<Pick<LandLane, "entry">>, tree: string): boolean {
+  return targets.length === 1 && targets[0]!.entry.gateReceipt?.tree === tree;
+}
+
+function proveMerge(repo: string, commit: string, targets: LandLane[]): string | undefined {
+  const tree = git(repo, "rev-parse", `${commit}^{tree}`);
+  if (receiptProves(targets, tree)) return;
+  const first = targets[0]!;
+  const log = `${ROOT}/logs/${first.lane}-land-${tree.slice(0, 12)}.gate.log`;
+  console.log(`cdx: gating merge result ${commit.slice(0, 12)} of ${targets.map((target) => target.lane).join(", ")}`);
+  const { gate, receipt } = runFrozenGate(first.entry.work.round!, first.entry.worktreePath!, mergeGateCommand(targets), log, first.lane,
+    { create: (cwd, lane, round) => createReviewSnapshot(cwd, lane, round, { head: commit, tree }) });
+  if (receipt.valid) {
+    const regated = targets.filter((target) => target.tree === tree && target.entry.gateReceipt!.tree !== tree);
+    if (regated.length) withLedger((ledger) => { for (const target of regated) ledger[target.lane]!.gateReceipt = receipt; });
+    return;
+  }
+  const failure = gate.exitCode !== 0 ? gateFailure(gate.exitCode, gate.output).diagnostic : receipt.reason;
+  return `gate red on the merge result: ${failure} (log ${displayPath(log)})`;
+}
+
+function branchCheckout(repo: string, ref: string): string | undefined {
+  let path: string | undefined;
+  for (const line of git(repo, "worktree", "list", "--porcelain").split("\n")) {
+    if (line.startsWith("worktree ")) path = line.slice("worktree ".length);
+    else if (line === `branch ${ref}`) return path;
+  }
+}
+
+function refuseOverlap(checkout: string, repo: string, from: string, to: string): void {
+  const dirty = statusPaths(gitRaw(checkout, "status", "--porcelain=v1", "-z", "--untracked-files=all"));
+  const changed = gitRaw(repo, "diff", "--name-only", "-z", from, to).split("\0").filter(Boolean);
+  const overlap = overlappingPaths(dirty, changed);
+  if (overlap.length) fail(`base checkout ${displayPath(checkout)} has uncommitted changes in files the merge touches: ${overlap.join(", ")}`);
+}
+
+function pushBranch(repo: string, branch: string): string {
+  const config = (key: string) => Bun.spawnSync({ cmd: ["git", "-C", repo, "config", key] }).stdout.toString().trim();
+  const remote = config(`branch.${branch}.remote`);
+  if (!remote) return `not pushed, ${branch} has no upstream`;
+  git(repo, "push", "--quiet", remote, `refs/heads/${branch}:${config(`branch.${branch}.merge`) || `refs/heads/${branch}`}`);
+  return `pushed to ${remote}`;
+}
+
+function retireLane(lane: string, entry: Lane, repo: string, baseRef: string, note: string): void {
+  if (entry.worktreePath && existsSync(entry.worktreePath)) git(repo, "worktree", "remove", entry.worktreePath);
+  if (entry.branch && gitOk(repo, "merge-base", "--is-ancestor", `refs/heads/${entry.branch}`, baseRef)) git(repo, "branch", "-D", entry.branch);
+  withLedger((ledger) => {
+    const item = ledger[lane]!;
+    item.work.state = "closed";
+    item.work.note = note;
+    item.updatedAt = new Date().toISOString();
+  });
+}
+
+function landLanes(lanes: string[], entries: Lane[], repo: string, baseBranch: string): void {
+  const baseRef = `refs/heads/${baseBranch}`;
+  const baseHead = git(repo, "rev-parse", baseRef);
+  const pending: LandLane[] = [];
+  const merged: string[] = [];
+  for (const [index, lane] of lanes.entries()) {
+    const target = prepareLane(lane, entries[index]!, repo, baseRef);
+    if (target) pending.push(target);
+    else merged.push(lane);
+  }
+  const merges: string[] = [];
+  let candidate = baseHead;
+  for (const target of pending) merges.push(candidate = mergeCandidate(repo, candidate, target));
+  const checkout = branchCheckout(repo, baseRef);
+  if (checkout && candidate !== baseHead) refuseOverlap(checkout, repo, baseHead, candidate);
+  let landed = pending;
+  let culprit: string | undefined;
+  const failure = pending.length ? proveMerge(repo, candidate, pending) : undefined;
+  if (failure && pending.length === 1) fail(`cannot land ${pending[0]!.lane}: ${failure}`);
+  if (failure) {
+    const failures = new Map([[pending.length, failure]]);
+    const red = firstRedPrefix(pending.length, (prefix) => {
+      const result = proveMerge(repo, merges[prefix - 1]!, pending.slice(0, prefix));
+      if (result) failures.set(prefix, result);
+      return !result;
+    });
+    culprit = `merging ${pending[red - 1]!.lane} turned the batch red: ${failures.get(red)}`;
+    landed = pending.slice(0, red - 1);
+    candidate = red > 1 ? merges[red - 2]! : baseHead;
+  }
+  if (candidate !== baseHead) {
+    if (!checkout) git(repo, "update-ref", baseRef, candidate, baseHead);
+    else {
+      refuseOverlap(checkout, repo, baseHead, candidate);
+      git(checkout, "merge", "--ff-only", "--quiet", candidate);
+    }
+    withLedger((ledger) => { for (const target of landed) ledger[target.lane]!.landedCommit = candidate; });
+  }
+  const retiring = [...merged, ...landed.map((target) => target.lane)];
+  const pushed = retiring.length ? pushBranch(repo, baseBranch) : "nothing pushed";
+  for (const lane of retiring) retireLane(lane, entries[lanes.indexOf(lane)]!, repo, baseRef, `landed ${candidate}`);
+  if (retiring.length) console.log(`cdx: landed ${retiring.join(", ")} on ${baseBranch} as ${candidate}; ${pushed}; removed worktrees and branches, closed`);
+  if (culprit) fail(`${culprit}${landed.length ? "" : "; nothing landed"}`);
 }
 
 export function landCommand(argv: string[]): void {
-  const [lane, extra] = argv;
-  if (!lane || extra) fail("usage: cdx land <lane>");
-  const entry = readLane(lane);
-  requireOwnChild(lane, entry);
-  if (!entry.worktreeRepo || !entry.worktreePath || !entry.branch) fail("land requires a managed worktree");
-  const base = entry.worktreeRepo;
-  const work = entry.worktreePath;
-  const git = (cwd: string, ...args: string[]) => {
-    const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
-    if (!result.success) throw new CmdError(`git ${args[0]} failed: ${result.stderr.toString().trim()}`);
-    return result.stdout.toString().trim();
-  };
-  const lock = `${git(base, "rev-parse", "--path-format=absolute", "--git-common-dir")}/cdx-land.lock`;
+  const batch = argv[0] === "--batch";
+  const lanes = batch ? argv.slice(1) : argv;
+  if (!lanes.length || !batch && lanes.length > 1 || lanes.some((lane) => lane.startsWith("-"))) fail("usage: cdx land <lane> | cdx land --batch <lane>...");
+  if (new Set(lanes).size !== lanes.length) fail("cdx land --batch names a lane twice");
+  const entries = lanes.map((lane) => {
+    const entry = readLane(lane);
+    requireOwnChild(lane, entry);
+    return entry;
+  });
+  const repo = entries[0]!.worktreeRepo;
+  const baseBranch = entries[0]!.baseBranch ?? "main";
+  if (!repo) fail(`cannot land ${lanes[0]}: lane has no managed worktree`);
+  if (entries.some((entry) => entry.worktreeRepo !== repo || (entry.baseBranch ?? "main") !== baseBranch)) fail("cdx land --batch needs lanes from one repository and base branch");
+  const supervisor = supervisorLane();
+  if (supervisor && readLane(supervisor).branch !== baseBranch) fail(`supervisor ${supervisor} lands children only into its own worktree branch; the liaison lands the rest`);
+  const lock = `${git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")}/cdx-land.lock`;
   try { mkdirSync(lock); } catch { fail(`another landing holds ${lock}`); }
-  try {
-    const baseBranch = entry.baseBranch ?? "main";
-    if (git(base, "symbolic-ref", "--short", "HEAD") !== baseBranch) fail(`base checkout must be on ${baseBranch}`);
-    const removed = !existsSync(work);
-    if (removed && !entry.landedCommit) fail("lane worktree is missing before merge");
-    if (!removed && git(work, "symbolic-ref", "--short", "HEAD") !== entry.branch) fail("lane checkout is not on its recorded branch");
-    let current = removed && entry.landingCommit
-      ? { head: entry.landingCommit, tree: git(base, "rev-parse", `${entry.landingCommit}^{tree}`) }
-      : captureGateTree(work);
-    const baseDirty = Boolean(git(base, "status", "--porcelain", "--untracked-files=all"));
-    const checked = removed ? { refusal: landRefusal(entry, baseDirty, current), current } : refreshChangedLandReceipt(entry, baseDirty, current,
-      () => runFrozenGate(entry.work.round!, work, entry.gateReceipt!.command,
-        `${ROOT}/logs/${lane}-r${entry.work.round}.land-gate.log`, lane).receipt,
-      (update) => { withLedger((ledger) => { Object.assign(ledger[lane]!, update); }); },
-      () => captureGateTree(work));
-    current = checked.current;
-    const refusal = checked.refusal;
-    if (refusal) fail(`cannot land ${lane}: ${refusal}`);
-    if (git(base, "status", "--porcelain", "--untracked-files=all")) fail(`cannot land ${lane}: base checkout is dirty`);
-    // Catch lane edits made after the receipt was checked.
-    const all = removed ? current : captureGateTree(work);
-    if (!all || all.tree !== current!.tree) fail("lane changed after its gate receipt was checked");
-    if (!entry.landingCommit) {
-      git(work, "add", "--all");
-      if (git(work, "diff", "--cached", "--name-only")) git(work, "commit", "-m", `Land ${lane}`);
-      entry.landingCommit = git(work, "rev-parse", "HEAD");
-      if (git(work, "rev-parse", "HEAD^{tree}") !== current!.tree || git(work, "status", "--porcelain", "--untracked-files=all")) fail("commit hooks changed the lane tree; rerun the gate before landing");
-      withLedger((ledger) => { ledger[lane]!.landingCommit = entry.landingCommit; });
+  try { landLanes(lanes, entries, repo, baseBranch); } finally { rmdirSync(lock); }
+}
+
+export interface StaleWorktree { repo: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }
+
+// Merged worktrees go with their branch. A closed or unrecorded lane keeps an
+// unmerged branch so committed work survives; git itself refuses dirty trees.
+export function staleWorktreeAction(item: { running: boolean; closed: boolean; merged: boolean; ageDays: number }, days: number): StaleWorktree["action"] | undefined {
+  if (item.running || item.ageDays < days) return;
+  if (item.merged) return "remove";
+  if (item.closed) return "remove-worktree";
+}
+
+export function staleWorktrees(ledger: Ledger, days: number, now = Date.now()): StaleWorktree[] {
+  const repos = new Map<string, string>();
+  for (const entry of Object.values(ledger)) {
+    if (!entry.worktreeRepo || !existsSync(entry.worktreeRepo)) continue;
+    const common = Bun.spawnSync({ cmd: ["git", "-C", entry.worktreeRepo, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+    if (common.success) repos.set(common.stdout.toString().trim(), entry.worktreeRepo);
+  }
+  const stale: StaleWorktree[] = [];
+  for (const repo of repos.values()) {
+    const blocks = git(repo, "worktree", "list", "--porcelain").split("\n\n");
+    const primaryRef = blocks[0]?.match(/^branch (.+)$/m)?.[1];
+    for (const block of blocks.slice(1)) {
+      const path = block.match(/^worktree (.+)$/m)?.[1];
+      const ref = block.match(/^branch (refs\/heads\/lane\/.+)$/m)?.[1];
+      if (!path || !ref) continue;
+      const branch = ref.slice("refs/heads/".length);
+      const entry = ledger[branch.slice("lane/".length)];
+      const bases = [entry?.baseBranch ? `refs/heads/${entry.baseBranch}` : undefined, primaryRef].filter((base): base is string => Boolean(base));
+      const committed = Number(Bun.spawnSync({ cmd: ["git", "-C", repo, "log", "-1", "--format=%ct", ref] }).stdout.toString().trim()) * 1000;
+      const ageDays = (now - Math.max(committed || 0, entry ? Date.parse(entry.updatedAt) : 0)) / 86_400_000;
+      const action = staleWorktreeAction({
+        running: Boolean(entry && laneRunning(entry)), closed: !entry || entry.work.state === "closed",
+        merged: bases.some((base) => gitOk(repo, "merge-base", "--is-ancestor", ref, base)), ageDays,
+      }, days);
+      if (action) stale.push({ repo, path, branch, action, ageDays });
     }
-    if (git(base, "rev-parse", `${entry.landingCommit}^{tree}`) !== entry.gateReceipt!.tree) fail("landing commit differs from its green receipt");
-    const merged = Bun.spawnSync({ cmd: ["git", "-C", base, "merge-base", "--is-ancestor", entry.landingCommit!, "HEAD"] });
-    if (!merged.success) git(base, "merge", "--no-ff", entry.landingCommit!, "-m", `Merge ${lane}`);
-    const landedCommit = git(base, "rev-parse", "HEAD");
-    withLedger((ledger) => { ledger[lane]!.landedCommit = landedCommit; });
-    git(base, "push");
-    if (!removed) git(base, "worktree", "remove", work);
-    if (Bun.spawnSync({ cmd: ["git", "-C", base, "show-ref", "--verify", "--quiet", `refs/heads/${entry.branch}`] }).success) git(base, "branch", "-d", entry.branch);
-    withLedger((ledger) => {
-      const item = ledger[lane]!;
-      item.work.state = "closed";
-      item.work.note = `landed ${landedCommit}`;
-      item.updatedAt = new Date().toISOString();
-    });
-    console.log(`cdx: landed ${lane} as ${landedCommit}; pushed, removed worktree and branch, closed`);
-  } finally { rmdirSync(lock); }
+  }
+  return stale;
+}
+
+export function removeStaleWorktree(item: StaleWorktree): string {
+  const remove = Bun.spawnSync({ cmd: ["git", "-C", item.repo, "worktree", "remove", item.path] });
+  if (!remove.success) throw new CmdError(`kept ${displayPath(item.path)}: ${remove.stderr.toString().trim().split("\n").at(-1)}`);
+  if (item.action === "remove-worktree") return `removed ${displayPath(item.path)}; kept unmerged branch ${item.branch}`;
+  git(item.repo, "branch", "-D", item.branch);
+  return `removed ${displayPath(item.path)} and branch ${item.branch}`;
 }

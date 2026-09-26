@@ -39,7 +39,7 @@ import {
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
-import { createWorktree, mergeDirectories, storedDirectories, type WorktreeInfo } from "./worktrees.ts";
+import { childWorktreeTarget, createWorktree, mergeDirectories, storedDirectories, type WorktreeInfo } from "./worktrees.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
   existsSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
@@ -228,9 +228,10 @@ export async function spawnCommand(argv: string[]) {
     engine, forcedAccount: parsed.flags.account, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate, pre,
     ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
-  if (parsed.flags.worktree) {
+  const worktreeTarget = childWorktreeTarget(lane, parsed.flags.worktree, parent, Boolean(existingLane));
+  if (worktreeTarget) {
     try {
-      worktree = createWorktree(roots.worktreeRepo, parsed.flags.worktree, lane);
+      worktree = createWorktree(roots.worktreeRepo, worktreeTarget, lane);
       cwd = worktree.path;
       withLedger((ledger) => {
         const item = ledger[lane]!;

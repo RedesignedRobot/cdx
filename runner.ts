@@ -20,7 +20,7 @@ import {
 } from "./engines.ts";
 import {
   captureGateTree, captureReviewTree, changedReviewPath, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
-  gateAcceptanceFailed, gateOutputForReport, verifyGate,
+  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewRoot,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
@@ -1406,7 +1406,12 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   if (entry.kind === "review" && !entry.consult) {
     try {
       const verdict = JSON.parse(readFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, "utf8"));
-      withLedger((ledger) => { ledger[lane]!.reviewClosed = reviewLoopClosed(verdict.findings); });
+      const closed = reviewLoopClosed(verdict.findings);
+      const root = reviewRoot(entry.review!.cwd);
+      withLedger((ledger) => {
+        ledger[lane]!.reviewClosed = closed;
+        attestReview(ledger, lane, closed, existsSync(reportPath) ? reportPath : undefined, root);
+      });
     } catch { /* absent verdict cannot close the loop */ }
   }
   const finalRoundState = activeStateOf(entry);
