@@ -26,7 +26,7 @@ export const MAX_PROCESS_TIMEOUT_MS = 10 * 60_000;
 
 export const TOOLS: ToolDefinition[] = [
   {
-    name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix. A merge gate longer than ten minutes needs `cdx land` from a terminal.",
+    name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix. A land that must run its gate detaches into a tracked job and returns at once; the land result arrives as a [cdx] event.",
     inputSchema: { type: "object", properties: { lane: { type: "string" }, lanes: { type: "array", items: { type: "string" }, description: "Land several lanes with one gate" } } },
     run: (input) => {
       if (Array.isArray(input.lanes) && input.lanes.length) {
