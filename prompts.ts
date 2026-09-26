@@ -7,7 +7,9 @@ import { contextDigest, digestLine } from "./context.ts";
 import { type Engine, laneRunning, type Ledger, type Spec, workCwdOf } from "./ledger.ts";
 import { specPathOf } from "./reports.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
+import { codegraphRoot } from "./sandbox.ts";
 import { existsSync, readFileSync } from "node:fs";
+import { relative } from "node:path";
 
 // Standing rules live in the lane home: Codex loads $CODEX_HOME/AGENTS.md into
 // every thread and agy loads the agent file, so the brief carries only a pointer
@@ -21,6 +23,8 @@ const SECRETS_RULE = "Never print or inline secrets; use environment lookups.";
 const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
+// Codegraph opens its index read-write, which the Codex read-only sandbox refuses.
+const CODEGRAPH_READ_ONLY = "Codegraph cannot open its index inside this read-only sandbox; use rg and targeted file reads for code questions.";
 export const CODEGRAPH_RULE = `In a repository with .codegraph/, \`${CODEGRAPH_EXPLORE} "<question>"\` is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph is missing, the repository is unindexed, or the call times out (exit 142) or fails, fall back to rg and file reads and note it in the report.`;
 const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
@@ -54,7 +58,7 @@ const ownerRules = () => config.rules.filter((rule) => !retiredLaneRule(rule));
 
 // The AGENTS.md cdx writes into each role's Codex lane home.
 export function laneInstructions(role: LaneRole = {}): string {
-  const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_RULE]
+  const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_READ_ONLY]
     : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
       VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule()])];
   const owner = ownerRules();
@@ -112,6 +116,10 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
   if (engine !== "gpt") facts.push(...ownerRules(), ...(reviewOnly ? [] : [testRunRule()]));
   const projectRules = `${cwd}/.cdx-rules.md`;
   if (existsSync(projectRules) && readFileSync(projectRules, "utf8").trim()) facts.push(`Project rules: read ${projectRules} before starting.`);
+  const index = codegraphRoot(cwd);
+  if (index && relative(index, cwd).startsWith("..") && !(engine === "gpt" && reviewOnly)) {
+    facts.push(`Codegraph: this worktree has no index of its own; run \`${CODEGRAPH_EXPLORE} -p ${index} "<question>"\`. It answers from the primary checkout at ${index}, so read files you changed from the worktree.`);
+  }
   const digest = digestLine(contextDigest(cwd));
   if (digest) facts.push(digest);
   return facts.map((fact) => `- ${fact}`).join("\n");
