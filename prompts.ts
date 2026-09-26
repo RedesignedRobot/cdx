@@ -51,6 +51,7 @@ const SUPERVISOR_RULES = [
   "Run each cdx command as a plain call, because only plain calls leave the sandbox: wrap every brief, gate and question in single quotes and keep apostrophes out of them (write do not, it is). Double quotes expand backticks and $, and a '\\'' splice is not plain, so either keeps the call sandboxed. Use no redirect, pipe, env prefix, $(...) or wildcard, and never run git writes yourself; cdx does them.",
   "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs and clean to it.",
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
+  "Codegraph cannot open a child worktree's index from your sandbox, so review a child's tree with git reads and file reads. An index misses edits made after it was built: after `cdx land`, run `codegraph sync .` before querying your tree, but only when the tree has its own .codegraph/codegraph.db.",
   "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",
 ];
 
