@@ -44,14 +44,110 @@ export function orderedRows(rows: readonly LiveRow[]): LiveRow[] {
   return ordered;
 }
 
-export function bandRow(row: LiveRow, now: number, columns: number): string {
-  const mark = row.question ? "?" : row.stage === "outage" || row.stage === "stalled" ? "!" : row.stage === "gate" ? "◆" : row.stage === "queued" ? "○" : "●";
-  const indent = row.parent ? "  " : "";
-  const model = row.model ? `${row.engine}/${row.model}` : row.engine;
-  const count = row.kind === "job" ? "" : ` ${row.steps} steps${row.files === undefined ? "" : ` ${row.files} files`}`;
-  const detail = row.question ? `question: ${row.question.replace(/\s+/g, " ")}` : actionWords(row.action);
-  const line = `${indent}${mark} ${row.name} ${model} ${row.stage} ${elapsed(row.startedAt, now)}${count} ${detail}`;
-  return Array.from(line).length > columns ? `${cut(line, columns - 1)}…` : line;
+// One styled run of a band line; its text carries the padding and the gap
+// after it, so the texts of a line joined are the line as drawn.
+export interface BandCell {
+  text: string;
+  color?: string;
+  bold?: boolean;
+  dim?: boolean;
+}
+
+interface BandColumn {
+  title: string;
+  value: (row: LiveRow, now: number) => string;
+  style: (row: LiveRow) => Omit<BandCell, "text">;
+  gap: number;
+  max?: number;
+  right?: boolean;
+}
+
+const STAGE_COLORS: Record<string, string> = {
+  working: "green", gate: "cyan", review: "cyan", question: "yellow", stalled: "yellow", outage: "red",
+};
+
+export function stageColor(stage: string): string | undefined {
+  return STAGE_COLORS[stage];
+}
+
+function markOf(row: LiveRow): string {
+  return row.question ? "?" : row.stage === "outage" || row.stage === "stalled" ? "!" : row.stage === "gate" ? "◆" : row.stage === "queued" ? "○" : "●";
+}
+
+const plain = () => ({});
+const staged = (row: LiveRow) => ({ color: stageColor(row.stage) });
+const dim = () => ({ dim: true });
+
+const BAND_COLUMNS: BandColumn[] = [
+  { title: "", value: markOf, style: staged, gap: 1 },
+  { title: "NAME", value: (row) => `${row.parent ? "  " : ""}${row.name}`, style: () => ({ bold: true }), gap: 2, max: 28 },
+  { title: "KIND", value: (row) => row.kind, style: plain, gap: 2 },
+  { title: "ENGINE", value: (row) => row.kind === "job" ? "-" : row.model ?? row.engine, style: plain, gap: 2, max: 18 },
+  { title: "STAGE", value: (row) => row.stage, style: staged, gap: 2 },
+  { title: "AGE", value: (row, now) => elapsed(row.startedAt, now), style: dim, gap: 2 },
+  { title: "STEPS", value: (row) => row.kind === "job" ? "-" : String(row.steps), style: plain, gap: 2, right: true },
+  { title: "FILES", value: (row) => row.files === undefined ? "-" : String(row.files), style: plain, gap: 2, right: true },
+];
+
+// Below this many columns for NOW the band drops ENGINE, then KIND.
+const NOW_MIN = 20;
+
+function width(text: string): number {
+  return Array.from(text).length;
+}
+
+function ellipsis(text: string, size: number): string {
+  if (size <= 0) return "";
+  return width(text) > size ? `${cut(text, size - 1)}…` : text;
+}
+
+function detailOf(row: LiveRow): string {
+  return row.question ? `question: ${row.question.replace(/\s+/g, " ")}` : actionWords(row.action);
+}
+
+// The band as a table: a header line, then one line per row in the order
+// given. Fixed columns fit the widest value shown (NAME and ENGINE capped),
+// NOW takes the rest of the width, and no line is wider than columns.
+export function bandTable(rows: readonly LiveRow[], now: number, columns: number): BandCell[][] {
+  let layout = BAND_COLUMNS.map((column) => {
+    const widest = Math.max(width(column.title), ...rows.map((row) => width(column.value(row, now))));
+    return { column, size: Math.min(widest, column.max ?? widest) };
+  });
+  const rest = () => columns - layout.reduce((sum, { column, size }) => sum + size + column.gap, 0);
+  for (const dropped of ["ENGINE", "KIND"]) {
+    if (rest() < NOW_MIN) layout = layout.filter(({ column }) => column.title !== dropped);
+  }
+  const nowSize = Math.max(0, rest());
+  const pad = (text: string, size: number, right?: boolean) => {
+    const shown = ellipsis(text, size);
+    const fill = " ".repeat(size - width(shown));
+    return right ? fill + shown : shown + fill;
+  };
+  const header = [...layout.map(({ column, size }) => ({ text: pad(column.title, size) + " ".repeat(column.gap), dim: true })),
+    { text: ellipsis("NOW", nowSize), dim: true }];
+  const lines = rows.map((row) => [
+    ...layout.map(({ column, size }) => ({ text: pad(column.value(row, now), size, column.right) + " ".repeat(column.gap), ...column.style(row) })),
+    { text: ellipsis(detailOf(row), nowSize), dim: true },
+  ]);
+  return [header, ...lines].map((line) => clip(line, columns));
+}
+
+// A terminal too narrow for the fixed columns still gets lines no wider
+// than it: the cell at the edge is cut and the rest dropped.
+function clip(line: BandCell[], columns: number): BandCell[] {
+  const kept: BandCell[] = [];
+  let left = columns;
+  for (const cell of line) {
+    if (left <= 0) break;
+    const text = cut(cell.text, left);
+    kept.push({ ...cell, text });
+    left -= width(text);
+  }
+  return kept.filter((cell) => cell.text);
+}
+
+export function bandText(line: readonly BandCell[]): string {
+  return line.map((cell) => cell.text).join("");
 }
 
 export function pinnedLine(rows: readonly LiveRow[], now: number, wakesOff = false): string {

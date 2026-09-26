@@ -1,3 +1,12 @@
+## 10.0.5 (2026-09-26)
+
+### Band
+
+- The band above the prompt is a table with a dim header: NAME, KIND, ENGINE, STAGE, AGE, STEPS, FILES and NOW, one blank line below the chat. NAME is bold. STAGE is green while working, cyan at a gate or review, yellow on a question or stall, red in an outage. AGE and NOW are dim. The glyphs keep their meaning, and a child lane's name stays indented under its supervisor.
+- Columns fit the widest value shown, with NAME capped at 28 and ENGINE at 18. STEPS and FILES are right-aligned. NOW takes the rest of the width and ends in `…` when cut. When NOW would get under 20 columns the band drops ENGINE, then KIND, and no line is ever wider than the band.
+- ENGINE shows the model (`gpt-6-astra`) where the lane has one, the engine otherwise, and `-` for a job. It used to read `gpt/gpt-6-astra`.
+- The `/lanes` Pane draws the same table, with each row's recent transcript lines under it. The pinned status line is unchanged.
+
 ## 10.0.4 (2026-09-26)
 
 ### Delivery

@@ -9,9 +9,12 @@ import {
   onTurnComplete,
   onTurnStart,
   WAKE_COALESCE_MS,
-  bandRow,
+  bandTable,
+  bandText,
   orderedRows,
   pinnedLine,
+  stageColor,
+  type LiveRow,
 } from "./delivery";
 
 describe("delivery rules", () => {
@@ -24,18 +27,72 @@ describe("delivery rules", () => {
     expect(afterToolCall(outcome.state).context).toContain("[cdx] job-exit");
   });
 
-  test("band rows show hierarchy, elapsed round time, and questions within width", () => {
+  test("band rows keep hierarchy, elapsed round time and questions", () => {
     const now = Date.parse("2026-09-24T12:02:03Z");
     const startedAt = "2026-09-24T12:00:00Z";
     const parent = { name: "parent", kind: "lane" as const, engine: "gpt", model: "sol", stage: "gate", startedAt,
       steps: 12, files: 3, action: "bun test hooks/delivery.test.ts" };
     const child = { ...parent, name: "child", parent: "parent", stage: "question", question: "Which branch?" };
     expect(orderedRows([child, parent]).map((row) => row.name)).toEqual(["parent", "child"]);
-    expect(bandRow(parent, now, 120)).toContain("gate 2m3s 12 steps 3 files running bun test");
-    expect(bandRow(child, now, 120)).toContain("  ? child");
-    expect(bandRow(child, now, 50)).toHaveLength(50);
+    const [, parentLine, childLine] = bandTable(orderedRows([child, parent]), now, 120).map(bandText);
+    expect(parentLine).toMatch(/^◆ parent +lane +sol +gate +2m3s +12 +3 +running bun test/);
+    expect(childLine).toMatch(/^\?   child +lane +sol +question +2m3s +12 +3 +question: Which branch\?$/);
     expect(pinnedLine([parent, child], now)).toContain("2m3s");
   });
+
+  const bandNow = Date.parse("2026-09-26T16:00:00Z");
+  const bandRows: LiveRow[] = [
+    { name: "m29-mixed", kind: "lane", engine: "gpt", model: "gpt-6-astra", stage: "working", startedAt: "2026-09-26T12:14:00Z",
+      steps: 374, files: 8, action: "commandExecution: bun test src/nonbonded/mixed-precision.test.ts --timeout 600000" },
+    { name: "m29-unified", kind: "lane", engine: "gpt", model: "gpt-6-astra", stage: "gate", startedAt: "2026-09-26T12:13:00Z",
+      steps: 331, files: 0, action: "agentMessage: Dead: the migration left two readers behind" },
+    { name: "m29-resident", kind: "lane", engine: "gpt", model: "gpt-6-astra", stage: "question", startedAt: "2026-09-26T12:13:00Z",
+      steps: 235, files: 10, action: "", question: "merge candidate A or keep both kernels?" },
+    { name: "ship-r123", kind: "job", engine: "job", stage: "working", startedAt: "2026-09-26T15:04:00Z",
+      steps: 0, action: "publish-npm: + hsx@1.0.123" },
+  ];
+  const columnStart = (line: string, title: string) => line.indexOf(title);
+
+  test("band columns fit the widest value, align under the header and right-align counts", () => {
+    const lines = bandTable(bandRows, bandNow, 120).map(bandText);
+    expect(lines[0]).toStartWith("  NAME          KIND  ENGINE       STAGE     AGE    STEPS  FILES  NOW");
+    expect(lines[1]).toStartWith("● m29-mixed     lane  gpt-6-astra  working   3h46m    374      8  running bun test");
+    expect(lines[4]).toStartWith("● ship-r123     job   -            working   56m0s      -      -  publish-npm: + hsx@1.0.123");
+    for (const line of lines.slice(1)) expect(line.charAt(columnStart(lines[0]!, "STAGE") - 1)).toBe(" ");
+    expect(lines.every((line) => Array.from(line).length <= 120)).toBe(true);
+  });
+
+  test("NOW takes the rest of the width and truncates; NAME and ENGINE are capped", () => {
+    const long = { ...bandRows[0]!, name: "a-very-long-lane-name-that-goes-on-and-on", model: "gpt-6-astra-extended-context" };
+    const lines = bandTable([long], bandNow, 120).map(bandText);
+    expect(lines[1]).toStartWith("● a-very-long-lane-name-that-…  lane  gpt-6-astra-exten…  working");
+    expect(Array.from(lines[1]!)).toHaveLength(120);
+    expect(lines[1]).toEndWith("…");
+  });
+
+  test("a narrow band drops ENGINE, then KIND, and never exceeds the width", () => {
+    const at = (columns: number) => bandTable(bandRows, bandNow, columns).map(bandText);
+    expect(at(90)[0]).toContain("ENGINE");
+    expect(at(75)[0]).not.toContain("ENGINE");
+    expect(at(75)[0]).toContain("KIND");
+    expect(at(70)[0]).not.toContain("KIND");
+    expect(at(70)[0]).toContain("NOW");
+    for (const columns of [120, 75, 70, 40, 10]) expect(at(columns).every((line) => Array.from(line).length <= columns)).toBe(true);
+  });
+
+  test("band colours: NAME bold, STAGE by state, AGE and NOW dim, header dim", () => {
+    expect(["working", "gate", "review", "question", "stalled", "outage", "queued", "reporting"].map(stageColor))
+      .toEqual(["green", "cyan", "cyan", "yellow", "yellow", "red", undefined, undefined]);
+    const [header, row] = bandTable([bandRows[2]!], bandNow, 120);
+    expect(header!.every((cell) => cell.dim)).toBe(true);
+    const cell = (prefix: string) => row!.find((item) => item.text.startsWith(prefix))!;
+    expect(cell("?")).toMatchObject({ color: "yellow" });
+    expect(cell("m29-resident")).toMatchObject({ bold: true });
+    expect(cell("question ")).toMatchObject({ color: "yellow" });
+    expect(cell("3h47m")).toMatchObject({ dim: true });
+    expect(row!.at(-1)).toMatchObject({ text: "question: merge candidate A or keep both kernels?", dim: true });
+  });
+
   test("a wake event submits a prompt only when no turn runs, after the coalesce window", () => {
     const idleState = initialDeliveryState();
     const event = { text: "[cdx] lane=alpha round=1 started", wake: true };

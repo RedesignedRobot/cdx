@@ -1,4 +1,4 @@
-import type { EngineInterface, On, RenderSurface } from "claude-code";
+import type { BoxProps, ElementConstructor, EngineInterface, On, RenderElement, RenderSurface, TextProps } from "claude-code";
 import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, nativeCdxCommand, nativeCdxRefusal, rawEngineRefusal } from "../guard";
 import {
   afterPoll,
@@ -12,7 +12,8 @@ import {
   type DeliveryState,
   type PendingEvent,
   type LiveSnapshot,
-  bandRow,
+  type BandCell,
+  bandTable,
   orderedRows,
   pinnedLine,
 } from "./delivery";
@@ -132,27 +133,34 @@ function eventsToolResult(exitCode: number, stdout: string, stderr: string): str
   return lines.length ? lines.join("\n") : "no pending events";
 }
 
+function bandLine(Box: ElementConstructor<BoxProps>, Text: ElementConstructor<TextProps>, cells: BandCell[]): RenderElement {
+  return Box({ flexDirection: "row", children: cells.map((cell) =>
+    Text({ ...(cell.color ? { color: cell.color } : {}), ...(cell.bold ? { bold: true } : {}), ...(cell.dim ? { dimColor: true } : {}),
+      wrap: "truncate", children: cell.text })) });
+}
+
 export function register(on: On) {
   on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
     const { value } = await $.state.get(liveRef);
     if (!value?.rows.length || e.props.hasSurvey) return next(e);
     const { Box, Text } = $.ui.resolve(e);
-    return Box({ flexDirection: "column", children: orderedRows(value.rows).map((row) =>
-      Text({ ...(row.question || row.stage === "stalled" ? { color: "yellow" } : row.stage === "outage" ? { color: "red" } : {}),
-        wrap: "truncate", children: bandRow(row, value.now, e.props.bodyColumns) })) });
+    // The margin is the blank line between the chat and the band.
+    return Box({ flexDirection: "column", marginTop: 1, children: bandTable(orderedRows(value.rows), value.now, e.props.bodyColumns)
+      .map((cells) => bandLine(Box, Text, cells)) });
   });
 
   on("ui.render", { component: "Pane" }, async ($, e, next) => {
     if (e.requestId !== "cdx-lanes") return next(e);
     const { value } = await $.state.get(liveRef);
     const { Box, Text } = $.ui.resolve(e);
-    const rows = value?.rows ?? [];
-    return Box({ flexDirection: "column", children: rows.length ? orderedRows(rows).flatMap((row) => [
-      Text({ ...(row.question || row.stage === "stalled" ? { color: "yellow" } : row.stage === "outage" ? { color: "red" } : {}),
-        bold: true, wrap: "truncate", children: bandRow(row, value?.now ?? Date.now(), e.props.bodyColumns) }),
-      ...(row.transcript ?? []).map((line) => Text({ dimColor: true, wrap: "truncate",
-        children: `  ${Array.from(line).slice(0, Math.max(0, e.props.bodyColumns - 3)).join("")}` })),
-    ]) : [Text({ children: "No running lanes or jobs" })] });
+    const rows = orderedRows(value?.rows ?? []);
+    if (!rows.length) return Box({ flexDirection: "column", children: [Text({ children: "No running lanes or jobs" })] });
+    const [header, ...lines] = bandTable(rows, value?.now ?? Date.now(), e.props.bodyColumns);
+    return Box({ flexDirection: "column", children: [bandLine(Box, Text, header!), ...rows.flatMap((row, index) => [
+      bandLine(Box, Text, lines[index]!),
+      ...(row.transcript ?? []).map((text) => Text({ dimColor: true, wrap: "truncate",
+        children: `  ${Array.from(text).slice(0, Math.max(0, e.props.bodyColumns - 3)).join("")}` })),
+    ])] });
   });
 
   on("session.start", async ($, e, next) => {
