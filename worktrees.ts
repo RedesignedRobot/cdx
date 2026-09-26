@@ -5,8 +5,9 @@ import { readLane, requireOwnChild, supervisorLane, withLedger, laneRunning, typ
 import { captureGateTree, gateFailure, receiptRefusal, reviewRefusal } from "./gates.ts";
 import { createReviewSnapshot, runFrozenGate } from "./snapshots.ts";
 import { specPathOf } from "./reports.ts";
-import { CmdError, displayPath, fail, HOME, ROOT, shellQuote, uncoloredChildEnv } from "./runtime.ts";
-import { existsSync, mkdirSync, rmdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { CmdError, displayPath, fail, HOME, pidAlive, ROOT, shellQuote, uncoloredChildEnv } from "./runtime.ts";
+import { write } from "./store.ts";
+import { existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 export function resolveWorktreeTarget(target: string): string {
@@ -355,9 +356,33 @@ export function landCommand(argv: string[]): void {
   if (entries.some((entry) => entry.worktreeRepo !== repo || (entry.baseBranch ?? "main") !== baseBranch)) fail("cdx land --batch needs lanes from one repository and base branch");
   const supervisor = supervisorLane();
   if (supervisor && readLane(supervisor).branch !== baseBranch) fail(`supervisor ${supervisor} lands children only into its own worktree branch; the liaison lands the rest`);
-  const lock = `${git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")}/cdx-land.lock`;
-  try { mkdirSync(lock); } catch { fail(`another landing holds ${lock}`); }
-  try { landLanes(lanes, entries, repo, baseBranch); } finally { rmdirSync(lock); }
+  const lock = landLockOf(repo);
+  takeLandLock(lock);
+  try { landLanes(lanes, entries, repo, baseBranch); } finally { rmSync(lock, { force: true }); }
+}
+
+// The land lock file holds the lander's pid. SIGKILL or a caller's timeout
+// skips the finally that removes it, so a lock whose pid is dead is stale:
+// the next land takes it over. The store's write lock makes check-and-take
+// atomic between cdx processes. A lock without a pid (a 9.x directory lock)
+// is left for doctor --fix.
+export const landLockOf = (repo: string) => `${git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")}/cdx-land.lock`;
+
+export function landLockHolder(lock: string): number | undefined {
+  try {
+    const pid = Number(readFileSync(lock, "utf8").trim());
+    return Number.isInteger(pid) && pid > 0 ? pid : undefined;
+  } catch { return undefined; }
+}
+
+export function takeLandLock(lock: string, alive: (pid: number) => boolean = pidAlive): void {
+  write(() => {
+    if (existsSync(lock)) {
+      const holder = landLockHolder(lock);
+      if (!holder || alive(holder)) fail(`another landing ${holder ? `(pid ${holder}) ` : ""}holds ${lock}; cdx doctor --fix clears it once no land runs`);
+    }
+    writeFileSync(lock, `${process.pid}\n`);
+  });
 }
 
 export interface StaleWorktree { repo: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }

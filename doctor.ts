@@ -22,9 +22,9 @@ import {
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
 import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
-import { removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
+import { landLockHolder, landLockOf, removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, rmSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -710,6 +710,14 @@ export async function doctorCommand(argv: string[]) {
     try { good(`fixed: ${removeStaleWorktree(item)}`); } catch (error) { warn(String(error instanceof Error ? error.message : error)); }
   }
   if (staleTrees.length && !parsed.bools.has("fix")) warn(`run \`cdx doctor --fix\` to remove cdx worktrees idle over ${worktreeDays} days (--days N)`);
+  const repos = [...Object.values(readLedger()).map((entry) => entry.worktreeRepo), ...archivedWorktreeRepos()];
+  const locks = new Set(repos.flatMap((repo) => { try { return repo && existsSync(repo) ? [landLockOf(repo)] : []; } catch { return []; } }));
+  for (const lock of [...locks].filter((path) => existsSync(path) && !pidAlive(landLockHolder(path)))) {
+    warn(`land: stale lock ${displayPath(lock)} from a land that died`);
+    if (!parsed.bools.has("fix")) { warn("run `cdx doctor --fix` to remove it"); continue; }
+    rmSync(lock, { recursive: true, force: true });
+    good(`fixed: removed ${displayPath(lock)}`);
+  }
   const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {
     const orphan = pidAlive(entry.codexPid) ? ` and its codex child (pid ${entry.codexPid}) is STILL RUNNING` : "";

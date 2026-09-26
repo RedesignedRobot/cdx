@@ -29,6 +29,8 @@ import { resolveWorktreeTarget } from "./worktrees.ts";
 import { linkIgnoredEntries, materializeGitTree, runFrozenGate, staleReviewSnapshots, SNAPSHOT_ROOT } from "./snapshots.ts";
 import type { GateTree, Lane } from "./ledger.ts";
 import { join } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { reviewBaseTarget } from "./lane-commands.ts";
 
 test("bare worktree names resolve under the managed directory", () => {
@@ -162,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewRefusal } from "./gates.ts";
-import { childWorktreeTarget, firstRedPrefix, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths } from "./worktrees.ts";
+import { childWorktreeTarget, firstRedPrefix, landLockHolder, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
 import { briefContractRefusal } from "./brief-contract.ts";
 
@@ -225,4 +227,18 @@ test("doctor removes merged worktrees and keeps unmerged branches of abandoned l
   expect(staleWorktreeAction({ ...old, merged: false, closed: false }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, running: true }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, ageDays: 2 }, 7)).toBeUndefined();
+});
+
+test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-land-lock-"));
+  const lock = join(dir, "cdx-land.lock");
+  try {
+    writeFileSync(lock, "4242\n");
+    expect(() => takeLandLock(lock, () => true)).toThrow("pid 4242");
+    takeLandLock(lock, () => false);
+    expect(landLockHolder(lock)).toBe(process.pid);
+    rmSync(lock);
+    mkdirSync(lock);
+    expect(() => takeLandLock(lock, () => false)).toThrow("doctor --fix");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
