@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test";
-import { nativeToolResult, formatToolOutput, TOOLS, TOOLS_BY_NAME } from "./tools";
+import { nativeToolResult, formatToolOutput, MAX_PROCESS_TIMEOUT_MS, TOOLS, TOOLS_BY_NAME } from "./tools";
 
 describe("tool rules", () => {
+  test("land stays within the process.run timeout ceiling", () => {
+    const land = TOOLS_BY_NAME.get("land")!;
+    expect(land.run({ lane: "a" }).timeoutMs).toBeLessThanOrEqual(MAX_PROCESS_TIMEOUT_MS);
+    expect(land.run({ lanes: ["a", "b"] }).timeoutMs).toBeLessThanOrEqual(MAX_PROCESS_TIMEOUT_MS);
+  });
+
   test("spawn tool argv ends with --bg - and carries the brief on stdin", () => {
     const spawn = TOOLS_BY_NAME.get("spawn");
     expect(spawn).toBeDefined();

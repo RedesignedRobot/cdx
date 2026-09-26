@@ -344,8 +344,13 @@ export function register(on: On) {
     if (runSpec.timeoutMs !== undefined) {
       procInit.timeoutMs = runSpec.timeoutMs;
     }
-    const res = await runFromCwd(procInit.cwd, root, (path) => $.fs.stat(path),
-      (cwd) => $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd }));
+    let res;
+    try {
+      res = await runFromCwd(procInit.cwd, root, (path) => $.fs.stat(path),
+        (cwd) => $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd }));
+    } catch (error) {
+      return { isError: true, result: `cdx ${runSpec.argv[0]}: ${error instanceof Error ? error.message : String(error)}` };
+    }
     const stdout = toolName === "events" ? eventsToolResult(res.exitCode, res.stdout, res.stderr) : res.stdout;
     const text = await formatToolOutput(res.exitCode, stdout, res.stderr, async (content) => {
       const home = await $.env.get("CDX_HOME") || `${await $.env.get("HOME")}/.cdx`;
