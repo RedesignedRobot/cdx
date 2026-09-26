@@ -1,3 +1,4 @@
+import { isScopePermissionAsk, scopeAnswer } from "./brief-contract.ts";
 import { geminiOverwrite } from "./cap.ts";
 import { safeJSON } from "./safe-text.ts";
 // Questions, steering delivery, peer messages, and the Gemini invocation hook.
@@ -150,20 +151,30 @@ export async function askCommand(argv: string[]): Promise<void> {
   if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) fail("--timeout must be a positive number of minutes");
   const timeoutMinutes = Math.min(requestedTimeout, 30);
   if (requestedTimeout > 30) console.error(`cdx: --timeout ${requestedTimeout}m exceeds the 30m limit; using 30m`);
+  // The scope policy answers "may I edit outside my files" so the head never sees it.
+  const policy = findLane(lane)?.scopePolicy;
+  const autoAnswer = policy && policy !== "ask" && isScopePermissionAsk(question) ? scopeAnswer(policy) : undefined;
   const created = write(() => {
     const seq = readQuestions(lane).reduce((highest, item) => Math.max(highest, item.seq), 0) + 1;
+    const askedAt = new Date().toISOString();
     const record: QuestionRecord = {
       lane,
       round,
       seq,
       question,
-      askedAt: new Date().toISOString(),
-      answered: false,
+      askedAt,
+      answered: autoAnswer !== undefined,
+      ...(autoAnswer ? { answer: autoAnswer, answeredAt: askedAt } : {}),
       ...(owner ? { owner } : {}),
     };
     storeQuestion(record);
     return record;
   });
+  if (autoAnswer) {
+    logProgress(lane, round, `answered question=${lane}:r${round}:q${created.seq} from scope policy ${policy}`);
+    console.log(autoAnswer);
+    return;
+  }
   feedEvent("question", `[cdx] lane=${lane} round=${round} QUESTION #${created.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner, { lane, round });
   const deadline = Date.now() + timeoutMinutes * 60_000;
   while (Date.now() < deadline) {

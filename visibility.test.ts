@@ -36,14 +36,10 @@ test("failed command repetition resets on success or a different command and war
   expect(roundProgress("/repo")(toolObservation(gemini(1, "DONE", { CommandLine: "false" }, { exit_code: 1 }))!).thrash).toBeUndefined();
 });
 
-test("file repetition uses normalized paths and only warns above the configured count", () => {
-  const progress = roundProgress("/repo", { ...VISIBILITY_DEFAULTS, fileEdits: 2 });
-  const change = (id: string, path: string) => toolObservation({ method: "item/completed", params: { item: { id, type: "fileChange", changes: [{ path }, { path }] } } })!;
-  expect(progress(change("a", "file.ts")).thrash).toBeUndefined();
-  expect(progress(change("b", "./file.ts")).thrash).toBeUndefined();
-  expect(progress(change("b", "./file.ts")).thrash).toBeUndefined();
-  expect(progress({ ...change("rejected", "file.ts"), failed: true }).thrash).toBeUndefined();
-  expect(progress(change("c", "/repo/file.ts")).thrash).toContain("file edited 3x");
+test("file edits are observed without a repetition warning", () => {
+  const progress = roundProgress("/repo");
+  const change = (id: string, path: string) => toolObservation({ method: "item/completed", params: { item: { id, type: "fileChange", changes: [{ path }] } } })!;
+  for (let index = 0; index < 30; index++) expect(progress(change(String(index), "file.ts")).thrash).toBeUndefined();
   const event = gemini(4, "DONE", { TargetFile: "/repo/file.ts" });
   event.step_update.tool_name = "replace_file_content";
   expect(toolObservation(event)?.files).toEqual(["/repo/file.ts"]);
@@ -79,9 +75,8 @@ test("test runs count at start, completion-only runs count once, and the fourth 
 
 test("visibility settings reject invalid cadence and thresholds and status flags parse", () => {
   expect(parseConfig("{}").visibility).toEqual(VISIBILITY_DEFAULTS);
-  expect(parseConfig('{"visibility":{"heartbeatMinutes":0.5,"failureRepeats":2,"fileEdits":3}}').visibility)
-    .toEqual({ heartbeatMinutes: 0.5, failureRepeats: 2, fileEdits: 3, testRuns: 3 });
-  for (const visibility of [null, [], { extra: 1 }, { heartbeatMinutes: 0 }, { failureRepeats: 1.5 }, { fileEdits: -1 }, { testRuns: 0 }]) {
+  expect(parseConfig('{"visibility":{"failureRepeats":2}}').visibility).toEqual({ failureRepeats: 2, testRuns: 3 });
+  for (const visibility of [null, [], { extra: 1 }, { heartbeatMinutes: 10 }, { fileEdits: 20 }, { failureRepeats: 1.5 }, { testRuns: 0 }]) {
     expect(() => parseConfig(JSON.stringify({ visibility }))).toThrow();
   }
   const flags = parseArgs(["--brief", "--watch", "--interval", "3"], ["brief", "watch", "interval"]);

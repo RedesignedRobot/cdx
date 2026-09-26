@@ -13,7 +13,6 @@ const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 // Shipped ceilings. Configured caps may raise or lower either model's ceiling.
 const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6-sol": "high" };
-const DEFAULT_REPO_ROUTING = { "/Users/mas/code/hyperscale-portals": { model: "gpt-6-astra" } };
 
 // GPT-6 split (owner ruling 2026-09-23): Sol executes work lanes, Astra thinks.
 // Astra runs head-launched consults, reviews and supervisors; children never.
@@ -49,7 +48,7 @@ export function parseConfig(text: string): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
-    repoRouting: DEFAULT_REPO_ROUTING,
+    repoRouting: {},
     expectMinutes: 15,
     gemini: geminiConfig(),
   };
@@ -70,13 +69,12 @@ export function parseConfig(text: string): Config {
     models = { ...(value as Record<string, string>) };
   }
 
-  let repoRouting: Record<string, { model: string }> = { ...DEFAULT_REPO_ROUTING };
+  let repoRouting: Record<string, { model: string }> = {};
   if (Object.hasOwn(input, "repoRouting")) {
     const value = input.repoRouting;
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
       configError("repoRouting must be an object mapping canonical repository paths to model entries");
     }
-    repoRouting = {};
     for (const [path, entry] of Object.entries(value as Record<string, unknown>)) {
       if (!isAbsolute(path) || resolve(path) !== path) configError(`repoRouting key "${path}" must be an absolute canonical path`);
       if (entry === null || typeof entry !== "object" || Array.isArray(entry)
@@ -195,8 +193,7 @@ export function parseConfig(text: string): Config {
     if (!values || typeof values !== "object" || Array.isArray(values)) configError("visibility must be an object");
     for (const [key, value] of Object.entries(values)) {
       if (!Object.hasOwn(visibility, key)) configError(`unknown visibility key: ${key}`);
-      if (typeof value !== "number" || !Number.isFinite(value) || value <= 0
-        || (key !== "heartbeatMinutes" && !Number.isSafeInteger(value))) configError(`visibility.${key} must be a positive ${key === "heartbeatMinutes" ? "number" : "integer"}`);
+      if (!Number.isSafeInteger(value) || (value as number) <= 0) configError(`visibility.${key} must be a positive integer`);
       visibility[key as keyof VisibilityConfig] = value as number;
     }
   }
@@ -231,7 +228,7 @@ function readConfig(skipFile = false): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
-    repoRouting: DEFAULT_REPO_ROUTING,
+    repoRouting: {},
     expectMinutes: 15,
     gemini: geminiConfig(),
   };
@@ -267,7 +264,7 @@ export const config: Config = Bun.main === SELF
 // The CLI must keep delivering events when config.json is broken, so `events`
 // falls back to the defaults and says so once on stderr.
 function readConfigForCommand(command: string | undefined): Config {
-  const pinned = command === "_run" || command === "view" || command === "hook";
+  const pinned = command === "_run" || command === "hook";
   if (command !== "events") return readConfig(pinned);
   try { return readConfig(false); }
   catch (error) {
@@ -283,22 +280,23 @@ function configuredEffort(effort: string): Effort {
   return effort;
 }
 
-export const ENGINE_PICKER = `gpt is the default engine; pass --engine gemini for mechanical sweeps.
-gpt work lanes run gpt-6-sol (alias sol). Head-launched reviews, consults and
-supervisors run gpt-6-astra (alias astra); a child lane never runs Astra.
-For a whole change, use --engine gpt --supervisor: Astra owns the design,
-delegates bounded work to Sol or Gemini children, verifies, and reports.
-Children need one outcome, named files, and an acceptance gate.
+export const ENGINE_PICKER = `gpt is the default engine and runs gpt-6-sol (alias sol) for work in every repository.
+Head-launched reviews, consults and supervisors run gpt-6-astra (alias astra); a
+child lane never runs Astra. Gemini is for read-only consults, reviews and
+pre-reads; a Gemini work lane runs with a warning.
+A work brief needs "## Outcome", "## Files", "## Acceptance" and "## Out of scope"
+sections plus a gate (--gate or .cdx-gate). --supervisor also needs "## Children"
+with two or more child file sets; a single file set belongs to a direct Sol lane.
 --model picks a Codex model alias or id; Sol and Astra run at effort medium unless --effort high is asked for, and high is the cap.`;
 
-export function engineOf(parsed: Parsed, command: "spawn" | "review" | "adopt"): Engine {
+export function engineOf(parsed: Parsed, command: "spawn" | "review"): Engine {
   const value = parsed.flags.engine;
   if (value === undefined) {
     console.log("cdx: engine gpt (default)");
     return "gpt";
   }
   if (value === "gpt" || value === "gemini") return value;
-  const usage = `usage: cdx ${command} requires --engine gpt|gemini; gpt is the default (Sol for work, Astra for head-launched thinking), gemini for mechanical sweeps`;
+  const usage = `usage: cdx ${command} requires --engine gpt|gemini; gpt is the default (Sol for work, Astra for head-launched thinking), gemini for read-only work`;
   if (command === "spawn") fail(`${usage}\n\n${ENGINE_PICKER}`);
   fail(usage);
 }

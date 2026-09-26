@@ -18,16 +18,14 @@ import {
   roundReportOf, type Tokens, workCwdOf,
 } from "./ledger.ts";
 import { questionOpen, type QuestionRecord, readQuestions } from "./questions.ts";
-import { availableReportPath, jobPhase, logPathOf, openCursor, readTailLines, renderEventLine } from "./reports.ts";
+import { availableReportPath, jobPhase, logPathOf, readTailLines, renderEventLine } from "./reports.ts";
 import { legacyStatePending } from "./migrate.ts";
+import { laneOutcomes, outcomeLines } from "./outcomes.ts";
 import { safeText } from "./safe-text.ts";
 import {
   color, coloredState, displayPath, fail, FINISHED_SHOWN, fmtAge, fmtCreated, fmtTokens, fmtTokensFull,
   fmtUntil, HOME, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText, uncoloredChildEnv,
 } from "./runtime.ts";
-import {
-  firstExhaustion, liveView, renderNote, renderStatus, renderTable, renderUsageTable, tuiEnabled, type View,
-} from "./tui.ts";
 import {
   projectWindow, readUsageHistory, readUsageSnapshot, type UsageReading, type UsageSnapshot, type WindowProjection,
 } from "./usage-store.ts";
@@ -280,69 +278,6 @@ export function statusLine(
   return line;
 }
 
-function laneView(): View {
-  const entries = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) || entry.work.state !== "closed")
-    .sort((a, b) => Number(laneRunning(b[1])) - Number(laneRunning(a[1])) || Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt));
-  const files = new Map<string, number | undefined>();
-  const rows = entries.map(([name, entry]) => {
-    const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
-    if (!files.has(cwd)) files.set(cwd, changedFileCount(cwd));
-    const gate = entry.stage === "gate" && laneRunning(entry) ? "running"
-      : entry.gateReceipt ? entry.gateReceipt.valid ? `passed r${entry.gateReceipt.round}` : `${entry.gateReceipt.exitCode ? "failed" : "invalid"} r${entry.gateReceipt.round}`
-      : entry.work.state === "gate-invalid" ? "invalid" : entry.gate ? "pending" : "-";
-    return [name, String(entry.rounds), activeStateOf(entry), entry.lastAction ?? "-", String(files.get(cwd) ?? "?"), gate];
-  });
-  const jobs = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
-  return { title: "lanes", header: ["lane", "round", "state", "last step", "files", "gate"], rows,
-    reports: entries.map(([, entry]) => roundReportOf(entry)),
-    progress: `${entries.filter(([, entry]) => laneRunning(entry)).length} running lanes; ${jobs.length} running jobs`,
-    lines: jobs.map(([name, job]) => `job ${name} ${jobPhase(job.log) || "-"}`) };
-}
-
-// Read only the final rendered records. Never reload a whole round's log per frame.
-function paneLines(path: string | undefined, count: number): string[] {
-  if (!path) return [];
-  const json = path.endsWith(".jsonl");
-  return readTailLines(path, count, (line) => !json || renderEventLine(line) !== undefined)
-    .map((line) => json ? renderEventLine(line)! : line).flatMap((line) => line.split("\n")).slice(-count);
-}
-
-export function targetView(names: string[], title: string, count = 30): View {
-  const ledger = readLedger(), jobs = readJobs();
-  const lines: string[] = [], progress: string[] = [], reports: (string | undefined)[] = [];
-  for (const name of names) {
-    const entry = ledger[name], job = jobs[name];
-    if (entry) {
-      const cursor = openCursor(name, entry, true);
-      lines.push(...paneLines(cursor?.path, count).map((line) => names.length > 1 ? `[${name}] ${line}` : line));
-      progress.push(`${name} r${entry.rounds} ${activeStateOf(entry)} ${entry.roundSteps ?? 0} steps ${entry.lastAction ?? "-"}`);
-      reports.push(roundReportOf(entry));
-    } else if (job) {
-      lines.push(...paneLines(job.log, count).map((line) => names.length > 1 ? `[${name}] ${line}` : line));
-      progress.push(`${name} ${job.state} ${jobPhase(job.log) || "-"}`);
-      reports.push(job.log);
-    } else progress.push(`${name} unavailable`);
-  }
-  return { title, lines, progress: progress.join("; "), reports };
-}
-
-export async function tailView(name: string | undefined, count: number): Promise<void> {
-  let failed = false;
-  await liveView(() => {
-    const ledger = readLedger(), jobs = readJobs();
-    const names = name ? [name] : Object.entries(ledger).filter(([, entry]) => laneRunning(entry)).map(([lane]) => lane);
-    if (name && !ledger[name] && !jobs[name]) fail(`unknown lane or job "${name}"`);
-    const entry = name ? ledger[name] : undefined;
-    const job = name && !entry ? jobs[name] : undefined;
-    const dead = Boolean(entry && laneRunning(entry) && !pidAlive(entry.pid) || job && jobRunning(job) && !pidAlive(job.pid));
-    failed = dead || Boolean(entry && ["failed", "gate-invalid"].includes(activeStateOf(entry)) || job?.state === "failed");
-    const view = targetView(names, "tail", count);
-    if (dead) view.progress += "; runner died without finalizing";
-    return { ...view, done: Boolean(name && (dead || entry && !laneRunning(entry) || job && !jobRunning(job))) };
-  });
-  if (failed) process.exitCode = 1;
-}
-
 export async function statusCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["json", "all", "brief", "line", "watch", "interval"]);
   if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --line | --watch [--interval S]]");
@@ -357,10 +292,6 @@ export async function statusCommand(argv: string[]) {
     const ledger = readLedger();
     const line = statusLine(ledger, readJobs(), readQuestions().map((record) => ({ record })), geminiQuotaState(), { now: Date.now() });
     if (line) console.log(line);
-    return;
-  }
-  if (watch && tuiEnabled()) {
-    await liveView(() => laneView(), interval * 1000);
     return;
   }
   if (watch || parsed.bools.has("brief")) {
@@ -387,13 +318,11 @@ export async function statusCommand(argv: string[]) {
     console.log(JSON.stringify(enriched, null, 2));
     return;
   }
-  const tui = tuiEnabled();
   const quotaState = geminiQuotaState();
   if (quotaState.block) {
-    const note = `gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`;
-    console.log(tui ? renderNote(note) : color.yellow(note));
+    console.log(color.yellow(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`));
   }
-  if (all.length === 0) { console.log(tui ? renderStatus([]) : "cdx: no lanes"); printRunningJobs(tui); return; }
+  if (all.length === 0) { console.log("cdx: no lanes"); printRunningJobs(); return; }
   // Running lanes first (most recent activity on top), then finished ones
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
@@ -403,14 +332,9 @@ export async function statusCommand(argv: string[]) {
   const finished = all.filter(([, entry]) => !laneRunning(entry) && (showAll || entry.work.state !== "closed")).sort(byRecency);
   const hidden = showAll ? 0 : Math.max(0, finished.length - FINISHED_SHOWN);
   const lanes = [...running, ...finished.slice(0, finished.length - hidden)];
-  console.log(tui ? renderStatus(lanes.map(([name, entry]) => ({
-    name, parent: entry.parent, active: laneRunning(entry), block: renderLaneBlock(name, entry),
-  }))) : lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
-  if (hidden > 0) {
-    const note = `${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`;
-    console.log(`\n${tui ? renderNote(note) : color.dim(`… ${note}`)}`);
-  }
-  printRunningJobs(tui);
+  console.log(lanes.map(([lane, entry]) => renderLaneBlock(lane, entry)).join("\n\n"));
+  if (hidden > 0) console.log(`\n${color.dim(`… ${hidden} older finished lane${hidden === 1 ? "" : "s"} hidden (cdx status --all)`)}`);
+  printRunningJobs();
 }
 
 export async function waitCommand(argv: string[]) {
@@ -434,21 +358,9 @@ export async function waitCommand(argv: string[]) {
     const path = roundReportOf(entry);
     try {
       if (!path) return undefined;
-      const text = readFileSync(path, "utf8");
-      return !json && tuiEnabled() ? text.split("\n").map((line) => renderNote(line)).join("\n") : text;
+      return readFileSync(path, "utf8");
     } catch { return undefined; }
   };
-  if (tuiEnabled() && !json) {
-    const result = await liveView(() => {
-      const ledger = readLedger(), jobs = readJobs();
-      const questions = lanes.some((lane) => readQuestions(lane).some((record) => questionOpen(record) && ledger[lane]?.rounds === record.round));
-      const running = lanes.some((lane) => ledger[lane] && laneRunning(ledger[lane]) && pidAlive(ledger[lane].pid))
-        || jobNames.some((name) => jobs[name] && jobRunning(jobs[name]) && pidAlive(jobs[name].pid));
-      if (running && !questions && Date.now() > deadline) fail(`timeout waiting for: ${names.join(", ")}`);
-      return { ...targetView(names, "wait"), done: questions || !running };
-    });
-    if (result === "quit") return;
-  }
   // --json prints one JSON object per finished lane, in completion order.
   const emitJson = (lane: string, entry: Lane, error?: string) => console.log(JSON.stringify({
     lane, engine: roundEngine(entry), work: entry.work, review: entry.review, roundState: activeStateOf(entry), kind: entry.kind,
@@ -567,7 +479,7 @@ export function claudeUsageRows(status: CcaStatus | undefined, now: number): Usa
     })));
 }
 
-export function usageTable(rows: UsageRow[], now = Date.now(), tui = false): string[] {
+export function usageTable(rows: UsageRow[], now = Date.now()): string[] {
   const percent = (n: number | null) => n === null ? "?" : `${n.toFixed(1)}%`;
   const cells = rows.map((r) => [r.account, r.window, percent(r.usedPercent), percent(r.remainingPercent),
     `${r.blockedUntil ? "blocked " : ""}${fmtUntil(r.blockedUntil ?? r.resetsAt, now)}`,
@@ -575,11 +487,8 @@ export function usageTable(rows: UsageRow[], now = Date.now(), tui = false): str
     `${r.heldPercent}%`, r.tokensPerPercent === undefined ? "-" : String(r.tokensPerPercent)]);
   const header = ["account", "window", "used", "left", "resets in", "burn/h", "at reset", "empty in", "holds", "tokens/%"];
   if (!rows.some((r) => r.tokensPerPercent !== undefined)) { header.pop(); cells.forEach((c) => c.pop()); }
-  if (tui) {
-    return renderUsageTable(header, cells, undefined, firstExhaustion(rows)).split("\n");
-  }
-  return renderTable(header, cells, { columns: Number.MAX_SAFE_INTEGER, color: false, unicode: false },
-    { legacy: true }).split("\n");
+  const widths = header.map((label, index) => Math.max(label.length, ...cells.map((row) => row[index]!.length)));
+  return [header, ...cells].map((row) => row.map((value, index) => value.padEnd(widths[index]!)).join("  ").trimEnd());
 }
 
 function fmtSpan(ms: number): string {
@@ -661,7 +570,9 @@ export async function usageCommand(argv: string[]): Promise<void> {
   // (resume, native review) report none.
   const totals = new Map<string, { lanes: number; tokens: Tokens; incomplete: boolean }>();
   const geminiTotals = { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } as Tokens, incomplete: false };
-  for (const entry of Object.values(readAllLanes())) {
+  const allLanes = readAllLanes();
+  const outcomes = laneOutcomes(allLanes);
+  for (const entry of Object.values(allLanes)) {
     if (laneEngine(entry) === "gemini") {
       geminiTotals.lanes += 1;
       if (entry.tokensIncomplete) geminiTotals.incomplete = true;
@@ -716,14 +627,13 @@ export async function usageCommand(argv: string[]): Promise<void> {
         lanes: total?.lanes ?? 0, ledgerTokens: total?.tokens ?? null, incomplete: Boolean(total?.incomplete) };
     });
     console.log(JSON.stringify({ windows, codex, advice, alerts: advice.alerts, gemini: gemini ?? null, geminiLedger: geminiTotals,
-      claude: cca ?? null }, null, 2));
+      claude: cca ?? null, outcomes }, null, 2));
     return;
   }
-  const tui = tuiEnabled();
   const shown = [...windows.filter((w) => w.window !== "5h"), ...claudeUsageRows(cca, now)].sort((a, b) => Math.round(a.resetsAt / 60) - Math.round(b.resetsAt / 60));
-  usageTable(shown, now, tui).forEach((line, index) => {
+  usageTable(shown, now).forEach((line, index) => {
     const used = shown[index - 1]?.usedPercent ?? 0;
-    console.log(tui ? line : used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
+    console.log(used >= 95 ? color.red(line) : used >= 75 ? color.yellow(line) : line);
   });
   const lines = adviceLines(effectiveStandings, now);
   const geminiReason = geminiRows.find((w) => w.blockedUntil)?.reason ?? geminiRows.find((w) => w.reason !== "spend normally")?.reason;
@@ -731,9 +641,10 @@ export async function usageCommand(argv: string[]): Promise<void> {
   if (geminiNote) lines[1] = [lines[1], geminiNote].filter(Boolean).join(" ");
   const claudeNote = cca?.advice?.reason ? `claude: ${cca.advice.reason}` : !cca ? "claude: usage unknown; cca status failed." : "";
   if (claudeNote) lines.push(claudeNote);
-  for (const line of lines) console.log(tui ? renderNote(line) : line);
+  for (const line of lines) console.log(line);
   if (parsed.bools.has("totals")) {
     for (const [account, total] of [...totals, ["gemini", geminiTotals] as const])
       console.log(`${account}: lanes ${total.lanes}, ledger tokens ${fmtTokensFull(total.tokens, total.incomplete)}`);
+    for (const line of outcomeLines(outcomes, displayPath)) console.log(line);
   }
 }

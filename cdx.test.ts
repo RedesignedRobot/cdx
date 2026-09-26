@@ -1132,7 +1132,7 @@ test("the brief drops finished jobs older than the age window and keeps running 
 });
 
 test("unchanged rereads are measured once per step and never alert", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => "first");
+  const track = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => "first");
   const event = (id: number, state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: id, step_type: "tool", state, tool_name: "view_file",
     tool_info: { parameters: { AbsolutePath: "/repo/file.ts" }, output: "2 lines, 77 bytes" },
@@ -1148,7 +1148,7 @@ test("unchanged rereads are measured once per step and never alert", () => {
 });
 
 test("tool measurements retain bytes and tokens without inventing tool tree hashes", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
+  const track = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => null);
   const event = (state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: 1, step_type: "tool", state, tool_name: "write_to_file",
     usage: { input_tokens: 5, cache_read_tokens: 2, output_tokens: 3 },
@@ -1160,7 +1160,7 @@ test("tool measurements retain bytes and tokens without inventing tool tree hash
   const line = JSON.stringify(record);
   const end = JSON.stringify({ type: "cdx_round_end", gateReceiptId: "lane:r1" });
   expect(toolLogRecords([JSON.stringify(event("DONE")), line, "broken", end].join("\n"))).toEqual([line, end]);
-  const gpt = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
+  const gpt = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => null);
   const item = { id: "gpt", type: "commandExecution", command: "check", cwd: "/repo" };
   gpt({ method: "item/started", params: { item } }, "start");
   const measured = gpt({ method: "item/completed", params: { item: { ...item, aggregatedOutput: "ok" } } }, "end")!.record!;
