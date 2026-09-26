@@ -1,13 +1,16 @@
-// Written by Claude Code 2.1.281.
+// Written by Claude Code 2.1.283.
 // Claude Code function hooks: the plugin API's TypeScript declarations.
 //
 // EARLY ACCESS: this surface may change between releases without notice.
-// Written by `/plugin-types`; regenerate with that command after an update
-// rather than editing. The first line names the Claude Code version that
-// wrote it. TypeScript 5.4 or newer reads it. `claude plugin validate <dir>`
-// is the other half: it reads a plugin's manifest and its hooks module's
-// source the way the engine will and reports what the module hooks and
-// calls and everything the engine would refuse, before any session loads it.
+// Written by the engine each time it loads a mod from a folder the person
+// owns, beside that mod as .claude-plugin/types/claude-code/index.d.ts, and
+// by `/plugin-types` into a directory the person names; written again
+// after an update rather than edited. The first line names the Claude Code
+// version that wrote it. TypeScript 5.4 or newer reads it.
+// `claude plugin validate <dir>` is the other half: it reads a plugin's
+// manifest and its hooks module's source the way the engine will and
+// reports what the module hooks and calls and everything the engine would
+// refuse, before any session loads it.
 //
 // What is here: the module a hooks module may import types from,
 //   import type { Register, On, EngineInterface } from 'claude-code'
@@ -78,7 +81,11 @@
 // you depend on is typed with nothing copied (the include above takes the
 // whole folder). "hooks" is the plugin's hooks/ folder and "tests" its test
 // files. `lib` names no DOM: the environment has none, and its `Text`
-// would shadow the element.
+// would shadow the element. A mod the engine loads from a folder the person
+// owns has these options without writing them: its tsconfig.json extends
+// .claude-plugin/types/tsconfig.json, which carries them with that folder
+// as the one type root, holding this file and one entry per plugin the
+// mod's plugin.json lists under "dependencies" (that plugin's own contract).
 //
 // A plugin that adds a noun to `$` ships its own contract: a .d.ts its
 // plugin.json names as "types", exporting the noun's types at its top level
@@ -930,6 +937,27 @@ declare module 'claude-code' {
        * under the pointer or the focus: a secondary control, a path in a list.
        */
       dimColor?: boolean;
+      /**
+       * Which button of several is the main action: `"primary"` is drawn as the
+       * surface marks the one to press, `"secondary"`, and absent, as before.
+       *
+       * The terminal draws a primary `[ label ]` in the accent color, a desktop
+       * its own primary button; `dimColor`, `hover`, the focus and the pointer
+       * apply to both. `plain` wins: a plain Button draws the same either way.
+       *
+       * @example <Button variant="primary" onPress={save}>Save</Button>
+       */
+      variant?: 'primary' | 'secondary';
+      /**
+       * Marks the Button that closes its site: a drawing hint only. `onPress`
+       * still does the dismissing and the press is raised as for any Button.
+       *
+       * The terminal draws it as without the prop; a desktop draws its native
+       * close control at the site's trailing edge, the label its accessible name.
+       *
+       * @example <Button role="dismiss" onPress={close}>Dismiss</Button>
+       */
+      role?: 'dismiss';
       /**
        * The site's focus ring starts here when the site takes the keyboard,
        * instead of on nothing, as the DOM's `autofocus`: Enter acts on it at once.
@@ -5076,7 +5104,8 @@ declare module 'claude-code' {
        */
       key?: string;
       /**
-       * The markdown drawn, as an assistant reply would write it.
+       * The markdown drawn, as an assistant reply would write it; a `<context>`
+       * block, hidden in a reply's own text, is drawn here as written.
        *
        * At most 10000 characters, tab and newline its only control characters;
        * a link whose scheme is not `https:`, `http:` or `file:` draws as text,
@@ -7434,6 +7463,14 @@ declare module 'claude-code' {
        */
       isFilled: boolean;
       /**
+       * Why the box did not take the text, when the engine itself refused
+       * (PromptFillResult): `no_composer` where the session binds no box,
+       * `dialog` while one holds the keys. A hook's refusal carries none, so
+       * a caller choosing a fallback treats an absent cause as unknown and
+       * does not act as if no box existed.
+       */
+      refusal?: 'no_composer' | 'dialog';
+      /**
        * The draft after the fill; unchanged when `isFilled` is false; `''` where
        * no box is drawn or the caller may not read it (see above).
        */
@@ -7514,6 +7551,18 @@ declare module 'claude-code' {
        * out.
        */
       isFilled: boolean;
+      /**
+       * Why the box did not take the text, on the two refusals the engine
+       * itself answers: the session binds no prompt box (`no_composer`:
+       * headless, or a surface that draws its own composer), or a dialog holds
+       * the keys (`dialog`), so the write would land under it, unseen. A hook's
+       * own refusal carries none: the site strips a cause a hook writes itself,
+       * keeping only one its `next` gave it, passed up as it was. A caller
+       * branching on the cause treats an absent one as unknown and takes its
+       * refusing arm; `no_composer` is the only value that says no box exists
+       * to protect.
+       */
+      refusal?: 'no_composer' | 'dialog';
   };
 
   /**
@@ -8037,6 +8086,25 @@ declare module 'claude-code' {
            */
           dimColor?: TextProps['dimColor'];
           /**
+           * `"primary"` marks the main action of several, drawn as the surface
+           * marks the one to press; `"secondary"`, and absent, draw as before.
+           *
+           * The terminal draws a primary in the accent color; `plain` wins over
+           * it. Carried to every surface as written, never filled in.
+           *
+           * @example { key: 'save', label: 'Save', variant: 'primary' }
+           */
+          variant?: ButtonProps['variant'];
+          /**
+           * `"dismiss"` marks the Button that closes its site, a drawing hint
+           * only: the terminal draws it as without, a desktop its close control.
+           *
+           * Carried to every surface as written, never filled in.
+           *
+           * @example { key: 'dismiss', label: 'Dismiss', role: 'dismiss' }
+           */
+          role?: ButtonProps['role'];
+          /**
            * The site's ring starts on this element when the site takes the
            * keyboard; the first drawn of several. Absent draws as before.
            */
@@ -8436,7 +8504,8 @@ declare module 'claude-code' {
        */
       AssistantMessage: {
           /**
-           * The block's text, markdown, as the transcript will draw it.
+           * The block's text, markdown, as the surface's transcript will draw it:
+           * what it hides of a reply (the terminal's, a `<context>` block) is gone.
            */
           text: string;
           /**
@@ -8665,17 +8734,20 @@ declare module 'claude-code' {
       };
       /**
        * The line that animates while a turn runs (`Sauteing... (12s, 300
-       * tokens)`); a remote surface draws its own.
+       * tokens)`); on the desktop, the row that carries the turn's mark.
        *
-       * The row reads `word` (or `message` while one overrides it), then
-       * `suffix`, then the dim parenthetical the engine keeps (elapsed time,
-       * tokens, effort); a hook rewrites the first three or draws its own tree.
+       * Reads `word` (or `message` while one overrides it), `suffix`, then what
+       * the surface keeps and no prop carries: elapsed time, tokens, effort. A
+       * hook rewrites the first three, or draws a tree in place of all of it.
        *
-       * Raised on the terminal surface only.
+       * Raised on the terminal and desktop surfaces only.
        */
       Spinner: {
           /**
            * Animated by the line (`Sauteing`), as sampled for this turn.
+           *
+           * On the desktop, what the row says its step is doing (`Creating
+           * notes.md`), or `Working` while the row shows no words.
            */
           word: string;
           /**
@@ -8692,7 +8764,8 @@ declare module 'claude-code' {
            */
           suffix: string;
           /**
-           * What the turn is doing.
+           * What the turn is doing. The desktop tells `thinking`, `requesting`,
+           * `tool-use` and `responding` apart and never says `tool-input`.
            */
           mode: 'requesting' | 'responding' | 'thinking' | 'tool-input' | 'tool-use';
       };
@@ -8767,8 +8840,9 @@ declare module 'claude-code' {
        * The dim hint line under the prompt (`? for shortcuts`, `esc to
        * interrupt`, the pills beside them). One instance.
        *
-       * A hook rewrites `hint` and the rewrite is drawn in the line's place, or
-       * draws its own tree; `isDraft` and `isWorking` say what the line is for.
+       * A hook rewrites `hint`, drawn in the line's place, or draws its own tree;
+       * `isDraft` and `isWorking` say what the line is for. On the terminal, until
+       * a new answer lands the last keeps its row (the engine's line before any).
        *
        * Raised on the terminal and desktop surfaces only.
        */
@@ -9678,6 +9752,12 @@ declare module 'claude-code' {
        * The event's discriminator (`pull_request.closed`, `check_suite`).
        */
       kind: string;
+      /**
+       * The envelope's sender-kind attribute as the server stamped it (`system`
+       * for a relay's own event, `rc_owner` for the user's own relayed message);
+       * absent when the envelope carries none.
+       */
+      from?: string;
       /**
        * The envelope's JSON body (`{ pr: "acme/app#12", outcome: "merged" }`).
        */
@@ -11363,11 +11443,11 @@ declare module 'claude-code' {
        */
       agentId?: string;
       /**
-       * What the turn cost: its responses' token counts summed and the model of
-       * the last, read off the API responses the engine already holds.
+       * What the turn cost: its real requests' token counts, plus what a made-up
+       * response's stop stated, summed, and the model of the last that counted.
        *
-       * Absent when the turn got no response (interrupted before one, an API
-       * error).
+       * A response a `turn.step` hook made up adds nothing unless its stop states
+       * usage; absent when nothing counted (an interrupt, an API error).
        */
       usage?: TurnUsage;
   };
@@ -13753,8 +13833,6 @@ declare module 'claude-code' {
       subagent_type?: string
       /** Optional model override for this agent. Takes precedence over the agent definition's model frontmatter and the configured default subagent model. If omitted, uses the agent definition's model, else the default (inherits from the parent unless a default subagent model is configured). Ignored for subagent_type: "fork" — forks always inherit the parent model. */
       model?: "sonnet" | "opus" | "haiku" | "fable"
-      /** Agents run in the background by default; you will be notified when one completes. Set to false only when your very next action depends on this agent's result and nothing else could usefully happen while it runs — otherwise leave it in the background so the user can hand you other work. */
-      run_in_background?: boolean
       /** Name for the spawned agent. Makes it addressable via SendMessage({to: name}) while running. */
       name?: string
       /** Deprecated; ignored. The session has a single implicit team. */
@@ -13763,6 +13841,35 @@ declare module 'claude-code' {
       mode?: "acceptEdits" | "auto" | "bypassPermissions" | "default" | "dontAsk" | "plan"
       /** Isolation mode. "worktree" creates a temporary git worktree so the agent works on an isolated copy of the repo. "remote" launches the agent in a remote cloud environment (always runs in background; availability is gated). */
       isolation?: "worktree" | "remote"
+    }
+    AskUserQuestion: {
+      /** Questions to ask the user (1-4 questions) */
+      questions: Array<{
+        /** The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: "Which library should we use for date formatting?" If multiSelect is true, phrase it accordingly, e.g. "Which features do you want to enable?" */
+        question: string
+        /** Very short label displayed as a chip/tag (max 12 chars). Examples: "Auth method", "Library", "Approach". */
+        header: string
+        /** The available choices for this question. Must have 2-4 options. Each option should be a distinct, mutually exclusive choice (unless multiSelect is enabled). There should be no 'Other' option, that will be provided automatically. */
+        options: Array<{
+          /** The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice. */
+          label: string
+          /** Explanation of what this option means or what will happen if chosen. Useful for providing context about trade-offs or implications. */
+          description: string
+          /** Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format. */
+          preview?: string
+        }>
+        /** Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive. */
+        multiSelect: boolean
+      }>
+      /** User answers collected by the permission component */
+      answers?: {}
+      /** Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text. */
+      annotations?: {}
+      /** Optional metadata for tracking and analytics purposes. Not displayed to user. */
+      metadata?: {
+        /** Optional identifier for the source of this question (e.g., "remember" for /remember command). Used for analytics tracking. */
+        source?: string
+      }
     }
     Bash: {
       /** The command to execute */
@@ -13856,17 +13963,32 @@ declare module 'claude-code' {
       /** Replace all occurrences of old_string (default false) */
       replace_all?: boolean
     }
+    EndConversation: {}
+    EnterPlanMode: {}
     EnterWorktree: {
       /** Optional name for a new worktree. Each "/"-separated segment may contain only letters, digits, dots, underscores, and dashes; max 64 chars total. A random name is generated if not provided. Mutually exclusive with `path`. */
       name?: string
       /** Path to an existing worktree to switch into instead of creating a new one. Must appear in `git worktree list` for the current repo — or, on first entry from the launch directory, for a repo nested inside it (multi-repo workspace). Mutually exclusive with `name`. */
       path?: string
     }
+    ExitPlanMode: {
+      /** Deprecated: no longer used. */
+      allowedPrompts?: Array<{
+        /** The tool this prompt applies to */
+        tool: "Bash"
+        /** Semantic description of the action, e.g. "run tests", "install dependencies" */
+        prompt: string
+      }>
+    }
     ExitWorktree: {
       /** "keep" leaves the worktree and branch on disk; "remove" deletes both. */
       action: "keep" | "remove"
       /** Required true when action is "remove" and the worktree has uncommitted files or unmerged commits. The tool will refuse and list them otherwise. */
       discard_changes?: boolean
+    }
+    FetchInboxMessage: {
+      /** The file_id from the session-inbox notification you received */
+      file_id: string
     }
     ListAgents: {
       /** Not available in this build; leave unset. */
@@ -13893,7 +14015,7 @@ declare module 'claude-code' {
     Monitor: {
       /** Short human-readable description of what you are monitoring (shown in notifications). */
       description: string
-      /** Kill the monitor after this deadline. Default 300000ms. Deadlines above 600000ms are capped to 600000ms. You are notified at expiry and can re-arm. */
+      /** Kill the monitor after this deadline. Default 300000ms. Deadlines above 1800000ms are capped to 1800000ms. You are notified at expiry and can re-arm. */
       timeout_ms: number
       /** Shell command or script. Each stdout line is an event; exit ends the watch. */
       command?: string
@@ -13942,6 +14064,7 @@ declare module 'claude-code' {
       /** The resource URI to read */
       uri: string
     }
+    ReadNotifications: {}
     RemoteTrigger: {
       action: "list" | "get" | "create" | "update" | "run" | "create_webhook_trigger" | "list_runs" | "get_run_log"
       /** Required for get, update, run, and list_runs */
@@ -14009,6 +14132,16 @@ declare module 'claude-code' {
       }
       /** Ask a session ON THIS MACHINE to send you ONE notice when it next goes idle (finishes its turn with nothing queued) or exits — opt-in, one-shot, no polling. With a message: deliver it now AND subscribe. Without a message (omit it): a pure subscription that costs the other session nothing. */
       notify_when_idle?: boolean
+    }
+    SendUserFile: {
+      /** File paths (absolute or relative to cwd) to send to the user. Always pass an array, even for a single file. */
+      files: string[]
+      /** Optional short caption for the file(s). */
+      caption?: string
+      /** Use 'proactive' when you're surfacing a file the user hasn't asked for and needs to see now — a generated artifact, a completed report. Use 'normal' when replying to something the user just said. */
+      status: "normal" | "proactive"
+      /** How the client should present the file. 'render' opens it inline in the side panel (for HTML, SVG, Mermaid, images, PDFs — anything the user wants to look at now). 'attach' shows a download card only, no inline preview (for deliverables the user will save and open elsewhere). Omit to let the client decide by file type — today that means renderable types render and everything else attaches, same as before this parameter existed. */
+      display?: "render" | "attach"
     }
     Skill: {
       /** The name of a skill from the available-skills list. Do not guess names. */
@@ -14143,6 +14276,52 @@ declare module 'claude-code' {
       prompt: string
       /** Path to the output file for checking agent progress */
       outputFile: string
+    }
+    AskUserQuestion: {
+      /** The questions that were asked */
+      questions: Array<{
+        /** The complete question to ask the user. Should be clear, specific, and end with a question mark. Example: "Which library should we use for date formatting?" If multiSelect is true, phrase it accordingly, e.g. "Which features do you want to enable?" */
+        question: string
+        /** Very short label displayed as a chip/tag (max 12 chars). Examples: "Auth method", "Library", "Approach". */
+        header: string
+        /** How the user answers. "choice" (the default when omitted): picks from options. "text": a free-text box, no options — for open-ended input. "number": a slider/stepper between min and max — for quantities. */
+        kind?: "choice" | "text" | "number"
+        /** Optional single helper line shown under the question. */
+        description?: string
+        /** Choices for a "choice" question: 2-4 distinct options; with multiSelect false they must be mutually exclusive. Omit for "text" and "number" questions. There should be no 'Other' or 'Skip' option; the form lets the user type their own answer or leave a question unanswered. */
+        options: Array<{
+          /** The display text for this option that the user will see and select. Should be concise (1-5 words) and clearly describe the choice. */
+          label: string
+          /** Optional: add only when the label alone would be ambiguous. One short line on what choosing it leads to. */
+          description?: string
+          /** Optional preview content rendered when this option is focused. Use for mockups, code snippets, or visual comparisons that help users compare options. See the tool description for the expected content format. */
+          preview?: string
+        }>
+        /** Set to true to allow the user to select multiple options instead of just one. Use when choices are not mutually exclusive. */
+        multiSelect: boolean
+        /** "text" questions only: placeholder for the empty text box. */
+        placeholder?: string
+        /** "number" questions only (required there): lowest value. */
+        min?: number
+        /** "number" questions only (required there): highest value. */
+        max?: number
+        /** "number" questions only: increment between values. */
+        step?: number
+        /** "number" questions only: the value the control starts at (within min..max). */
+        defaultValue?: number
+        /** "number" questions only: short unit shown next to the value, e.g. "px", "slides", "%". */
+        unit?: string
+      }>
+      /** The answers provided by the user (question text -> answer string; multi-select answers are comma-separated) */
+      answers: {}
+      /** Freeform text the user typed instead of selecting a structured option */
+      response?: string
+      /** Optional per-question annotations from the user (e.g., notes on preview selections). Keyed by question text. */
+      annotations?: {}
+      /** Set when the dialog auto-resolved after this many milliseconds of idle (user away from keyboard). Absent on every human-resolved path. */
+      afkTimeoutMs?: number
+      /** Set when the user asked for another round of questions instead of (or after partially) answering. */
+      followUp?: boolean
     }
     Bash: {
       /** The standard output of the command */
@@ -14341,10 +14520,33 @@ declare module 'claude-code' {
       /** True when the edit was held for the machine owner to review instead of written; the file is unchanged */
       staged?: boolean
     }
+    EndConversation: {
+      ended: boolean
+      message: string
+    }
+    EnterPlanMode: {
+      /** Confirmation that plan mode was entered */
+      message: string
+    }
     EnterWorktree: {
       worktreePath: string
       worktreeBranch?: string
       message: string
+    }
+    ExitPlanMode: {
+      /** The plan that was presented to the user */
+      plan: string | null
+      isAgent: boolean
+      /** The file path where the plan was saved */
+      filePath?: string
+      /** Whether the Agent tool is available in the current context */
+      hasTaskTool?: boolean
+      /** True when the user edited the plan (CCR web UI or Ctrl+G); determines whether the plan is echoed back in tool_result */
+      planWasEdited?: boolean
+      /** When true, the teammate has sent a plan approval request to the team leader */
+      awaitingLeaderApproval?: boolean
+      /** Unique identifier for the plan approval request */
+      requestId?: string
     }
     ExitWorktree: {
       action: "keep" | "remove"
@@ -14359,6 +14561,20 @@ declare module 'claude-code' {
       /** @internal originalCwd was gone (or a network path the session will not touch), so restoredCwd is a fallback directory. */
       originalCwdMissing?: boolean
       message: string
+    }
+    FetchInboxMessage: {
+      ok: boolean
+      file_id?: string
+      message_id?: string
+      enveloped_text?: string
+      body?: string
+      sender_display?: string
+      sender_kind?: string
+      source?: string
+      slack_permalink?: string
+      received_at?: string
+      attachments_prefix?: string
+      reason?: string
     }
     ListAgents: {
       /** Formatted list of reachable agents */
@@ -14545,6 +14761,20 @@ declare module 'claude-code' {
       /** Human-readable error when the server could not read the resource */
       error?: string
     }
+    ReadNotifications: {
+      notifications: Array<{
+        /** Server-assigned stable id — the dedup key across redeliveries. */
+        notification_id: string
+        /** Server-attested source token: "github_webhook" | "trigger_fire" | "mcp_send_message" (open set; unknown well-formed tokens pass through verbatim, off-grammar values coerce to "unknown"). */
+        origin: string
+        /** RFC3339 timestamp of when the backend queued it. */
+        queued_at: string
+        /** Verbatim notification body. */
+        content: string
+      }>
+      /** Notifications still queued after this drain (drains are size-budgeted); call the tool again to read them. */
+      remaining: number
+    }
     RemoteTrigger: {
       status: number
       json: string
@@ -14588,6 +14818,23 @@ declare module 'claude-code' {
       cancelledWakeups?: number
     }
     SendMessage: unknown
+    SendUserFile: {
+      caption?: string
+      display?: "render" | "attach"
+      /** Resolved file metadata */
+      attachments: {
+        path: string
+        size: number
+        isImage: boolean
+        file_uuid?: string
+        media_type?: string
+        pathValidated?: boolean
+        upload_error?: string
+        project_path?: string
+        partial_error?: string
+      }[]
+      rendered_locally?: boolean
+    }
     Skill: {
       /** Whether the skill is valid */
       success: boolean
