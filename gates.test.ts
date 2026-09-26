@@ -163,7 +163,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
   expect(target).not.toContain("review-base");
 });
 
-import { attestReview, reviewRefusal } from "./gates.ts";
+import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
 import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
 import { reviewFollowUp } from "./lane-commands.ts";
@@ -255,6 +255,14 @@ test("a closed review allows a fresh review of a changed tree and refuses the sa
   expect(reviewFollowUp("no findings", true, old, next)).toBe("");
   expect(() => reviewFollowUp("no findings", true, old, { head: "h2", tree: "old" })).toThrow("reuse its report");
   expect(reviewFollowUp("", true, old, next)).toBe("");
+});
+
+test("only a finished, non-consult review round attests", () => {
+  const review = { kind: "review", review: { state: "done" }, work: { state: "adopted" } } as Lane;
+  expect(reviewAttests(review)).toBe(true);
+  expect(reviewAttests({ ...review, review: { state: "failed" } } as Lane)).toBe(false);
+  expect(reviewAttests({ ...review, consult: true })).toBe(false);
+  expect(reviewAttests({ ...review, kind: "work" })).toBe(false);
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {

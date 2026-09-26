@@ -23,7 +23,7 @@ import {
 } from "./engines.ts";
 import {
   captureGateTree, captureReviewTree, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
-  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewRoot,
+  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
@@ -1428,7 +1428,7 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
       } catch { /* not the verdict block */ }
     }
   }
-  if (entry.kind === "review" && !entry.consult) {
+  if (reviewAttests(entry)) {
     try {
       const verdict = JSON.parse(readFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, "utf8"));
       const closed = reviewLoopClosed(verdict.findings);
