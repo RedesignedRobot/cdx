@@ -210,6 +210,7 @@ test("supervisor children get their own worktree and land into the parent branch
   expect(childWorktreeTarget("lane", undefined, undefined, false)).toBeUndefined();
   const rules = houseRules("/nonexistent", false, "gpt", { supervisor: true });
   expect(rules).toContain("cdx land <child>");
+  expect(rules).toContain("plain call");
   expect(rules).not.toContain("shared-tree");
 });
 
