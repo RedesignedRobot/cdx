@@ -184,7 +184,9 @@ export function register(on: On) {
       await poll($);
     });
 
-    const briefResult = await $.process.run(CDX.concat(["brief"]), {
+    // cdx elects the head only from sessions that drove it. A person at the
+    // prompt claims the wakes at start; a -p run or an SDK host never does.
+    const briefResult = await $.process.run(CDX.concat(e.isInteractive ? ["brief", "--head"] : ["brief"]), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
     });
