@@ -191,10 +191,10 @@ export function geminiAdmission(snapshot: GeminiUsageSnapshot | undefined, ledge
   if (!snapshot || Date.parse(snapshot.fiveHour.resetsAt) <= now) return { projectedPercent: 0 };
   const running = Object.entries(ledger).filter(([name, item]) => name !== exclude && laneRunning(item) && !item.queuedUntil && (item.kind === "review" ? item.reviewEngine ?? item.engine : item.engine) === "gemini");
   const rates = running.flatMap(([, item]) => item.modelCalls && item.roundTokens
-    ? [(item.roundTokens.input + item.roundTokens.output) / item.modelCalls] : []);
+    ? [(item.roundTokens.input - item.roundTokens.cached + item.roundTokens.output) / item.modelCalls] : []);
   const perCall = rates.length ? rates.reduce((sum, rate) => sum + rate, 0) / rates.length : 12_250;
   const projectedTokens = 250 * perCall + running.reduce((sum, [, item]) => {
-    const rate = item.modelCalls && item.roundTokens ? (item.roundTokens.input + item.roundTokens.output) / item.modelCalls : perCall;
+    const rate = item.modelCalls && item.roundTokens ? (item.roundTokens.input - item.roundTokens.cached + item.roundTokens.output) / item.modelCalls : perCall;
     return sum + Math.max(0, 250 - (item.modelCalls ?? 0)) * rate;
   }, 0);
   const projectedPercent = projectedTokens / 800_000;

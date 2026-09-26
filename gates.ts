@@ -17,7 +17,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, relative } from "node:path";
 
-// Keep ledger v5 readable by older clients. Absence means no content proof.
+// Receipt format stays at version 1 across ledger migrations. Absence means no content proof.
 export function makeGateReceipt(round: number, cwd: string, command: string, exitCode: number,
   finishedAt: string, before?: GateTree, after?: GateTree, error?: string): GateReceipt {
   const reason = error ?? (!before || !after ? "tree snapshot unavailable"
@@ -69,16 +69,17 @@ export function repositoryGate(cwd: string): string | undefined {
   return command;
 }
 
-export function gateTreeFromGit(root: string, git: (cwd: string, ...args: string[]) => string, paths?: string[]): GateTree {
+export function gateTreeFromGit(root: string, git: (cwd: string, ...args: string[]) => string, _paths?: string[]): GateTree {
   const head = git(root, "rev-parse", "HEAD");
   git(root, "read-tree", head);
-  if (paths === undefined || paths.length) git(root, "add", "--all", "--", ...(paths ?? ["."]));
-  // Inspect the whole repository even when the lane works in a subdirectory.
+  // A receipt proves the entire checkout. Scoped staging could admit unrelated
+  // edits after a green gate and before landing.
+  git(root, "add", "--all", "--", ".");
   if (/^160000 /m.test(git(root, "ls-files", "--stage"))) throw new CmdError("gate receipts do not support submodules or embedded repositories");
   return { head, tree: git(root, "write-tree") };
 }
 
-export function captureGateTree(cwd: string, paths?: string[]): GateTree | undefined {
+export function captureGateTree(cwd: string, _paths?: string[]): GateTree | undefined {
   const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
   if (!top.success) return undefined;
   const root = top.stdout.toString().trim();
@@ -91,8 +92,7 @@ export function captureGateTree(cwd: string, paths?: string[]): GateTree | undef
     return result.stdout.toString().trim();
   };
   try {
-    const included = paths?.filter((path) => existsSync(join(root, path)) || git(root, "ls-files", "--", path));
-    return gateTreeFromGit(root, git, included);
+    return gateTreeFromGit(root, git);
   } finally {
     for (const file of [index, `${index}.lock`]) { if (existsSync(file)) unlinkSync(file); }
     rmdirSync(scratch);

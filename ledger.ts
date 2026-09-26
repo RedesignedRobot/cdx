@@ -1,3 +1,4 @@
+import { migrateTokenAccounting, type TokenRoundEvidence } from "./tokens.ts";
 import { failureDigest } from "./gates.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane records, ledger migration and locks, ownership, and the event journal.
@@ -73,6 +74,7 @@ export interface GeminiConfig {
 export interface Config {
   model_auto_compact_token_limit?: number;
   tool_output_token_limit?: number;
+  expectMinutes?: number;
   visibility?: VisibilityConfig;
   // Codex model for work lanes (the executor).
   model: string;
@@ -83,8 +85,7 @@ export interface Config {
   defaultEffort: string;
   rules: string[];
   accounts?: Record<string, string>;
-  // Highest effort a Codex model may run at, by model id. Astra and Sol are
-  // capped at high by default because higher efforts burn the weekly window.
+  // Highest effort a Codex model may run at, by model id.
   effortCaps: Record<string, string>;
   worktreeSetup?: string;
   gemini?: GeminiConfig;
@@ -122,6 +123,11 @@ export interface GateReceipt {
 }
 
 export interface RoundRecord<S extends WorkState = WorkState> {
+  testRuns?: number;
+  testSuites?: number;
+  testStatus?: "passed" | "failed" | "running";
+  expectMinutes?: number;
+  overrunSent?: boolean;
   exitCode?: number;
   note?: string;
   state: S;
@@ -199,9 +205,15 @@ export interface Lane {
   rounds: number;
   workRounds?: number;
   reports: string[];
+  tokenAccounting?: 1;
   tokens?: Tokens;
   roundTokens?: Tokens;
   tokensIncomplete?: boolean;
+  roundTestRuns?: number;
+  roundTestSuites?: number;
+  roundTestStatus?: "passed" | "failed" | "running";
+  expectMinutes?: number;
+  overrunSent?: boolean;
   roundSteps?: number;
   stage?: "working" | "gate" | "reporting";
   stageStartedAt?: string;
@@ -232,6 +244,7 @@ export interface Lane {
 }
 
 export interface Spec {
+  expectMinutes?: number;
   promptBytes?: Record<string, number>;
   model_auto_compact_token_limit?: number;
   tool_output_token_limit?: number;
@@ -270,7 +283,7 @@ export interface Spec {
 
 export type Ledger = Record<string, Lane>;
 
-type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "outage" | "gate-started" | "gate-finished" | "report-written";
+type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "overrun" | "outage" | "gate-started" | "gate-finished" | "report-written";
 
 export interface FeedEvent {
   id: number;
@@ -304,7 +317,7 @@ interface SessionState {
 
 const SESSION_STATE = `${ROOT}/sessions.json`;
 
-export const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash", "outage"]);
+export const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash", "overrun", "outage"]);
 
 export function readSessions(): SessionState {
   return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
@@ -337,7 +350,7 @@ export function parseFeedEvent(line: string): FeedEvent | undefined {
     const event = JSON.parse(line);
     if (Number.isSafeInteger(event.id) && event.id > 0 && typeof event.timestamp === "string"
       && typeof event.owner === "string" && typeof event.message === "string"
-      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "outage", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
+      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "overrun", "outage", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
   } catch { /* Version 5 free-text records are deliberately ignored. */ }
 }
 
@@ -374,6 +387,7 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
     if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     const lane = identity.lane ? readLedger()[identity.lane] : undefined;
     const terminal = kind === "terminal" || kind === "job-exit";
+    if (kind === "terminal" && lane) message += ` tests=${lane.roundTestRuns ?? 0} suites=${lane.roundTestSuites ?? 0}${lane.roundTestStatus ? ` testStatus=${lane.roundTestStatus}` : ""}`;
     const read = (path?: string) => { try { return path && path !== "-" ? readFileSync(path, "utf8") : undefined; } catch { return undefined; } };
     if (terminal) {
       const report = read(/(?:^|\s)report=(\S+)/.exec(message)?.[1]);
@@ -499,13 +513,11 @@ const LEDGER_VERSION_PATH = `${ROOT}/.ledger-version`;
 
 const LEGACY_LANE_KEYS = ["state", "cwd", "workState", "workRound", "workCwd", "workReport", "workUpdatedAt", "exitCode", "note", "reviewState", "reviewRound", "reviewCwd", "reviewExitCode", "reviewNote", "reviewReport", "reviewUpdatedAt"];
 
-export function readLedger(): Ledger {
-  if (!existsSync(LEDGER)) return {};
-  const document = JSON.parse(readFileSync(LEDGER, "utf8"));
-  if (document && typeof document === "object" && Object.keys(document).length === 0) return {};
+function readLedgerDocument(document: any = existsSync(LEDGER) ? JSON.parse(readFileSync(LEDGER, "utf8")) : {}) {
+  if (document && typeof document === "object" && Object.keys(document).length === 0) return { version: 5, tokenAccounting: 1, lanes: {} as Ledger };
   const current = document?.version === 5;
   if (!current && (existsSync(LEDGER_VERSION_PATH) || typeof document?.version === "number")) {
-    throw new CmdError("unsupported ledger shape after migration to 5.0; stop older cdx writers and restore the version 5 ledger");
+    throw new CmdError("unsupported ledger shape; stop older cdx writers and restore a version 5 ledger");
   }
   const ledger = current ? document.lanes : document;
   if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) throw new CmdError("invalid ledger: expected lane records");
@@ -521,14 +533,55 @@ export function readLedger(): Ledger {
       throw new CmdError(`invalid ledger lane "${name}": version 5 requires an engine and work/review records, without flat aliases`);
     }
   }
-  return ledger;
+  const result = { version: 5, tokenAccounting: document.tokenAccounting as number | undefined, lanes: ledger as Ledger };
+  migrateTokenAccounting(result, (name, entry) => {
+      const evidence: (TokenRoundEvidence & { round: number })[] = [];
+      for (let round = 1; round <= entry.rounds; round++) {
+        try {
+          const spec = JSON.parse(readFileSync(`${ROOT}/specs/${name}-r${round}.json`, "utf8"));
+          if (["gpt", "gemini"].includes(spec.engine)) evidence.push({ engine: spec.engine, round });
+        } catch { /* cleaned specs leave engine attribution incomplete */ }
+      }
+      const mixed = new Set([entry.engine, entry.reviewEngine ?? entry.engine, ...evidence.map((round) => round.engine)]).size > 1;
+      if (mixed) {
+        for (const record of evidence) {
+          if (record.engine !== "gemini") continue;
+          try {
+            const round = record.round;
+            const lines = readFileSync(`${ROOT}/logs/${name}-r${round}.jsonl`, "utf8").split("\n");
+            let cached = 0;
+            for (const line of lines) {
+              let event: any;
+              try { event = JSON.parse(line); } catch { continue; }
+              const usage = event.event === "step_update" ? event.step_update?.usage : undefined;
+              if (usage && [usage.input_tokens, usage.cache_read_tokens, usage.output_tokens]
+                .every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)) cached += usage.cache_read_tokens;
+            }
+            record.cached = cached;
+          } catch { /* preserve the incomplete evidence */ }
+        }
+      }
+      return evidence;
+  });
+  return result;
+}
+
+export function readLedger(): Ledger {
+  if (!existsSync(LEDGER)) return {};
+  const document = JSON.parse(readFileSync(LEDGER, "utf8"));
+  if (document.version === 5 && document.tokenAccounting === 1 && Object.values(document.lanes ?? {}).every((lane: any) => lane.tokenAccounting === 1)) return readLedgerDocument(document).lanes;
+  // Persist the migration under the normal writer lock, including read-only
+  // usage requests. A second reader rechecks the marker after taking the lock.
+  return withLockedJson(LEDGER, `${ROOT}/.lock`, readLedgerDocument, (document) => document.lanes);
 }
 
 export function withLedger<T>(mutate: (ledger: Ledger) => T): T {
+  // Finish any legacy migration before callbacks can read under this lock.
+  readLedger();
   return withLockedJson(LEDGER, `${ROOT}/.lock`,
-    () => ({ version: 5, lanes: readLedger() }),
+    readLedgerDocument,
     (document) => {
-      if (!existsSync(LEDGER_VERSION_PATH)) writeFileSync(LEDGER_VERSION_PATH, "5\n");
+      if (!existsSync(LEDGER_VERSION_PATH) || readFileSync(LEDGER_VERSION_PATH, "utf8").trim() !== "5") writeFileSync(LEDGER_VERSION_PATH, "5\n");
       return mutate(document.lanes);
     });
 }

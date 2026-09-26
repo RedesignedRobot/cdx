@@ -4,6 +4,7 @@ import { retiredLaneRule } from "./account-sync.ts";
 import { config } from "./config.ts";
 import { type Engine, laneRunning, type Ledger, type Spec, workCwdOf } from "./ledger.ts";
 import { specPathOf } from "./reports.ts";
+import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { existsSync, readFileSync } from "node:fs";
 
 // Standing rules live here; task briefs supply the outcome and owned files.
@@ -95,6 +96,7 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));
   }
   if (!reviewOnly) builtIns.push(VERIFICATION_RULE);
+  if (!reviewOnly && !opts.supervisor) builtIns.push(`Keep test invocations within ${config.visibility?.testRuns ?? VISIBILITY_DEFAULTS.testRuns} this round, including the lane gate. Run each touched spec once; ask the supervisor if the gate needs more.`);
   const sections = [builtIns.map((rule) => `- ${rule}`).join("\n")];
   if (config.rules.length > 0) sections.push(config.rules.filter((rule) => !retiredLaneRule(rule)).map((rule) => `- ${rule}`).join("\n"));
   const projectRules = `${cwd}/.cdx-rules.md`;
@@ -141,6 +143,7 @@ export function resumeRefusal(kind: string | undefined, lane: import("./ledger.t
   const fresh = "New scope requires a fresh lane seeded from the report. Resume accepts only --fix gate or --fix review on the same diff.";
   if (lane.consult || !["gate", "review"].includes(kind ?? "")) return fresh;
   const previous = kind === "gate" ? lane.gateReceipt : lane.reviewTree;
+  if (kind === "review" && !previous?.head) return "Review must run on the work lane itself; a separate named review is not attached to this lane.";
   if (!previous?.head || previous.head !== head) return `The diff HEAD changed. ${fresh}`;
   if (kind === "gate" && (!lane.gateReceipt || lane.gateReceipt.exitCode === 0 && lane.gateReceipt.valid)) return `There is no failed gate to fix. ${fresh}`;
   if (kind === "review" && (!lane.review || lane.reviewClosed !== false)) return `There are no blocking review findings to fix. ${fresh}`;

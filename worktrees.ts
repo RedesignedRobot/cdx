@@ -3,9 +3,16 @@
 import { config } from "./config.ts";
 import { readLane, requireOwnChild, withLedger, laneRunning, type Lane, type Spec } from "./ledger.ts";
 import { captureGateTree, receiptRefusal } from "./gates.ts";
+import { runFrozenGate } from "./snapshots.ts";
 import { specPathOf } from "./reports.ts";
-import { CmdError, displayPath, fail, shellQuote, uncoloredChildEnv } from "./runtime.ts";
+import { CmdError, displayPath, fail, HOME, ROOT, shellQuote, uncoloredChildEnv } from "./runtime.ts";
 import { existsSync, mkdirSync, rmdirSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+
+export function resolveWorktreeTarget(target: string): string {
+  if (isAbsolute(target)) return target;
+  return target.includes("/") ? join(process.cwd(), target) : join(HOME, "code", "wt", target);
+}
 
 export function storedDirectories(lane: string, entry?: Pick<Lane, "additionalDirectories" | "work" | "rounds">,
   readSpec: (lane: string, round: number) => Pick<Spec, "additionalDirectories"> | undefined = (name, round) => {
@@ -41,7 +48,7 @@ export function createWorktree(repo: string, target: string, lane: string): Work
   const repoRoot = top.stdout.toString().trim();
   const baseBranch = Bun.spawnSync({ cmd: ["git", "-C", repoRoot, "symbolic-ref", "--short", "HEAD"] }).stdout.toString().trim();
   if (!baseBranch) fail("worktree source must be on a branch");
-  const path = target.startsWith("/") ? target : `${process.cwd()}/${target}`;
+  const path = resolveWorktreeTarget(target);
   const branch = `lane/${lane}`;
   if (existsSync(path)) {
     const probe = (...args: string[]) => Bun.spawnSync({ cmd: ["git", "-C", path, ...args] });
@@ -139,6 +146,20 @@ export function landRefusal(entry: Lane, baseDirty: boolean, current?: import(".
   if (current.head !== entry.gateReceipt!.head || current.tree !== entry.gateReceipt!.tree) return "worktree differs from its green receipt";
 }
 
+export function refreshChangedLandReceipt(entry: Lane, baseDirty: boolean, current: import("./ledger.ts").GateTree | undefined,
+  run: () => import("./ledger.ts").GateReceipt, save: (update: Pick<Lane, "gateReceipt" | "landingCommit" | "landedCommit">) => void,
+  capture: () => import("./ledger.ts").GateTree | undefined): { refusal?: string; current?: import("./ledger.ts").GateTree } {
+  let refusal = landRefusal(entry, baseDirty, current);
+  if (refusal !== "worktree differs from its green receipt") return { refusal, current };
+  const receipt = run();
+  const update = { gateReceipt: receipt, landingCommit: undefined, landedCommit: undefined };
+  Object.assign(entry, update);
+  save(update);
+  current = capture();
+  refusal = landRefusal(entry, baseDirty, current);
+  return { refusal, current };
+}
+
 export function landCommand(argv: string[]): void {
   const [lane, extra] = argv;
   if (!lane || extra) fail("usage: cdx land <lane>");
@@ -160,14 +181,22 @@ export function landCommand(argv: string[]): void {
     const removed = !existsSync(work);
     if (removed && !entry.landedCommit) fail("lane worktree is missing before merge");
     if (!removed && git(work, "symbolic-ref", "--short", "HEAD") !== entry.branch) fail("lane checkout is not on its recorded branch");
-    const current = removed && entry.landingCommit
+    let current = removed && entry.landingCommit
       ? { head: entry.landingCommit, tree: git(base, "rev-parse", `${entry.landingCommit}^{tree}`) }
-      : captureGateTree(work, entry.gateReceipt?.paths);
-    const refusal = landRefusal(entry, Boolean(git(base, "status", "--porcelain", "--untracked-files=all")), current);
+      : captureGateTree(work);
+    const baseDirty = Boolean(git(base, "status", "--porcelain", "--untracked-files=all"));
+    const checked = removed ? { refusal: landRefusal(entry, baseDirty, current), current } : refreshChangedLandReceipt(entry, baseDirty, current,
+      () => runFrozenGate(entry.work.round!, work, entry.gateReceipt!.command,
+        `${ROOT}/logs/${lane}-r${entry.work.round}.land-gate.log`, lane).receipt,
+      (update) => { withLedger((ledger) => { Object.assign(ledger[lane]!, update); }); },
+      () => captureGateTree(work));
+    current = checked.current;
+    const refusal = checked.refusal;
     if (refusal) fail(`cannot land ${lane}: ${refusal}`);
-    // A scoped receipt cannot authorize committing or deleting unrelated dirty files.
+    if (git(base, "status", "--porcelain", "--untracked-files=all")) fail(`cannot land ${lane}: base checkout is dirty`);
+    // Catch lane edits made after the receipt was checked.
     const all = removed ? current : captureGateTree(work);
-    if (!all || all.tree !== current!.tree) fail("lane has changes outside its gate receipt paths");
+    if (!all || all.tree !== current!.tree) fail("lane changed after its gate receipt was checked");
     if (!entry.landingCommit) {
       git(work, "add", "--all");
       if (git(work, "diff", "--cached", "--name-only")) git(work, "commit", "-m", `Land ${lane}`);
@@ -175,8 +204,9 @@ export function landCommand(argv: string[]): void {
       if (git(work, "rev-parse", "HEAD^{tree}") !== current!.tree || git(work, "status", "--porcelain", "--untracked-files=all")) fail("commit hooks changed the lane tree; rerun the gate before landing");
       withLedger((ledger) => { ledger[lane]!.landingCommit = entry.landingCommit; });
     }
+    if (git(base, "rev-parse", `${entry.landingCommit}^{tree}`) !== entry.gateReceipt!.tree) fail("landing commit differs from its green receipt");
     const merged = Bun.spawnSync({ cmd: ["git", "-C", base, "merge-base", "--is-ancestor", entry.landingCommit!, "HEAD"] });
-    if (!merged.success) git(base, "merge", "--no-ff", entry.branch, "-m", `Merge ${lane}`);
+    if (!merged.success) git(base, "merge", "--no-ff", entry.landingCommit!, "-m", `Merge ${lane}`);
     const landedCommit = git(base, "rev-parse", "HEAD");
     withLedger((ledger) => { ledger[lane]!.landedCommit = landedCommit; });
     git(base, "push");

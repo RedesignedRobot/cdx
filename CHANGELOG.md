@@ -1,3 +1,13 @@
+## 9.4.0
+
+- Gemini input tokens now include cache reads, matching Codex; existing ledger rows migrate once with per-lane markers that survive older writers. This removes negative uncached input from `cdx usage --totals`.
+- Review rounds use isolated snapshots of the reviewed tree, including uncommitted state. Gate snapshots keep the tree they proved available for receipt checks and crash cleanup. Snapshot capture detects movement during capture, and doctor can find leftover snapshots.
+- A bare `--worktree` name resolves under `~/code/wt`. Landing a green lane with later tree changes reruns its stored gate once; a red result still refuses landing.
+- Visibility counts test runs per round and reports one notice when they exceed the configured threshold, default 3. Round records, status and terminal feed show the count.
+- Spawns, resumes and jobs accept an expected duration. Matching history supplies an estimate when available, otherwise `expectMinutes` defaults to 15. Overruns produce one feed event with elapsed time and last activity.
+- `resume --fix review` distinguishes missing review evidence on the work lane from a changed HEAD and explains that separately named reviews are not attached.
+- Shipped `effortCaps` now set Astra to medium and Sol to high. Config can raise or lower either cap while model ids and effort values remain validated. The routing guide points to the Model routing table in `~/.agents/GLOBAL.md`, and SKILL limits feature work to owner requests.
+
 ## 9.3.0
 
 - `usage` shows the head's Claude seats from `cca status --json` beside the Codex and Gemini lanes, one row per weekly limit (`claude <name>`, `*` marks the live login), plus cca's pick. `--json` carries the cca status under `claude`.

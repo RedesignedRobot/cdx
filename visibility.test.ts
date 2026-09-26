@@ -1,6 +1,8 @@
 import { expect, test } from "bun:test";
-import { digestLines, heartbeatDue, roundProgress, toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
+import { digestLines, heartbeatDue, roundProgress, testCommands, toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { parseArgs, parseConfig, parseFeedEvent, summaryJobs, WAKE_EVENTS } from "./cdx.ts";
+import { expectMinutes, historyMinutes, markOverrun, overrunNotice } from "./duration.ts";
+import { composeGate } from "./gates.ts";
 
 const gemini = (index: number, state: string, parameters = {}, extra = {}) => ({ event: "step_update", step_update: {
   conversation_id: "conversation", step_index: index, step_type: "tool", state, tool_name: "run_command",
@@ -54,6 +56,27 @@ test("unstructured output does not invent a failed command", () => {
   expect(toolObservation(gemini(3, "DONE", { CommandLine: "false" }, { error: { message: "command failed" } }))?.failed).toBe(true);
 });
 
+test("test runs count at start, completion-only runs count once, and the fourth run warns once", () => {
+  const progress = roundProgress("/repo", VISIBILITY_DEFAULTS, "custom-gate");
+  const codex = (id: string, method: string, command?: string, exitCode?: number) => toolObservation({ method,
+    params: { item: { id, type: "commandExecution", command, exitCode } } })!;
+  expect(progress(codex("a", "item/started", "bun test tests/a.test.ts"))).toMatchObject({ testRuns: 1, testSuites: 0, testStatus: "running" });
+  expect(progress(codex("a", "item/completed", undefined, 0))).toMatchObject({ testRuns: 1, testStatus: "passed" });
+  expect(progress(codex("b", "item/completed", "bun run check", 1))).toMatchObject({ testRuns: 2, testSuites: 1, testStatus: "failed" });
+  expect(progress(toolObservation(gemini(3, "DONE", { CommandLine: "custom-gate" }, { exit_code: 0 }))!)).toMatchObject({ testRuns: 3, testSuites: 1 });
+  expect(progress(codex("d", "item/started", "bunx vp test run tests/b.test.ts"))).toMatchObject({ testRuns: 4, testSuites: 1, testThrash: "tests run 4x this round" });
+  expect(progress(codex("d", "item/completed", undefined, 0)).testThrash).toBeUndefined();
+  expect(testCommands("bun test && bunx vp test run x.test.ts && vitest run && wall").map((run) => run.suite)).toEqual([true, false, true, true]);
+  expect(testCommands("/bin/zsh -lc 'cd /repo && bun test a.test.ts'")).toHaveLength(1);
+  expect(testCommands("/bin/zsh -lc 'echo \"bun test\"'")).toHaveLength(0);
+  expect(testCommands("/bin/zsh -lc 'echo \"a;b\"; bun test a.test.ts'")).toHaveLength(1);
+  expect(testCommands("/bin/zsh -lc 'echo one && echo two'", "echo one && echo two")).toHaveLength(1);
+  expect(testCommands("/bin/zsh -lc 'bun run wall'")[0]?.suite).toBe(true);
+  const composed = composeGate('echo "bun test && vitest run"; bun run check', "bunx vp test run tests/gate.test.ts")!;
+  expect(testCommands(composed).map((run) => run.suite)).toEqual([true, false]);
+  expect(testCommands('echo "bun test && vitest run"')).toHaveLength(0);
+});
+
 test("digests combine rows and reset step deltas across rounds", () => {
   const previous = [{ key: "lane=a", round: 1, steps: 50, files: 4, stage: "working", action: "old" }];
   const current = [{ key: "lane=a", round: 1, steps: 55, files: 3, stage: "gate", action: "last 2s check" }, { key: "job=train", stage: "running", action: "land 10/15" }];
@@ -71,8 +94,8 @@ test("digests combine rows and reset step deltas across rounds", () => {
 test("visibility settings reject invalid cadence and thresholds and status flags parse", () => {
   expect(parseConfig("{}").visibility).toEqual(VISIBILITY_DEFAULTS);
   expect(parseConfig('{"visibility":{"heartbeatMinutes":0.5,"failureRepeats":2,"fileEdits":3}}').visibility)
-    .toEqual({ heartbeatMinutes: 0.5, failureRepeats: 2, fileEdits: 3 });
-  for (const visibility of [null, [], { extra: 1 }, { heartbeatMinutes: 0 }, { failureRepeats: 1.5 }, { fileEdits: -1 }]) {
+    .toEqual({ heartbeatMinutes: 0.5, failureRepeats: 2, fileEdits: 3, testRuns: 3 });
+  for (const visibility of [null, [], { extra: 1 }, { heartbeatMinutes: 0 }, { failureRepeats: 1.5 }, { fileEdits: -1 }, { testRuns: 0 }]) {
     expect(() => parseConfig(JSON.stringify({ visibility }))).toThrow();
   }
   const flags = parseArgs(["--brief", "--watch", "--interval", "3"], ["brief", "watch", "interval"]);
@@ -95,4 +118,20 @@ test("session summaries keep every running job and only the ten newest finished 
   expect(selected).toHaveLength(11);
   expect(selected[0]).toBe("running");
   expect(selected.slice(1)).toEqual(["149", "148", "147", "146", "145", "144", "143", "142", "141", "140"]);
+});
+
+test("duration estimates use recent completed history and explicit expectations reject invalid values", () => {
+  const start = "2026-09-11T12:00:00Z";
+  expect(historyMinutes([{ startedAt: start, finishedAt: "2026-09-11T12:12:00Z" },
+    { startedAt: start, finishedAt: "2026-09-11T12:20:00Z" }, { startedAt: start }], 15)).toBe(20);
+  expect(historyMinutes([], 15)).toBe(15);
+  expect(expectMinutes("7.5", 15)).toBe(7.5);
+  expect(() => expectMinutes("0", 15)).toThrow("--expect");
+  expect(overrunNotice(start, 15, Date.parse(start) + 899_999)).toBeUndefined();
+  expect(overrunNotice(start, 15, Date.parse(start) + 900_000, "read file", "/tmp/log", "2026-09-11T12:12:00Z"))
+    .toBe("expected 15m, elapsed 15m; lastActivity=read file lastActivityAt=2026-09-11T12:12:00Z age=3m log=/tmp/log");
+  const round = { overrunSent: false };
+  expect(markOverrun(round, start, 15, Date.parse(start) + 900_000)).toContain("elapsed 15m");
+  expect(markOverrun(round, start, 15, Date.parse(start) + 900_000)).toBeUndefined();
+  expect(markOverrun({ overrunSent: false }, start, 15, Date.parse(start) + 900_000)).toContain("elapsed 15m");
 });

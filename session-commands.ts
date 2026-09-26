@@ -2,9 +2,10 @@
 
 import { config } from "./config.ts";
 import { geminiQuotaState } from "./gemini-usage.ts";
-import { jobRunning, readJobs, renderJobLine, summaryJobs } from "./jobs.ts";
+import { jobRunning, markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts";
+import { markOverrun, overrunNotice } from "./duration.ts";
 import {
-  activeStateOf, callerSession, delivery, type FeedEvent, laneRunning, owned, readEvents, readLedger,
+  activeStateOf, callerSession, delivery, feedEvent, type FeedEvent, laneRunning, owned, readEvents, readLedger,
   readSessions, recipientOf, roundReportOf, scopedEvents, selectEvents, withEvents, withLedger,
 } from "./ledger.ts";
 import { questionFiles, questionOpen } from "./questions.ts";
@@ -52,6 +53,7 @@ export async function eventsCommand(argv: string[]): Promise<void> {
 
   const now = Date.now();
   const visibilityCfg = config.visibility ?? VISIBILITY_DEFAULTS;
+  if (!peek) monitorOverruns(now, session);
 
   withEvents((state) => {
     const current = delivery(state, session);
@@ -98,6 +100,35 @@ export async function eventsCommand(argv: string[]): Promise<void> {
   });
 }
 
+// The head calls events throughout a lane's life. This path still runs while
+// a synchronous gate blocks the runner's own watchdog.
+export function monitorOverruns(now: number, session: string): void {
+  const state = readSessions();
+  const ledger = readLedger();
+  const due = Object.entries(ledger).filter(([name, entry]) => laneRunning(entry) && !entry.overrunSent
+    && owned(entry.ownerSession, name, session, state) && entry.expectMinutes
+    && overrunNotice(entry.roundStartedAt ?? entry.createdAt, entry.expectMinutes, now));
+  if (due.length) {
+    const notices = withLedger((current) => due.flatMap(([name, original]) => {
+      const entry = current[name];
+      if (!entry || !laneRunning(entry) || !entry.expectMinutes || entry.rounds !== original.rounds
+        || (entry.roundStartedAt ?? entry.createdAt) !== (original.roundStartedAt ?? original.createdAt)
+        || !owned(entry.ownerSession, name, session, readSessions())) return [];
+      const notice = markOverrun(entry, entry.roundStartedAt ?? entry.createdAt, entry.expectMinutes, now, entry.lastAction,
+        entry.stage === "gate" ? `${ROOT}/logs/${name}-r${entry.rounds}.gate.log` : `${ROOT}/logs/${name}-r${entry.rounds}.jsonl`,
+        entry.lastActionAt ?? entry.roundStartedAt ?? entry.createdAt);
+      if (!notice) return [];
+      const record = entry.kind === "review" ? entry.review : entry.work;
+      if (record) record.overrunSent = true;
+      return [{ name, round: entry.rounds, owner: entry.ownerSession, notice }];
+    }));
+    for (const item of notices) feedEvent("overrun", `[cdx] lane=${item.name} round=${item.round} overrun ${item.notice}`, item.owner, { lane: item.name, round: item.round });
+  }
+  for (const item of markJobOverruns(now, (job) => owned(job.ownerSession, undefined, session, readSessions()))) {
+    feedEvent("overrun", `[cdx] job=${item.name} overrun ${item.notice}`, item.owner, { job: item.name });
+  }
+}
+
 function sessionProgress(session: string, now: number): ProgressSample[] {
   const detailDeadline = Date.now() + 100;
   const state = readSessions();
@@ -113,7 +144,7 @@ function sessionProgress(session: string, now: number): ProgressSample[] {
     const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
     const gateAge = stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)} ` : "";
     samples.push({ key: `lane=${name}`, round: entry.rounds, steps: entry.roundSteps ?? 0, files: files.get(cwd), stage,
-      action: `${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
+      action: `${entry.roundTestRuns ? `tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"} ` : ""}${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
   }
   for (const [name, job] of Object.entries(readJobs())) {
     if (jobRunning(job) && owned(job.ownerSession, undefined, session, state)) {

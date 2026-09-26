@@ -44,6 +44,7 @@ export const TOOLS: ToolDefinition[] = [
         pre: { type: "string", description: "Setup command to run before starting work" },
         effort: { type: "string", description: "Reasoning effort" },
         maxRuntime: { type: "number", description: "Maximum runtime in minutes" },
+        expect: { type: "number", description: "Expected duration in minutes before an overrun notice" },
         account: { type: "string", description: "Account name" },
         addDirs: { type: "array", items: { type: "string" }, description: "Additional directories" },
         schema: { type: "string", description: "Structured output JSON schema path" },
@@ -62,6 +63,7 @@ export const TOOLS: ToolDefinition[] = [
       if (input.pre) argv.push("--pre", String(input.pre));
       if (input.effort) argv.push("--effort", String(input.effort));
       if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
+      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
       if (input.account) argv.push("--account", String(input.account));
       if (Array.isArray(input.addDirs)) {
         for (const dir of input.addDirs) argv.push("--add-dir", String(dir));
@@ -85,6 +87,7 @@ export const TOOLS: ToolDefinition[] = [
         fix: { type: "string", enum: ["gate", "review"], description: "Evidence being repaired" },
         effort: { type: "string", description: "Reasoning effort" },
         maxRuntime: { type: "number", description: "Maximum runtime in minutes" },
+        expect: { type: "number", description: "Expected duration in minutes before an overrun notice" },
       },
       required: ["lane", "followUp", "fix"],
     },
@@ -92,6 +95,7 @@ export const TOOLS: ToolDefinition[] = [
       const argv = ["resume", String(input.lane), "--fix", String(input.fix)];
       if (input.effort) argv.push("--effort", String(input.effort));
       if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
+      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
       argv.push("--bg", "-");
       return { argv, stdin: String(input.followUp) };
     },
@@ -342,12 +346,14 @@ export const TOOLS: ToolDefinition[] = [
         name: { type: "string", description: "Job name" },
         cmd: { type: "string", description: "Shell command to run" },
         cd: { type: "string", description: "Explicit working directory for the job" },
+        expect: { type: "number", description: "Expected duration in minutes before an overrun notice" },
       },
       required: ["name", "cmd", "cd"],
     },
     run: (input) => {
       const argv = ["job", String(input.name)];
       if (input.cd) argv.push("--cd", String(input.cd));
+      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
       argv.push("-");
       return { argv, stdin: String(input.cmd) };
     },

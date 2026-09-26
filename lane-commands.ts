@@ -30,6 +30,7 @@ import {
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { failActiveRound } from "./round-state.ts";
+import { expectMinutes, historyMinutes } from "./duration.ts";
 import { openRound } from "./rounds.ts";
 import { runRound } from "./runner.ts";
 import {
@@ -60,6 +61,20 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     repositoryRules: projectBytes, configRules: configuredBytes,
     laneRules: Math.max(0, Buffer.byteLength(rules) - projectBytes - configuredBytes) };
   const entry = readLane(spec.lane);
+  const history = Object.entries(readLedger()).filter(([name, lane]) => name !== spec.lane && lane.kind === entry.kind
+    && Boolean(lane.consult) === Boolean(entry.consult)
+    && (entry.kind === "review" || Boolean(lane.supervisor) === Boolean(entry.supervisor)))
+    .map(([, lane]) => entry.kind === "review" ? lane.review : lane.work)
+    .filter((record) => record && record.state !== "running" && record.updatedAt)
+    .map((record) => ({ startedAt: record!.startedAt, finishedAt: record!.updatedAt }));
+  spec.expectMinutes ??= historyMinutes(history, config.expectMinutes ?? 15);
+  withLedger((ledger) => {
+    const current = ledger[spec.lane];
+    if (!current || current.rounds !== spec.round) return;
+    current.expectMinutes = spec.expectMinutes;
+    const record = current.kind === "review" ? current.review : current.work;
+    if (record) record.expectMinutes = spec.expectMinutes;
+  });
   spec.queuedUntil = entry.queuedUntil;
   if (spec.engine === "gpt") {
     const choice = entry.roundAccount;
@@ -115,7 +130,8 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
 }
 
 export async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "model", "supervisor", "pre"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "expect", "model", "supervisor", "pre"]);
+  const expected = parsed.flags.expect === undefined ? undefined : expectMinutes(parsed.flags.expect, config.expectMinutes ?? 15);
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
   const usage = `usage: cdx spawn <lane> [--engine gpt|gemini] [options] "<brief>"\n\n${ENGINE_PICKER}`;
@@ -240,6 +256,7 @@ export async function spawnCommand(argv: string[]) {
     ...(effectiveGate ? { gate: effectiveGate } : {}),
     ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
+    ...(expected !== undefined ? { expectMinutes: expected } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
   }, fullBrief, parsed.bools.has("bg"));
 }
@@ -249,7 +266,8 @@ export async function resumeCommand(argv: string[]) {
   // resume takes that word (gate or review) out before parsing.
   const fixAt = argv.indexOf("--fix");
   const fix = fixAt < 0 ? undefined : argv[fixAt + 1];
-  const parsed = parseArgs(fixAt < 0 ? argv : argv.toSpliced(fixAt, 2), ["effort", "gate", "bg", "max-runtime", "account", "pre", "add-dir"]);
+  const parsed = parseArgs(fixAt < 0 ? argv : argv.toSpliced(fixAt, 2), ["effort", "gate", "bg", "max-runtime", "expect", "account", "pre", "add-dir"]);
+  const expected = parsed.flags.expect === undefined ? undefined : expectMinutes(parsed.flags.expect, config.expectMinutes ?? 15);
   const [lane, followUpArg] = parsed.rest;
   const usage = 'usage: cdx resume <lane> --fix gate|review [--effort <effort>] [--bg] "<fix instructions>"';
   const followUp = await resolveBrief(followUpArg, usage);
@@ -315,6 +333,7 @@ export async function resumeCommand(argv: string[]) {
     ...(effectiveGate ? { gate: effectiveGate } : {}),
     ...(additionalDirectories.length ? { additionalDirectories } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
+    ...(expected !== undefined ? { expectMinutes: expected } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
   }, prompt, parsed.bools.has("bg"));
 }
@@ -336,6 +355,15 @@ export async function consultCommand(argv: string[]) {
   const engine = parsed.flags.engine ?? (parentEntry?.consult ? "gemini" : "gpt");
   const forwardArgv = argv.filter((arg) => arg !== questionArg);
   return reviewCommand(["--engine", engine, ...forwardArgv, "--", question], { consult: true, supervisor: parsed.bools.has("supervisor") });
+}
+
+export function reviewBaseTarget(cwd: string, base: string, run = (cwd: string, ...args: string[]): string => {
+  const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
+  if (!result.success) fail(`cannot resolve review base: ${result.stderr.toString().trim()}`);
+  return result.stdout.toString().trim();
+}): string {
+  const commit = run(cwd, "rev-parse", "--verify", "--end-of-options", `${base}^{commit}`);
+  return `Review git diff ${commit}...HEAD.`;
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
@@ -395,7 +423,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   const roundAccount = { forcedAccount: parsed.flags.account, ...(engine === "gpt" && !preserveAccount ? { account } : existing ? { preserveAccount: true as const } : {}) };
 
   const target = parsed.bools.has("uncommitted") ? "Review git diff HEAD."
-    : parsed.flags.base ? `Review git diff ${parsed.flags.base}...HEAD.`
+    : parsed.flags.base ? reviewBaseTarget(cwd, parsed.flags.base)
     : parsed.flags.commit ? `Review git show ${parsed.flags.commit}.` : intent;
   const reviewTree = !opts.consult ? captureGateTree(cwd) : undefined;
   if (!opts.consult && !reviewTree) fail("review requires a git tree snapshot");

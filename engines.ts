@@ -1,3 +1,4 @@
+import { geminiTokens } from "./tokens.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Codex protocol helpers, Gemini result and retry policy, and recovery prompts.
 
@@ -394,7 +395,7 @@ export async function qualifyGeminiResult({ lane, round, ownerSession, result, f
 
   const errorKind = classifyGeminiError(effectiveError);
   const isTransportError = errorKind === "transport" || errorKind === "503";
-  const previousResultError = readLedger()[lane]?.lastResultError;
+  const previousResultError = result.status !== "SUCCESS" && !isTransportError ? readLedger()[lane]?.lastResultError : undefined;
   const isVerbatimReplay = Boolean(!isTransportError && previousResultError && effectiveError === previousResultError);
 
   let treatedAsReplay = false;
@@ -530,8 +531,8 @@ function canonicalHash(value: unknown): string {
 
 // Engine events remain the source for arguments and output. Only derived measurements
 // go into cdx_tool, once per completed identity, beside those original events.
-export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null) {
-  const progress = roundProgress(cwd, limits);
+export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null, gate?: string) {
+  const progress = roundProgress(cwd, limits, gate);
   const reads = new Map<string, number>();
   const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
   const completed = new Set<string>();
@@ -559,24 +560,23 @@ export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (pat
         startLine: StartLine ?? start_line ?? rest.startLine, endLine: EndLine ?? end_line ?? rest.endLine };
     }
     const id = observation.id;
-    if (id && completed.has(id)) return { steps: count.steps };
+    if (id && completed.has(id)) return { ...count, record: undefined };
     const start = id ? starts.get(id) : undefined;
-    if (!observation.completed && start) return { steps: count.steps };
+    if (!observation.completed && start) return { ...count, record: undefined };
     const path = kind === "read" ? args?.path : undefined;
     const readPaths = start ? Object.keys(start.readFiles) : typeof path === "string" ? [resolve(cwd, path)] : [];
     const readFiles = Object.fromEntries(readPaths.map((path) => [path, fileHash(path)]));
     const sample = { kind, argumentHash: canonicalHash(args), readFiles };
     if (!observation.completed) {
       if (id) starts.set(id, sample);
-      return { steps: count.steps };
+      return { ...count, record: undefined };
     }
     if (id) { completed.add(id); starts.delete(id); }
     const before = start ?? sample;
     const output = step?.tool_info?.output ?? item?.aggregatedOutput ?? item?.aggregated_output ?? item?.result ?? item?.output;
     const summaryBytes = before.kind === "read" && step && typeof output === "string" ? /^\d+ lines?, ([\d,]+) bytes$/.exec(output.trim())?.[1] : undefined;
     const usage = step?.usage;
-    const tokenDelta = usage && [usage.input_tokens, usage.cache_read_tokens, usage.output_tokens].every(isFiniteCount)
-      ? { input: usage.input_tokens, cached: usage.cache_read_tokens, output: usage.output_tokens } : undefined;
+    const tokenDelta = geminiTokens(usage);
     const record = { type: "cdx_tool", id, timestamp, toolKind: before.kind, argumentHash: before.argumentHash,
       ...(Object.keys(before.readFiles).length ? { readFiles: before.readFiles } : {}),
       step: step?.step_index, failed: observation.failed === true,
@@ -603,6 +603,6 @@ export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (pat
     const reason = count.thrash;
     const thrash = !warned ? reason : undefined;
     if (thrash) warned = true;
-    return { steps: count.steps, record, thrash };
+    return { ...count, record, thrash };
   };
 }

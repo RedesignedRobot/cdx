@@ -119,7 +119,7 @@ export function recordUsageHistory(account: string, windows: RateLimitWindow[], 
     if (!lane.roundStartedAt || Date.parse(lane.updatedAt) < Date.parse(checkedAt) - BURN_HORIZON_MS) continue;
     const tokens = lane.roundTokens;
     if (lane.tokensIncomplete || !tokens || ![tokens.input, tokens.output].every(Number.isFinite)) { complete = false; continue; }
-    rounds[`${name}/${lane.roundStartedAt}`] = tokens.input + tokens.output;
+    rounds[`${name}/${lane.roundStartedAt}`] = tokens.input + tokens.output - (roundEngine(lane) === "gemini" ? tokens.cached : 0);
   }
   const merged = mergeUsageHistory(readUsageHistory(), windows.map((w) => ({ ...w, account, checkedAt, ...(complete ? { rounds } : {}) })));
   const tmp = `${USAGE_HISTORY_PATH}.tmp.${process.pid}`;

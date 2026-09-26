@@ -119,7 +119,8 @@ export function outageText(outage: LaneOutage, agyRetries: number | undefined, n
 
 export function laneProgress(entry: Lane, files: number | undefined, now = Date.now()): string {
   const stage = entry.stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)}` : entry.stage ?? "working";
-  return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
+  const tests = entry.roundTestRuns ? ` tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"}` : "";
+  return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`}${tests} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
 }
 
 function renderLaneBlock(lane: string, entry: Lane): string {
@@ -153,7 +154,7 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
     : `finished ${fmtAge(record.updatedAt ?? entry.updatedAt)} ago`;
-  const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}`;
+  const laneDetail = `cwd ${displayPath(workCwdOf(entry))}${entry.branch ? ` · worktree ${entry.branch}` : ""} · created ${fmtCreated(entry.createdAt)} · ${timing}${entry.expectMinutes ? ` · expect ${entry.expectMinutes}m` : ""}`;
   const tokenLabel = active && entry.roundTokens
     ? `${fmtTokens(entry.roundTokens, record.tokensIncomplete)} round / ${fmtTokens(entry.tokens, entry.tokensIncomplete)} total`
     : fmtTokens(entry.tokens, entry.tokensIncomplete);
@@ -195,7 +196,7 @@ export function statusBrief(ledger: Ledger, jobs: Jobs, io: {
   }
   for (const [name, job] of Object.entries(jobs)) {
     if (!jobRunning(job) || !io.ownsJob(job)) continue;
-    lines.push(statusText(`job ${statusText(name, 24)} ${statusAge(job.startedAt, io.now)} ${io.phase(job.log) || "-"}`, 99));
+    lines.push(statusText(`job ${statusText(name, 24)} ${statusAge(job.startedAt, io.now)}${job.expectMinutes ? ` expect ${job.expectMinutes}m` : ""} ${io.phase(job.log) || "-"}`, 99));
   }
   return lines.join("\n");
 }

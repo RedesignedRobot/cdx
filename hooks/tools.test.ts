@@ -47,6 +47,12 @@ describe("tool rules", () => {
 
   });
 
+  test("spawn, resume, and job tools forward expected minutes", () => {
+    expect(TOOLS_BY_NAME.get("spawn")!.run({ lane: "l", cd: "/repo", brief: "b", expect: 12 }).argv).toContain("--expect");
+    expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "l", fix: "gate", followUp: "f", expect: 12 }).argv).toContain("12");
+    expect(TOOLS_BY_NAME.get("job")!.run({ name: "j", cd: "/repo", cmd: "true", expect: 12 }).argv).toContain("12");
+  });
+
   test("no tool argv contains wait", () => {
     const sampleInputs: Record<string, Record<string, unknown>> = {
       land: { lane: "test-lane" },

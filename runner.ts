@@ -1,3 +1,6 @@
+import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
+import { monitorOverruns } from "./session-commands.ts";
+import { geminiTokens } from "./tokens.ts";
 import { installLaneHome, laneCodexHome } from "./account-sync.ts";
 import { defaultCodexHome } from "./accounts.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
@@ -20,7 +23,7 @@ import {
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
+  activeStateOf, callerSession, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
   type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLedger,
 } from "./ledger.ts";
 import { sharedTreeLanes, reviewLoopClosed } from "./prompts.ts";
@@ -152,6 +155,22 @@ export async function runRound(lane: string, round: number): Promise<number> {
 
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
+  const entry = readLedger()[lane];
+  if (entry?.kind !== "review" || entry.consult) return executeRound(lane, round, spec);
+  const snapshot = createReviewSnapshot(spec.cwd, lane, round, spec.reviewTree);
+  try {
+    return await executeRound(lane, round, { ...spec, cwd: snapshot.cwd, reviewDir: snapshot.cwd,
+      prompt: `${spec.prompt}\n\nThe reviewed checkout is ${snapshot.cwd}. Inspect this detached snapshot for all review findings.`,
+    });
+  } finally {
+    try {
+      const persisted = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
+      writeFileSync(specPathOf(lane, round), safeJSON({ ...persisted, cwd: spec.cwd, reviewDir: spec.reviewDir, prompt: spec.prompt }, 2));
+    } finally { removeReviewSnapshot(snapshot.path); }
+  }
+}
+
+async function executeRound(lane: string, round: number, spec: Spec): Promise<number> {
   let startingLane = readLedger()[lane];
   while (startingLane?.queuedUntil) {
     withLedger((ledger) => { ledger[lane]!.pid = process.pid; ledger[lane]!.lastAction = `queued until ${startingLane!.queuedUntil}`; });
@@ -178,6 +197,9 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   withLedger((ledger) => {
     const item = ledger[lane]!;
     item.pid = process.pid;
+    item.expectMinutes ??= spec.expectMinutes ?? config.expectMinutes ?? 15;
+    const record = item.kind === "review" ? item.review! : item.work;
+    record.expectMinutes = item.expectMinutes;
     if (item.kind === "review") item.review!.state = "running";
     else { item.work.state = "running"; }
     if (gemini && hooksInstalled) item.hooksActive = true;
@@ -297,6 +319,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     : undefined;
   const watchdog = setInterval(() => {
     flushLedger();
+    monitorOverruns(Date.now(), callerSession());
     if (gemini && Date.now() - Date.parse(readGeminiUsageSnapshot()?.checkedAt ?? "1970-01-01") > 60_000) void refreshGeminiUsage().catch(() => undefined);
     const quiet = Date.now() - lastEventMs;
     if (quiet >= 300_000 && !lastStallWarn) {
@@ -455,7 +478,7 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
   };
 
   const trackTools = roundTools(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS,
-    (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } });
+    (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } }, spec.gate);
   // Files this round's own tool calls wrote, for the shared-worktree check below.
   const writtenPaths = new Set<string>();
   const commandTrees = new Map<string, ReturnType<typeof captureReviewTree>>();
@@ -472,16 +495,42 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     const root = Bun.spawnSync({ cmd: ["git", "-C", spec.cwd, "rev-parse", "--show-toplevel"] }).stdout.toString().trim();
     return paths.map((path) => relative(root || spec.cwd, path)).filter((path) => path && !path.startsWith("../"));
   };
+  const persistProgress = (progress: NonNullable<ReturnType<typeof trackTools>>, now: string) => {
+    if (progress.record) { log.write(`${safeJSON(progress.record)}\n`); log.flush(); }
+    roundStepCount = progress.steps;
+    touchLedger((item) => {
+      item.roundSteps = progress.steps;
+      item.roundTestRuns = progress.testRuns;
+      item.roundTestSuites = progress.testSuites;
+      item.roundTestStatus = progress.testStatus;
+      const record = item.kind === "review" ? item.review! : item.work;
+      record.testRuns = progress.testRuns;
+      record.testSuites = progress.testSuites;
+      record.testStatus = progress.testStatus;
+      item.lastActionAt = now;
+      item.lastEventAt = now;
+    }, Boolean(progress.testThrash || progress.thrash));
+    if (progress.testThrash || progress.thrash) {
+      const reason = [progress.testThrash, progress.thrash].filter(Boolean).join("; ");
+      const notice = `[cdx] lane=${lane} round=${round} ${reason}; ${thrashAdvice(lane)}`;
+      feedEvent("thrash", notice, spec.ownerSession, { lane, round });
+      notifyParent(lane, notice);
+    }
+  };
+  let gateAttempt = 0;
   let preparedGate: ReturnType<typeof verifyGate> | undefined;
   const runAcceptedGate = async (repair: (prompt: string) => Promise<boolean>) => {
     if (!spec.gate || startingLane?.kind !== "work" || turnFailureReason || receivedSignal || maxRuntimeHit || !existsSync(reportPath)) return;
     const run = () => {
-      const paths = gatePaths();
+      gatePaths();
+      const gateItem = { id: `cdx-gate-${++gateAttempt}`, type: "commandExecution", command: spec.gate };
+      persistProgress(trackTools({ method: "item/started", params: { item: gateItem } }, new Date().toISOString())!, new Date().toISOString());
+      flushLedger();
       withLedger((ledger) => { ledger[lane]!.stage = "gate"; });
       feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
-      const verified = verifyGate(round, spec.cwd, spec.gate!, () => captureGateTree(spec.cwd, paths),
-        () => executeGate(spec.gate!, spec.cwd, `${ROOT}/logs/${lane}-r${round}.gate.log`));
-      verified.receipt.paths = paths;
+      const verified = runFrozenGate(round, spec.cwd, spec.gate!, `${ROOT}/logs/${lane}-r${round}.gate.log`, lane);
+      persistProgress(trackTools({ method: "item/completed", params: { item: { ...gateItem, exitCode: verified.gate.exitCode } } }, new Date().toISOString())!, new Date().toISOString());
+      flushLedger();
       return verified;
     };
     preparedGate = await repairGateOnce(() => (preparedGate = run()), async (prompt) => {
@@ -523,19 +572,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
     }
     if (writtenPaths.size) touchLedger((item) => { item.touchedPaths = [...new Set([...(startingLane?.touchedPaths ?? []), ...writtenPaths])]; });
     const progress = trackTools(event, now)!;
-    if (progress.record) { log.write(`${safeJSON(progress.record)}\n`); log.flush(); }
-    roundStepCount = progress.steps;
-    touchLedger((item) => {
-      item.roundSteps = progress.steps;
-      item.lastActionAt = now;
-      item.lastEventAt = now;
-      if (event.params?.item ?? event.item) item.lastAction = excerpt(event.params?.item ?? event.item);
-    }, Boolean(progress.thrash));
-    if (progress.thrash) {
-      const notice = `[cdx] lane=${lane} round=${round} ${progress.thrash}; ${thrashAdvice(lane)}`;
-      feedEvent("thrash", notice, spec.ownerSession, { lane, round });
-      notifyParent(lane, notice);
-    }
+    persistProgress(progress, now);
+    if (event.params?.item ?? event.item) touchLedger((item) => { item.lastAction = excerpt(event.params?.item ?? event.item); });
   };
   const handleGeminiEvent = async (event: any) => {
     noteActivity();
@@ -552,7 +590,8 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
       const update = event.step_update;
       const stepUsage = update.usage;
       if (stepUsage && typeof stepUsage === "object") {
-        if (![stepUsage.input_tokens, stepUsage.cache_read_tokens, stepUsage.output_tokens].every(isFiniteCount)) {
+        const delta = geminiTokens(stepUsage);
+        if (!delta) {
           touchLedger((item) => {
             item.tokensIncomplete = true;
             if (item.kind === "review") {
@@ -563,11 +602,6 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
             item.lastEventAt = now;
           }, true);
         } else {
-          const delta: Tokens = {
-            input: stepUsage.input_tokens,
-            cached: stepUsage.cache_read_tokens,
-            output: stepUsage.output_tokens,
-          };
           if (delta.input || delta.cached || delta.output) {
             touchLedger((item) => {
               const cumulative = (item.tokens ??= { input: 0, cached: 0, output: 0 });
@@ -1394,7 +1428,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   const geminiStanding = gemini ? readGeminiUsageSnapshot() : undefined;
   const standingToken = geminiStanding ? ` gemini=${geminiStanding.weekly.remainingPercent}% weekly left/${geminiStanding.fiveHour.remainingPercent}% five-hour left` : "";
   if (!entry.quotaFailure && !fallbackRound) feedEvent("terminal", `[cdx] lane=${lane} round=${round} kind=${entry.kind} state=${finalRoundState} exit=${exitCode}${diffToken}${finalRoundNote ? ` note=${finalRoundNote}` : ""} tokens=${fmtTokens(entry.roundTokens ?? entry.tokens, roundIncomplete)}${standingToken} report=${capturedReport ?? "-"} log=${logPath} gateExit=${gateExit ?? "not-run"} gateLog=${gateExit === undefined ? "-" : `${ROOT}/logs/${lane}-r${round}.gate.log`} verdict=${JSON.stringify(completionVerdict(finalRoundState, finalRoundNote))}`, entry.ownerSession, { lane, round });
-  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${capturedReport ?? "-"}`);
+  console.log(`lane=${color.magenta(lane)} session=${entry.sessionId ?? "?"} round=${round} kind=${entry.kind} state=${coloredState(finalRoundState)} exit=${exitCode} tests=${entry.roundTestRuns ?? 0} suites=${entry.roundTestSuites ?? 0} tokens=${fmtTokens(entry.tokens, entry.tokensIncomplete)} report=${capturedReport ?? "-"}`);
   if (finalRoundNote) console.log(`note: ${finalRoundNote}`);
   if (reportOk) {
     console.log("--- report ---");

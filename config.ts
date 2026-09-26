@@ -11,9 +11,8 @@ import { isAbsolute, resolve } from "node:path";
 // native sub-agents; cdx lanes disable those, so ultra is not accepted.
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-// Owner rulings: Astra runs at high at most (2026-09-22). Sol gets the same
-// ceiling until a ruling raises it; config may lower a cap, never raise one.
-const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "high", "gpt-6-sol": "high" };
+// Shipped ceilings. Configured caps may raise or lower either model's ceiling.
+const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6-sol": "high" };
 
 // GPT-6 split (owner ruling 2026-09-23): Sol executes work lanes, Astra thinks.
 // Astra runs head-launched consults, reviews and supervisors; children never.
@@ -38,7 +37,7 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "thinkerModel", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
+  const allowed = new Set(["model", "thinkerModel", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -49,6 +48,7 @@ export function parseConfig(text: string): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
+    expectMinutes: 15,
     gemini: geminiConfig(),
   };
 
@@ -120,11 +120,6 @@ export function parseConfig(text: string): Config {
       if (typeof cap !== "string" || !EFFORT_ORDER.includes(cap)) {
         configError(`effortCaps.${modelId} must be one of ${EFFORT_ORDER.join(", ")}`);
       }
-      // A built-in cap is an owner ruling; config may lower it, never raise it.
-      const builtIn = DEFAULT_EFFORT_CAPS[modelId];
-      if (builtIn && EFFORT_ORDER.indexOf(cap) > EFFORT_ORDER.indexOf(builtIn)) {
-        configError(`effortCaps.${modelId} cannot exceed the built-in cap ${builtIn}`);
-      }
       effortCaps[modelId] = cap;
     }
   }
@@ -185,6 +180,15 @@ export function parseConfig(text: string): Config {
     }
   }
 
+  let expectMinutes = defaults.expectMinutes;
+  if (Object.hasOwn(input, "expectMinutes")) {
+    const value = input.expectMinutes;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+      configError("expectMinutes must be a positive number of minutes");
+    }
+    expectMinutes = value;
+  }
+
   const limits = { model_auto_compact_token_limit: 150_000, tool_output_token_limit: 6_000 };
   for (const key of Object.keys(limits) as Array<keyof typeof limits>) {
     if (!Object.hasOwn(input, key)) continue;
@@ -192,7 +196,7 @@ export function parseConfig(text: string): Config {
     limits[key] = Number(input[key]);
   }
   return {
-    ...limits, visibility,
+    ...limits, visibility, expectMinutes,
     model, thinkerModel, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };
@@ -206,6 +210,7 @@ function readConfig(skipFile = false): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
+    expectMinutes: 15,
     gemini: geminiConfig(),
   };
   if (skipFile || !existsSync(CONFIG_PATH)) return defaults;
@@ -339,7 +344,7 @@ export function resolveEffort(engine: Engine, model: string | undefined, explici
 // explicit --effort above the cap is refused. Any other source above it (the
 // config default, a lane recorded before the cap, a gemini review round that
 // stored "high" on a gpt lane) clamps to the cap with a note, so nothing runs
-// Astra above high by accident and nothing blocks a resume over bookkeeping.
+// above its configured cap by accident, while preserving resumability.
 // Every caller must send the returned effort to Codex; a session's stored
 // effort is never trusted.
 export function cappedEffort(model: string | undefined, effort: Effort, explicit = true, cfg?: { model?: string; models?: Record<string, string>; effortCaps?: Record<string, string>; efforts?: string[] }): Effort {

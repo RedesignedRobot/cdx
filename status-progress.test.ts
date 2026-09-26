@@ -18,6 +18,8 @@ test("progress retains stage age and action age separately and skips unavailable
     .toBe("12 steps 3 files gate running 2m last 5s read src/main.ts");
   expect(laneProgress(lane({ stage: "reporting", lastActionAt: undefined, lastEventAt: "2026-09-11T12:09:50Z" }), undefined, now))
     .toBe("12 steps reporting last 10s read src/main.ts");
+  expect(laneProgress(lane({ roundTestRuns: 4, roundTestSuites: 1, roundTestStatus: "failed" }), 3, now))
+    .toContain("tests=4 suites=1 failed working");
 });
 
 test("job phase uses the last nonempty line and removes terminal control characters", () => {

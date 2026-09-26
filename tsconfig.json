@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["cdx.ts", "tui.test.ts", "cdx.test.ts", "gates.test.ts", "persistence.test.ts", "read-reuse.test.ts", "account-sync.ts", "guard.ts", "hooks/*.test.ts"]
+  "include": ["cdx.ts", "test-state.ts", "tui.test.ts", "tokens.test.ts", "effort-caps.test.ts", "visibility.test.ts", "status-progress.test.ts", "cdx.test.ts", "gates.test.ts", "persistence.test.ts", "read-reuse.test.ts", "account-sync.ts", "guard.ts", "hooks/*.test.ts"]
 }

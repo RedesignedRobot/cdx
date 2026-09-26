@@ -491,19 +491,7 @@ test("cappedEffort resolves model aliases and clamps Astra to the configured cap
   // Uncapped model returns requested effort
   expect(cappedEffort("gpt-5-codex", "high", true, cfg)).toBe("high");
 
-  // The built-in Astra cap is high: high passes, xhigh fails or clamps
-  const builtIn = parseConfig("{}");
-  expect(cappedEffort("gpt-6-astra", "high", true, builtIn)).toBe("high");
-  expect(cappedEffort("gpt-6-astra", "xhigh", false, builtIn)).toBe("high");
-  expect(() => cappedEffort("gpt-6-astra", "xhigh", true, builtIn)).toThrow("exceeds the cap for gpt-6-astra (max high)");
-  expect(() => parseConfig('{"effortCaps":{"gpt-6-astra":"xhigh"}}')).toThrow("cannot exceed the built-in cap high");
-  expect(parseConfig('{"effortCaps":{"gpt-6-astra":"medium"}}').effortCaps["gpt-6-astra"]).toBe("medium");
 
-  // Sol carries the same built-in ceiling; max and ultra sit above it
-  expect(cappedEffort("sol", "high", true, builtIn)).toBe("high");
-  expect(cappedEffort("gpt-6-sol", "max", false, builtIn)).toBe("high");
-  expect(() => cappedEffort("gpt-6-sol", "xhigh", true, builtIn)).toThrow("exceeds the cap for gpt-6-sol (max high)");
-  expect(() => parseConfig('{"effortCaps":{"gpt-6-sol":"max"}}')).toThrow("cannot exceed the built-in cap high");
 });
 
 test("9.0.0: the GPT-6 split defaults work to Sol and head-launched thinking to Astra", () => {
@@ -1239,7 +1227,7 @@ test("the brief drops finished jobs older than the age window and keeps running 
 });
 
 test("unchanged rereads are measured once per step and never alert", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => "first");
+  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => "first");
   const event = (id: number, state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: id, step_type: "tool", state, tool_name: "view_file",
     tool_info: { parameters: { AbsolutePath: "/repo/file.ts" }, output: "2 lines, 77 bytes" },
@@ -1255,7 +1243,7 @@ test("unchanged rereads are measured once per step and never alert", () => {
 });
 
 test("tool measurements retain bytes and tokens without inventing tool tree hashes", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => null);
+  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
   const event = (state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: 1, step_type: "tool", state, tool_name: "write_to_file",
     usage: { input_tokens: 5, cache_read_tokens: 2, output_tokens: 3 },
@@ -1263,11 +1251,11 @@ test("tool measurements retain bytes and tokens without inventing tool tree hash
   } });
   track(event("ACTIVE"), "start");
   const record = track(event("DONE"), "end")!.record!;
-  expect(record).toMatchObject({ toolKind: "edit", outputBytes: 2, treeBefore: null, treeAfter: null, tokenDelta: { input: 5, cached: 2, output: 3 } });
+  expect(record).toMatchObject({ toolKind: "edit", outputBytes: 2, treeBefore: null, treeAfter: null, tokenDelta: { input: 7, cached: 2, output: 3 } });
   const line = JSON.stringify(record);
   const end = JSON.stringify({ type: "cdx_round_end", gateReceiptId: "lane:r1" });
   expect(toolLogRecords([JSON.stringify(event("DONE")), line, "broken", end].join("\n"))).toEqual([line, end]);
-  const gpt = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20 }, () => null);
+  const gpt = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
   const item = { id: "gpt", type: "commandExecution", command: "check", cwd: "/repo" };
   gpt({ method: "item/started", params: { item } }, "start");
   const measured = gpt({ method: "item/completed", params: { item: { ...item, aggregatedOutput: "ok" } } }, "end")!.record!;
@@ -1360,6 +1348,9 @@ test("resume requires failed evidence at the same HEAD and reviews close after P
   expect(resumeRefusal("gate", entry, "other")).toContain("HEAD changed");
   expect(resumeRefusal("gate", { ...entry, gateReceipt: { head: "head", exitCode: 0, valid: true } }, "head")).toContain("no failed gate");
   expect(resumeRefusal("review", entry, "head")).toBeUndefined();
+  const missingReview = resumeRefusal("review", { ...entry, review: undefined, reviewTree: undefined }, "head");
+  expect(missingReview).toContain("work lane");
+  expect(missingReview).not.toContain("HEAD changed");
   expect(reviewLoopClosed([{ severity: "P3" }])).toBe(true);
   expect(reviewLoopClosed([{ severity: "P2" }, { severity: "P3" }])).toBe(false);
   expect(reviewLoopClosed(undefined)).toBe(false);

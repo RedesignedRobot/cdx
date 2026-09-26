@@ -1,4 +1,6 @@
 import { captureGateTree } from "./gates.ts";
+import { config } from "./config.ts";
+import { expectMinutes, historyMinutes, markOverrun, overrunNotice } from "./duration.ts";
 import { safeText } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 // Detached shell jobs and their lifecycle.
@@ -40,6 +42,8 @@ export interface Job {
   cwd?: string;
   exitCode?: number;
   finishedAt?: string;
+  expectMinutes?: number;
+  overrunSent?: boolean;
   log: string;
   note?: string;
   ownerSession?: string;
@@ -69,6 +73,20 @@ export function jobRunning(job: Job): boolean {
   return job.state === "running";
 }
 
+export function markJobOverruns(now: number, belongs: (job: Job, name: string) => boolean): { name: string; owner?: string; notice: string }[] {
+  const due = Object.entries(readJobs()).filter(([name, job]) => jobRunning(job) && belongs(job, name) && !job.overrunSent && job.expectMinutes
+    && overrunNotice(job.startedAt, job.expectMinutes, now)).map(([name, job]) => [name, job.startedAt] as const);
+  if (!due.length) return [];
+  return withJobs((jobs) => Object.entries(jobs).flatMap(([name, job]) => {
+    if (!due.some(([dueName, startedAt]) => dueName === name && startedAt === job.startedAt)
+      || !jobRunning(job) || !belongs(job, name) || !job.expectMinutes) return [];
+    const activityAt = existsSync(job.log) ? statSync(job.log).mtime.toISOString() : job.startedAt;
+    const notice = markOverrun(job, job.startedAt, job.expectMinutes, now, jobPhase(job.log), job.log, activityAt);
+    if (!notice) return [];
+    return [{ name, owner: job.ownerSession, notice }];
+  }));
+}
+
 export function jobDuration(job: Job): string {
   const end = job.finishedAt ? Date.parse(job.finishedAt) : Date.now();
   const seconds = Math.max(0, Math.round((end - Date.parse(job.startedAt)) / 1000));
@@ -80,7 +98,7 @@ export function renderJobLine(name: string, job: Job): string {
   const exit = job.exitCode === undefined ? "" : ` exit=${job.exitCode}`;
   const note = job.note ? ` note=${job.note}` : "";
   const phase = jobRunning(job) ? jobPhase(job.log) : "";
-  return `job=${color.magenta(name)} state=${coloredState(state)}${exit} ${jobDuration(job)}${phase ? ` phase=${phase}` : ""} log=${job.log}${note}`;
+  return `job=${color.magenta(name)} state=${coloredState(state)}${exit} ${jobDuration(job)}${job.expectMinutes ? ` expect=${job.expectMinutes}m` : ""}${phase ? ` phase=${phase}` : ""} log=${job.log}${note}`;
 }
 
 // A running job whose runner died never finalized itself; record that here so
@@ -118,7 +136,7 @@ function listJobs(): void {
 }
 
 export async function jobCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["cd"]);
+  const parsed = parseArgs(argv, ["cd", "expect"]);
   const [name, ...rest] = parsed.rest;
   if (!name) { listJobs(); return; }
   if (!JOB_NAME.test(name)) fail(`job name "${name}" must match ${JOB_NAME.source}`);
@@ -133,6 +151,9 @@ export async function jobCommand(argv: string[]) {
   const log = `${ROOT}/logs/job-${name}.log`;
   const startedAt = new Date().toISOString();
   const ownerSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const previous = readJobs()[name];
+  const expected = expectMinutes(parsed.flags.expect, historyMinutes(previous && !jobRunning(previous)
+    ? [{ startedAt: previous.startedAt, finishedAt: previous.finishedAt }] : [], config.expectMinutes ?? 15));
   // Reserve the name under the lock with this process's pid, as openRound
   // does for lanes: two concurrent launches cannot both pass the running
   // check, and a concurrent wait never sees a running job without a pid.
@@ -142,7 +163,7 @@ export async function jobCommand(argv: string[]) {
     if (existing && jobRunning(existing) && pidAlive(existing.pid)) {
       throw new CmdError(`job "${name}" is still running (pid ${existing.pid}); cdx kill ${name} first or pick another name`);
     }
-    jobs[name] = { cmd, cwd, log, startedAt, state: "running", pid: process.pid, ...(ownerSession ? { ownerSession } : {}) };
+    jobs[name] = { cmd, cwd, log, startedAt, expectMinutes: expected, state: "running", pid: process.pid, ...(ownerSession ? { ownerSession } : {}) };
   });
   writeFileSync(log, safeText(`# cdx job ${name}\n# cwd ${cwd}\n# cmd ${cmd}\n# started ${startedAt}\n`));
   const runnerLog = openSync(`${ROOT}/logs/job-${name}.runner.log`, "a");
@@ -172,6 +193,12 @@ export async function runJob(name: string): Promise<number> {
   for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
   withJobs((jobs) => { jobs[name]!.treeStart = jobTree(cwd); });
   const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
+  const timer = job.expectMinutes ? setTimeout(() => {
+    for (const item of markJobOverruns(Date.now(), (entry, candidate) => candidate === name
+      && entry.startedAt === job.startedAt && entry.ownerSession === job.ownerSession)) {
+      feedEvent("overrun", `[cdx] job=${item.name} overrun ${item.notice}`, item.owner, { job: item.name });
+    }
+  }, Math.max(0, Date.parse(job.startedAt) + job.expectMinutes * 60_000 - Date.now())) : undefined;
   let signal: string | undefined;
   const forward = (sig: NodeJS.Signals) => {
     signal = sig;
@@ -187,6 +214,7 @@ export async function runJob(name: string): Promise<number> {
     for await (const text of safeLines(stream)) appendFileSync(job.log, text);
   };
   const [exitCode] = await Promise.all([exited, drain(child.stdout!), drain(child.stderr!)]);
+  if (timer) clearTimeout(timer);
   const state: JobState = exitCode === 0 ? "done" : "failed";
   const note = signal ? `terminated by ${signal}` : undefined;
   const finished = withJobs((jobs) => {

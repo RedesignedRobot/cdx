@@ -18,6 +18,7 @@ import {
   uncoloredChildEnv, VERSION,
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
+import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
 import {
   existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync,
   writeFileSync, renameSync,
@@ -689,6 +690,15 @@ export async function doctorCommand(argv: string[]) {
 
   if (parsed.bools.has("fix")) withLedger(() => {});
   good(`ledger: ${LEDGER} (${Object.keys(readLedger()).length} lanes)`);
+  const staleSnapshots = staleReviewSnapshots(pidAlive);
+  for (const path of staleSnapshots) {
+    warn(`snapshot: stale ${displayPath(path)}`);
+    if (parsed.bools.has("fix")) {
+      removeReviewSnapshot(path);
+      good(`fixed: removed ${displayPath(path)}`);
+    }
+  }
+  if (staleSnapshots.length && !parsed.bools.has("fix")) warn("run `cdx doctor --fix` to remove stale review snapshots");
   if (existsSync(`${ROOT}/.lock`)) warn("warning: ledger lock present (breaks automatically after 30s if stale)");
   const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {
