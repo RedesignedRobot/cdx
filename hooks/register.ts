@@ -320,7 +320,7 @@ export function register(on: On) {
       : e.tool;
     const def = TOOLS_BY_NAME.get(toolName);
     if (!def) {
-      return { result: `unknown tool ${e.tool}` };
+      return { isError: true, result: `unknown tool ${e.tool}` };
     }
     const toolInput = (e as { input?: Record<string, unknown> }).input ?? (e as Record<string, unknown>);
     let runSpec;

@@ -24,7 +24,15 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix. A merge gate longer than ten minutes needs `cdx land` from a terminal.",
     inputSchema: { type: "object", properties: { lane: { type: "string" }, lanes: { type: "array", items: { type: "string" }, description: "Land several lanes with one gate" } } },
-    run: (input) => ({ argv: Array.isArray(input.lanes) ? ["land", "--batch", ...input.lanes.map(String)] : ["land", String(input.lane)], timeoutMs: MAX_PROCESS_TIMEOUT_MS }),
+    run: (input) => {
+      if (Array.isArray(input.lanes) && input.lanes.length) {
+        if (input.lane !== undefined) throw new Error("land takes lane or lanes, not both");
+        if (!input.lanes.every(isName)) throw new Error("invalid lanes: every item must be a lane name");
+        return { argv: ["land", "--batch", ...input.lanes], timeoutMs: MAX_PROCESS_TIMEOUT_MS };
+      }
+      if (!isName(input.lane)) throw new Error("missing required field: lane or lanes");
+      return { argv: ["land", input.lane], timeoutMs: MAX_PROCESS_TIMEOUT_MS };
+    },
   },
   {
     name: "ask", description: "Ask Gemini a synchronous read-only code question without creating a lane. Returns file and line evidence within 90 seconds.",
@@ -74,8 +82,8 @@ export const TOOLS: ToolDefinition[] = [
       if (input.gate) argv.push("--gate", String(input.gate));
       if (input.pre) argv.push("--pre", String(input.pre));
       if (input.effort) argv.push("--effort", String(input.effort));
-      if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
-      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
+      if (input.maxRuntime != null) argv.push("--max-runtime", String(input.maxRuntime));
+      if (input.expect != null) argv.push("--expect", String(input.expect));
       if (input.account) argv.push("--account", String(input.account));
       if (Array.isArray(input.addDirs)) {
         for (const dir of input.addDirs) argv.push("--add-dir", String(dir));
@@ -110,8 +118,8 @@ export const TOOLS: ToolDefinition[] = [
     run: (input) => {
       const argv = ["resume", String(input.lane), "--fix", String(input.fix)];
       if (input.effort) argv.push("--effort", String(input.effort));
-      if (input.maxRuntime !== undefined) argv.push("--max-runtime", String(input.maxRuntime));
-      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
+      if (input.maxRuntime != null) argv.push("--max-runtime", String(input.maxRuntime));
+      if (input.expect != null) argv.push("--expect", String(input.expect));
       argv.push("--bg", "-");
       return { argv, stdin: String(input.followUp) };
     },
@@ -358,13 +366,9 @@ export const TOOLS: ToolDefinition[] = [
       required: ["lane"],
     },
     run: (input) => {
-      const argv = ["gate", String(input.lane)];
-      if (input.clear) {
-        argv.push("--clear");
-      } else if (input.cmd) {
-        argv.push(String(input.cmd));
-      }
-      return { argv };
+      if (input.clear) return { argv: ["gate", String(input.lane), "--clear"] };
+      if (!isName(input.cmd)) throw new Error("gate needs cmd or clear");
+      return { argv: ["gate", String(input.lane), input.cmd] };
     },
   },
   {
@@ -389,7 +393,7 @@ export const TOOLS: ToolDefinition[] = [
     run: (input) => {
       const argv = ["job", String(input.name)];
       if (input.cd) argv.push("--cd", String(input.cd));
-      if (input.expect !== undefined) argv.push("--expect", String(input.expect));
+      if (input.expect != null) argv.push("--expect", String(input.expect));
       argv.push("-");
       return { argv, stdin: String(input.cmd) };
     },
@@ -461,11 +465,16 @@ export const TOOLS: ToolDefinition[] = [
 export const TOOL_NAMES = TOOLS.map((t) => t.name);
 export const CDX_TOOL_PREFIX = "mcp__cdx__";
 
+// A model that drops a field can still send the text "undefined".
+function isName(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "" && value !== "undefined";
+}
+
 // Validate before any argv or stdin conversion, including direct table callers.
 export function requiredInput(schema: Record<string, unknown>, input: Record<string, unknown>): void {
   for (const field of (schema.required as string[] ?? [])) {
     const value = input[field];
-    if (typeof value !== "string" || !value.trim() || value === "undefined") throw new Error(`missing required field: ${field}`);
+    if (!isName(value)) throw new Error(`missing required field: ${field}`);
     const property = (schema.properties as Record<string, { enum?: string[] }> | undefined)?.[field];
     if (property?.enum && !property.enum.includes(value)) throw new Error(`invalid ${field}: expected ${property.enum.join(" or ")}`);
   }

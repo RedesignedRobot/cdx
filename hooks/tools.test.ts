@@ -193,6 +193,16 @@ test("native admission refuses missing fields before argv conversion and reports
   expect(TOOLS_BY_NAME.get("land")!.run({ lane: "fix" }).argv).toEqual(["land", "fix"]);
 });
 
+test("land and gate refuse the input shapes that used to reach cdx as the text undefined", () => {
+  const land = TOOLS_BY_NAME.get("land")!;
+  for (const input of [{}, { lanes: [] }, { lane: "undefined" }]) expect(() => land.run(input)).toThrow("missing required field: lane or lanes");
+  expect(() => land.run({ lanes: ["a", undefined] })).toThrow("invalid lanes");
+  expect(() => land.run({ lane: "a", lanes: ["b"] })).toThrow("not both");
+  expect(land.run({ lanes: ["a", "b"] }).argv).toEqual(["land", "--batch", "a", "b"]);
+  expect(() => TOOLS_BY_NAME.get("gate")!.run({ lane: "a" })).toThrow("gate needs cmd or clear");
+  expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "a", fix: "gate", followUp: "f", maxRuntime: null }).argv).not.toContain("null");
+});
+
 test("spawn renders structured brief fields as the sections cdx checks", () => {
   const result = TOOLS_BY_NAME.get("spawn")!.run({
     lane: "l", cd: "/repo", brief: "Context.", outcome: "Totals print", files: ["status.ts", "outcomes.ts"],
