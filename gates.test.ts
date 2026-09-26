@@ -165,6 +165,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 
 import { attestReview, reviewRefusal } from "./gates.ts";
 import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { reusedLaneProof } from "./rounds.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
 import { briefContractRefusal } from "./brief-contract.ts";
 
@@ -235,6 +236,16 @@ test("a migrated 9.x lane with an open review cannot land until a review attests
   expect(landRefusal(lane)).toContain("9.x review has unresolved P1/P2");
   expect(landRefusal({ ...lane, reviewClosed: true })).toBeUndefined();
   expect(landRefusal({ ...lane, reviewAttestations: [{ tree: "t", head: "h", reviewer: "a", closed: true, at: "" }] })).toBeUndefined();
+});
+
+test("a spawn under a closed lane's name drops the old landing and review proof; other rounds keep it", () => {
+  const attestation = { tree: "t", head: "h", reviewer: "r", closed: false, at: "" };
+  const closed = { work: { state: "closed" }, reviewAttestations: [attestation], landedCommit: "c", reviewClosed: false } as Lane;
+  expect(reusedLaneProof("work", true, closed)).toEqual({ reviewAttestations: undefined, reviewClosed: undefined, landedCommit: undefined });
+  expect(reusedLaneProof("work", false, closed)).toEqual({ reviewAttestations: [attestation], reviewClosed: false, landedCommit: "c" });
+  const done = { ...closed, work: { state: "done" } } as Lane;
+  expect(reusedLaneProof("work", true, done).reviewAttestations).toEqual([attestation]);
+  expect(reusedLaneProof("review", false, done)).toEqual({ reviewAttestations: [attestation], reviewClosed: undefined, landedCommit: "c" });
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {
