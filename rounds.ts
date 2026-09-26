@@ -68,7 +68,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; spawn a fresh lane`);
       if (opts?.reviewTree) {
         const duplicate = reviewerForTree(ledger, opts.reviewTree);
-        if (duplicate) throw new CmdError(`SHA ${opts.reviewTree.tree} already has reviewer ${duplicate}; reuse its report`);
+        if (duplicate) throw new CmdError(`SHA ${opts.reviewTree.tree}${opts.reviewTree.target ? ` (${opts.reviewTree.target})` : ""} already has reviewer ${duplicate}; reuse its report`);
       }
       const rounds = (existing?.rounds ?? 0) + 1;
       const existingWorkRounds = existing?.workRounds ?? existing?.rounds ?? 0;

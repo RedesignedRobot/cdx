@@ -178,7 +178,7 @@ export function reviewLoopClosed(findings: unknown): boolean {
 }
 
 export function reviewerForTree(ledger: Ledger, tree: import("./ledger.ts").GateTree): string | undefined {
-  return Object.entries(ledger).find(([, item]) => item.reviewTree?.tree === tree.tree && item.reviewTree.head === tree.head)?.[0];
+  return Object.entries(ledger).find(([, item]) => item.reviewTree?.tree === tree.tree && item.reviewTree.head === tree.head && item.reviewTree.target === tree.target)?.[0];
 }
 
 export function fixReviewPrompt(previous: import("./ledger.ts").GateTree, current: import("./ledger.ts").GateTree, report: string): string {

@@ -362,13 +362,24 @@ export async function consultCommand(argv: string[]) {
   return reviewCommand(["--engine", engine, ...forwardArgv, "--", question], { consult: true, supervisor: parsed.bools.has("supervisor") });
 }
 
-export function reviewBaseTarget(cwd: string, base: string, run = (cwd: string, ...args: string[]): string => {
+function gitOutput(cwd: string, ...args: string[]): string {
   const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
-  if (!result.success) fail(`cannot resolve review base: ${result.stderr.toString().trim()}`);
+  if (!result.success) fail(`cannot resolve review target: ${result.stderr.toString().trim()}`);
   return result.stdout.toString().trim();
-}): string {
+}
+
+export function reviewBaseTarget(cwd: string, base: string, run = gitOutput): string {
   const commit = run(cwd, "rev-parse", "--verify", "--end-of-options", `${base}^{commit}`);
   return `Review git diff ${commit}...HEAD.`;
+}
+
+// Reviews dedupe on the checkout's tree plus this key, so two commits or two
+// bases reviewed from one checkout are two reviews.
+export function reviewTargetKey(cwd: string, flags: { base?: string; commit?: string }, run = gitOutput): string | undefined {
+  const resolve = (ref: string) => run(cwd, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`);
+  if (flags.base !== undefined) return `base ${resolve(flags.base)}`;
+  if (flags.commit !== undefined) return `commit ${resolve(flags.commit)}`;
+  return undefined;
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
@@ -432,8 +443,10 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   const target = parsed.bools.has("uncommitted") ? "Review git diff HEAD."
     : parsed.flags.base ? reviewBaseTarget(cwd, parsed.flags.base)
     : parsed.flags.commit ? `Review git show ${parsed.flags.commit}.` : intent;
-  const reviewTree = !opts.consult ? captureGateTree(cwd) : undefined;
-  if (!opts.consult && !reviewTree) fail("review requires a git tree snapshot");
+  const snapshotTree = !opts.consult ? captureGateTree(cwd) : undefined;
+  if (!opts.consult && !snapshotTree) fail("review requires a git tree snapshot");
+  const reviewTarget = snapshotTree && reviewTargetKey(cwd, parsed.flags);
+  const reviewTree = snapshotTree && { ...snapshotTree, ...(reviewTarget ? { target: reviewTarget } : {}) };
   const previous = existing?.reviewTree;
   let prior = "";
   if (!opts.consult && existing?.review?.report && existsSync(existing.review.report)) prior = readFileSync(existing.review.report, "utf8");
@@ -456,9 +469,9 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
 
 // An open review's next round checks the fix diff against its findings. A
 // closed review left nothing to check, so a changed tree gets a fresh review
-// and the same tree reuses the report.
+// and the same tree reuses the report. A new target starts fresh.
 export function reviewFollowUp(prior: string, closed: boolean | undefined, previous: GateTree | undefined, current: GateTree | undefined): string {
-  if (!prior || !previous || !current) return "";
+  if (!prior || !previous || !current || previous.target !== current.target) return "";
   if (!closed) return fixReviewPrompt(previous, current, prior);
   if (previous.tree === current.tree) fail("the previous review found no P1/P2 findings on this tree; reuse its report");
   return "";

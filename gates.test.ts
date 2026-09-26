@@ -27,11 +27,12 @@ for (const [kind, diagnostic] of Object.entries(diagnostics) as Array<[GateFailu
 import { gateTreeFromGit, makeGateReceipt, repairGateOnce, failureDigest } from "./gates.ts";
 import { resolveWorktreeTarget } from "./worktrees.ts";
 import { linkIgnoredEntries, materializeGitTree, runFrozenGate, staleReviewSnapshots, SNAPSHOT_ROOT } from "./snapshots.ts";
-import type { GateTree, Lane } from "./ledger.ts";
+import type { GateTree, Lane, Ledger } from "./ledger.ts";
 import { join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { reviewBaseTarget } from "./lane-commands.ts";
+import { reviewBaseTarget, reviewTargetKey } from "./lane-commands.ts";
+import { reviewerForTree } from "./prompts.ts";
 
 test("bare worktree names resolve under the managed directory", () => {
   expect(resolveWorktreeTarget("feature")).toBe(join(process.env.HOME ?? "", "code", "wt", "feature"));
@@ -161,6 +162,22 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
   });
   expect(target).toBe(`Review git diff ${commit}...HEAD.`);
   expect(target).not.toContain("review-base");
+});
+
+test("two --commit reviews from one checkout get different dedup keys", () => {
+  const resolved: Record<string, string> = { "5b3b660db^{commit}": "5".repeat(40), "162b2aadb^{commit}": "1".repeat(40), "main^{commit}": "m".repeat(40) };
+  const key = (flags: { base?: string; commit?: string }) => reviewTargetKey("/repo", flags, (_cwd, ...args) => resolved[args.at(-1)!]!);
+  const checkout = { head: "b253d0fd5867", tree: "t" };
+  const [first, second] = [key({ commit: "5b3b660db" }), key({ commit: "162b2aadb" })];
+  expect(first).toBe(`commit ${"5".repeat(40)}`);
+  expect(first).not.toBe(second);
+  expect(key({ base: "main" })).toBe(`base ${"m".repeat(40)}`);
+  expect(key({})).toBeUndefined();
+  const ledger = { "burn-arc-ship-review": { reviewTree: { ...checkout, target: first } } } as unknown as Ledger;
+  expect(reviewerForTree(ledger, { ...checkout, target: second })).toBeUndefined();
+  expect(reviewerForTree(ledger, { ...checkout })).toBeUndefined();
+  expect(reviewerForTree(ledger, { ...checkout, target: first })).toBe("burn-arc-ship-review");
+  expect(reviewFollowUp("P2 overflow", false, { ...checkout, target: first }, { ...checkout, target: second })).toBe("");
 });
 
 import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";

@@ -96,7 +96,12 @@ type WorkState = "running" | "done" | "failed" | "gate-invalid" | "adopted" | "c
 
 export type ReviewState = "running" | "done" | "failed";
 
-export interface GateTree { head: string; tree: string }
+export interface GateTree {
+  head: string;
+  tree: string;
+  // A --base or --commit review's resolved commit, part of its dedup key.
+  target?: string;
+}
 
 export interface ReviewAttestation { tree: string; head: string; reviewer: string; closed: boolean; report?: string; at: string }
 
