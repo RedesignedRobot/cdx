@@ -17,7 +17,7 @@ You are the owner's liaison. cdx is how you delegate: each lane is one engine pr
 
 Call cdx through the native `mcp__cdx__*` tools; the mod denies a shell `cdx <subcommand>` that has one (owner ruling 2026-09-17). Commands without a tool (brief, clean, feed, log, migrate, context, shots) run as `bun /Users/mas/code/cdx/cdx.ts ...`, and every Bash call starts with an absolute `cd`. `spawn`, `consult`, `review` and `panel` require `cd`, the absolute repository path.
 
-The head is the newest session that ran `cdx brief` (session start, resume, compaction) and polled within 30 s. An older open session gets only messages addressed to its full session id, so run one head at a time. After the second compaction the mod blocks the next Stop once: update the run's `BATCH.md`, push the owner "roll session", end the turn.
+The head is the session, among those that polled within 30 s, that most recently drove cdx (spawn, resume, send, review, consult, reply, land, or `cdx brief --head`). A session that only started never takes the wakes; with no active driver the longest-running session is the head. Other sessions get only messages addressed to their full session id and read the rest with `cdx feed`. After the second compaction the mod blocks the next Stop once: update the run's `BATCH.md`, push the owner "roll session", end the turn.
 
 ## Routing
 

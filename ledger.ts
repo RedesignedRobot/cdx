@@ -393,44 +393,67 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
 }
 
 // A Claude session is a delivery cursor, not an owner: every lane belongs to
-// the one owner. The newest session that polled within ACTIVE_SESSION_MS is
-// the head and receives the events. Older sessions still open advance their
-// cursor and hear only messages addressed to them, so when the newest one
-// closes, delivery moves to the next without replaying history.
+// the one owner. The head is the active session (polled within
+// ACTIVE_SESSION_MS) that most recently drove cdx: spawned, resumed, sent,
+// reviewed, consulted, replied, landed, or ran cdx brief --head. With no
+// active driver the longest-running active session is the head, so a
+// session that only starts and polls (a teammate, a headless claude -p, a
+// second terminal) never takes the wakes. Owner events have one cursor in
+// meta, advanced only after a head received them, so a change of head never
+// skips an event; each session's own cursor covers messages addressed to it.
 const ACTIVE_SESSION_MS = 30_000;
 
 // An idle poll with nothing new skips the write until its liveness mark is
 // this old; the mod polls every two seconds.
 const POLL_MARK_MS = 10_000;
 
-export interface SessionRow { session: string; cursor: number; started_at: string; polled_at: string; brief_hash: string | null; brief_at: string | null }
+export interface SessionRow { session: string; cursor: number; started_at: string; polled_at: string; drove_at: string | null; brief_hash: string | null; brief_at: string | null }
 
 export function readSession(session: string): SessionRow | undefined {
   return db().query<SessionRow, [string]>("SELECT * FROM sessions WHERE session = ?").get(session) ?? undefined;
 }
 
-// Session start, resume and compaction call this through cdx brief, making
-// the session the head. A new session starts at the newest event: what
-// happened before it is the brief's job, not a replay.
+// Session start, resume and compaction call this through cdx brief. A new
+// session's own cursor starts at the newest event: what happened before it
+// is the brief's job, not a replay. A restart keeps the first start time.
 export function startSession(session: string, now = Date.now()): void {
   const at = new Date(now).toISOString();
   write(() => db().query(`INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)
-    ON CONFLICT (session) DO UPDATE SET started_at = excluded.started_at, polled_at = excluded.polled_at`).run(session, latestEventId(), at, at));
+    ON CONFLICT (session) DO UPDATE SET polled_at = excluded.polled_at`).run(session, latestEventId(), at, at));
 }
 
-// Only a session that already has a row records its brief; the terminal
-// never becomes a delivery target.
+// Only a session that already has a row records its brief or its drive; the
+// terminal never becomes a delivery target.
 export function markBrief(session: string, hash: string, now: number): void {
   write(() => db().query("UPDATE sessions SET brief_hash = ?, brief_at = ? WHERE session = ?").run(hash, new Date(now).toISOString(), session));
+}
+
+export function markDriver(session: string, now = Date.now()): void {
+  write(() => db().query("UPDATE sessions SET drove_at = ? WHERE session = ?").run(new Date(now).toISOString(), session));
 }
 
 export function acknowledgeEvents(session: string, id: number): void {
   write(() => db().query("UPDATE sessions SET cursor = MAX(cursor, ?) WHERE session = ?").run(id, session));
 }
 
+// Migrate sets it past imported history; a fresh store starts at zero.
+export function ownerCursor(): number {
+  return Number(db().query<{ value: string }, []>("SELECT value FROM meta WHERE key = 'owner_cursor'").get()?.value ?? 0);
+}
+
+export function acknowledgeOwnerEvents(id: number): void {
+  write(() => db().query(`INSERT INTO meta (key, value) VALUES ('owner_cursor', ?)
+    ON CONFLICT (key) DO UPDATE SET value = MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))`).run(String(id)));
+}
+
+export function electHead(sessions: readonly SessionRow[], now: number): string | undefined {
+  const active = sessions.filter((row) => Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS);
+  const driver = active.filter((row) => row.drove_at).sort((a, b) => b.drove_at!.localeCompare(a.drove_at!))[0];
+  return (driver ?? active.sort((a, b) => a.started_at.localeCompare(b.started_at))[0])?.session;
+}
+
 export function deliveryHead(now = Date.now()): string | undefined {
-  return db().query<{ session: string }, [string]>("SELECT session FROM sessions WHERE polled_at >= ? ORDER BY started_at DESC LIMIT 1")
-    .get(new Date(now - ACTIVE_SESSION_MS).toISOString())?.session;
+  return electHead(db().query<SessionRow, []>("SELECT * FROM sessions").all(), now);
 }
 
 export interface EventsRecord {
@@ -445,12 +468,13 @@ export interface EventsRecord {
   recipient?: string;
 }
 
-// Which events after a cursor reach a session: actionable kinds only, never
-// a child's terminal routed to its supervisor, addressed messages to their
-// session and everything else to the head.
-export function selectEvents(records: readonly FeedEvent[], session: string, head: boolean): EventsRecord[] {
+// Which events reach a session: actionable kinds only, never a child's
+// terminal routed to its supervisor. An addressed message goes to its
+// session past that session's cursor; everything else goes to the head past
+// the owner cursor. A session that is not the head passes no owner cursor.
+export function selectEvents(records: readonly FeedEvent[], session: string, cursor: number, owner?: number): EventsRecord[] {
   return records.filter((event) => WAKE_EVENTS.has(event.kind) && !event.supervisor
-    && (event.recipient ? event.recipient === session : head)).map((event) => {
+    && (event.recipient ? event.recipient === session && event.id > cursor : owner !== undefined && event.id > owner)).map((event) => {
     const record: EventsRecord = { id: event.id, kind: event.kind, wake: true, text: renderEvent(event) };
     if (event.lane !== undefined) record.lane = event.lane;
     if (event.round !== undefined) record.round = event.round;
@@ -461,20 +485,24 @@ export function selectEvents(records: readonly FeedEvent[], session: string, hea
   });
 }
 
-// Hands the session its events and advances the cursor only after emit
-// returns: a crash in between replays events, never drops them.
+// Hands the session its events and advances the cursors only after emit
+// returns: a crash in between replays events, never drops them. Only the
+// head moves the owner cursor.
 export function deliverEvents(session: string, now: number, peek: boolean, emit: (events: EventsRecord[]) => void): void {
   const current = readSession(session);
-  if (current && latestEventId() <= current.cursor && now - Date.parse(current.polled_at) < POLL_MARK_MS) { emit([]); return; }
+  if (current && latestEventId() <= Math.min(current.cursor, ownerCursor()) && now - Date.parse(current.polled_at) < POLL_MARK_MS) { emit([]); return; }
   write(() => {
     const at = new Date(now).toISOString();
     const row = readSession(session);
     const cursor = row?.cursor ?? latestEventId();
     if (row) db().query("UPDATE sessions SET polled_at = ? WHERE session = ?").run(at, session);
     else db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, cursor, at, at);
-    const records = eventsAfter(cursor);
-    emit(selectEvents(records, session, deliveryHead(now) === session));
-    if (!peek && records.length) acknowledgeEvents(session, records.at(-1)!.id);
+    const owner = deliveryHead(now) === session ? ownerCursor() : undefined;
+    const records = eventsAfter(Math.min(cursor, owner ?? cursor));
+    emit(selectEvents(records, session, cursor, owner));
+    if (peek || !records.length) return;
+    acknowledgeEvents(session, records.at(-1)!.id);
+    if (owner !== undefined) acknowledgeOwnerEvents(records.at(-1)!.id);
   });
 }
 

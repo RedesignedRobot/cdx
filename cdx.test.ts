@@ -18,7 +18,7 @@ import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktr
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
-import { validLane } from "./ledger.ts";
+import { electHead, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { registeredFlag } from "./runtime.ts";
 
@@ -29,16 +29,34 @@ const feed = (id: number, kind: string, extra: object = {}) => ({ id, timestamp:
 test("the head receives actionable kinds only, and never a child's terminal", () => {
   const records = [feed(1, "question"), feed(2, "gate-finished"), feed(3, "terminal"), feed(4, "partial"),
     feed(5, "terminal", { lane: "child", supervisor: "parent" }), feed(6, "job-exit")];
-  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([1, 3, 6]);
-  expect(selectEvents(records, "head", true).every((event) => event.wake)).toBe(true);
-  expect(selectEvents(records, "older", false)).toEqual([]);
+  expect(selectEvents(records, "head", 0, 0).map((event) => event.id)).toEqual([1, 3, 6]);
+  expect(selectEvents(records, "head", 0, 0).every((event) => event.wake)).toBe(true);
+  expect(selectEvents(records, "older", 0)).toEqual([]);
 });
 
 test("an addressed message reaches its session whether or not it is the head", () => {
   const records = [feed(1, "message", { recipient: "older", from: "lane-a" }), feed(2, "message", { from: "lane-b" })];
-  expect(selectEvents(records, "older", false).map((event) => event.id)).toEqual([1]);
-  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([2]);
-  expect(selectEvents(records, "head", true)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
+  expect(selectEvents(records, "older", 0).map((event) => event.id)).toEqual([1]);
+  expect(selectEvents(records, "head", 0, 0).map((event) => event.id)).toEqual([2]);
+  expect(selectEvents(records, "head", 0, 0)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
+});
+
+test("a session that starts and polls later never steals the wakes from the session that drove cdx", () => {
+  const now = Date.parse("2026-09-26T12:00:00Z");
+  const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
+  const row = (session: string, started: number, drove?: number) => ({ session, cursor: 0, started_at: at(started), polled_at: at(1),
+    drove_at: drove === undefined ? null : at(drove), brief_hash: null, brief_at: null });
+  const head = row("head", 3600, 600);
+  const teammate = row("teammate", 5);
+  expect(electHead([head, teammate], now)).toBe("head");
+  expect(electHead([row("head", 3600), teammate], now)).toBe("head");
+  expect(electHead([head, row("teammate", 5, 2)], now)).toBe("teammate");
+  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBe("teammate");
+  // The teammate's cursor moves; the head still gets the question past the owner cursor.
+  const question = [feed(7, "question")];
+  expect(selectEvents(question, "teammate", 0)).toEqual([]);
+  expect(selectEvents(question, "head", 7, 6).map((event) => event.id)).toEqual([7]);
+  expect(selectEvents(question, "head", 0, 7)).toEqual([]);
 });
 
 test("config parsing reads gemini.maxRounds and defaults to 2", () => {
@@ -1294,8 +1312,8 @@ test("terminal events carry a five-line digest and child terminals never wake th
   const long = terminalText("done report=/tmp/a", "# Report\n" + Array.from({ length: 50 }, (_, index) => `line ${index}`).join("\n"), undefined);
   expect(long.split("\n")).toEqual(["done report=/tmp/a", "line 0", "line 1", "line 2", "line 3"]);
   const event = { id: 1, timestamp: "now", kind: "terminal", owner: "head", lane: "claimed", supervisor: "parent", message: "done" };
-  expect(selectEvents([event], "head", true)).toEqual([]);
-  expect(selectEvents([{ ...event, supervisor: undefined }], "head", true)).toHaveLength(1);
+  expect(selectEvents([event], "head", 0, 0)).toEqual([]);
+  expect(selectEvents([{ ...event, supervisor: undefined }], "head", 0, 0)).toHaveLength(1);
 });
 
 

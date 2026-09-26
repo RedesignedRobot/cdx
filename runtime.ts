@@ -135,7 +135,7 @@ const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base"
 
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "transcript", "tools", "supervisor", "brief", "watch", "line", "peek", "snapshot", "totals", "downscale"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "transcript", "tools", "supervisor", "brief", "watch", "line", "peek", "snapshot", "totals", "downscale", "head"]);
 
 // A flag missing from these sets fails as "unknown flag" even when the
 // command allows it; cdx.test.ts checks every parseArgs allow-list.

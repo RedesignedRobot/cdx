@@ -254,7 +254,9 @@ export function register(on: On) {
     if (surface !== null) {
       await $.ui.status(undefined);
     }
-    const briefResult = await $.process.run(CDX.concat(["brief"]), {
+    // The user typed /clear or /resume here, so this session keeps the head
+    // under its new id.
+    const briefResult = await $.process.run(CDX.concat(["brief", "--head"]), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
     });

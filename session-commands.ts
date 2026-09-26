@@ -5,7 +5,7 @@ import { markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts
 import { markOverrun, overrunNotice } from "./duration.ts";
 import {
   activeStateOf, callerSession, deliverEvents, feedEvent, laneRunning,
-  markBrief, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
+  markBrief, markDriver, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
   withLedger,
 } from "./ledger.ts";
 import { questionOpen, readQuestions } from "./questions.ts";
@@ -107,13 +107,17 @@ function briefRepeated(session: string, text: string, now = Date.now()): boolean
   });
 }
 
-// Session start, resume and compaction run the brief, so the calling session
-// becomes the head that receives events from here on.
-export function briefCommand() {
+// Session start, resume and compaction run the brief, which registers the
+// session for delivery. Only --head, a user's explicit claim, makes it the
+// head; a session that merely started never takes the wakes.
+export function briefCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["head"]);
+  if (parsed.rest.length) fail("usage: cdx brief [--head]");
   const quotaState = geminiQuotaState();
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
   const session = callerSession();
   if (session !== "terminal") startSession(session);
+  if (parsed.bools.has("head")) markDriver(session);
   const summary = sessionSummary();
   if (summary && !briefRepeated(session, summary)) console.log(summary);
 }

@@ -8,7 +8,7 @@ import { jobCommand, runJob } from "./jobs.ts";
 import {
   codeQuestionCommand, cleanCommand, consultCommand, resumeCommand, reviewCommand, spawnCommand,
 } from "./lane-commands.ts";
-import { laneRunning, readLane, requireOwnChild, supervisorLane, withLedger } from "./ledger.ts";
+import { callerSession, laneRunning, markDriver, readLane, requireOwnChild, supervisorLane, withLedger } from "./ledger.ts";
 import {
   askCommand, hookCommand, inboxCommand, msgCommand, questionsCommand, replyCommand, sendCommand,
 } from "./questions.ts";
@@ -64,7 +64,7 @@ ${ENGINE_PICKER}
   job                     # list jobs
   doctor [--fix] [--probe] [--days N]
   migrate                 # one-shot import of the 9.x JSON state into state/cdx.db
-  brief                   # makes this session the head; lanes, completed work awaiting attention, and open questions
+  brief [--head]          # lanes, completed work awaiting attention, and open questions; --head makes this session the head
 
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
 one blocking call over many lanes. Foreground lanes print the report on exit.
@@ -86,6 +86,10 @@ const REFUSED_INSIDE_LANE = new Set([
 // A supervisor drives its children with these; each mutation checks ownership.
 const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "land", "kill", "close", "gate", "reply"]);
 
+// A session that runs one of these drives cdx and becomes the head that
+// receives wakes. Commands from inside a lane leave the head as it is.
+const DRIVING_COMMANDS = new Set(["spawn", "resume", "review", "consult", "send", "reply", "land"]);
+
 export async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
     const supervisor = supervisorLane();
@@ -94,6 +98,7 @@ export async function dispatch(command: string | undefined, argv: string[]) {
     }
     if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the liaison`);
   }
+  if (!process.env.CDX_LANE && command && DRIVING_COMMANDS.has(command)) markDriver(callerSession());
 switch (command) {
   case "events": await eventsCommand(argv); break;
   case "migrate": migrateCommand(argv); break;
@@ -233,7 +238,7 @@ switch (command) {
   case "kill": await killCommand(argv); break;
   case "clean": cleanCommand(argv); break;
   case "doctor": await doctorCommand(argv); break;
-  case "brief": briefCommand(); break;
+  case "brief": briefCommand(argv); break;
   case "help": case "--help": case "-h": case undefined: console.log(USAGE); break;
   default:
     fail(`unknown command "${command}"\n${USAGE}`);
