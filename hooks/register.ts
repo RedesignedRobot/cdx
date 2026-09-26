@@ -23,6 +23,7 @@ import {
   MAX_PROCESS_TIMEOUT_MS,
   nativeToolResult, formatToolOutput,
   runFromCwd,
+  SESSION_TOOLS,
   TOOL_NAMES,
   TOOLS,
   TOOLS_BY_NAME,
@@ -39,6 +40,9 @@ let pollInFlight = false;
 let outputSequence = 0;
 const liveRef = { plugin: "cdx", key: "live" } as const;
 const rolloverRef = { plugin: "cdx", key: "rollover" } as const;
+const pollerRef = { plugin: "cdx", key: "poller" } as const;
+const POLL_INTERVAL_MS = 2000;
+const INSTANCE = `${Date.now()}-${Math.random()}`;
 // Each refusal message is logged once; the poll runs every two seconds and
 // a repeated log would flood the transcript.
 const loggedRefusals = new Set<string>();
@@ -112,6 +116,25 @@ async function poll($: EngineInterface) {
   }
 }
 
+// A hot reload runs this module afresh with every variable above empty, and
+// session.start does not always fire again, so each hook that needs the
+// session context loads it here. The engine may not drop the old instance's
+// timer either: the newest instance claims the poller in $.state and an
+// older timer stops at its next tick.
+async function ensure($: EngineInterface) {
+  if (!session) session = await $.session.id();
+  if (root) return;
+  root = $.plugin.root;
+  CDX = ["bun", `${root}/cdx.ts`];
+  if (surface === null) surface = (await $.session.surfaces())[0] ?? null;
+  await $.state.set(pollerRef, INSTANCE);
+  const timer = $.clock.every(POLL_INTERVAL_MS, async () => {
+    if ((await $.state.get(pollerRef)).value !== INSTANCE) return timer.cancel();
+    await ensure($);
+    await poll($);
+  });
+}
+
 // The poll drains the feed every two seconds into the buffer, so the CLI
 // alone would answer "nothing" while wake events sit in memory. The tool
 // answers with the buffer first, then whatever the feed still held, and
@@ -164,10 +187,8 @@ export function register(on: On) {
   });
 
   on("session.start", async ($, e, next) => {
-    session = await $.session.id();
-    root = $.plugin.root;
-    CDX = ["bun", `${root}/cdx.ts`];
     surface = e.surface;
+    await ensure($);
 
     for (const tool of TOOLS) {
       await $.tool.register({
@@ -187,10 +208,6 @@ export function register(on: On) {
     } catch (error) {
       await $.ui.log(`cdx: /lanes not registered: ${error instanceof Error ? error.message : String(error)}`);
     }
-
-    $.clock.every(2000, async () => {
-      await poll($);
-    });
 
     // cdx elects the head only from sessions that drove it. A person at the
     // prompt claims the wakes at start; a -p run or an SDK host never does.
@@ -215,6 +232,7 @@ export function register(on: On) {
   // A subagent's loop raises its own turn events with agentId set. Only the
   // head's turn decides whether the session is idle.
   on("turn.start", async ($, e, next) => {
+    await ensure($);
     if (!(e as { agentId?: string }).agentId) deliveryState = onTurnStart(deliveryState);
     return next(e);
   });
@@ -246,6 +264,7 @@ export function register(on: On) {
   });
 
   on("command.run", { command: "lanes" }, async ($, e) => {
+    await ensure($);
     if (!e.args.trim()) {
       const opened = await $.ui.open({ id: "cdx-lanes", title: "Lanes", focus: true });
       return { text: opened.isPlaced ? "Lanes pane opened" : `Lanes pane unavailable: ${opened.reason ?? "surface refused"}` };
@@ -263,6 +282,7 @@ export function register(on: On) {
 
   on("command.run", { command: ["clear", "resume"] }, async ($, e, next) => {
     const result = await next(e);
+    await ensure($);
     session = await $.session.id();
     deliveryState = clearBuffer(deliveryState);
     if (surface !== null) {
@@ -307,6 +327,7 @@ export function register(on: On) {
   });
 
   on("tool.call", async ($, e, next) => {
+    await ensure($);
     const result = await next(e);
     if (result && "deny" in result && result.deny !== undefined) {
       return result;
@@ -335,6 +356,10 @@ export function register(on: On) {
     const def = TOOLS_BY_NAME.get(toolName);
     if (!def) {
       return { isError: true, result: `unknown tool ${e.tool}` };
+    }
+    await ensure($);
+    if (!session && SESSION_TOOLS.has(toolName)) {
+      return { isError: true, result: `cdx ${toolName}: the engine gave no session id, so the lane or job would have no owner; retry, or run /clear` };
     }
     const toolInput = (e as { input?: Record<string, unknown> }).input ?? (e as Record<string, unknown>);
     let runSpec;
@@ -374,6 +399,7 @@ export function register(on: On) {
   });
 
   on("prompt.submit", async ($, e, next) => {
+    await ensure($);
     if (e.origin && e.origin.kind === "plugin" && e.origin.name === "cdx") {
       return next(e);
     }

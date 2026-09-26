@@ -486,6 +486,9 @@ export function requiredInput(schema: Record<string, unknown>, input: Record<str
 // Tools that drive one lane. cdx refuses them on a lane another live Claude
 // session owns unless force is set.
 const LANE_TOOLS = new Set(["land", "spawn", "resume", "consult", "review", "send", "reply", "close", "kill", "gate"]);
+// Tools whose lane or job belongs to the calling session. Without a session
+// id cdx would run them as the terminal, owner checks and stamps skipped.
+export const SESSION_TOOLS: ReadonlySet<string> = new Set([...LANE_TOOLS, "job", "panel"]);
 
 for (const tool of TOOLS) {
   const run = tool.run;

@@ -1,3 +1,11 @@
+## 10.0.6 (2026-09-26)
+
+### Delivery
+
+- A hot reload that changed `hooks/register.ts` left the new module with no session id, plugin root or cdx command, because only `session.start` and `/clear` or `/resume` set them. The session then lost its band and status line, and tool calls ran with `CLAUDE_CODE_SESSION_ID` empty, so a job started from `mcp__cdx__job` had no owner and did not count as driving cdx. Every hook that needs the context now loads it from `$.session.id()` and `$.plugin.root` on first use, and that first use also starts the poll.
+- Exactly one module instance polls. Starting its timer, an instance writes its id to `$.state` key `poller`; a timer whose id no longer stands there cancels itself at its next tick, so an old timer the engine kept after a reload stops within two seconds.
+- A lane, job or panel tool call is refused with an error while the engine still gives no session id, instead of running as `terminal`. Read tools such as `status` still run.
+
 ## 10.0.5 (2026-09-26)
 
 ### Band

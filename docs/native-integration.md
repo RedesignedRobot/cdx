@@ -112,6 +112,8 @@ Reference material outside the repo: `/tmp/cdx-mods-reference/mods` (Anthropic's
 
 On `session.start`: `session = await $.session.id()`; `root = $.plugin.root`; `CDX = [\"bun\", \`${root}/cdx.ts\`]`. Register every tool in the table, then `/lanes` with `$.command.register({ name: "lanes", ... })` inside a try/catch: Claude Code refuses the name `cdx` because `/cdx` is the user's skill, and a refused command must never stop the tools and the poll. Start `$.clock.every(2000, poll)`. Run `cdx brief`; a non-empty result goes to `$.ui.log` (when `e.surface` is not null) and into the pending buffer as one quiet entry so the first prompt carries it. Then `next(e)`.
 
+A hot reload runs the module afresh with these variables empty and may not fire `session.start` again, so since 10.0.6 every hook that needs them (session.start, the poll, `tool.call`, `prompt.submit`, `turn.start`, `command.run`) calls `ensure($)`, which fills them and starts the poll once per module instance. The instance writes its id to `$.state` key `poller` as it starts the timer, and a timer whose id no longer stands there cancels itself, so a reload never leaves two pollers. Lane, job and panel tools are refused while the session id is empty.
+
 Every `$.process.run` on cdx passes `env: { CLAUDE_CODE_SESSION_ID: session }` and `cwd: root`.
 
 On `command.run` of `clear` or `resume`, after `next`: re-read the session id, clear the buffer, clear the status line, run `cdx brief` again as at start.
