@@ -194,3 +194,23 @@ test("the store refuses the live state home under test", () => {
     expect(existsSync(join(fakeHome, ".cdx"))).toBe(false);
   } finally { rmSync(fakeHome, { recursive: true, force: true }); }
 });
+
+test("cdx wait blocks on a panel alone and on a panel beside a lane", () => {
+  const home = tempHome();
+  try {
+    const panel = (name: string, state: string, summary: string) => ({ name, cwd: "/repo", question: "q", owner: { ownerCwd: "/repo" }, state, startedAt: "2026-09-26T12:00:00Z", summary });
+    evalIn(home, `import { withLedger } from ${LEDGER};
+import { db } from ${JSON.stringify(new URL("./store.ts", import.meta.url).pathname)};
+withLedger((ledger) => { ledger["w-lane"] = ${JSON.stringify(lane("done", { work: { state: "done", cwd: "/repo", round: 1, exitCode: 0, updatedAt: "2026-09-20T00:00:00.000Z" } }))}; });
+for (const record of ${JSON.stringify([panel("p-failed", "failed", "[cdx] panel=p-failed state=failed runner died"), panel("p-done", "done", "[cdx] panel=p-done coverage=3/3")])}) {
+  db().query("INSERT INTO panels (name, data) VALUES (?, ?)").run(record.name, JSON.stringify(record));
+}`);
+    const alone = cdx(home, ["wait", "p-failed"]);
+    expect(alone.code).toBe(1);
+    expect(alone.stdout).toContain("[cdx] panel=p-failed state=failed runner died");
+    const mixed = cdx(home, ["wait", "w-lane", "p-done"]);
+    expect(mixed.code).toBe(0);
+    expect(mixed.stdout).toContain("lane=w-lane");
+    expect(mixed.stdout).toContain("[cdx] panel=p-done coverage=3/3");
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});

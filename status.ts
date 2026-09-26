@@ -377,7 +377,7 @@ export async function waitCommand(argv: string[]) {
   }));
   let failed = false;
   if (!json && multiple) console.log(`cdx: waiting for ${[...new Set(names)].join(", ")}`);
-  while (pending.size > 0 || pendingJobs.size > 0) {
+  while (pending.size > 0 || pendingJobs.size > 0 || pendingPanels.size > 0) {
     const ledger = readLedger();
     // A waited lane that asks a question is blocked, not busy: return at
     // once (exit 2) so the caller answers instead of both sides idling.
