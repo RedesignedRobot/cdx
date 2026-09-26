@@ -183,7 +183,7 @@ export function register(on: On) {
       await poll($);
     });
 
-    const briefResult = await $.process.run(CDX.concat(["brief"]), {
+    const briefResult = await $.process.run(CDX.concat(["brief", ...(e.isInteractive ? ["--head"] : [])]), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
     });
