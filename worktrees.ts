@@ -1,13 +1,15 @@
 // Worktree creation, reuse, directory persistence, and cleanup.
 
 import { config } from "./config.ts";
-import { readLane, requireOwnChild, supervisorLane, withLedger, laneRunning, type Lane, type Ledger, type Spec } from "./ledger.ts";
+import { feedEvent, readLane, requireOwnChild, supervisorLane, withLedger, laneRunning, type Lane, type Ledger, type Spec } from "./ledger.ts";
+import { type Job, jobDuration, jobRunning, readJobs, storeJob } from "./jobs.ts";
 import { captureGateTree, gateFailure, receiptRefusal, reviewRefusal } from "./gates.ts";
 import { createReviewSnapshot, runFrozenGate } from "./snapshots.ts";
 import { specPathOf } from "./reports.ts";
-import { CmdError, displayPath, fail, HOME, pidAlive, ROOT, shellQuote, uncoloredChildEnv } from "./runtime.ts";
+import { CmdError, completionVerdict, displayPath, fail, HOME, pidAlive, ROOT, SELF, settleHint, shellQuote, uncoloredChildEnv } from "./runtime.ts";
 import { write } from "./store.ts";
-import { existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 export function resolveWorktreeTarget(target: string): string {
@@ -161,9 +163,12 @@ function gitOk(cwd: string, ...args: string[]): boolean {
   return Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] }).success;
 }
 
+// A 9.x review recorded only reviewClosed; migrate carries it over without
+// attestations, so an open one still blocks until a review of the tree.
 export function landRefusal(entry: Lane): string | undefined {
   if (laneRunning(entry)) return "lane is still running";
   if (!entry.worktreePath || !entry.worktreeRepo || !entry.branch) return "lane has no managed worktree";
+  if (!entry.reviewAttestations?.length && entry.reviewClosed === false) return "its 9.x review has unresolved P1/P2 findings; review the current tree with any review lane";
   return receiptRefusal(entry.gateReceipt, entry.work);
 }
 
@@ -195,7 +200,20 @@ export function overlappingPaths(dirty: string[], changed: string[]): string[] {
   return [...new Set(dirty.filter((path) => touched.has(path)))].sort();
 }
 
-interface LandLane { lane: string; entry: Lane; commit: string; tree: string }
+interface LandLane { lane: string; entry: Lane; commit: string; tree: string; installs: boolean }
+
+// Lockfiles decide what the ignored install directories hold.
+const LOCKFILE = /(^|\/)(bun\.lockb?|package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum|uv\.lock|poetry\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock)$/;
+
+export function changesInstalls(paths: string[]): boolean {
+  return paths.some((path) => LOCKFILE.test(path));
+}
+
+// The merge gate borrows node_modules and other ignored entries from one lane
+// checkout: the lane that changed a lockfile, else the first lane.
+export function installSource<T extends Pick<LandLane, "installs">>(targets: T[]): T {
+  return targets.find((target) => target.installs) ?? targets[0]!;
+}
 
 // Commits the lane checkout so the merge carries exactly the tree its receipt
 // and reviews saw. Undefined means the lane is already in the base branch.
@@ -221,7 +239,8 @@ function prepareLane(lane: string, entry: Lane, repo: string, baseRef: string): 
   const commit = git(work, "rev-parse", "HEAD");
   const tree = git(work, "rev-parse", "HEAD^{tree}");
   if (tree !== current.tree || !clean()) fail(`cannot land ${lane}: commit hooks changed the lane tree; check the change and land again`);
-  return { lane, entry, commit, tree };
+  const changed = gitRaw(repo, "diff", "--name-only", "-z", `${baseRef}...${commit}`).split("\0").filter(Boolean);
+  return { lane, entry, commit, tree, installs: changesInstalls(changed) };
 }
 
 function mergeCandidate(repo: string, base: string, target: LandLane): string {
@@ -247,14 +266,13 @@ export function receiptProves(targets: Array<Pick<LandLane, "entry">>, tree: str
 function proveMerge(repo: string, commit: string, targets: LandLane[]): string | undefined {
   const tree = git(repo, "rev-parse", `${commit}^{tree}`);
   if (receiptProves(targets, tree)) return;
-  const first = targets[0]!;
-  const log = `${ROOT}/logs/${first.lane}-land-${tree.slice(0, 12)}.gate.log`;
+  const source = installSource(targets);
+  const log = `${ROOT}/logs/${source.lane}-land-${tree.slice(0, 12)}.gate.log`;
   console.log(`cdx: gating merge result ${commit.slice(0, 12)} of ${targets.map((target) => target.lane).join(", ")}`);
-  const { gate, receipt } = runFrozenGate(first.entry.work.round!, first.entry.worktreePath!, mergeGateCommand(targets), log, first.lane,
+  const { gate, receipt } = runFrozenGate(source.entry.work.round!, source.entry.worktreePath!, mergeGateCommand(targets), log, source.lane,
     { create: (cwd, lane, round) => createReviewSnapshot(cwd, lane, round, { head: commit, tree }) });
   if (receipt.valid) {
-    const regated = targets.filter((target) => target.tree === tree && target.entry.gateReceipt!.tree !== tree);
-    if (regated.length) withLedger((ledger) => { for (const target of regated) ledger[target.lane]!.gateReceipt = receipt; });
+    if (source.tree === tree && source.entry.gateReceipt!.tree !== tree) withLedger((ledger) => { ledger[source.lane]!.gateReceipt = receipt; });
     return;
   }
   const failure = gate.exitCode !== 0 ? gateFailure(gate.exitCode, gate.output).diagnostic : receipt.reason;
@@ -295,7 +313,11 @@ function retireLane(lane: string, entry: Lane, repo: string, baseRef: string, no
   });
 }
 
-function landLanes(lanes: string[], entries: Lane[], repo: string, baseBranch: string): void {
+interface LandPlan { repo: string; baseBranch: string; baseHead: string; pending: LandLane[]; merged: string[]; merges: string[]; checkout?: string }
+
+// Everything before the gate: commit the lanes, build the merge chain, and
+// refuse what a gate cannot fix. Rerunning it after a detach is idempotent.
+function planLand(lanes: string[], entries: Lane[], repo: string, baseBranch: string): LandPlan {
   const baseRef = `refs/heads/${baseBranch}`;
   const baseHead = git(repo, "rev-parse", baseRef);
   const pending: LandLane[] = [];
@@ -305,11 +327,24 @@ function landLanes(lanes: string[], entries: Lane[], repo: string, baseBranch: s
     if (target) pending.push(target);
     else merged.push(lane);
   }
+  const installing = pending.filter((target) => target.installs).map((target) => target.lane);
+  if (installing.length > 1) fail(`${installing.join(", ")} each change a lockfile, and one merge gate cannot share their installs; land them in separate batches`);
   const merges: string[] = [];
   let candidate = baseHead;
   for (const target of pending) merges.push(candidate = mergeCandidate(repo, candidate, target));
   const checkout = branchCheckout(repo, baseRef);
   if (checkout && candidate !== baseHead) refuseOverlap(checkout, repo, baseHead, candidate);
+  return { repo, baseBranch, baseHead, pending, merged, merges, checkout };
+}
+
+function mergeNeedsGate(plan: LandPlan): boolean {
+  return plan.pending.length > 0 && !receiptProves(plan.pending, git(plan.repo, "rev-parse", `${plan.merges.at(-1)}^{tree}`));
+}
+
+function landLanes(plan: LandPlan, lanes: string[], entries: Lane[]): void {
+  const { repo, baseBranch, baseHead, pending, merged, merges, checkout } = plan;
+  const baseRef = `refs/heads/${baseBranch}`;
+  let candidate = merges.at(-1) ?? baseHead;
   let landed = pending;
   let culprit: string | undefined;
   const failure = pending.length ? proveMerge(repo, candidate, pending) : undefined;
@@ -340,7 +375,10 @@ function landLanes(lanes: string[], entries: Lane[], repo: string, baseBranch: s
   if (culprit) fail(`${culprit}${landed.length ? "" : "; nothing landed"}`);
 }
 
-export function landCommand(argv: string[]): void {
+// A merge gate can outlast the ten minute ceiling of the plugin's
+// process.run, so a land that must gate runs detached; a supervisor waits in
+// its own shell instead. A receipt-proven land needs no gate and stays inline.
+export function landCommand(argv: string[], detached = false): void {
   const batch = argv[0] === "--batch";
   const lanes = batch ? argv.slice(1) : argv;
   if (!lanes.length || !batch && lanes.length > 1 || lanes.some((lane) => lane.startsWith("-"))) fail("usage: cdx land <lane> | cdx land --batch <lane>...");
@@ -358,7 +396,55 @@ export function landCommand(argv: string[]): void {
   if (supervisor && readLane(supervisor).branch !== baseBranch) fail(`supervisor ${supervisor} lands children only into its own worktree branch; the liaison lands the rest`);
   const lock = landLockOf(repo);
   takeLandLock(lock);
-  try { landLanes(lanes, entries, repo, baseBranch); } finally { rmSync(lock, { force: true }); }
+  try {
+    const plan = planLand(lanes, entries, repo, baseBranch);
+    if (detached || supervisor || !mergeNeedsGate(plan)) return landLanes(plan, lanes, entries);
+  } finally { rmSync(lock, { force: true }); }
+  detachLand(argv, repo, lanes);
+}
+
+export function landJobName(lane: string): string {
+  return `land-${lane}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64);
+}
+
+function detachLand(argv: string[], repo: string, lanes: string[]): void {
+  const name = landJobName(lanes[0]!);
+  const log = `${ROOT}/logs/job-${name}.log`;
+  const ownerSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  mkdirSync(`${ROOT}/logs`, { recursive: true });
+  write(() => {
+    const running = readJobs()[name];
+    if (running && jobRunning(running) && pidAlive(running.pid)) fail(`land job ${name} is still running (pid ${running.pid})`);
+    storeJob(name, { cmd: `cdx land ${argv.join(" ")}`, cwd: repo, log, startedAt: new Date().toISOString(), state: "running", pid: process.pid, ...(ownerSession ? { ownerSession } : {}) });
+  });
+  const out = openSync(log, "w");
+  const child = spawn(process.execPath, [SELF, "_land", name, ...argv], { detached: true, env: uncoloredChildEnv(undefined, ROOT), stdio: ["ignore", out, out] });
+  child.unref();
+  // The child may finish first; its final record must survive this write.
+  write(() => {
+    const job = readJobs()[name];
+    if (job && jobRunning(job) && job.pid === process.pid) storeJob(name, { ...job, pid: child.pid });
+  });
+  console.log(`cdx: the merge of ${lanes.join(", ")} needs a gate, so land runs as job=${name} pid=${child.pid} log=${log}`);
+  console.log(`cdx: the job-exit event carries the land result; ${settleHint(name)}`);
+}
+
+// The job-exit event names the land output as its report, so its digest is
+// the land result on success and the refusal on failure.
+export function runLandJob(name: string, argv: string[]): number {
+  let exitCode = 0;
+  try { landCommand(argv, true); } catch (error) {
+    console.error(`cdx: ${error instanceof Error ? error.message : String(error)}`);
+    exitCode = 1;
+  }
+  const state = exitCode ? "failed" : "done";
+  const job = write(() => {
+    const entry: Job = { ...readJobs()[name]!, state, exitCode, finishedAt: new Date().toISOString() };
+    storeJob(name, entry);
+    return entry;
+  });
+  feedEvent("job-exit", `[cdx] job=${name} state=${state} exit=${exitCode} in=${jobDuration(job)} log=${job.log} report=${job.log} gateExit=not-applicable verdict=${JSON.stringify(completionVerdict(state))}`, job.ownerSession, { job: name });
+  return exitCode;
 }
 
 // The land lock file holds the lander's pid. SIGKILL or a caller's timeout
@@ -385,18 +471,19 @@ export function takeLandLock(lock: string, alive: (pid: number) => boolean = pid
   });
 }
 
-export interface StaleWorktree { repo: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }
+export interface StaleWorktree { repo: string; primary: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }
 
-// Merged worktrees go with their branch. A closed or unrecorded lane keeps an
-// unmerged branch so committed work survives; git itself refuses dirty trees.
+// Merged worktrees go with their branch. A closed lane keeps an unmerged
+// branch so committed work survives. A lane cdx has no record of, active or
+// archived, is not cdx's to judge unless its branch is merged.
 export function staleWorktreeAction(item: { running: boolean; closed: boolean; merged: boolean; ageDays: number }, days: number): StaleWorktree["action"] | undefined {
   if (item.running || item.ageDays < days) return;
   if (item.merged) return "remove";
   if (item.closed) return "remove-worktree";
 }
 
-// Closed lanes leave the ledger, so the caller passes their repositories too;
-// a worktree whose lane is gone counts as closed.
+// Closed lanes leave the active table, so the caller passes their
+// repositories too; the ledger proxy finds their records in the archive.
 export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: string[] = [], now = Date.now()): StaleWorktree[] {
   const repos = new Map<string, string>();
   const candidates = new Set([...Object.values(ledger).map((entry) => entry.worktreeRepo), ...archivedRepos]);
@@ -408,6 +495,7 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
   const stale: StaleWorktree[] = [];
   for (const repo of repos.values()) {
     const blocks = git(repo, "worktree", "list", "--porcelain").split("\n\n");
+    const primary = blocks[0]!.match(/^worktree (.+)$/m)![1]!;
     const primaryRef = blocks[0]?.match(/^branch (.+)$/m)?.[1];
     for (const block of blocks.slice(1)) {
       const path = block.match(/^worktree (.+)$/m)?.[1];
@@ -419,16 +507,31 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
       const committed = Number(Bun.spawnSync({ cmd: ["git", "-C", repo, "log", "-1", "--format=%ct", ref] }).stdout.toString().trim()) * 1000;
       const ageDays = (now - Math.max(committed || 0, entry ? Date.parse(entry.updatedAt) : 0)) / 86_400_000;
       const action = staleWorktreeAction({
-        running: Boolean(entry && laneRunning(entry)), closed: !entry || entry.work.state === "closed",
+        running: Boolean(entry && laneRunning(entry)), closed: entry?.work.state === "closed",
         merged: bases.some((base) => gitOk(repo, "merge-base", "--is-ancestor", ref, base)), ageDays,
       }, days);
-      if (action) stale.push({ repo, path, branch, action, ageDays });
+      if (action) stale.push({ repo, primary, path, branch, action, ageDays });
     }
   }
   return stale;
 }
 
+// git worktree remove refuses untracked and modified files but deletes
+// ignored ones. An ignored directory the primary checkout also has is an
+// install or build output; an ignored file survives only as an identical copy
+// there. Anything else (a .env written in the lane) keeps the worktree.
+export function primaryHasCopy(worktree: string, primary: string, entry: string): boolean {
+  const mine = join(worktree, entry), theirs = join(primary, entry);
+  try {
+    if (entry.endsWith("/")) return statSync(theirs).isDirectory();
+    return readFileSync(mine).equals(readFileSync(theirs));
+  } catch { return false; }
+}
+
 export function removeStaleWorktree(item: StaleWorktree): string {
+  const ignored = gitRaw(item.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").split("\0").filter(Boolean);
+  const lost = ignored.filter((entry) => !primaryHasCopy(item.path, item.primary, entry));
+  if (lost.length) throw new CmdError(`kept ${displayPath(item.path)}: removal would delete ignored files with no copy in ${displayPath(item.primary)}: ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? ", ..." : ""}`);
   const remove = Bun.spawnSync({ cmd: ["git", "-C", item.repo, "worktree", "remove", item.path] });
   if (!remove.success) throw new CmdError(`kept ${displayPath(item.path)}: ${remove.stderr.toString().trim().split("\n").at(-1)}`);
   if (item.action === "remove-worktree") return `removed ${displayPath(item.path)}; kept unmerged branch ${item.branch}`;

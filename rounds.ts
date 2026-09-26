@@ -25,6 +25,13 @@ function roundModelOf(kind: "work" | "review", opts: { model?: string; reviewMod
   return (kind === "review" ? opts?.reviewModel : undefined) ?? opts?.model ?? existing?.model;
 }
 
+// A spawn under a closed lane's name starts new work. The old lane's landing
+// and review proof belongs to trees that no longer exist, so it goes.
+export function reusedLaneProof(kind: "work" | "review", spawn: boolean, existing: Lane | undefined): Pick<Lane, "reviewAttestations" | "reviewClosed" | "landedCommit"> {
+  if (kind === "work" && spawn && existing?.work.state === "closed") return { reviewAttestations: undefined, reviewClosed: undefined, landedCommit: undefined };
+  return { reviewAttestations: existing?.reviewAttestations, reviewClosed: kind === "review" ? undefined : existing?.reviewClosed, landedCommit: existing?.landedCommit };
+}
+
 export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; reviewModel?: string; lineage?: Lineage; consult?: true; panelMember?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
   const existingBefore = readLedger()[lane];
@@ -115,7 +122,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         sessionId: opts?.sessionOverride ?? (opts?.requireSession ? existing?.sessionId : undefined),
         transcriptPath: undefined,
         reviewTree: opts?.reviewTree ?? existing?.reviewTree,
-        reviewClosed: kind === "review" ? undefined : existing?.reviewClosed,
+        ...reusedLaneProof(kind, Boolean(opts?.lineage), existing),
         // Fix, review and continuation rounds work on the same diff, so the
         // gate receipt must still cover files earlier rounds touched.
         touchedPaths: opts?.preserveGate ? existing?.touchedPaths ?? [] : [],

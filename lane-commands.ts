@@ -18,7 +18,7 @@ import {
 import { captureGateTree, composeGate, printGateChange, repositoryGate, runPreCheck } from "./gates.ts";
 import { formatGeminiStanding, readGeminiUsageSnapshot, requireGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, BATCH_ENV, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
+  activeStateOf, BATCH_ENV, callerLineage, callerOwnership, dropLane, type GateTree, laneEngine, laneRunning,
   ownershipSpec, readLane, readLedger, requireOwnChild, spawnRoots, type Spec,
   storedOwnership, supervisorLane, validLane, withLane, withLedger, workCwdOf,
 } from "./ledger.ts";
@@ -436,9 +436,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   const previous = existing?.reviewTree;
   let prior = "";
   if (!opts.consult && existing?.review?.report && existsSync(existing.review.report)) prior = readFileSync(existing.review.report, "utf8");
-  if (prior && existing?.reviewClosed) fail("The previous review has no P1/P2 findings; the review loop is closed");
-  const fix = prior && previous && reviewTree
-    ? fixReviewPrompt(previous, reviewTree, prior) : "";
+  const fix = reviewFollowUp(prior, existing?.reviewClosed, previous, reviewTree);
   const scope = parsed.flags.scope ? `\nReview only these paths: ${parsed.flags.scope}` : "";
   const owner = callerOwnership();
   const fullBrief = [opts.consult ? CONSULT_FRAME : reviewFrame(engine) + scope,
@@ -453,6 +451,16 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
     ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
     ...(images.length ? { images } : {}),
     ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
+}
+
+// An open review's next round checks the fix diff against its findings. A
+// closed review left nothing to check, so a changed tree gets a fresh review
+// and the same tree reuses the report.
+export function reviewFollowUp(prior: string, closed: boolean | undefined, previous: GateTree | undefined, current: GateTree | undefined): string {
+  if (!prior || !previous || !current) return "";
+  if (!closed) return fixReviewPrompt(previous, current, prior);
+  if (previous.tree === current.tree) fail("the previous review found no P1/P2 findings on this tree; reuse its report");
+  return "";
 }
 
 export function cleanCommand(argv: string[]) {

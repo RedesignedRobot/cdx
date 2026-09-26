@@ -163,8 +163,10 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
   expect(target).not.toContain("review-base");
 });
 
-import { attestReview, reviewRefusal } from "./gates.ts";
-import { childWorktreeTarget, firstRedPrefix, landLockHolder, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
+import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { reusedLaneProof } from "./rounds.ts";
+import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
 import { briefContractRefusal } from "./brief-contract.ts";
 
@@ -227,6 +229,67 @@ test("doctor removes merged worktrees and keeps unmerged branches of abandoned l
   expect(staleWorktreeAction({ ...old, merged: false, closed: false }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, running: true }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, ageDays: 2 }, 7)).toBeUndefined();
+});
+
+test("doctor keeps a stale worktree whose ignored files have no copy in the primary checkout", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-stale-"));
+  const [lane, primary] = [join(dir, "lane"), join(dir, "primary")];
+  try {
+    for (const root of [lane, primary]) mkdirSync(join(root, "node_modules"), { recursive: true });
+    mkdirSync(join(lane, "dist"));
+    writeFileSync(join(lane, ".env"), "TOKEN=lane\n");
+    writeFileSync(join(primary, ".env"), "TOKEN=primary\n");
+    writeFileSync(join(lane, "same.env"), "A=1\n");
+    writeFileSync(join(primary, "same.env"), "A=1\n");
+    expect(primaryHasCopy(lane, primary, "node_modules/")).toBe(true);
+    expect(primaryHasCopy(lane, primary, "dist/")).toBe(false);
+    expect(primaryHasCopy(lane, primary, ".env")).toBe(false);
+    expect(primaryHasCopy(lane, primary, "same.env")).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a migrated 9.x lane with an open review cannot land until a review attests its tree", () => {
+  const lane = { work: { state: "done", round: 1, exitCode: 0 }, worktreePath: "/wt/a", worktreeRepo: "/repo", branch: "lane/a",
+    gateReceipt: { valid: true, round: 1, exitCode: 0, head: "h", tree: "t" }, reviewClosed: false } as Lane;
+  expect(landRefusal(lane)).toContain("9.x review has unresolved P1/P2");
+  expect(landRefusal({ ...lane, reviewClosed: true })).toBeUndefined();
+  expect(landRefusal({ ...lane, reviewAttestations: [{ tree: "t", head: "h", reviewer: "a", closed: true, at: "" }] })).toBeUndefined();
+});
+
+test("a spawn under a closed lane's name drops the old landing and review proof; other rounds keep it", () => {
+  const attestation = { tree: "t", head: "h", reviewer: "r", closed: false, at: "" };
+  const closed = { work: { state: "closed" }, reviewAttestations: [attestation], landedCommit: "c", reviewClosed: false } as Lane;
+  expect(reusedLaneProof("work", true, closed)).toEqual({ reviewAttestations: undefined, reviewClosed: undefined, landedCommit: undefined });
+  expect(reusedLaneProof("work", false, closed)).toEqual({ reviewAttestations: [attestation], reviewClosed: false, landedCommit: "c" });
+  const done = { ...closed, work: { state: "done" } } as Lane;
+  expect(reusedLaneProof("work", true, done).reviewAttestations).toEqual([attestation]);
+  expect(reusedLaneProof("review", false, done)).toEqual({ reviewAttestations: [attestation], reviewClosed: undefined, landedCommit: "c" });
+});
+
+test("a closed review allows a fresh review of a changed tree and refuses the same tree", () => {
+  const [old, next] = [{ head: "h", tree: "old" }, { head: "h2", tree: "new" }];
+  expect(reviewFollowUp("P2 overflow", false, old, next)).toContain("git diff old new");
+  expect(reviewFollowUp("no findings", true, old, next)).toBe("");
+  expect(() => reviewFollowUp("no findings", true, old, { head: "h2", tree: "old" })).toThrow("reuse its report");
+  expect(reviewFollowUp("", true, old, next)).toBe("");
+});
+
+test("only a finished, non-consult review round attests", () => {
+  const review = { kind: "review", review: { state: "done" }, work: { state: "adopted" } } as Lane;
+  expect(reviewAttests(review)).toBe(true);
+  expect(reviewAttests({ ...review, review: { state: "failed" } } as Lane)).toBe(false);
+  expect(reviewAttests({ ...review, consult: true })).toBe(false);
+  expect(reviewAttests({ ...review, kind: "work" })).toBe(false);
+});
+
+test("a batch merge gate borrows installs from the lane that changed a lockfile", () => {
+  expect(changesInstalls(["src/a.ts", "package.json"])).toBe(false);
+  expect(changesInstalls(["apps/web/bun.lock"])).toBe(true);
+  expect(changesInstalls(["Cargo.lock"])).toBe(true);
+  const [first, second] = [{ lane: "a", installs: false }, { lane: "b", installs: true }];
+  expect(installSource([first, second])).toBe(second);
+  expect(installSource([first, { ...second, installs: false }])).toBe(first);
+  expect(landJobName("feat.x")).toBe("land-feat-x");
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {

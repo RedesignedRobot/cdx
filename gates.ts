@@ -3,7 +3,7 @@ import { safeText } from "./safe-text.ts";
 // Gate execution, content receipts, review tree snapshots, and gate commands.
 
 import {
-  type GateReceipt, type GateTree, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
+  activeStateOf, type GateReceipt, type GateTree, type Lane, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
   type RoundRecord, supervisorLane, withLedger,
 } from "./ledger.ts";
 import { tailOutput } from "./reports.ts";
@@ -60,6 +60,12 @@ export function realpathOrUndefined(path: string): string | undefined {
 export function reviewRoot(cwd: string): string | undefined {
   const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
   return top.success ? realpathOrUndefined(top.stdout.toString().trim()) : undefined;
+}
+
+// Only a review round that finished attests; a failed round's findings may
+// be partial.
+export function reviewAttests(entry: Lane): boolean {
+  return entry.kind === "review" && !entry.consult && activeStateOf(entry) === "done";
 }
 
 export function attestReview(ledger: Ledger, reviewer: string, closed: boolean, report: string | undefined, root: string | undefined,
