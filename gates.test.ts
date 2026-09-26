@@ -164,6 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 import { attestReview, reviewRefusal } from "./gates.ts";
 import { childWorktreeTarget, firstRedPrefix, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths } from "./worktrees.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
+import { briefContractRefusal } from "./brief-contract.ts";
 
 test("a review by any lane name attests to the tree it saw and gates land by content", () => {
   const work = { work: { state: "done" }, worktreePath: "/wt/feature", gateReceipt: { tree: "gated" } } as Lane;
@@ -211,6 +212,7 @@ test("supervisors and their children get their own worktree, and children land i
   expect(childWorktreeTarget("sup", undefined, undefined, false, true)).toBe("sup");
   expect(childWorktreeTarget("sup", undefined, undefined, true, true)).toBeUndefined();
   const rules = laneInstructions({ supervisor: true });
+  for (const heading of briefContractRefusal("", true, false)!.match(/## [A-Za-z ]+/g)!) expect(rules).toContain(heading);
   expect(rules).toContain("cdx land <child>");
   expect(rules).toContain("plain call");
   expect(rules).not.toContain("shared-tree");
