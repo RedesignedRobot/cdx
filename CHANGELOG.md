@@ -1,6 +1,6 @@
 ## 10.0.1 (2026-09-26)
 
-Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses.
+Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses. A reload leaves the head where it was.
 
 ### Landing
 
@@ -24,6 +24,7 @@ Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open 
 ### Delivery
 
 - Only a session that drove cdx can be head. The mod runs `cdx brief --head` at an interactive session start, so a new session beside an older idle one takes the wakes at once; a headless start never claims. With no driver, events wait for one.
+- `cdx brief --head` claims only in the first 30 s of a session's live stretch: a new session, `/clear`, `/resume`, or a session that had stopped polling for 30 s. A plugin reload, enable or worker respawn in a running session no longer takes the head.
 - `cdx shots grade` runs as job `shots-<dir>`, and its `job-exit` is the one wake. Terminal events of the consults that `shots grade` and `cdx context` start no longer reach the head; their questions still do.
 - The rollover Stop block runs the settings Stop hooks first, the owner's push guard included, and joins their block text with its own.
 - Native tools run under the ten-minute `$.process.run` ceiling instead of the engine's 30 s default, unless they name a shorter bound (`ask` 100 s, `doctor` 120 s).

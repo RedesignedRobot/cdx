@@ -430,13 +430,33 @@ export function readSession(session: string): SessionRow | undefined {
   return db().query<SessionRow, [string]>("SELECT * FROM sessions WHERE session = ?").get(session) ?? undefined;
 }
 
-// Session start, resume and compaction call this through cdx brief. A new
-// session's own cursor starts at the newest event: what happened before it
-// is the brief's job, not a replay. A restart keeps the first start time.
-export function startSession(session: string, now = Date.now()): void {
+// A new session's own cursor starts at the newest event: what happened
+// before it is the brief's job, not a replay. started_at marks the start of
+// the current live stretch: a row not polled within ACTIVE_SESSION_MS
+// belongs to no running process, so the next start or poll restarts it.
+function touchSession(session: string, now: number): SessionRow {
   const at = new Date(now).toISOString();
-  write(() => db().query(`INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)
-    ON CONFLICT (session) DO UPDATE SET polled_at = excluded.polled_at`).run(session, latestEventId(), at, at));
+  const row = readSession(session);
+  if (!row) db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, latestEventId(), at, at);
+  else db().query("UPDATE sessions SET polled_at = ?, started_at = ? WHERE session = ?")
+    .run(at, Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS ? row.started_at : at, session);
+  return readSession(session)!;
+}
+
+// brief --head claims the wakes only early in a live stretch: a new session,
+// /clear, /resume, or a restart of an idle one. A reload, plugin enable or
+// worker respawn re-fires session.start inside a session that kept polling,
+// and must not take the head from the session the person is using.
+export function mayClaimHead(row: SessionRow, now: number): boolean {
+  return Date.parse(row.started_at) >= now - ACTIVE_SESSION_MS;
+}
+
+// Session start, /clear, /resume and compaction call this through cdx brief.
+export function startSession(session: string, now = Date.now(), claim = false): void {
+  write(() => {
+    const row = touchSession(session, now);
+    if (claim && mayClaimHead(row, now)) markDriver(session, now);
+  });
 }
 
 // Only a session that already has a row records its brief or its drive; the
@@ -508,11 +528,7 @@ export function deliverEvents(session: string, now: number, peek: boolean, emit:
   const current = readSession(session);
   if (current && latestEventId() <= Math.min(current.cursor, ownerCursor()) && now - Date.parse(current.polled_at) < POLL_MARK_MS) { emit([]); return; }
   write(() => {
-    const at = new Date(now).toISOString();
-    const row = readSession(session);
-    const cursor = row?.cursor ?? latestEventId();
-    if (row) db().query("UPDATE sessions SET polled_at = ? WHERE session = ?").run(at, session);
-    else db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, cursor, at, at);
+    const cursor = touchSession(session, now).cursor;
     const owner = deliveryHead(now) === session ? ownerCursor() : undefined;
     const records = eventsAfter(Math.min(cursor, owner ?? cursor));
     emit(selectEvents(records, session, cursor, owner));
