@@ -10,7 +10,7 @@ import { CmdError, completionVerdict, displayPath, fail, HOME, pidAlive, ROOT, S
 import { write } from "./store.ts";
 import { spawn } from "node:child_process";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { basename, isAbsolute, join } from "node:path";
 
 export function resolveWorktreeTarget(target: string): string {
   if (isAbsolute(target)) return target;
@@ -581,21 +581,24 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
   return stale;
 }
 
+// Install and index directories rebuild from tracked files.
+const DISPOSABLE_DIRS = new Set(["node_modules", ".codegraph"]);
+
 // git worktree remove refuses untracked and modified files but deletes
-// ignored ones. An ignored directory the primary checkout also has is an
-// install or build output; an ignored file survives only as an identical copy
-// there. Anything else (a .env written in the lane) keeps the worktree.
-export function primaryHasCopy(worktree: string, primary: string, entry: string): boolean {
+// ignored ones. Only a disposable directory may go; an ignored file survives
+// only as an identical copy in the primary checkout. Anything else (a .env
+// written in the lane, an ignored data/ directory) keeps the worktree.
+export function removableIgnored(worktree: string, primary: string, entry: string): boolean {
   const mine = join(worktree, entry), theirs = join(primary, entry);
   try {
-    if (entry.endsWith("/")) return statSync(theirs).isDirectory();
+    if (entry.endsWith("/")) return DISPOSABLE_DIRS.has(basename(entry));
     return readFileSync(mine).equals(readFileSync(theirs));
   } catch { return false; }
 }
 
 export function removeStaleWorktree(item: StaleWorktree): string {
   const ignored = gitRaw(item.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").split("\0").filter(Boolean);
-  const lost = ignored.filter((entry) => !primaryHasCopy(item.path, item.primary, entry));
+  const lost = ignored.filter((entry) => !removableIgnored(item.path, item.primary, entry));
   if (lost.length) throw new CmdError(`kept ${displayPath(item.path)}: removal would delete ignored files with no copy in ${displayPath(item.primary)}: ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? ", ..." : ""}`);
   const remove = Bun.spawnSync({ cmd: ["git", "-C", item.repo, "worktree", "remove", item.path] });
   if (!remove.success) throw new CmdError(`kept ${displayPath(item.path)}: ${remove.stderr.toString().trim().split("\n").at(-1)}`);

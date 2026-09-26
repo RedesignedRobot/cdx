@@ -164,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
-import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, runWorktreeSetup, staleWorktreeAction, statusPaths, takeLandLock, worktreeSetupCommands } from "./worktrees.ts";
+import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, removableIgnored, receiptProves, runWorktreeSetup, staleWorktreeAction, statusPaths, takeLandLock, worktreeSetupCommands } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
 import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
@@ -241,10 +241,16 @@ test("doctor keeps a stale worktree whose ignored files have no copy in the prim
     writeFileSync(join(primary, ".env"), "TOKEN=primary\n");
     writeFileSync(join(lane, "same.env"), "A=1\n");
     writeFileSync(join(primary, "same.env"), "A=1\n");
-    expect(primaryHasCopy(lane, primary, "node_modules/")).toBe(true);
-    expect(primaryHasCopy(lane, primary, "dist/")).toBe(false);
-    expect(primaryHasCopy(lane, primary, ".env")).toBe(false);
-    expect(primaryHasCopy(lane, primary, "same.env")).toBe(true);
+    expect(removableIgnored(lane, primary, "node_modules/")).toBe(true);
+    expect(removableIgnored(lane, primary, "dist/")).toBe(false);
+    expect(removableIgnored(lane, primary, ".env")).toBe(false);
+    expect(removableIgnored(lane, primary, "same.env")).toBe(true);
+    // Both checkouts have an ignored data/, but only the lane holds local.sqlite.
+    for (const root of [lane, primary]) mkdirSync(join(root, "data"));
+    writeFileSync(join(lane, "data", "local.sqlite"), "lane rows");
+    expect(removableIgnored(lane, primary, "data/")).toBe(false);
+    mkdirSync(join(lane, "packages", "a", "node_modules"), { recursive: true });
+    expect(removableIgnored(lane, primary, "packages/a/node_modules/")).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
