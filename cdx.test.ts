@@ -1,7 +1,7 @@
 import "./visibility.test.ts";
 import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
-import { unlinkSync } from "node:fs";
+import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import {
   verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
   checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
@@ -20,6 +20,7 @@ import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
 import { validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
+import { registeredFlag } from "./runtime.ts";
 
 // Keep tests pure. Pass state explicitly so these tests
 // never read user files, spawn engines, or wait on timers.
@@ -1395,4 +1396,12 @@ test("doctor treats hooks without the call-cap callback as stale", () => {
   expect(hooksCurrent(hooks, "bun /cdx.ts")).toBe(true);
   delete hooks.PostInvocation;
   expect(hooksCurrent(hooks, "bun /cdx.ts")).toBe(false);
+});
+
+test("every flag a command allows is registered with the parser", () => {
+  const sources = readdirSync(import.meta.dir).filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"));
+  const allowed = sources.flatMap((f) => [...readFileSync(`${import.meta.dir}/${f}`, "utf8").matchAll(/parseArgs\([^,]+,\s*\[([^\]]*)\]/g)]
+    .flatMap((m) => [...m[1]!.matchAll(/"([^"]+)"/g)].map((n) => n[1]!)));
+  expect(allowed.length).toBeGreaterThan(50);
+  expect(allowed.filter((name) => !registeredFlag(name))).toEqual([]);
 });
