@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine } from "./guard";
+import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, nativeCdxCommand } from "./guard";
 
 // The head must not block on a lane or job: the shapes the mod denies.
 test("blockingCdxCommand catches cdx wait in every spelling the head uses", () => {
@@ -106,4 +106,33 @@ test("invokedRawEngine survives the shared command-start refactor", () => {
   expect(invokedRawEngine("cd /x && nice -n 5 agy --print=/usage")).toBe("gemini");
   expect(invokedRawEngine("codex --version")).toBeUndefined();
   expect(invokedRawEngine("cdx spawn x --engine gpt \"codex exec\"")).toBeUndefined();
+});
+
+// A guard refuses a command only where the shell would run cdx or an engine:
+// quoted text and quoted heredoc bodies are data, while a substitution inside
+// double quotes or an unquoted heredoc runs.
+test("the guards match invocations, not text that mentions them", () => {
+  const native = new Set(["land", "status"]);
+  const invocations: [string, string | undefined][] = [
+    ["cdx land x", "land"],
+    ["bun /Users/mas/code/cdx/cdx.ts land x", "land"],
+    ["FOO=1 cdx land x", "land"],
+    ["git status && cdx land x", "land"],
+    ["git diff | cdx land x", "land"],
+    ["echo $(cdx land x)", "land"],
+    ['git commit -m "Refuse `cdx land x`"', "land"],
+    ["cat <<EOF\n$(cdx land x)\nEOF", "land"],
+    ['git commit -m "Keep cdx land inside the ceiling"', undefined],
+    ["git commit -m 'cdx land, codex exec and cdx wait'", undefined],
+    ["git commit -F - <<'EOF'\ncdx land x\ncodex exec y\nwhile true; do cdx status; done\nEOF", undefined],
+    ["git commit -F - <<EOF\ncdx land x\nEOF", undefined],
+    ['echo "cdx land x" | grep cdx', undefined],
+    ["echo cdx land x", undefined],
+    ["grep -rn 'cdx land' .", undefined],
+  ];
+  for (const [command, expected] of invocations) expect([command, nativeCdxCommand(command, native)]).toEqual([command, expected]);
+  expect(blockingCdxCommand("git commit -F - <<'EOF'\nwhile true; do cdx status; done\nEOF")).toBeUndefined();
+  expect(blockingCdxCommand("git commit -m \"never cdx wait a lane\"")).toBeUndefined();
+  expect(invokedRawEngine("git commit -m \"codex exec is banned\"")).toBeUndefined();
+  expect(invokedRawEngine("git commit -F - <<'EOF'\ncodex exec y\nEOF")).toBeUndefined();
 });
