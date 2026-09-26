@@ -21,6 +21,7 @@ import { missingCodexModels, usageVerdict } from "./doctor.ts";
 import { deliverEvents, electHead, eventsAfter, feedEvent, latestEventId, type Lane, readSession, startSession, storeLane, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
+import { jobShellEnv } from "./jobs.ts";
 import { logProgress, progressLogPathOf } from "./reports.ts";
 
 // Keep tests pure: selection is a filter over rows passed in, so these
@@ -460,7 +461,7 @@ test("6.6.0: a cdx-authored control record is announced as a notice, a head stee
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z" })).toBe("stop and report");
 });
 
-test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners keep it", () => {
+test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners and job commands keep it", () => {
   expect(process.env.CDX_STATE_HOME).toBe(ROOT);
   const lane = laneChildEnv("/codex", { lane: "w", round: 1 });
   for (const env of [lane, gateEnv("/repo")]) {
@@ -468,6 +469,8 @@ test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_H
     expect(env.CDX_HOME).toBe(ROOT);
   }
   expect(runnerEnv(undefined).CDX_STATE_HOME).toBe(ROOT);
+  const job = jobShellEnv({ CDX_STATE_HOME: "/tmp/state", CDX_JOB_CMD: "true", CDX_JOB_CWD: "/repo", CDX_JOB_OWNER: "s" });
+  expect(job).toEqual({ CDX_STATE_HOME: "/tmp/state" });
 });
 
 test("a progress note the sandbox cannot write never fails the command", () => {

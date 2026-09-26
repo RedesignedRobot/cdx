@@ -192,14 +192,22 @@ function jobTree(cwd: string): import("./ledger.ts").GateTree | undefined {
   try { return captureGateTree(cwd); } catch { return undefined; }
 }
 
+// Jobs run for the head, never inside a lane, so the job's command keeps the
+// runner's CDX_STATE_HOME: a cdx call from it (shots _grade and its consults)
+// must reach the same state home. Lanes and gates drop it in uncoloredChildEnv.
+export function jobShellEnv(parent: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const env = { ...parent };
+  for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER"]) delete env[key];
+  return env;
+}
+
 export async function runJob(name: string): Promise<number> {
   const cmd = process.env.CDX_JOB_CMD;
   const cwd = process.env.CDX_JOB_CWD;
   if (!cmd || !cwd) fail("internal: _job needs CDX_JOB_CMD and CDX_JOB_CWD");
   const job = readJobs()[name];
   if (!job) fail(`internal: job "${name}" is missing from the state store`);
-  const env = { ...process.env };
-  for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
+  const env = jobShellEnv(process.env);
   // The git call runs before the write transaction, never inside its lock.
   const treeStart = jobTree(cwd);
   withJobs((jobs) => { jobs[name]!.treeStart = treeStart; });
