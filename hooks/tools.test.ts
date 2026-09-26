@@ -200,6 +200,7 @@ test("land and gate refuse the input shapes that used to reach cdx as the text u
   expect(() => land.run({ lane: "a", lanes: ["b"] })).toThrow("not both");
   expect(land.run({ lanes: ["a", "b"] }).argv).toEqual(["land", "--batch", "a", "b"]);
   expect(() => TOOLS_BY_NAME.get("gate")!.run({ lane: "a" })).toThrow("gate needs cmd or clear");
+  expect(TOOLS_BY_NAME.get("panel")!.run({ name: "p", cd: "/repo", question: "q" }).argv).toEqual(["panel", "p", "--cd", "/repo", "-"]);
   expect(TOOLS_BY_NAME.get("resume")!.run({ lane: "a", fix: "gate", followUp: "f", maxRuntime: null }).argv).not.toContain("null");
 });
 

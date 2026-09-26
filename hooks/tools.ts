@@ -26,7 +26,7 @@ export const MAX_PROCESS_TIMEOUT_MS = 10 * 60_000;
 
 export const TOOLS: ToolDefinition[] = [
   {
-    name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix. A land that must run its gate detaches into a tracked job and returns at once; the land result arrives as a [cdx] event.",
+    name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix. A land a receipt proves runs inline; one that must run its gate detaches into a land-<lane> job and returns at once, and that job's exit event carries the land result.",
     inputSchema: { type: "object", properties: { lane: { type: "string" }, lanes: { type: "array", items: { type: "string" }, description: "Land several lanes with one gate" } } },
     run: (input) => {
       if (Array.isArray(input.lanes) && input.lanes.length) {
@@ -173,7 +173,7 @@ export const TOOLS: ToolDefinition[] = [
     run: (input) => {
       const argv = ["panel", String(input.name), "--cd", String(input.cd)];
       if (input.pack) argv.push("--pack", String(input.pack));
-      argv.push("--bg", "-");
+      argv.push("-");
       return { argv, stdin: String(input.question) };
     },
   },

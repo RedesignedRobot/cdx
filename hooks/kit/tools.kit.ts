@@ -35,3 +35,11 @@ test("a tool with no bound of its own runs at the ten minute ceiling, ask keeps 
   await $.tool.call({ tool: "mcp__cdx__ask", cd: "/repo", question: "q" } as never);
   expect(runs.map((run) => [run.argv.at(2), run.init?.timeoutMs])).toEqual([["spawn", 600_000], ["ask", 100_000]]);
 });
+
+test("an interactive start claims the head with brief --head, a headless start only reads the brief", async ($, on) => {
+  const runs: { argv: readonly string[] }[] = [];
+  engine(on, runs);
+  await $.session.start({ cwd: "/tmp", surface: "terminal", isInteractive: true });
+  await $.session.start({ cwd: "/tmp", surface: null, isInteractive: false });
+  expect(runs.map((run) => run.argv.slice(2))).toEqual([["brief", "--head"], ["brief"]]);
+});
