@@ -75,6 +75,7 @@ Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code sessio
 1. Stop every lane and job. A 9.x runner left running writes `ledger.json`, which 10.0 never reads.
 2. Install 10.0 and run `cdx doctor --fix`. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; 10.0 refuses unknown keys.
 3. Run `cdx migrate` once.
+4. Restart every open Claude Code session, or run `/reload-plugins` in each, before the first spawn. A session that still holds the 9.x mod calls the removed takeover tool, sends the old spawn schema that 10.0 refuses, polls with the 9.x cursor, and runs land with a 120 s timeout that kills it mid-merge.
 
 `cdx migrate` imports version 5 ledger lanes (closed ones straight into the archive), feed events, jobs and questions into `state/cdx.db` in one transaction, then moves the old files to `state/legacy/` as the backup. It refuses a second run. Lanes already in the database win over the JSON copy. The lifecycle events `started`, `active`, `progress`, `gate-started` and `report-written` are dropped. Nothing migrates on read: until `cdx migrate` runs, `cdx status` prints a hint on stderr and `cdx doctor` warns. A round spec from 9.x lacks the rendered lane instructions and the runner refuses it; give such a lane a fresh round.
 
@@ -182,7 +183,7 @@ The brief's `Ground rules:` block is a pointer, not a copy: the role's lane home
 | `cdx usage` | Quota windows, observed burn, projections, account picks, outcome totals |
 | `cdx tail`, `cdx report`, `cdx log`, `cdx feed` | Read transcripts, reports, logs and recent events |
 | `cdx kill`, `cdx close`, `cdx clean` | Stop, close, prune |
-| `cdx doctor`, `cdx migrate`, `cdx brief` | Diagnose, import 9.x state, make this session the head |
+| `cdx doctor`, `cdx migrate`, `cdx brief` | Diagnose, import 9.x state, print the session brief (`--head` makes this session the head) |
 
 <details>
 <summary><b>Full flag reference</b></summary>

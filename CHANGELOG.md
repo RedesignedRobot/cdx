@@ -1,6 +1,6 @@
 ## 10.0.0
 
-Breaking. Stop every lane and job, install 10.0, then run `cdx migrate` once. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; they are now unknown keys and refuse.
+Breaking. Stop every lane and job, install 10.0, run `cdx migrate` once, then restart every open Claude Code session (or `/reload-plugins` in each) before the first spawn; a session still holding the 9.x mod calls removed tools and lands with a 120 s timeout. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; they are now unknown keys and refuse.
 
 ### State
 

@@ -97,6 +97,7 @@ Before you look at any screenshot, run `cdx shots grade <dir> --rubric <file>`. 
 1. Stop every lane and job. A 9.x runner left running writes `ledger.json`, which 10.0 never reads.
 2. Install 10.0: pull, run `cdx doctor --fix` to render the role lane homes, reload the plugin. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; 10.0 refuses them.
 3. Run `cdx migrate` once. It imports lanes, events, jobs and questions into `state/cdx.db` and moves the old files to `state/legacy/`. Until it runs, `cdx status` prints a hint and `cdx doctor` warns.
+4. Restart every open Claude Code session, or run `/reload-plugins` in each, before the first spawn. A session that still holds the 9.x mod calls the removed takeover tool, sends the old spawn schema that 10.0 refuses, polls with the 9.x cursor, and runs land with a 120 s timeout that kills it mid-merge.
 
 ## Commands
 
