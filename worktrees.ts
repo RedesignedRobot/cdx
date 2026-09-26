@@ -9,7 +9,7 @@ import { specPathOf } from "./reports.ts";
 import { CmdError, completionVerdict, displayPath, fail, HOME, pidAlive, ROOT, SELF, settleHint, shellQuote, uncoloredChildEnv } from "./runtime.ts";
 import { write } from "./store.ts";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 export function resolveWorktreeTarget(target: string): string {
@@ -37,7 +37,7 @@ export function worktreeReuseRefusal(expectedBranch: string, actualBranch: strin
   if (!clean) return "target worktree has uncommitted changes";
 }
 
-export interface WorktreeInfo { path: string; repo: string; branch: string; baseBranch?: string }
+export interface WorktreeInfo { path: string; repo: string; branch: string; baseBranch?: string; created?: true }
 
 export function createWorktree(repo: string, target: string, lane: string): WorktreeInfo {
   const top = Bun.spawnSync({ cmd: ["git", "-C", repo, "rev-parse", "--show-toplevel"] });
@@ -67,32 +67,39 @@ export function createWorktree(repo: string, target: string, lane: string): Work
     fail(`git worktree add failed: ${(add.stderr.toString() || add.stdout.toString()).trim().split("\n").at(-1)}`);
   }
   console.log(`cdx: worktree ${displayPath(path)} on branch ${branch} (from ${displayPath(repoRoot)})`);
-  if (config.worktreeSetup) {
-    console.log(`cdx: worktree setup: ${config.worktreeSetup}`);
-    const setup = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", config.worktreeSetup], cwd: path, env: uncoloredChildEnv() });
-    if (!setup.success) {
-      const tail = (setup.stderr.toString() || setup.stdout.toString()).trim().split("\n").at(-1) ?? "";
-      // Leave the worktree in place for inspection; the caller decides.
-      fail(`worktree setup failed in ${path}${tail ? `: ${tail}` : ""}`);
-    }
-  }
-  const repoSetup = `${path}/.cdx-worktree-setup`;
-  let isExecutable = false;
+  return { path, repo: repoRoot, branch, baseBranch, created: true };
+}
+
+export function worktreeSetupCommands(path: string, configured = config.worktreeSetup): string[] {
+  const repoSetup = join(path, ".cdx-worktree-setup");
+  let executable = false;
   try {
     const st = statSync(repoSetup);
-    if (st.isFile() && (st.mode & 0o111) !== 0) {
-      isExecutable = true;
-    }
+    executable = st.isFile() && (st.mode & 0o111) !== 0;
   } catch { /* not present */ }
-  if (isExecutable) {
-    console.log("cdx: repo worktree setup: .cdx-worktree-setup");
-    const setup = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", "./.cdx-worktree-setup"], cwd: path, env: uncoloredChildEnv() });
-    if (!setup.success) {
-      const tail = (setup.stderr.toString() || setup.stdout.toString()).trim().split("\n").at(-1) ?? "";
-      fail(`worktree setup failed in ${path}${tail ? `: ${tail}` : ""}`);
+  return [...(configured ? [configured] : []), ...(executable ? ["./.cdx-worktree-setup"] : [])];
+}
+
+export interface WorktreeSetup { type: "cdx_worktree_setup"; commands: string[]; exitCode: number; log: string; seconds: number; tail?: string }
+
+// A new worktree's setup (installs, indexing) can outlast the plugin's ten
+// minute process.run, so the detached runner runs it before the engine
+// starts instead of spawn. A failure leaves the worktree for inspection.
+export function runWorktreeSetup(path: string, logPath: string, commands = worktreeSetupCommands(path)): WorktreeSetup {
+  const started = Date.now();
+  writeFileSync(logPath, "");
+  let exitCode = 0;
+  const out = openSync(logPath, "a");
+  try {
+    for (const command of commands) {
+      appendFileSync(out, `$ ${command}\n`);
+      exitCode = Bun.spawnSync({ cmd: ["/bin/sh", "-lc", command], cwd: path, env: uncoloredChildEnv(), stdout: out, stderr: out }).exitCode ?? 1;
+      if (exitCode !== 0) break;
     }
-  }
-  return { path, repo: repoRoot, branch, baseBranch };
+  } finally { closeSync(out); }
+  const result: WorktreeSetup = { type: "cdx_worktree_setup", commands, exitCode, log: logPath, seconds: Math.round((Date.now() - started) / 1000) };
+  if (exitCode === 0) return result;
+  return { ...result, tail: readFileSync(logPath, "utf8").trimEnd().split("\n").slice(-20).join("\n") };
 }
 
 // A supervisor's writers never share a tree: each child gets a worktree cut

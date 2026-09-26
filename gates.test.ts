@@ -164,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
-import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, runWorktreeSetup, staleWorktreeAction, statusPaths, takeLandLock, worktreeSetupCommands } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
 import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
@@ -303,5 +303,19 @@ test("a land lock left by a dead lander is taken over; a live or pid-less one re
     rmSync(lock);
     mkdirSync(lock);
     expect(() => takeLandLock(lock, () => false)).toThrow("doctor --fix");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("worktree setup runs the configured command, then an executable repo script, and stops at the first failure", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-setup-"));
+  try {
+    expect(worktreeSetupCommands(dir, "bun install")).toEqual(["bun install"]);
+    writeFileSync(join(dir, ".cdx-worktree-setup"), "#!/bin/sh\n", { mode: 0o755 });
+    expect(worktreeSetupCommands(dir, "bun install")).toEqual(["bun install", "./.cdx-worktree-setup"]);
+    const log = join(dir, "setup.log");
+    expect(runWorktreeSetup(dir, log, ["echo installed"]).exitCode).toBe(0);
+    const failed = runWorktreeSetup(dir, log, ["echo first", "echo broken >&2; exit 3", "echo never"]);
+    expect(failed.exitCode).toBe(3);
+    expect(failed.tail).toBe("$ echo first\nfirst\n$ echo broken >&2; exit 3\nbroken");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

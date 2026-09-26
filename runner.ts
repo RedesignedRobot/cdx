@@ -26,6 +26,7 @@ import {
   gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
+import { runWorktreeSetup } from "./worktrees.ts";
 import {
   activeStateOf, feedEvent, findLane, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
   type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLane, withLedger,
@@ -208,9 +209,14 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   const jsonMode = true;
   const role = { review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) };
   if (!gemini && spec.laneInstructions === undefined) throw new CmdError("round spec has no lane instructions; start a new round with cdx 10");
+  const logPath = logPathOf(lane, round, jsonMode);
+  const setup = spec.worktreeSetupRound === round ? runWorktreeSetup(spec.cwd, `${ROOT}/logs/${lane}-r${round}.setup.log`) : undefined;
+  if (setup?.exitCode) {
+    writeFileSync(logPath, `${safeJSON(setup)}\n`);
+    throw new CmdError(`worktree setup failed in ${spec.cwd} (log ${setup.log}): ${setup.tail?.split("\n").at(-1) ?? ""}`);
+  }
   if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), spec.laneInstructions!, role);
   prepareSandboxDirs(spec);
-  const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
   try { unlinkSync(`${ROOT}/reports/${lane}-r${round}.findings.json`); } catch { /* ignore if missing */ }
   const treeProbe = Bun.spawnSync({ cmd: ["git", "-C", spec.cwd, "rev-parse", "--show-toplevel"] });
@@ -278,6 +284,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     const usage = readGeminiUsageSnapshot();
     return usage ? { fiveHour: 100 - usage.fiveHour.remainingPercent, weekly: 100 - usage.weekly.remainingPercent } : undefined;
   };
+  if (setup) log.write(`${safeJSON(setup)}\n`);
   if (gemini) accountPercent("Start", geminiPercent());
   log.write(`${safeJSON({ type: "cdx_prompt_size", sources: spec.promptBytes ?? { supplied: Buffer.byteLength(spec.prompt) }, providerInjected: null })}\n`);
   const stopEngine = (signal: "SIGTERM" | "SIGINT" | "SIGKILL", reason: string) => {

@@ -285,6 +285,9 @@ export interface Spec {
   supervisor?: true;
   // agy agent name, pinned at launch so the detached runner cannot drift.
   agent?: string;
+  // The round whose runner sets up the new worktree before the engine starts.
+  // A number, not a flag: fallback and failover rounds copy the spec.
+  worktreeSetupRound?: number;
   startedAt?: string;
 }
 

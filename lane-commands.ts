@@ -261,6 +261,7 @@ export async function spawnCommand(argv: string[]) {
     ...(effectiveGate ? { gate: effectiveGate } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...(expected !== undefined ? { expectMinutes: expected } : {}),
+    ...(worktree?.created ? { worktreeSetupRound: round } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
   }, fullBrief, parsed.bools.has("bg"));
 }
