@@ -19,6 +19,7 @@ import {
 import { afterCompaction, stopOutcome } from "./rollover";
 import {
   CDX_TOOL_PREFIX,
+  MAX_PROCESS_TIMEOUT_MS,
   nativeToolResult, formatToolOutput,
   runFromCwd,
   TOOL_NAMES,
@@ -336,16 +337,14 @@ export function register(on: On) {
       env: Record<string, string>;
       cwd: string;
       stdin?: string;
-      timeoutMs?: number;
+      timeoutMs: number;
     } = {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: await $.session.cwd(),
+      timeoutMs: runSpec.timeoutMs ?? MAX_PROCESS_TIMEOUT_MS,
     };
     if (runSpec.stdin !== undefined) {
       procInit.stdin = runSpec.stdin;
-    }
-    if (runSpec.timeoutMs !== undefined) {
-      procInit.timeoutMs = runSpec.timeoutMs;
     }
     let res;
     try {

@@ -6,6 +6,7 @@ import { safeText } from "../safe-text";
 export interface ToolRunResult {
   argv: string[];
   stdin?: string;
+  // A shorter bound for a command known to be quick; absent means the ceiling.
   timeoutMs?: number;
 }
 
@@ -17,7 +18,10 @@ export interface ToolDefinition {
 }
 
 // $.process.run rejects any timeoutMs above ten minutes, and a rejecting
-// handler reaches the head as "no tool.call hook answered".
+// handler reaches the head as "no tool.call hook answered". Its own default
+// is 30 seconds, shorter than the foreground part of a spawn (git worktree
+// add plus the configured worktreeSetup) or a close removing a worktree, so
+// every tool runs with the ceiling unless it names a shorter bound.
 export const MAX_PROCESS_TIMEOUT_MS = 10 * 60_000;
 
 export const TOOLS: ToolDefinition[] = [
@@ -28,10 +32,10 @@ export const TOOLS: ToolDefinition[] = [
       if (Array.isArray(input.lanes) && input.lanes.length) {
         if (input.lane !== undefined) throw new Error("land takes lane or lanes, not both");
         if (!input.lanes.every(isName)) throw new Error("invalid lanes: every item must be a lane name");
-        return { argv: ["land", "--batch", ...input.lanes], timeoutMs: MAX_PROCESS_TIMEOUT_MS };
+        return { argv: ["land", "--batch", ...input.lanes] };
       }
       if (!isName(input.lane)) throw new Error("missing required field: lane or lanes");
-      return { argv: ["land", input.lane], timeoutMs: MAX_PROCESS_TIMEOUT_MS };
+      return { argv: ["land", input.lane] };
     },
   },
   {

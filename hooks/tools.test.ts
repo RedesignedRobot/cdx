@@ -2,10 +2,10 @@ import { describe, expect, test } from "bun:test";
 import { nativeToolResult, formatToolOutput, MAX_PROCESS_TIMEOUT_MS, TOOLS, TOOLS_BY_NAME } from "./tools";
 
 describe("tool rules", () => {
-  test("land stays within the process.run timeout ceiling", () => {
-    const land = TOOLS_BY_NAME.get("land")!;
-    expect(land.run({ lane: "a" }).timeoutMs).toBeLessThanOrEqual(MAX_PROCESS_TIMEOUT_MS);
-    expect(land.run({ lanes: ["a", "b"] }).timeoutMs).toBeLessThanOrEqual(MAX_PROCESS_TIMEOUT_MS);
+  test("a tool bound never exceeds the process.run ceiling the others run with", () => {
+    const bounds = TOOLS.map((tool) => tool.run({ lane: "a", cd: "/repo", question: "q", brief: "b", followUp: "f", fix: "gate",
+      name: "n", text: "t", answer: "a", cmd: "c", target: "t" }).timeoutMs).filter((bound) => bound !== undefined);
+    expect(bounds.every((bound) => bound! < MAX_PROCESS_TIMEOUT_MS)).toBe(true);
   });
 
   test("spawn tool argv ends with --bg - and carries the brief on stdin", () => {
