@@ -3,9 +3,11 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  answerPath, citationProblem, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  answerPath, citationProblem, memberSpec, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
   panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
+import type { Lane } from "./ledger.ts";
+import { laneInstructions } from "./prompts.ts";
 import { reportPathOf } from "./reports.ts";
 
 const cwd = "/repo";
@@ -121,6 +123,15 @@ test("panel files never share a path with a lane report or another panel's files
   expect(panelReportPath("foo-r2")).not.toBe(reportPathOf("foo", 2));
   expect(panelReportPath("foo-astra")).not.toBe(answerPath("foo", "astra"));
   expect(answerPath("foo", "astra")).not.toBe(reportPathOf("foo-astra", 1));
+});
+
+test("a supervisor-started panel's Codex members carry review lane instructions; the Claude member needs none", () => {
+  const panel = { name: "p", cwd, question: "q", caller: "sup", callerRound: 2, owner: { ownerCwd: cwd }, state: "running" as const, startedAt: "2026-09-26T12:00:00Z" };
+  const round = { lane: "p-astra", round: 1, engine: "gpt" as const, model: "gpt-6-astra", effort: "medium", prompt: "q", maxRuntimeMins: 15 };
+  const entry = { roundStartedAt: "2026-09-26T12:00:00Z" } as Lane;
+  expect(memberSpec(panel, entry, round).laneInstructions).toBe(laneInstructions({ review: true }));
+  expect(memberSpec({ ...panel, caller: undefined, callerRound: undefined }, entry, round).laneInstructions).toBe(laneInstructions({ review: true }));
+  expect(memberSpec(panel, entry, { ...round, lane: "p-fable", engine: "claude" }).laneInstructions).toBeUndefined();
 });
 
 test("claude headroom reads the active account's tightest weekly window", () => {

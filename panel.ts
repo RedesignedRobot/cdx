@@ -6,9 +6,10 @@ import { accountSpec, accountStandings, chooseAccount } from "./accounts.ts";
 import { CLAUDE_MODEL } from "./claude.ts";
 import { config, EXECUTOR_MODEL, resolveEffort, THINKER_MODEL } from "./config.ts";
 import {
-  activeStateOf, callerOwnership, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
-  readLedger, roundNoteOf, type Spec, supervisorLane, type Tokens, validLane, withLane, withLedger,
+  activeStateOf, callerOwnership, type Effort, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
+  type Lane, readLedger, roundNoteOf, type Spec, supervisorLane, type Tokens, validLane, withLane, withLedger,
 } from "./ledger.ts";
+import { laneInstructions } from "./prompts.ts";
 import { controlPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { openRound } from "./rounds.ts";
 import { fail, fmtTokens, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF, settleHint, singleLine } from "./runtime.ts";
@@ -348,6 +349,26 @@ export function completionLine(record: Pick<PanelRecord, "name">, report: string
 
 // Runner
 
+// A member round is a read-only consult: a Codex member gets the review
+// lane home rules, which the runner refuses to start without.
+export function memberSpec(panel: PanelRecord, entry: Lane, round: {
+  lane: string; round: number; engine: Engine; model: string; effort: Effort; prompt: string; maxRuntimeMins: number;
+}): Spec {
+  const { lane, engine, model, effort, prompt, maxRuntimeMins } = round;
+  return {
+    effort, engine, model, mode: "spawn", lane, round: round.round, cwd: panel.cwd, reviewDir: panel.cwd, prompt, taskPrompt: prompt,
+    // The claude member's file tools see only the checkout and these.
+    ...(engine === "claude" && panel.pack ? { additionalDirectories: [dirname(panel.pack)] } : {}),
+    ...(engine === "gpt" ? { ...accountSpec(entry.roundAccount), laneInstructions: laneInstructions({ review: true }) } : {}),
+    maxRuntimeMins, accountHomes: config.accounts,
+    model_auto_compact_token_limit: config.model_auto_compact_token_limit ?? 150_000,
+    tool_output_token_limit: config.tool_output_token_limit ?? 6_000,
+    visibility: config.visibility ?? VISIBILITY_DEFAULTS,
+    ...ownershipSpec(panel.owner),
+    startedAt: entry.roundStartedAt ?? new Date().toISOString(),
+  };
+}
+
 async function startLane(panel: PanelRecord, lane: string, engine: Engine, model: string, prompt: string, maxRuntimeMins: number): Promise<void> {
   const effort = engine === "claude" ? "medium" : resolveEffort(engine, model);
   const { round } = await openRound(lane, "review", panel.cwd, effort, {
@@ -358,17 +379,7 @@ async function startLane(panel: PanelRecord, lane: string, engine: Engine, model
     lineage: { supervisor: false, ...(panel.caller ? { parent: panel.caller, parentRound: panel.callerRound } : {}) },
   });
   const entry = withLane(lane, (item) => { item!.panel = panel.name; return item!; });
-  const spec: Spec = {
-    effort, engine, model, mode: "spawn", lane, round, cwd: panel.cwd, reviewDir: panel.cwd, prompt, taskPrompt: prompt,
-    // The claude member's file tools see only the checkout and these.
-    ...(engine === "claude" && panel.pack ? { additionalDirectories: [dirname(panel.pack)] } : {}),
-    maxRuntimeMins, accountHomes: config.accounts,
-    model_auto_compact_token_limit: config.model_auto_compact_token_limit ?? 150_000,
-    tool_output_token_limit: config.tool_output_token_limit ?? 6_000,
-    visibility: config.visibility ?? VISIBILITY_DEFAULTS,
-    ...(engine === "gpt" ? accountSpec(entry.roundAccount) : {}), ...ownershipSpec(panel.owner),
-    startedAt: entry.roundStartedAt ?? new Date().toISOString(),
-  };
+  const spec = memberSpec(panel, entry, { lane, round, engine, model, effort, prompt, maxRuntimeMins });
   writeFileSync(specPathOf(lane, round), safeJSON(spec, 2));
   writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, safeText(prompt));
   const crashLog = openSync(`${ROOT}/logs/${lane}-r${round}.runner.log`, "a");
