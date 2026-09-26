@@ -18,9 +18,10 @@ import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktr
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
-import { electHead, eventsAfter, feedEvent, latestEventId, type Lane, storeLane, validLane } from "./ledger.ts";
+import { deliverEvents, electHead, eventsAfter, feedEvent, latestEventId, type Lane, readSession, startSession, storeLane, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
+import { jobShellEnv } from "./jobs.ts";
 import { logProgress, progressLogPathOf } from "./reports.ts";
 
 // Keep tests pure: selection is a filter over rows passed in, so these
@@ -75,6 +76,28 @@ test("a headless session never steals the wakes; a fresh interactive start takes
   expect(selectEvents(question, "teammate", 0)).toEqual([]);
   expect(selectEvents(question, "head", 7, 6).map((event) => event.id)).toEqual([7]);
   expect(selectEvents(question, "head", 0, 7)).toEqual([]);
+});
+
+test("brief --head claims only early in a live stretch, so a reload never steals the head", () => {
+  const t0 = Date.parse("2026-09-26T12:00:00Z");
+  const drove = (session: string) => readSession(session)?.drove_at ?? null;
+  startSession("claim-a", t0, true);
+  expect(drove("claim-a")).toBe(new Date(t0).toISOString());
+  // A poll that registered the row first still leaves a new session its claim.
+  deliverEvents("claim-b", t0 + 60_000, true, () => {});
+  startSession("claim-b", t0 + 61_000, true);
+  expect(drove("claim-b")).toBe(new Date(t0 + 61_000).toISOString());
+  // A reload in a session that kept polling re-runs brief --head: no claim.
+  deliverEvents("claim-a", t0 + 20_000, true, () => {});
+  startSession("claim-a", t0 + 40_000, true);
+  expect(drove("claim-a")).toBe(new Date(t0).toISOString());
+  // /resume of a session idle past ACTIVE_SESSION_MS claims, even after a poll revived it.
+  deliverEvents("claim-a", t0 + 200_000, true, () => {});
+  startSession("claim-a", t0 + 201_000, true);
+  expect(drove("claim-a")).toBe(new Date(t0 + 201_000).toISOString());
+  // Without --head a start never claims.
+  startSession("claim-c", t0, false);
+  expect(drove("claim-c")).toBeNull();
 });
 
 test("config parsing reads gemini.maxRounds and defaults to 2", () => {
@@ -438,7 +461,7 @@ test("6.6.0: a cdx-authored control record is announced as a notice, a head stee
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z" })).toBe("stop and report");
 });
 
-test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners keep it", () => {
+test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners and job commands keep it", () => {
   expect(process.env.CDX_STATE_HOME).toBe(ROOT);
   const lane = laneChildEnv("/codex", { lane: "w", round: 1 });
   for (const env of [lane, gateEnv("/repo")]) {
@@ -446,6 +469,8 @@ test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_H
     expect(env.CDX_HOME).toBe(ROOT);
   }
   expect(runnerEnv(undefined).CDX_STATE_HOME).toBe(ROOT);
+  const job = jobShellEnv({ CDX_STATE_HOME: "/tmp/state", CDX_JOB_CMD: "true", CDX_JOB_CWD: "/repo", CDX_JOB_OWNER: "s" });
+  expect(job).toEqual({ CDX_STATE_HOME: "/tmp/state" });
 });
 
 test("a progress note the sandbox cannot write never fails the command", () => {

@@ -142,7 +142,29 @@ export function settledPanel(name: string, alive = pidAlive): PanelRecord | unde
   const record = readPanel(name);
   if (!record || (record.state === "running" && alive(record.pid))) return undefined;
   if (record.state !== "running") return record;
-  return { ...record, state: "failed", summary: `[cdx] panel=${name} state=failed runner died without finishing; see ${ROOT}/logs/${name}.panel.log` };
+  return failPanel(name, "runner died without finishing") ?? readPanel(name);
+}
+
+// The events poll fails a panel whose runner was killed, so its line still
+// reaches the asker.
+export function reapPanels(alive = pidAlive): void {
+  for (const record of readPanels()) {
+    if (record.state === "running" && !alive(record.pid)) failPanel(record.name, "runner died without finishing");
+  }
+}
+
+// The runner's own catch, the events poll and cdx wait can all see one
+// death; only the first moves the record off running and delivers.
+function failPanel(name: string, reason: string): PanelRecord | undefined {
+  return write(() => {
+    const record = readPanel(name);
+    if (record?.state !== "running") return undefined;
+    const summary = `[cdx] panel=${name} state=failed ${reason}; see ${ROOT}/logs/${name}.panel.log`;
+    const failed: PanelRecord = { ...record, pid: undefined, state: "failed", summary, finishedAt: new Date().toISOString() };
+    storePanel(failed);
+    deliver(record, summary);
+    return failed;
+  });
 }
 
 // A running record whose runner died is not open; it failed.
@@ -473,6 +495,15 @@ export async function runPanel(name: string): Promise<number> {
   const record = readPanel(name);
   if (!record) fail(`internal: no panel ${name}`);
   storePanel({ ...record, pid: process.pid });
+  try {
+    return await askMembers(name, record);
+  } catch (error) {
+    failPanel(name, `runner failed: ${clip(singleLine(error instanceof Error ? error.message : String(error)), 200)}`);
+    throw error;
+  }
+}
+
+async function askMembers(name: string, record: PanelRecord): Promise<number> {
   mkdirSync(panelDir(name), { recursive: true });
   const prompt = panelPrompt(record.question, record.cwd, record.pack);
   const lanes = PANEL_MEMBERS.map(({ member }) => memberLane(name, member));

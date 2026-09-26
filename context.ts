@@ -1,9 +1,10 @@
 // Per-repo context digests keyed to commit, and the foreground consult that builds them.
 
 import { config } from "./config.ts";
+import { jobCommand } from "./jobs.ts";
 import { BATCH_ENV, readLedger } from "./ledger.ts";
 import { reportPathOf } from "./reports.ts";
-import { fail, parseArgs, ROOT, SELF } from "./runtime.ts";
+import { fail, parseArgs, ROOT, SELF, shellQuote } from "./runtime.ts";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 
@@ -103,8 +104,15 @@ function excludeDigests(cwd: string, run: Git = git): void {
   appendFileSync(exclude, `${text && !text.endsWith("\n") ? "\n" : ""}/.cdx/\n`);
 }
 
+// The consult lane owns the digest's lane name, so the job gets its own.
+export const contextJobName = (lane: string) => `${lane}-job`.replace(/[^A-Za-z0-9_-]/g, "-");
+
+// `cdx context` runs the consult as a job, as shots grade does: a digest can
+// outlive the ten minutes a tool call lives, and a killed caller must still
+// leave the job-exit event and its log with the digest path.
 export async function contextCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["engine", "model"]);
+  const internal = argv[0] === "_run";
+  const parsed = parseArgs(internal ? argv.slice(1) : argv, ["engine", "model"]);
   const usage = "usage: cdx context <repo> [--model M]";
   const repoArg = parsed.rest[0];
   if (!repoArg || !existsSync(repoArg)) fail(usage);
@@ -116,6 +124,11 @@ export async function contextCommand(argv: string[]): Promise<void> {
   const path = join(dir, `${commit}.md`);
   if (existsSync(path)) { console.log(`cdx: context digest current: ${path}`); return; }
   const lane = laneName("context", `${basename(dirname(dirname(dir)))}-${commit.slice(0, 8)}`);
+  if (!internal) {
+    const cmd = [process.execPath, SELF, "context", "_run", cwd, ...(parsed.flags.model ? ["--model", parsed.flags.model] : [])];
+    await jobCommand([contextJobName(lane), "--cd", cwd, cmd.map(shellQuote).join(" ")]);
+    return;
+  }
   const { report, reportPath } = await runConsult(lane, cwd, digestQuestion(commit), { model: parsed.flags.model, batch: lane });
   const digest = `<!-- cdx context digest for ${commit}; built ${new Date().toISOString()} -->\n${report}\n`;
   if (digest.length > CONTEXT_DIGEST_MAX_CHARS) fail(`digest is ${digest.length} chars, over ${CONTEXT_DIGEST_MAX_CHARS}; not written. Report: ${reportPath}`);

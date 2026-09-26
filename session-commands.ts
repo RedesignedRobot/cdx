@@ -5,13 +5,13 @@ import { markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts
 import { markOverrun, overrunNotice } from "./duration.ts";
 import {
   activeStateOf, callerSession, deliverEvents, feedEvent, laneRunning,
-  markBrief, markDriver, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
+  markBrief, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
   withLedger,
 } from "./ledger.ts";
 import { questionOpen, readQuestions } from "./questions.ts";
 import { fail, parseArgs, ROOT } from "./runtime.ts";
 import { liveRows } from "./status.ts";
-import { write } from "./store.ts";
+import { db, write } from "./store.ts";
 import { createHash } from "node:crypto";
 
 export async function eventsCommand(argv: string[]): Promise<void> {
@@ -24,6 +24,11 @@ export async function eventsCommand(argv: string[]): Promise<void> {
 
   const now = Date.now();
   if (!peek) monitorOverruns(now);
+  // Only a running panel loads panel.ts, which the poll otherwise never needs
+  // (and which imports back into this module through claude.ts).
+  if (!peek && db().query("SELECT 1 FROM panels WHERE json_extract(data, '$.state') = 'running' LIMIT 1").get()) {
+    (await import("./panel.ts")).reapPanels();
+  }
   deliverEvents(session, now, peek, (events) => {
     if (json) {
       let rows: ReturnType<typeof liveRows> | undefined;
@@ -110,15 +115,14 @@ function briefRepeated(session: string, text: string, now = Date.now()): boolean
 // Session start and /clear or /resume run the brief, which registers the
 // session for delivery. --head claims the wakes: the mod passes it when a
 // person is at the prompt, so a headless session that merely started never
-// takes them.
+// takes them. startSession decides whether this start may claim.
 export function briefCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["head"]);
   if (parsed.rest.length) fail("usage: cdx brief [--head]");
   const quotaState = geminiQuotaState();
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
   const session = callerSession();
-  if (session !== "terminal") startSession(session);
-  if (parsed.bools.has("head")) markDriver(session);
+  if (session !== "terminal") startSession(session, Date.now(), parsed.bools.has("head"));
   const summary = sessionSummary();
   if (summary && !briefRepeated(session, summary)) console.log(summary);
 }

@@ -1,6 +1,6 @@
 ## 10.0.1 (2026-09-26)
 
-Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses.
+Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses. A reload leaves the head where it was.
 
 ### Landing
 
@@ -18,13 +18,15 @@ Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open 
 - `cdx panel` always detaches and returns the report path; `--bg` is gone and refused.
 - Files moved to `reports/panels/<name>/`: `panel.md` is the merged report, `astra.md`, `sol.md` and `fable.md` the answers. A panel named `foo-r2` can no longer overwrite lane foo's round 2 report.
 - `cdx wait <panel>` blocks until the panel settles and prints its completion line; a supervisor's launch hint names that command.
+- A panel whose runner throws or is killed is stored as failed and its one `panel` event delivered, by the runner itself, the head's next events poll or `cdx wait`, whichever sees it first.
 - A panel refuses when `cca` is not on PATH or gives no weekly quota, and when its name is taken by a panel, lane or job. The name and open-panel guards run inside the transaction that records the panel.
 - Member rounds carry the review lane rules. Every 10.0.0 panel failed to start its Codex members without them.
 
 ### Delivery
 
 - Only a session that drove cdx can be head. The mod runs `cdx brief --head` at an interactive session start, so a new session beside an older idle one takes the wakes at once; a headless start never claims. With no driver, events wait for one.
-- `cdx shots grade` runs as job `shots-<dir>`, and its `job-exit` is the one wake. Terminal events of the consults that `shots grade` and `cdx context` start no longer reach the head; their questions still do.
+- `cdx brief --head` claims only in the first 30 s of a session's live stretch: a new session, `/clear`, `/resume`, or a session that had stopped polling for 30 s. A plugin reload, enable or worker respawn in a running session no longer takes the head.
+- `cdx shots grade` runs as job `shots-<dir>`, and `cdx context` as job `context-<repo>-<commit>-job`; each one's `job-exit` is the one wake, and the context job's log ends with the digest path. A digest already current for HEAD still prints at once without a job. Terminal events of the consults that `shots grade` and `cdx context` start no longer reach the head; their questions still do.
 - The rollover Stop block runs the settings Stop hooks first, the owner's push guard included, and joins their block text with its own.
 - Native tools run under the ten-minute `$.process.run` ceiling instead of the engine's 30 s default, unless they name a shorter bound (`ask` 100 s, `doctor` 120 s).
 - `land` refuses a call with neither `lane` nor `lanes`, with both, or with a bad `lanes` item, instead of running `cdx land undefined`. `gate` refuses a call with neither `cmd` nor `clear`. A null `maxRuntime` or `expect` is dropped, and an unknown tool name returns an error.
