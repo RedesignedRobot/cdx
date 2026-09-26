@@ -1,13 +1,14 @@
+import { isNoOpGate } from "./brief-contract.ts";
 import { safeText } from "./safe-text.ts";
 // Gate execution, content receipts, review tree snapshots, and gate commands.
 
 import {
-  feedEvent, type GateReceipt, type GateTree, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
+  type GateReceipt, type GateTree, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
   type RoundRecord, supervisorLane, withLedger,
 } from "./ledger.ts";
-import { reportPathOf, tailOutput } from "./reports.ts";
+import { tailOutput } from "./reports.ts";
 import {
-  CmdError, color, completionVerdict, fail, parseArgs, pidAlive, ROOT, shellQuote, uncoloredChildEnv,
+  CmdError, color, fail, parseArgs, pidAlive, shellQuote, uncoloredChildEnv,
 } from "./runtime.ts";
 import { createHash } from "node:crypto";
 import {
@@ -353,35 +354,6 @@ export function captureReviewTree(cwd: string): ReviewTreeSnapshot {
   };
 }
 
-export function finishInvalidBaseline(lane: string, round: number, command: string, cwd: string, result: GateResult): void {
-  const checkedAt = new Date().toISOString();
-  const reportPath = reportPathOf(lane, round);
-  const failure = gateFailure(result.exitCode, result.output);
-  const kindLabel = `gate ${failure.kind} failed on baseline`;
-  const note = result.timedOut
-    ? `gate invalid on baseline: timed out after 60 minutes: ${command}`
-    : `${failure.diagnostic}\n${kindLabel} (exit ${result.exitCode}): ${command} (cwd=${cwd}, log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log)`;
-  writeFileSync(reportPath, safeText(`# Gate baseline\n\n\`${command}\` exited ${result.exitCode} in ${cwd} before worker startup.\n\n\`\`\`\n${gateOutputForReport(result.output, result.exitCode)}\n\`\`\`\n`));
-  const entry = withLedger((ledger) => {
-    const item = ledger[lane]!;
-    item.work.state = "gate-invalid";
-    item.gateBaseline = { round, command, cwd, exitCode: result.exitCode, checkedAt };
-    item.work.exitCode = result.exitCode;
-    item.work.note = note;
-    item.work.report = reportPath;
-    item.work.updatedAt = checkedAt;
-    item.pid = undefined;
-    item.codexPid = undefined;
-    item.reports.push(reportPath);
-    item.updatedAt = checkedAt;
-    return item;
-  });
-  feedEvent("terminal", `[cdx] lane=${lane} round=${round} state=gate-invalid exit=${result.exitCode} note=${note} report=${reportPath} log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log gateExit=${result.exitCode} verdict=${JSON.stringify(completionVerdict("gate-invalid", note))}`, entry.ownerSession, { lane, round });
-  console.error(`cdx: lane=${color.magenta(lane)} state=${color.red("gate-invalid")} review the gate command before starting work`);
-  console.error(`cdx: ${note}`);
-  console.error(`cdx: gate log=${ROOT}/logs/${lane}-r${round}.gate-baseline.log`);
-}
-
 function gateLabel(command?: string): string {
   return command ?? "<none>";
 }
@@ -403,6 +375,7 @@ export function gateCommand(argv: string[]): void {
   if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the liaison's acceptance check (cdx ask if it is wrong)`);
   if (laneRunning(before) && pidAlive(before.pid)) fail(`lane "${lane}" is running; stop it before changing the gate`);
   const next = parsed.bools.has("clear") ? undefined : command;
+  if (next && isNoOpGate(next) && repositoryGate(before.work.cwd)) fail(`gate "${next}" checks nothing and this repository has .cdx-gate; clear the gate or pass a real check`);
   withLedger((ledger) => {
     const item = ledger[lane]!;
     requireOwnChild(lane, item);

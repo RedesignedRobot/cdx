@@ -26,9 +26,15 @@ function readText(path: string): string | undefined {
   return readFileSync(path, "utf8");
 }
 
-// Each account keeps its interactive instructions. New lane processes use this
-// home; supervisors get their own so only they carry the cdx exec-policy rule.
-export function laneCodexHome(home: string, supervisor = false): string { return join(home, supervisor ? "cdx-supervisor" : "cdx-lane"); }
+// Each account keeps its interactive instructions. Lane processes use one home
+// per role: Codex loads the home's AGENTS.md as the standing lane rules, and
+// only supervisors carry the cdx exec-policy rule.
+export interface LaneRole { review?: boolean; supervisor?: boolean }
+
+export function laneCodexHome(home: string, role: LaneRole = {}): string {
+  if (role.review) return join(home, role.supervisor ? "cdx-review-supervisor" : "cdx-review");
+  return join(home, role.supervisor ? "cdx-supervisor" : "cdx-lane");
+}
 
 // Seatbelt does not nest: a child lane started from a sandboxed supervisor could
 // not sandbox its own commands. Codex runs a command that matches an allow rule
@@ -53,8 +59,8 @@ export function laneHooks(value: any): any {
       ? `[ -n "$CDX_LANE" ] || ${item}` : laneHooks(item)]));
 }
 
-export function installLaneHome(home: string, instructions: string, supervisor = false): string {
-  const target = laneCodexHome(home, supervisor);
+export function installLaneHome(home: string, instructions: string, role: LaneRole = {}): string {
+  const target = laneCodexHome(home, role);
   mkdirSync(target, { recursive: true });
   // Auth and conversation history stay on the account. Never copy credentials or databases.
   for (const name of ["auth.json", "config.toml", "sessions", "archived_sessions", "models_cache.json"]) {
@@ -70,7 +76,7 @@ export function installLaneHome(home: string, instructions: string, supervisor =
   const text = JSON.stringify(withCapHook(hooks ? laneHooks(JSON.parse(hooks)) : {}), null, 2) + "\n";
   if (readText(join(target, "hooks.json")) !== text) atomicWrite(join(target, "hooks.json"), text);
   const rules = join(target, "rules", "cdx.rules");
-  if (supervisor && readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
+  if (role.supervisor && readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
   return target;
 }
 

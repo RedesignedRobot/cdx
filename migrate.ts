@@ -3,7 +3,7 @@
 // those files; no command migrates on read. The import commits in one
 // transaction, then the old files move to state/legacy as the backup copy.
 
-import { type FeedEvent, type Lane, storeLane } from "./ledger.ts";
+import { acknowledgeOwnerEvents, type FeedEvent, type Lane, latestEventId, storeLane } from "./ledger.ts";
 import { type Job, storeJob } from "./jobs.ts";
 import { type QuestionRecord, storeQuestion } from "./questions.ts";
 import { fail, LEGACY_LEDGER, parseArgs, ROOT } from "./runtime.ts";
@@ -121,6 +121,8 @@ export function migrateLegacyState(): MigrationResult {
       storeQuestion(record);
       result.questions += 1;
     }
+    // 9.x already delivered the imported history; no head replays it.
+    acknowledgeOwnerEvents(latestEventId());
     db().query("INSERT INTO meta (key, value) VALUES ('migrated', ?)").run(new Date().toISOString());
   });
   mkdirSync(LEGACY_DIR, { recursive: true });

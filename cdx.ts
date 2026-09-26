@@ -35,7 +35,7 @@ export {
   WAKE_EVENTS, callerLineage, selectEvents, spawnRoots,
 } from "./ledger.ts";
 export {
-  resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES,
+  resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE,
 } from "./prompts.ts";
 export {
   controlText,
@@ -68,7 +68,7 @@ if (import.meta.main) {
     console[method] = (...args: unknown[]) => print(safeText(format(...args)));
   }
   const isHookInvocation = process.argv[2] === "hook";
-  if (!isHookInvocation && process.argv[2] !== "view" && process.argv[2] !== "status") {
+  if (!isHookInvocation && process.argv[2] !== "status") {
     for (const dir of ["logs", "reports", "briefs", "specs", "control"]) {
       try {
         mkdirSync(`${ROOT}/${dir}`, { recursive: true });

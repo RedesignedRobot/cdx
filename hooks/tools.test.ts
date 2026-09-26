@@ -186,3 +186,12 @@ test("native admission refuses missing fields before argv conversion and reports
   expect(TOOLS_BY_NAME.get("ask")!.run({ cd: "/repo", question: "where?" })).toMatchObject({ argv: ["ask", "--cd", "/repo", "-"], stdin: "where?" });
   expect(TOOLS_BY_NAME.get("land")!.run({ lane: "fix" }).argv).toEqual(["land", "fix"]);
 });
+
+test("spawn renders structured brief fields as the sections cdx checks", () => {
+  const result = TOOLS_BY_NAME.get("spawn")!.run({
+    lane: "l", cd: "/repo", brief: "Context.", outcome: "Totals print", files: ["status.ts", "outcomes.ts"],
+    acceptance: "usage --totals shows shares", outOfScope: "accounts.ts", scopePolicy: "stop",
+  });
+  expect(result.argv).toContain("--scope-policy");
+  expect(result.stdin).toBe("## Outcome\n\nTotals print\n\n## Files\n\n- status.ts\n- outcomes.ts\n\n## Acceptance\n\nusage --totals shows shares\n\n## Out of scope\n\naccounts.ts\n\nContext.");
+});

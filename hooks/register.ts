@@ -16,6 +16,7 @@ import {
   orderedRows,
   pinnedLine,
 } from "./delivery";
+import { afterCompaction, stopOutcome } from "./rollover";
 import {
   CDX_TOOL_PREFIX,
   nativeToolResult, formatToolOutput,
@@ -35,6 +36,7 @@ let deliveryState: DeliveryState = initialDeliveryState();
 let pollInFlight = false;
 let outputSequence = 0;
 const liveRef = { plugin: "cdx", key: "live" } as const;
+const rolloverRef = { plugin: "cdx", key: "rollover" } as const;
 // Each refusal message is logged once; the poll runs every two seconds and
 // a repeated log would flood the transcript.
 const loggedRefusals = new Set<string>();
@@ -211,6 +213,24 @@ export function register(on: On) {
     return next(e);
   });
 
+  // Counts compactions that stand in the head's own conversation; a subagent's,
+  // a precompute and a skipped one leave the head's context as it was.
+  on("session.compact", async ($, e, next) => {
+    const result = await next(e);
+    if (e.agentId || e.trigger === "precompute" || !result.messages) return result;
+    const { value } = await $.state.get(rolloverRef);
+    await $.state.set(rolloverRef, afterCompaction(value, await $.session.id()));
+    return result;
+  });
+
+  on("classic.Stop", async ($, e, next) => {
+    const { value } = await $.state.get(rolloverRef);
+    const outcome = stopOutcome(value, await $.session.id());
+    if (!outcome) return next(e);
+    await $.state.set(rolloverRef, outcome.state);
+    return { block: outcome.block };
+  });
+
   on("command.run", { command: "lanes" }, async ($, e) => {
     if (!e.args.trim()) {
       const opened = await $.ui.open({ id: "cdx-lanes", title: "Lanes", focus: true });
@@ -234,7 +254,9 @@ export function register(on: On) {
     if (surface !== null) {
       await $.ui.status(undefined);
     }
-    const briefResult = await $.process.run(CDX.concat(["brief"]), {
+    // The user typed /clear or /resume here, so this session keeps the head
+    // under its new id.
+    const briefResult = await $.process.run(CDX.concat(["brief", "--head"]), {
       env: { CLAUDE_CODE_SESSION_ID: session },
       cwd: root,
     });

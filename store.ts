@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS events_round ON events (lane, round, kind);
 CREATE TABLE IF NOT EXISTS sessions (
   session TEXT PRIMARY KEY, cursor INTEGER NOT NULL, started_at TEXT NOT NULL, polled_at TEXT NOT NULL,
-  brief_hash TEXT, brief_at TEXT);
+  drove_at TEXT, brief_hash TEXT, brief_at TEXT);
 CREATE TABLE IF NOT EXISTS jobs (name TEXT PRIMARY KEY, data TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS questions (lane TEXT NOT NULL, seq INTEGER NOT NULL, round INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY (lane, seq));
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);

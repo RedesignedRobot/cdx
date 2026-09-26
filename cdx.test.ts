@@ -1,9 +1,9 @@
 import "./visibility.test.ts";
 import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
-import { readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
 import {
-  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
+  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, toolLogRecords,
   checkRoundCap, summaryJobs, parseArgs, parseConfig, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, claudeUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
@@ -18,9 +18,10 @@ import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktr
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
-import { validLane } from "./ledger.ts";
+import { electHead, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
-import { registeredFlag } from "./runtime.ts";
+import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
+import { logProgress, progressLogPathOf } from "./reports.ts";
 
 // Keep tests pure: selection is a filter over rows passed in, so these
 // tests never read user files, spawn engines, or wait on timers.
@@ -29,16 +30,34 @@ const feed = (id: number, kind: string, extra: object = {}) => ({ id, timestamp:
 test("the head receives actionable kinds only, and never a child's terminal", () => {
   const records = [feed(1, "question"), feed(2, "gate-finished"), feed(3, "terminal"), feed(4, "partial"),
     feed(5, "terminal", { lane: "child", supervisor: "parent" }), feed(6, "job-exit")];
-  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([1, 3, 6]);
-  expect(selectEvents(records, "head", true).every((event) => event.wake)).toBe(true);
-  expect(selectEvents(records, "older", false)).toEqual([]);
+  expect(selectEvents(records, "head", 0, 0).map((event) => event.id)).toEqual([1, 3, 6]);
+  expect(selectEvents(records, "head", 0, 0).every((event) => event.wake)).toBe(true);
+  expect(selectEvents(records, "older", 0)).toEqual([]);
 });
 
 test("an addressed message reaches its session whether or not it is the head", () => {
   const records = [feed(1, "message", { recipient: "older", from: "lane-a" }), feed(2, "message", { from: "lane-b" })];
-  expect(selectEvents(records, "older", false).map((event) => event.id)).toEqual([1]);
-  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([2]);
-  expect(selectEvents(records, "head", true)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
+  expect(selectEvents(records, "older", 0).map((event) => event.id)).toEqual([1]);
+  expect(selectEvents(records, "head", 0, 0).map((event) => event.id)).toEqual([2]);
+  expect(selectEvents(records, "head", 0, 0)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
+});
+
+test("a session that starts and polls later never steals the wakes from the session that drove cdx", () => {
+  const now = Date.parse("2026-09-26T12:00:00Z");
+  const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
+  const row = (session: string, started: number, drove?: number) => ({ session, cursor: 0, started_at: at(started), polled_at: at(1),
+    drove_at: drove === undefined ? null : at(drove), brief_hash: null, brief_at: null });
+  const head = row("head", 3600, 600);
+  const teammate = row("teammate", 5);
+  expect(electHead([head, teammate], now)).toBe("head");
+  expect(electHead([row("head", 3600), teammate], now)).toBe("head");
+  expect(electHead([head, row("teammate", 5, 2)], now)).toBe("teammate");
+  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBe("teammate");
+  // The teammate's cursor moves; the head still gets the question past the owner cursor.
+  const question = [feed(7, "question")];
+  expect(selectEvents(question, "teammate", 0)).toEqual([]);
+  expect(selectEvents(question, "head", 7, 6).map((event) => event.id)).toEqual([7]);
+  expect(selectEvents(question, "head", 0, 7)).toEqual([]);
 });
 
 test("config parsing reads gemini.maxRounds and defaults to 2", () => {
@@ -400,6 +419,23 @@ test("6.6.0: a cdx-authored control record is announced as a notice, a head stee
   expect(controlText({ text: "child lane x failed", sentAt: "2026-09-13T20:00:00Z", from: "cdx" })).toBe("CDX NOTICE (sent 2026-09-13T20:00:00Z): child lane x failed");
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z", from: "head-session" })).toBe("stop and report");
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z" })).toBe("stop and report");
+});
+
+test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners keep it", () => {
+  expect(process.env.CDX_STATE_HOME).toBe(ROOT);
+  const lane = laneChildEnv("/codex", { lane: "w", round: 1 });
+  for (const env of [lane, gateEnv("/repo")]) {
+    expect(env.CDX_STATE_HOME).toBeUndefined();
+    expect(env.CDX_HOME).toBe(ROOT);
+  }
+  expect(runnerEnv(undefined).CDX_STATE_HOME).toBe(ROOT);
+});
+
+test("a progress note the sandbox cannot write never fails the command", () => {
+  const path = progressLogPathOf("sandboxed", 1);
+  mkdirSync(path, { recursive: true });
+  try { expect(() => logProgress("sandboxed", 1, "answered from scope policy extend")).not.toThrow(); }
+  finally { rmdirSync(path); }
 });
 
 test("Rank 2: gateEnv prepends local bin to PATH and classifyGateFailure distinguishes setup vs assertion failures", () => {
@@ -1132,7 +1168,7 @@ test("the brief drops finished jobs older than the age window and keeps running 
 });
 
 test("unchanged rereads are measured once per step and never alert", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => "first");
+  const track = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => "first");
   const event = (id: number, state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: id, step_type: "tool", state, tool_name: "view_file",
     tool_info: { parameters: { AbsolutePath: "/repo/file.ts" }, output: "2 lines, 77 bytes" },
@@ -1148,7 +1184,7 @@ test("unchanged rereads are measured once per step and never alert", () => {
 });
 
 test("tool measurements retain bytes and tokens without inventing tool tree hashes", () => {
-  const track = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
+  const track = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => null);
   const event = (state: string) => ({ event: "step_update", step_update: {
     conversation_id: "session", step_index: 1, step_type: "tool", state, tool_name: "write_to_file",
     usage: { input_tokens: 5, cache_read_tokens: 2, output_tokens: 3 },
@@ -1160,7 +1196,7 @@ test("tool measurements retain bytes and tokens without inventing tool tree hash
   const line = JSON.stringify(record);
   const end = JSON.stringify({ type: "cdx_round_end", gateReceiptId: "lane:r1" });
   expect(toolLogRecords([JSON.stringify(event("DONE")), line, "broken", end].join("\n"))).toEqual([line, end]);
-  const gpt = roundTools("/repo", { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 }, () => null);
+  const gpt = roundTools("/repo", { failureRepeats: 5, testRuns: 3 }, () => null);
   const item = { id: "gpt", type: "commandExecution", command: "check", cwd: "/repo" };
   gpt({ method: "item/started", params: { item } }, "start");
   const measured = gpt({ method: "item/completed", params: { item: { ...item, aggregatedOutput: "ok" } } }, "end")!.record!;
@@ -1169,14 +1205,15 @@ test("tool measurements retain bytes and tokens without inventing tool tree hash
 });
 
 test("Gemini resumes are shorter than spawn prompts and carry only changed rules and recovery", () => {
-  const rules = [...GEMINI_WORKER_RULES, VERIFICATION_RULE].map((rule) => `- ${rule}`).join("\n");
+  const standing = "Deliver within your files; the parent owns design and scope.";
+  const rules = [standing, VERIFICATION_RULE].map((rule) => `- ${rule}`).join("\n");
   const spawn = `Ground rules:\n${rules}\n\nTask:\nFix the parser.`;
   const resumed = resumePrompt("Continue.", rules, promptRules(spawn), "Last action: parser fixed.");
   expect(resumed.length).toBeLessThan(spawn.length);
   expect(promptRules(`Ground rules:\n${rules}\n\nYour previous round ended with this partial report: pending\n\nTask:\nContinue.`)).toBe(rules);
   expect(resumed).toContain("Last action: parser fixed.");
   expect(resumed).not.toContain("Ground rules");
-  expect(resumed).not.toContain(GEMINI_WORKER_RULES[0]!);
+  expect(resumed).not.toContain(standing);
   const previous = `${rules}\nAllowed edits:\n- a.ts\nForbidden edits:\n- b.ts`;
   const current = `${rules}\nAllowed edits:\n- b.ts\nForbidden edits:\n- a.ts`;
   expect(resumePrompt("Continue.", current, previous)).toContain(`superseding the previous block:\n${current}`);
@@ -1293,8 +1330,8 @@ test("terminal events carry a five-line digest and child terminals never wake th
   const long = terminalText("done report=/tmp/a", "# Report\n" + Array.from({ length: 50 }, (_, index) => `line ${index}`).join("\n"), undefined);
   expect(long.split("\n")).toEqual(["done report=/tmp/a", "line 0", "line 1", "line 2", "line 3"]);
   const event = { id: 1, timestamp: "now", kind: "terminal", owner: "head", lane: "claimed", supervisor: "parent", message: "done" };
-  expect(selectEvents([event], "head", true)).toEqual([]);
-  expect(selectEvents([{ ...event, supervisor: undefined }], "head", true)).toHaveLength(1);
+  expect(selectEvents([event], "head", 0, 0)).toEqual([]);
+  expect(selectEvents([{ ...event, supervisor: undefined }], "head", 0, 0)).toHaveLength(1);
 });
 
 

@@ -1,10 +1,10 @@
 // Pure progress accounting. Runner memory owns tool identities and repetition state.
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { codegraphActions } from "./codegraph-policy.ts";
+import { CODEGRAPH_EXPLORE, codegraphActions } from "./codegraph-policy.ts";
 
-export interface VisibilityConfig { heartbeatMinutes: number; failureRepeats: number; fileEdits: number; testRuns: number }
-export const VISIBILITY_DEFAULTS: VisibilityConfig = { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 };
+export interface VisibilityConfig { failureRepeats: number; testRuns: number }
+export const VISIBILITY_DEFAULTS: VisibilityConfig = { failureRepeats: 5, testRuns: 3 };
 export interface ToolObservation { id?: string; completed: boolean; command?: string; toolName?: string; cwd?: string; args?: unknown; failed?: boolean; files: string[]; output?: string }
 const object = (value: any): any => value && typeof value === "object" ? value : {};
 
@@ -100,7 +100,6 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
   const seen = new Set<string>();
   const completed = new Set<string>();
   const countedTests = new Set<string>();
-  const edits = new Map<string, number>();
   const graphRepos = new Set<string>();
   const countedGraph = new Set<string>();
   let codegraphCalls = 0;
@@ -129,7 +128,7 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
           codeSearchesBeforeGraph++;
           if (!graphWarned) {
             graphWarned = true;
-            codegraphThrash = `codegraph-first: use codegraph explore before code questions in ${repo}. Exceptions: fixed-string or existence searches, non-code files, logs.`;
+            codegraphThrash = `codegraph-first: use codegraph explore before code questions in ${repo}, as \`${CODEGRAPH_EXPLORE} "<question>"\`; if it times out or fails, use text search. Exceptions: fixed-string or existence searches, non-code files, logs.`;
           }
         }
       }
@@ -158,11 +157,6 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
       failures = observation.failed === true ? (key === previousCommand ? failures + 1 : 1) : 0;
       previousCommand = key;
       if (failures >= limits.failureRepeats) reason = `command failed ${failures}x: ${command.replace(/\s+/g, " ").slice(0, 80)}`;
-    }
-    if (observation.failed !== true) for (const path of new Set(observation.files.map((path) => resolve(cwd, path)))) {
-      const count = (edits.get(path) ?? 0) + 1;
-      edits.set(path, count);
-      if (count > limits.fileEdits) reason ??= `file edited ${count}x: ${path.slice(-80)}`;
     }
     if (!reason || warned) return { steps, testRuns, testSuites, testStatus, testThrash, codegraphCalls, codeSearchesBeforeGraph, codegraphThrash };
     warned = true;

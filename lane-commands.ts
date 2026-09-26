@@ -1,31 +1,29 @@
 import { fixReviewPrompt } from "./prompts.ts";
-import { retiredLaneRule, installLaneHome } from "./account-sync.ts";
+import { briefContractRefusal, isNoOpGate, SCOPE_POLICIES, type ScopePolicy, scopeRule } from "./brief-contract.ts";
+import { retiredLaneRule } from "./account-sync.ts";
 import { requireGeminiAgent } from "./doctor.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane launch, spawn, resume, review, consult, and cleanup commands.
 
 import {
-  accountSpec, announceAccountSelection, defaultCodexHome, laneAccount, primaryAccount,
-  rejectPinnedAccountFlag, warnCachedUsageBeforeLaunch,
+  accountSpec, announceAccountSelection, defaultCodexHome, laneAccount, rejectPinnedAccountFlag, warnCachedUsageBeforeLaunch,
 } from "./accounts.ts";
 import {
   checkChildAstraRefusal, checkRoundCap, config, defaultMaxRuntime, ENGINE_PICKER, engineOf, geminiConfig,
   laneModel, maxRuntimeOf, modelOf, rejectEngineMismatch, requireEngineBinary, resolveEffort,
 } from "./config.ts";
 import {
-  CODEX_DISABLE_NATIVE_SUBAGENTS, freshAccountSpec, geminiCapacityNotice, recoveryPrompt,
+  freshAccountSpec, geminiCapacityNotice, recoveryPrompt,
 } from "./engines.ts";
-import {
-  captureGateTree, composeGate, executeGate, finishInvalidBaseline, printGateChange, repositoryGate, runPreCheck,
-} from "./gates.ts";
+import { captureGateTree, composeGate, printGateChange, repositoryGate, runPreCheck } from "./gates.ts";
 import { formatGeminiStanding, readGeminiUsageSnapshot, requireGeminiQuota } from "./gemini-usage.ts";
 import {
-  type AccountChoice, activeStateOf, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
+  activeStateOf, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
   ownershipSpec, readLane, readLedger, requireOwnChild, spawnRoots, type Spec,
   storedOwnership, supervisorLane, validLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
-  resumeRefusal, CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
+  resumeRefusal, CODEGRAPH_RULE, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
   REVIEW_FINDINGS_SCHEMA, reviewFrame,
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
@@ -36,7 +34,7 @@ import { openRound } from "./rounds.ts";
 import { chooseSpawnModel } from "./repo-routing.ts";
 import { runRound } from "./runner.ts";
 import {
-  color, displayPath, fail, fmtAge, HOME, REPO_ROOT, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
+  color, fail, fmtAge, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -93,7 +91,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.codexHome = choice?.home;
     spec.model ??= entry.model ?? config.model;
     Object.assign(spec, accountSpec(choice));
-    installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"));
+    spec.laneInstructions = laneInstructions({ review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) });
     if (changedHome && (spec.sourceThreadId || spec.mode === "resume")) {
       freshAccountSpec(spec, entry, recoveryPrompt(spec, entry));
       brief = spec.prompt;
@@ -139,7 +137,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
 }
 
 export async function spawnCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "gate-baseline-check", "max-runtime", "expect", "model", "supervisor", "pre"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "worktree", "bg", "add-dir", "image", "schema", "account", "gate", "max-runtime", "expect", "model", "supervisor", "pre", "scope-policy"]);
   const expected = parsed.flags.expect === undefined ? undefined : expectMinutes(parsed.flags.expect, config.expectMinutes ?? 15);
   const engine = engineOf(parsed, "spawn");
   const [lane, briefArg] = parsed.rest;
@@ -157,6 +155,8 @@ export async function spawnCommand(argv: string[]) {
   }
   if (supervisor && engine !== "gpt") fail("--supervisor needs --engine gpt; a supervisor runs on Codex and drives its children through cdx");
   if (supervisor && parent) fail(`supervisor ${parent} cannot spawn another supervisor; delegation is one level deep`);
+  const scopePolicy = (parsed.flags["scope-policy"] ?? "extend") as ScopePolicy;
+  if (!SCOPE_POLICIES.includes(scopePolicy)) fail(`--scope-policy must be one of ${SCOPE_POLICIES.join(", ")}`);
   // Cheap pre-check so a doomed launch is rejected before paying for usage
   // probes; openRound re-checks under the ledger lock.
   const existingLane = readLedger()[lane];
@@ -170,6 +170,14 @@ export async function spawnCommand(argv: string[]) {
   const roots = spawnRoots(parsed.flags.cd, existingLane, process.cwd(), existsSync);
   let cwd = roots.cwd;
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
+  if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
+  // A respawn keeps the stored gate and cwd unless the caller passes new ones.
+  const gate = parsed.flags.gate ?? existingLane?.gate;
+  const requiredGate = repositoryGate(cwd);
+  if (gate && requiredGate && isNoOpGate(gate)) fail(`--gate "${gate}" checks nothing and this repository has .cdx-gate; drop --gate to run the repository gate, or pass a real check`);
+  const contractRefusal = briefContractRefusal(brief, Boolean(gate || requiredGate), supervisor);
+  if (contractRefusal) fail(contractRefusal);
+  if (engine === "gemini") console.error("cdx: routing reserves Gemini for read-only work (consults, reviews, pre-reads); this work lane runs anyway");
   // A respawn without --model keeps the stored model. Fresh head work may
   // instead use the repository route for the actual working directory.
   const retained = Boolean(existingLane && engine === "gpt" && parsed.flags.model === undefined);
@@ -183,7 +191,6 @@ export async function spawnCommand(argv: string[]) {
   checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
-  if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
   if (parsed.flags.pre !== undefined && parsed.flags.pre.trim() === "") fail("--pre needs a nonempty command");
   if (existingLane) {
     requireOwnChild(lane, existingLane);
@@ -194,10 +201,7 @@ export async function spawnCommand(argv: string[]) {
     rejectEngineMismatch(lane, existingLane, engine);
     if (engine === "gpt") rejectPinnedAccountFlag(lane, existingLane, parsed.flags.account);
   }
-  // A respawn keeps the stored gate and cwd unless the caller passes new ones.
-  const gate = parsed.flags.gate ?? existingLane?.gate;
-  const effectiveGate = composeGate(parent ? undefined : repositoryGate(cwd), gate);
-  if (parsed.bools.has("gate-baseline-check") && !effectiveGate) fail("--gate-baseline-check requires --gate or .cdx-gate");
+  const effectiveGate = composeGate(parent ? undefined : requiredGate, gate);
   const pre = parsed.flags.pre ?? existingLane?.pre;
   const additionalDirectories = mergeDirectories(storedDirectories(lane, existingLane), (parsed.lists["add-dir"] ?? []).map((dir) => {
     if (!existsSync(dir) || !statSync(dir).isDirectory()) fail(`--add-dir is not a directory: ${dir}`);
@@ -229,7 +233,7 @@ export async function spawnCommand(argv: string[]) {
     engine, forcedAccount: parsed.flags.account, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate, pre,
     ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
-  const worktreeTarget = childWorktreeTarget(lane, parsed.flags.worktree, parent, Boolean(existingLane));
+  const worktreeTarget = childWorktreeTarget(lane, parsed.flags.worktree, parent, Boolean(existingLane), supervisor);
   if (worktreeTarget) {
     try {
       worktree = createWorktree(roots.worktreeRepo, worktreeTarget, lane);
@@ -246,25 +250,8 @@ export async function spawnCommand(argv: string[]) {
   }
   if (selection) announceAccountSelection(lane, selection);
   console.log(`cdx: model selection ${engine === "gemini" ? (config.gemini ?? geminiConfig()).model : model} because ${choice.reason}`);
-  const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
-  withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
-  const gateBaselineChecked = Boolean(!parent && effectiveGate && parsed.bools.has("gate-baseline-check"));
-  if (gateBaselineChecked) {
-    const baselineLog = `${ROOT}/logs/${lane}-r${round}.gate-baseline.log`;
-    console.log(`cdx: gate baseline check cwd=${cwd} cmd=${effectiveGate}`);
-    const result = executeGate(effectiveGate!, cwd, baselineLog);
-    const checkedAt = new Date().toISOString();
-    withLedger((ledger) => {
-      ledger[lane]!.gateBaseline = { round, command: effectiveGate!, cwd, exitCode: result.exitCode, checkedAt };
-    });
-    if (result.exitCode !== 0) {
-      writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, fullBrief);
-      finishInvalidBaseline(lane, round, effectiveGate!, cwd, result);
-      process.exitCode = 1;
-      return;
-    }
-    console.log(`cdx: gate baseline passed cwd=${cwd}`);
-  }
+  const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n- ${scopeRule(scopePolicy)}\n\nTask:\n${brief}`;
+  withLedger((ledger) => { Object.assign(ledger[lane]!, { additionalDirectories, scopePolicy }); });
   return launch({
     effort, engine, mode: "spawn", lane, round, cwd, prompt: fullBrief, model: engine === "gemini" ? (config.gemini ?? geminiConfig()).model : model,
     ...(supervisor ? { supervisor: true as const } : {}),
@@ -272,7 +259,6 @@ export async function spawnCommand(argv: string[]) {
     ...(images.length ? { images } : {}),
     ...(outputSchema !== undefined ? { outputSchema } : {}),
     ...(effectiveGate ? { gate: effectiveGate } : {}),
-    ...(gateBaselineChecked ? { gateBaselineChecked: true as const } : {}),
     ...(maxRuntime ? { maxRuntimeMins: maxRuntime } : {}),
     ...(expected !== undefined ? { expectMinutes: expected } : {}),
     ...accountSpec(account), ...ownershipSpec(owner),
@@ -342,7 +328,7 @@ export async function resumeCommand(argv: string[]) {
   if (selection) announceAccountSelection(lane, selection);
   if (parsed.flags.gate !== undefined) printGateChange(lane, before.gate, parsed.flags.gate);
   const previousRound = partial ? `\n\nYour previous round ended with this partial report at ${partialPath}; continue from it, do not redo completed work:\n${partial}` : "";
-  const injectedRules = houseRules(cwd, false, engine, { supervisor: Boolean(before.supervisor) });
+  const injectedRules = `${houseRules(cwd, false, engine, { supervisor: Boolean(before.supervisor) })}${before.scopePolicy ? `\n- ${scopeRule(before.scopePolicy)}` : ""}`;
   const prompt = resumePrompt(followUp, injectedRules, conversationRules(lane, before.rounds, sessionId, engine, false), previousRound.trim());
   return launch({
     effort, engine, model: engine === "gpt" ? laneModel(before) : undefined, mode: "resume", lane, round, cwd, prompt, injectedRules,
@@ -360,7 +346,7 @@ export async function resumeCommand(argv: string[]) {
 // as an advisor rather than a hostile reviewer. Further questions use a fresh consult.
 // A head consult may opt into --supervisor to spawn read-only Gemini helpers.
 export async function consultCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor", "image"]);
   const [lane, questionArg] = parsed.rest;
   const usage = 'usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"';
   const question = await resolveBrief(questionArg, usage);
@@ -385,7 +371,7 @@ export function reviewBaseTarget(cwd: string, base: string, run = (cwd: string, 
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor", "image"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const usage = 'usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]';
@@ -428,6 +414,8 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   }
   const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
+  if (engine !== "gpt" && parsed.lists.image) fail("--image needs --engine gpt; agy takes no image attachments");
+  const images = (parsed.lists.image ?? []).map((image) => existsSync(image) ? realpathSync(image) : fail(`--image does not exist: ${image}`));
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
@@ -460,6 +448,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   if (selection) announceAccountSelection(lane, selection);
   return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief,
     ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
+    ...(images.length ? { images } : {}),
     ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
@@ -506,7 +495,7 @@ export async function codeQuestionCommand(argv: string[]): Promise<void> {
   requireGeminiAgent(policy.reviewAgent, cwd);
   // Keep this request read-only even when its shell tool tries to write.
   if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
-  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
+  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. ${CODEGRAPH_RULE}\n${question}`,
     "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--print-timeout", "90s", "--add-dir", cwd],
     cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);

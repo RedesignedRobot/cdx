@@ -14,6 +14,7 @@ test("a quiet Gemini turn avoids ledger transactions until an undelivered contro
     lines: () => lines,
     deliveredCount: () => deliveredCount,
     markDelivered: (count: number) => { deliveredCount = count; },
+    callLimitHit: () => false,
     withLane: (action: (value: typeof lane) => void) => {
       transactions++;
       if (transactions > 3) throw new Error("ledger transaction budget exceeded within one second of quiet polling");
@@ -45,6 +46,7 @@ test("a steer queued during an active hooked turn waits without ledger transacti
     lines: () => [JSON.stringify({ text: "addendum", sentAt: "2026-09-26T10:59:00Z" })],
     deliveredCount: () => deliveredCount,
     markDelivered: (count: number) => { deliveredCount = count; },
+    callLimitHit: () => false,
     withLane: (action: (value: { steers?: number }) => void) => { transactions++; action({}); },
     deliver: (record: { text: string }) => { received.push(record.text); },
     now: () => "2026-09-26T11:00:00Z",
@@ -54,4 +56,20 @@ test("a steer queued during an active hooked turn waits without ledger transacti
   drainGeminiControls("/control/lane-r1.jsonl", false, true, io);
   expect(received).toEqual(["addendum"]);
   expect(transactions).toBe(1);
+});
+
+test("a lane past its call limit skips the write transaction on every poll", () => {
+  let transactions = 0;
+  const io = {
+    exists: () => true,
+    lines: () => [JSON.stringify({ text: "steer", sentAt: "2026-09-26T11:00:00Z" })],
+    deliveredCount: () => 0,
+    markDelivered: () => {},
+    callLimitHit: () => true,
+    withLane: () => { transactions++; },
+    deliver: () => { throw new Error("a lane past its call limit must not receive steers"); },
+    now: () => "2026-09-26T11:00:01Z",
+  };
+  for (let tick = 0; tick < 100; tick++) drainGeminiControls("/control/lane-r1.jsonl", false, true, io);
+  expect(transactions).toBe(0);
 });

@@ -12,7 +12,6 @@ import {
   settleHint, uncoloredChildEnv,
 } from "./runtime.ts";
 import { db, write } from "./store.ts";
-import { renderNote } from "./tui.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import { appendFileSync, existsSync, mkdirSync, openSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -130,11 +129,11 @@ export function settledJob(name: string): Job | undefined {
   });
 }
 
-export function printRunningJobs(tui = false): void {
+export function printRunningJobs(): void {
   const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
   if (running.length === 0) return;
   const text = `jobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`;
-  console.log(`\n${tui ? text.split("\n").map((line) => renderNote(line)).join("\n") : text}`);
+  console.log(`\n${text}`);
 }
 
 function listJobs(): void {

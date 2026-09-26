@@ -119,6 +119,30 @@ feedEvent("stalled", "[cdx] s1", "terminal", { lane: "a", round: 1 });`);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
+test("a session that starts after the head never takes its wakes, and the head's owner cursor moves only on receipt", () => {
+  const home = tempHome();
+  try {
+    const deliver = (session: string, failing = false) => evalIn(home, `import { deliverEvents } from ${LEDGER};
+try {
+  deliverEvents(${JSON.stringify(session)}, Date.now(), false, (events) => {
+    ${failing ? 'throw new Error("stdout closed");' : ""}
+    console.log(JSON.stringify(events.map((event) => event.text)));
+  });
+} catch { console.log("failed"); }`);
+    evalIn(home, `import { markDriver, startSession } from ${LEDGER};
+startSession("head", Date.now() - 20_000);
+markDriver("head");
+startSession("teammate");`);
+    evalIn(home, `import { feedEvent } from ${LEDGER};
+feedEvent("question", "[cdx] q1", "terminal", { lane: "a", round: 1 });`);
+    expect(JSON.parse(deliver("teammate"))).toEqual([]);
+    expect(deliver("head", true).trim()).toBe("failed");
+    expect(JSON.parse(deliver("teammate"))).toEqual([]);
+    expect(JSON.parse(deliver("head"))).toEqual(["[cdx] q1"]);
+    expect(JSON.parse(deliver("head"))).toEqual([]);
+  } finally { rmSync(home, { recursive: true, force: true }); }
+});
+
 test("migrate imports a synthetic 9.x home once, archives closed lanes, and nothing migrates on read", () => {
   const home = tempHome();
   try {

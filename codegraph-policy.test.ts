@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { codegraphActions } from "./codegraph-policy.ts";
+import { CODEGRAPH_EXPLORE, codegraphActions } from "./codegraph-policy.ts";
 import { roundProgress, toolObservation } from "./visibility.ts";
 
 const indexed = (path: string) => path === "/repo" || path.startsWith("/repo/") ? "/repo" :
@@ -16,6 +16,8 @@ test("shell order, effective cwd, and exact CLI name decide the first graph per 
   expect(codegraphActions({ command: "echo 'codegraph explore'; mycodegraph explore; codegraph search x" }, "/repo")).toEqual([]);
   expect(codegraphActions({ command: "rg needle src/a.ts\ncodegraph explore a\nrg next src/b.ts" }, "/repo"))
     .toEqual([{ kind: "search", cwd: "/repo/src/a.ts" }, { kind: "graph", cwd: "/repo" }, { kind: "search", cwd: "/repo/src/b.ts" }]);
+  expect(codegraphActions({ command: `${CODEGRAPH_EXPLORE} "where is a"; rg next src/b.ts` }, "/repo"))
+    .toEqual([{ kind: "graph", cwd: "/repo" }, { kind: "search", cwd: "/repo/src/b.ts" }]);
   expect(codegraphActions({ command: "rg needle ';' src/a.ts" }, "/repo"))
     .toEqual([{ kind: "search", cwd: "/repo/src/a.ts" }]);
 });

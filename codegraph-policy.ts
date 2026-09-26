@@ -63,6 +63,14 @@ function sourceSearch(argv: string[], cwd: string): CodegraphAction | undefined 
   return target ? { kind: "search", cwd: resolve(cwd, target) } : undefined;
 }
 
+// A hung codegraph call once held a lane for 15 minutes; every call cdx suggests carries this deadline.
+export const CODEGRAPH_EXPLORE = "perl -e 'alarm 60; exec @ARGV' codegraph explore";
+
+// Judge the command the deadline wrapper runs, not perl.
+function deadlineFree(argv: string[]): string[] {
+  return argv[0] === "perl" && argv[1] === "-e" && /^alarm \d+; ?exec @ARGV$/.test(argv[2] ?? "") ? argv.slice(3) : argv;
+}
+
 export function codegraphActions(input: CodegraphInput, defaultCwd: string): CodegraphAction[] {
   const base = resolve(input.cwd || defaultCwd);
   const args = input.args && typeof input.args === "object" ? input.args as Record<string, unknown> : {};
@@ -78,7 +86,7 @@ export function codegraphActions(input: CodegraphInput, defaultCwd: string): Cod
   let segment: string[] = [];
   const visit = () => {
     if (!segment.length) return;
-    const argv = segment;
+    const argv = deadlineFree(segment);
     segment = [];
     if (argv[0] === "cd" && argv.length === 2 && argv[1]) { cwd = resolve(cwd, argv[1]); return; }
     if (/^(?:\/bin\/)?(?:sh|bash|zsh)$/.test(argv[0] ?? "") && /^-[a-z]*c$/.test(argv[1] ?? "") && argv.length === 3) {

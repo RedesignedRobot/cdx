@@ -13,9 +13,10 @@ function select(overrides: Partial<Parameters<typeof chooseSpawnModel>[1]> = {})
   });
 }
 
-test("shipped route can be replaced and rejects invalid entries", () => {
-  expect(parseConfig("{}").repoRouting).toEqual(routing);
-  expect(parseConfig('{"repoRouting":{}}').repoRouting).toEqual({});
+test("Sol is the default everywhere; configured routes are validated", () => {
+  expect(parseConfig("{}").repoRouting).toEqual({});
+  expect(parseConfig("{}").model).toBe("gpt-6-sol");
+  expect(parseConfig(JSON.stringify({ repoRouting: routing })).repoRouting).toEqual(routing);
   expect(parseConfig(JSON.stringify({ repoRouting: { "/other/repo": { model: "gpt-6-sol" } } })).repoRouting)
     .toEqual({ "/other/repo": { model: "gpt-6-sol" } });
   for (const bad of [null, [], "repo"]) {

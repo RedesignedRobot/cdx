@@ -8,6 +8,7 @@ import { safeText, safeJSON } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 import { drainGeminiControls } from "./gemini-controls.ts";
 import { runClaudeRound } from "./claude.ts";
+import { scopeExtensions } from "./brief-contract.ts";
 // Round execution, engine event handling, account failover, and finalization.
 
 import { config, geminiConfig } from "./config.ts";
@@ -26,7 +27,7 @@ import {
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
+  activeStateOf, feedEvent, findLane, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
   type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLane, withLedger,
 } from "./ledger.ts";
 import { sharedTreeLanes, reviewLoopClosed } from "./prompts.ts";
@@ -41,7 +42,7 @@ import {
 import { failActiveRound, killChildren } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
 import {
-  CmdError, color, coloredState, completionVerdict, fmtTokens, laneChildEnv, REPO_ROOT, ROOT, singleLine, VERSION,
+  CmdError, color, coloredState, completionVerdict, fmtTokens, laneChildEnv, ROOT, singleLine, VERSION,
 } from "./runtime.ts";
 import { invalidateAccountUsage, isFiniteCount, readUsageSnapshot, recordCodexExhaustion } from "./usage-store.ts";
 import { toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -205,7 +206,9 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   const engine = spec.engine;
   const gemini = engine === "gemini";
   const jsonMode = true;
-  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"), Boolean(spec.supervisor));
+  const role = { review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) };
+  if (!gemini && spec.laneInstructions === undefined) throw new CmdError("round spec has no lane instructions; start a new round with cdx 10");
+  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), spec.laneInstructions!, role);
   prepareSandboxDirs(spec);
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
@@ -250,7 +253,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round), progressLogPathOf(lane, round)]), ...geminiArgs]
       : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
-    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), Boolean(spec.supervisor)), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
+    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -881,6 +884,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         lines: (path) => readFileSync(path, "utf8").split("\n").filter((line) => line.trim()),
         deliveredCount: () => readDeliveredCount(lane, round),
         markDelivered: (count) => writeDeliveredCount(lane, round, count),
+        callLimitHit: () => Boolean(findLane(lane)?.callLimitHit),
         withLane: (action) => withLane(lane, action),
         deliver: (record) => {
           writeUserTurn(controlText(record));
@@ -1308,6 +1312,8 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewTreeMoved && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
   if (gateReceipt) {
+    const extensions = existsSync(reportPath) ? scopeExtensions(readFileSync(reportPath, "utf8")) : [];
+    if (extensions.length) gateReceipt.scopeExtensions = extensions;
     const final = finishGateReceipt(gateReceipt, roundState);
     gateReceipt = final.receipt;
     appendFileSync(reportPath, final.report);
@@ -1332,9 +1338,8 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
       try { gateLogOutput = readFileSync(gateLogPath, "utf8"); } catch {}
       const failure = gateFailure(gateExit ?? 1, gateLogOutput);
       const kindLabel = `gate ${failure.kind} failed`;
-      roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
-        ? `${kindLabel} after work; baseline passed (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`
-        : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath}); baseline was not checked, use --gate-baseline-check on spawn`;
+      roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}`
+        : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`;
       roundNote = `${failure.diagnostic}\n${roundNote}`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (receivedSignal) roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;

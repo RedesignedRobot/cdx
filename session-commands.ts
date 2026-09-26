@@ -4,43 +4,23 @@ import { geminiQuotaState } from "./gemini-usage.ts";
 import { markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts";
 import { markOverrun, overrunNotice } from "./duration.ts";
 import {
-  acknowledgeEvents, activeStateOf, callerSession, deliverEvents, deliveryHead, eventsAfter, feedEvent, laneRunning,
-  latestEventId, markBrief, readLedger, readSession, recentEvents, renderEvent, roundReportOf, selectEvents, startSession,
+  activeStateOf, callerSession, deliverEvents, feedEvent, laneRunning,
+  markBrief, markDriver, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
   withLedger,
 } from "./ledger.ts";
 import { questionOpen, readQuestions } from "./questions.ts";
 import { fail, parseArgs, ROOT } from "./runtime.ts";
 import { liveRows } from "./status.ts";
-import { liveView, renderView, tuiEnabled } from "./tui.ts";
 import { write } from "./store.ts";
 import { createHash } from "node:crypto";
 
 export async function eventsCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["json", "peek", "watch", "snapshot"]);
-  if (parsed.rest.length || (parsed.bools.has("snapshot") && !parsed.bools.has("json"))) fail("usage: cdx events [--json] [--peek] [--watch] [--snapshot with --json]");
+  const parsed = parseArgs(argv, ["json", "peek", "snapshot"]);
+  if (parsed.rest.length || (parsed.bools.has("snapshot") && !parsed.bools.has("json"))) fail("usage: cdx events [--json] [--peek] [--snapshot with --json]");
   const session = callerSession();
   if (!session || session === "terminal") fail("cdx events needs a Claude session");
   const json = parsed.bools.has("json");
   const peek = parsed.bools.has("peek");
-
-  if (parsed.bools.has("watch")) {
-    if (!tuiEnabled() || json) fail("events --watch requires CDX_TUI=1 on a terminal without --json");
-    let seen = readSession(session)?.cursor ?? latestEventId();
-    const lines: string[] = [];
-    await liveView(() => {
-      const records = eventsAfter(seen);
-      for (const event of selectEvents(records, session, deliveryHead() === session)) {
-        lines.push(`${records.find((record) => record.id === event.id)!.timestamp}  ${event.kind}  ${event.text}`);
-      }
-      seen = records.at(-1)?.id ?? seen;
-      lines.splice(0, Math.max(0, lines.length - 100));
-      const cursor = seen;
-      return { title: "events", lines, progress: `${lines.length} recent events`, written: () => {
-        if (!peek) acknowledgeEvents(session, cursor);
-      } };
-    });
-    return;
-  }
 
   const now = Date.now();
   if (!peek) monitorOverruns(now);
@@ -52,7 +32,7 @@ export async function eventsCommand(argv: string[]): Promise<void> {
       }
       console.log(JSON.stringify({ session, events, ...(rows ? { rows, now } : {}) }));
     } else if (events.length > 0) {
-      console.log(tuiEnabled() ? renderView({ title: "events", lines: events.map((e) => e.text), progress: `${events.length} events` }, undefined, 0, Number.MAX_SAFE_INTEGER) : events.map((e) => e.text).join("\n"));
+      console.log(events.map((e) => e.text).join("\n"));
     }
   });
 }
@@ -127,13 +107,17 @@ function briefRepeated(session: string, text: string, now = Date.now()): boolean
   });
 }
 
-// Session start, resume and compaction run the brief, so the calling session
-// becomes the head that receives events from here on.
-export function briefCommand() {
+// Session start, resume and compaction run the brief, which registers the
+// session for delivery. Only --head, a user's explicit claim, makes it the
+// head; a session that merely started never takes the wakes.
+export function briefCommand(argv: string[]) {
+  const parsed = parseArgs(argv, ["head"]);
+  if (parsed.rest.length) fail("usage: cdx brief [--head]");
   const quotaState = geminiQuotaState();
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
   const session = callerSession();
   if (session !== "terminal") startSession(session);
+  if (parsed.bools.has("head")) markDriver(session);
   const summary = sessionSummary();
   if (summary && !briefRepeated(session, summary)) console.log(summary);
 }

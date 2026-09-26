@@ -125,9 +125,13 @@ export const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT
 // runner's buffered writer owns the round log, and that writer would
 // overwrite their bytes.
 export const progressLogPathOf = (lane: string, round: number) => `${ROOT}/logs/${lane}-r${round}.progress.log`;
+// Best effort: a Codex work lane's sandbox cannot write logs/, and its cdx
+// ask has already stored the scope-policy answer before it notes it here.
 export function logProgress(lane: string, round: number, text: string): void {
-  mkdirSync(`${ROOT}/logs`, { recursive: true });
-  appendFileSync(progressLogPathOf(lane, round), `${new Date().toISOString()} ${singleLine(text)}\n`);
+  try {
+    mkdirSync(`${ROOT}/logs`, { recursive: true });
+    appendFileSync(progressLogPathOf(lane, round), `${new Date().toISOString()} ${singleLine(text)}\n`);
+  } catch { /* the note is not worth failing the command */ }
 }
 
 export const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;

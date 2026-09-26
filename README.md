@@ -1,14 +1,14 @@
 <div align="center">
 
-# cdx 9.5.0
+# cdx 10.0.0
 
-**A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
+**A native Claude Code plugin that runs OpenAI Codex, Google Antigravity and Claude panel lanes.**
 
-Claude is the head. cdx keeps the books and wakes the head when a lane needs it. Use the Model routing table in `~/.agents/GLOBAL.md` for model and effort choices.
+Claude is the head. cdx keeps the books in one SQLite file, sandboxes every lane, and wakes the head when a lane needs it.
 
 [![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
 [![Function hooks](https://img.shields.io/badge/function_hooks-native_tools-d97757)](#registered-tools)
-[![Version](https://img.shields.io/badge/version-9.5.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-10.0.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
 [![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
@@ -17,19 +17,19 @@ Claude is the head. cdx keeps the books and wakes the head when a lane needs it.
 
 </div>
 
-cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. Claude Code is the owner's liaison. It briefs outcomes, answers questions, arranges independent review, and merges. cdx records lane state, reports, questions, logs, and token use. The Model routing table in `~/.agents/GLOBAL.md` guides model selection.
+cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone CLI for [OpenAI Codex](https://github.com/openai/codex) and Google Antigravity lanes. Claude Code is the owner's liaison: it briefs outcomes, answers questions, arranges independent review, and lands. cdx records lane state, reports, questions, logs and token use, runs each lane's gate, and proves what it lands. `SKILL.md` is the head's playbook; this file is the operator manual.
 
 ## Native in Claude Code
 
-cdx runs inside Claude Code as a [function hooks](#claude-code-integration) module. When a session starts, the mod registers tools under `mcp__cdx__`, the `/lanes` command, a live band, a status line, and a two-second poll of the event feed. The head spawns a lane with one tool call and ends its turn. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
+cdx runs inside Claude Code as a [function hooks](#claude-code-integration) module. At session start the mod registers tools under `mcp__cdx__`, the `/lanes` command, a live band, a status line, and a two-second poll of the event table. The head spawns a lane with one tool call and ends its turn. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
 
 ```mermaid
 sequenceDiagram
     participant Head as Claude Code head
     participant Mod as cdx mod (in-process)
     participant CLI as cdx CLI
-    participant Lane as Codex or Antigravity lane
-    Head->>Mod: mcp__cdx__spawn { lane, brief }
+    participant Lane as sandboxed Codex or Antigravity lane
+    Head->>Mod: mcp__cdx__spawn { lane, outcome, files, acceptance, outOfScope, brief }
     Mod->>CLI: cdx spawn --bg -
     CLI->>Lane: detached round starts
     Note over Head: turn ends, nothing waits
@@ -37,325 +37,320 @@ sequenceDiagram
         Mod->>CLI: cdx events --json --snapshot
     end
     Lane-->>CLI: question, report, stall, 503
-    CLI-->>Mod: wake event
+    CLI-->>Mod: wake event, digest of at most 5 lines
     Mod-->>Head: [cdx] prompt when idle, tool context mid-turn
-    Head->>Mod: mcp__cdx__reply, report, close
+    Head->>Mod: mcp__cdx__reply, review, land
 ```
 
 | In the session | What it does |
 |---|---|
-| `mcp__cdx__spawn`, `resume`, `review`, `consult` | Start work. The brief travels as a tool field, never through the shell. |
-| `mcp__cdx__reply`, `send`, `msg` | Answer a question, steer a running lane, message a peer session. |
-| `mcp__cdx__status`, `events`, `report`, `tail`, `questions`, `usage` | Check in without waiting. |
-| `mcp__cdx__close`, `kill`, `gate`, `job`, `takeover`, `doctor` | Finish, stop, gate, run detached jobs, claim work, diagnose. |
+| `mcp__cdx__spawn`, `resume`, `review`, `consult`, `panel` | Start work. The brief travels as a tool field, never through the shell. |
+| `mcp__cdx__reply`, `send`, `msg` | Answer a question, steer a running lane, message a session. |
+| `mcp__cdx__status`, `events`, `report`, `tail`, `questions`, `inbox`, `usage` | Check in without waiting. |
+| `mcp__cdx__land`, `close`, `kill`, `gate`, `gate-receipt`, `job`, `ask`, `doctor` | Land, finish, stop, gate, run detached jobs, ask a code question, diagnose. |
 | `[cdx]` prompts and toasts | Wake events arrive as a prompt when the head is idle and as context on the next tool result mid-turn. |
 | `/lanes` | Opens a live Pane with lane details and recent transcript lines. Arguments forward to cdx. |
-| Live band | Running lanes and jobs, stage, elapsed round time, steps, files, and current action above the prompt on terminal and desktop. |
-| Status line | Lane count, busiest stage, elapsed round time, and current action, refreshed every two seconds. |
+| Live band and status line | Running lanes and jobs, stage, elapsed round time, steps, files and current action, refreshed every two seconds. |
 
 There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and people at a terminal.
 
-## Setup in 60 seconds
+## Setup
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.5.0:
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. `cdx panel` also needs the `claude` binary and macOS `sandbox-exec`.
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
-```
-
-Install or refresh the Antigravity agent files, then verify the configured engines with live round trips:
-
-```bash
 cdx doctor --fix
 cdx doctor --probe
 ```
 
-`doctor` checks engine binaries, login and usage, configuration, function hooks, mod polling, and stale ledger entries. For Codex it reads `<primary Codex home>/models_cache.json` and fails `codex models` when `model`, `thinkerModel` or an alias target is missing from the catalog; run `codex update`, then `codex debug models`. For Antigravity it also checks agent files, loaded hooks, and model availability. `--fix` installs the shipped Antigravity agents and hooks and repairs stale rounds. `--probe` runs a short request through each installed engine. Missing `agy` is a warning unless the config enables Gemini.
+Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code session; the symlink makes cdx a terminal command. Works on macOS, Linux and WSL. The sandbox, `ask` and `panel` need macOS.
 
-`cdx doctor --fix` creates `<account-home>/cdx-lane` with short lane instructions and guarded hooks. It shares account auth, config and session paths without rewriting the interactive home. It installs real Gemini agent files under `~/.gemini/config/agents/`, removes retired cdx rules, and stores the work-lane defaults. Doctor checks `agy agents`; missing agents or hooks refuse new Gemini launches. Existing processes continue unchanged. New rounds use the new profile. Reload the Claude plugin after updating cdx to expose new native tools.
+`doctor` checks engine binaries, login and usage, configuration, the Codex model catalog, function hooks, mod polling, the state database, stale review snapshots and idle worktrees. It reads `<primary Codex home>/models_cache.json` and fails `codex models` when `model`, `thinkerModel` or an alias target is missing; run `codex update`, then `codex debug models`. For Antigravity it checks agent files, loaded hooks and model availability; missing `agy` is a warning unless the config enables Gemini. `--probe` runs a short request through each installed engine.
 
-Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code session. The symlink also makes cdx available as a terminal command.
+`doctor --fix` renders the Codex lane homes, installs the Gemini agents and hooks under `~/.gemini/config/`, removes retired rules from `config.json`, repairs stale rounds, and removes stale snapshots and idle cdx worktrees. Existing engine processes continue unchanged; new rounds use the new homes. Reload the Claude plugin after updating cdx to expose new native tools.
 
-Works on macOS, Linux, and WSL.
+### Upgrading from 9.x
 
-## Browser view
+1. Stop every lane and job. A 9.x runner left running writes `ledger.json`, which 10.0 never reads.
+2. Install 10.0 and run `cdx doctor --fix`. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; 10.0 refuses unknown keys.
+3. Run `cdx migrate` once.
+4. Restart every open Claude Code session, or run `/reload-plugins` in each, before the first spawn. A session that still holds the 9.x mod calls the removed takeover tool, sends the old spawn schema that 10.0 refuses, polls with the 9.x cursor, and runs land with a 120 s timeout that kills it mid-merge.
 
-Run `cdx view` in its own terminal, then open `http://127.0.0.1:7477`. Use `cdx view --open` on macOS to open the browser, or `--port N` to choose a port. Ctrl-C stops the server. Journal reads take the event lock without changing stored state.
+`cdx migrate` imports version 5 ledger lanes (closed ones straight into the archive), feed events, jobs and questions into `state/cdx.db` in one transaction, then moves the old files to `state/legacy/` as the backup. It refuses a second run. Lanes already in the database win over the JSON copy. The lifecycle events `started`, `active`, `progress`, `gate-started` and `report-written` are dropped. Nothing migrates on read: until `cdx migrate` runs, `cdx status` prints a hint on stderr and `cdx doctor` warns. A round spec from 9.x lacks the rendered lane instructions and the runner refuses it; give such a lane a fresh round.
 
-The page opens on running lanes and jobs. Running, Done, Failed, and All filters remember your choice across reloads. All keeps running work first, then finished work. Each group sorts by recent activity. Failed includes invalid gates; closed and adopted lanes appear only in All. Parent names stay on each row without changing the order. Expand Feed for the latest 200 entries. The dashboard reads discrete `work` and `review` round records directly, without flat state or cwd fallbacks.
+## Engines and routing
 
-Select a lane for its owner, elapsed time, questions, reports, and live transcript. Pick a round to inspect earlier output. Escape closes the details. Logs follow new output until you scroll up.
+`--engine` is optional on spawn and review and defaults to `gpt`; omitting it prints `cdx: engine gpt (default)`. Resume inherits the lane engine.
 
-Violet orbits mark GPT, teal scanlines mark Gemini, and amber tickers mark jobs. These show running state, not measured progress. A lane with no events for five minutes gets a quiet warning. New rounds enter once; new transcript lines fade in. The page respects reduced motion, works offline, and follows the system light or dark theme. It uses system fonts and no dependencies.
+- **Sol direct is the default in every repository.** A new gpt work lane runs `model`, default `gpt-6-sol`. `repoRouting` defaults to `{}`.
+- **Astra thinks.** Head-launched review, consult and `--supervisor` lanes run `thinkerModel`, default `gpt-6-astra`. A child lane can never run `gpt-6-astra`; the refusal is checked on the resolved model before any account probe or process start.
+- **Gemini is for read-only work**: consults, reviews, pre-reads and crawls. A Gemini work lane prints `cdx: routing reserves Gemini for read-only work (consults, reviews, pre-reads); this work lane runs anyway`. Gemini always runs `gemini-3.8-flash-high` at effort `high`, gets a 90-minute `--max-runtime` unless the flag says otherwise, and warns on briefs over 1,500 words.
+- **Claude** runs only panel members and read-only consults. `--engine` on spawn and consult accepts only `gpt` and `gemini`.
 
-## Two engines
+`--model M` takes an alias or a raw model id. The built-in aliases are `astra` and `sol`; the `models` config map adds more. A lane keeps its work model across resume. A review round records its model as `reviewModel`; the lane's `model` stays the work model. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog and refuses only when a complete catalog excludes it.
 
-`--engine` is optional on spawn, review, and adopt and defaults to `gpt`; omitting it prints `cdx: engine gpt (default)`. `--engine gemini` is the opt-in engine for mechanical sweeps. Resume inherits the lane engine. Gemini always runs `gemini-3.8-flash-high`; cdx ignores `--effort` for Gemini with a note. A Gemini lane gets a 90-minute `--max-runtime` unless the flag says otherwise (`gemini.maxRuntimeMins` in the config); Codex lanes have no default cap.
+`repoRouting` maps absolute canonical repository paths to work models, for example `{ "/Users/me/code/app": { "model": "gpt-6-astra" } }`. Linked worktrees and subdirectories use the main repository identity. An explicit `--model` or `--engine gemini` wins, a respawn keeps its stored model, and children never receive Astra from a route. Spawn prints the selection reason.
 
-Without `--model`, a new head-launched gpt work lane uses `repoRouting` for its repository, then the config `model`, default `gpt-6-sol`. Head-launched thinking lanes (review, consult, and `spawn --supervisor`) run `thinkerModel`, default `gpt-6-astra`. `--model M` overrides either with an alias or a raw model id. The built-in aliases are `astra` for `gpt-6-astra` and `sol` for `gpt-6-sol`; the `models` config map adds more. The lane keeps its work model across resume, and status shows it. A review round runs Astra unless `--model` says otherwise and records `reviewModel` beside the lane's `model`, which stays the work thread's model; status shows the review round's model. A child lane can never run `gpt-6-astra` and falls back to Sol. The refusal is checked on the resolved model (explicit `--model`, alias such as `astra`, config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog. Account probes request `model/list` with hidden models included and retain the complete catalog. Admission refuses only when a complete cached catalog excludes the resolved model, with the model and account named. A missing catalog admits the lane without a fallback probe. Account selection and sizing stay unchanged. The protocol is documented in [OpenAI's app-server model listing](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
-
-`repoRouting` maps absolute repository paths to work models. The shipped route sends `/Users/mas/code/hyperscale-portals` to `gpt-6-astra`, following the owner's portal UI ruling. Linked worktrees and subdirectories use the main repository identity. Spawn prints the selection reason. Omitting `repoRouting` uses the shipped map; an explicit object replaces it, and `{}` disables routing. An explicit `--model` or `--engine gemini` wins. Existing lanes retain their work model, and supervisor children never receive Astra from a route. Gemini remains available for mechanical portal follow-up. See the Model routing table in `~/.agents/GLOBAL.md`.
-
-```json
-{
-  "repoRouting": {
-    "/Users/mas/code/hyperscale-portals": { "model": "gpt-6-astra" }
-  }
-}
-```
-
-
-`--supervisor` lets a GPT lane drive its own children through spawn, resume, review, consult, send, reply, kill, and close. Children run Sol on the default gpt engine, or Gemini for mechanical sweeps; read-only consults are also available. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate.
-
-Limits retained in 7.0.0:
-
-- Supervisors drive only their own children so they cannot disturb another task. Ending a supervisor round stops running children; reporting with a running child fails the round.
-- Nested supervisors are refused to keep delegation one level deep. Child lanes are instructed not to delegate further; the Codex depth hook remains in place.
-- Child gates cannot change through `gate`, `resume --gate`, or respawn because they define acceptance. Omitting `--gate` on a supervised respawn preserves and runs the stored gate.
-- Reviews and consults run with full access: shell, network, scratch files. A review of either engine fails if the tree changes, so review only a quiet tree and do not commit in that checkout while it runs. Consults have no tree check.
-- Jobs stay with the liaison because they can outlive a lane. Fork, adopt, and clean also stay there because they can affect unrelated history or shared artifacts.
-- Lanes are instructed not to commit, push, or deploy because the liaison integrates after review. Review hooks and fingerprints are accidental-write controls, not a security sandbox against arbitrary shell access.
+`--supervisor` lets a GPT lane drive its own children through spawn, resume, review, consult, send, reply, kill, close and gate. It needs `## Children` in the brief with two or more child file sets; one file set belongs to a direct Sol lane. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12), so every child is a tracked cdx lane with its own cost and gate.
 
 ## Quickstart
 
 ```bash
-# Default path for a whole change
-cdx spawn search-fix --supervisor --bg \
-  --cd ~/code/myapp --gate "bun run check" "Fix the search timeout and verify the affected flows."
-cdx wait search-fix --report
+# One bounded change: a Sol work lane with the brief contract
+cdx spawn search-timeout --cd ~/code/myapp --worktree search-timeout --gate "bun test src/search" --bg - <<'EOF'
+## Outcome
+Search requests over 2 s return a partial page instead of a 504.
+## Files
+- src/search/handler.ts
+- src/search/handler.test.ts
+## Acceptance
+handler.test.ts has a case where the index answers after 3 s and the response is 200 with partial=true.
+## Out of scope
+Index tuning, the export endpoint.
+EOF
 
-# A bounded task goes straight to a Sol work lane
-cdx spawn fix-flaky-test --cd ~/code/myapp "The test in auth.test.ts fails
-intermittently. Find the race, fix it, and add a deterministic regression test."
+# A read-only question, no lane
+cdx ask --cd ~/code/myapp "Where is the search deadline set?"
 
-# Three workers in parallel, detached, each in its own git worktree
-cdx spawn api-docs   --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-docs --bg "Document every public endpoint in openapi.yaml."
-cdx spawn dead-code  --engine gemini --cd ~/code/myapp --worktree ~/code/myapp-dead --bg "Find and delete unreachable code. List every deletion."
-cdx spawn slow-query --cd ~/code/myapp --worktree ~/code/myapp-perf --bg "Profile the /search endpoint and fix the N+1."
-cdx wait api-docs dead-code slow-query
+# Correct a running lane without waiting for the round to finish
+cdx send search-timeout "The deadline lives in config/search.ts, not the handler."
 
-# Follow a worker thinking, live
-cdx tail -f slow-query
+# Review under any name; the proof binds to the tree
+cdx review search-timeout-review --cd ~/code/wt/search-timeout --uncommitted
 
-# Correct a running worker without waiting for the round to finish
-cdx send slow-query "The slow path is /search/export, not /search."
+# Land: commit, gate the merge once, fast-forward, push, clean up
+cdx land search-timeout
 
-# Continue a thread with its context intact
-cdx resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] ("<fix instructions>" | -)
-
-# Review a worker's diff in a fresh Astra session
-cdx review slow-query-review --cd ~/code/myapp-perf --uncommitted
-
-# Finish
-cdx report slow-query
-cdx close slow-query "landed in a1b2c3d"
+# Several green lanes, one gate and one push
+cdx land --batch api-docs dead-code slow-query
 ```
 
-## How it works
+## The brief contract
 
-The CLI entrypoint remains `cdx.ts`. The [module map](docs/modules.md) names the files that own state, engine execution, commands, and presentation.
+A work brief given to `cdx spawn`, a respawn included, must carry four sections and a gate:
 
-```mermaid
-flowchart LR
-    head["Claude Code head"] -->|"mcp__cdx__* tools"| mod["cdx mod<br/>(function hooks)"]
-    mod -->|argv and stdin| cdx["cdx CLI"]
-    cdx -->|supervisor lane| astra["Astra driver"]
-    astra -->|delegate and verify| cdx
-    cdx -->|bounded tasks| children["Sol or Gemini children"]
-    children -->|reports and questions| cdx
-    cdx -->|"feed, polled every 2 s"| mod
-    mod -->|"[cdx] prompt or tool context"| head
+| Section | Holds |
+|---|---|
+| `## Outcome` | What must be true when the lane is done |
+| `## Files` | The files the lane owns |
+| `## Acceptance` | The assertion that separates success from a plausible wrong answer |
+| `## Out of scope` | What the lane must not do or touch |
+
+Any heading level counts and titles match loosely: "Acceptance criteria", "Out-of-scope" and "Non-goals" all count. A section with an empty body does not. The gate comes from `--gate` or the repository's `.cdx-gate`. `--supervisor` also needs `## Children` (or "Child file sets") with two or more list items. Resume, consults and reviews are exempt. The refusal names every missing piece in one line:
+
+```
+work brief refused, missing "## Outcome", "## Files", ...; consults and reviews are exempt
 ```
 
+The MCP `spawn` tool takes `outcome`, `files[]`, `acceptance`, `outOfScope` and `children[]` as fields and renders them as sections ahead of `brief`.
 
-- Each lane has discrete `work` and `review` round records. Version 5 writes `{ version: 5, lanes: { ... } }` and `.ledger-version` to reject older writers. The writer migrates 3.x and 4.0 ledgers once on write under lock and rejects legacy shapes thereafter. Flat `state` and `cwd` aliases are removed from the ledger and view summaries. A new round clears its predecessor's report and note.
-- The runner handles engine events, qualifies Gemini results, and finalizes reports and gates. Shared JSONL framing handles unterminated responses and skips non-object values. Effort is pinned in the round spec; every round spec requires an explicit engine and effort, and pre-4 effort and account fallbacks are removed. Resuming a live round is refused.
-- Snapshot and probe history writes share `.usage.lock`; history is atomically replaced before its snapshot so a published snapshot always has its reading. Codex token usage is counted per thread from a per-thread baseline. Missing or non-finite counters mark the round "incomplete" instead of counting as zero; status and usage output show "(incomplete)", and `usage --json` rows carry an `incomplete` field. Every round records a start time and emits a `started` feed event.
-- Detached lanes: Detached lanes keep running after your shell exits.
-- One engine child per work round: GPT uses a Codex app-server over stdio. Gemini uses Antigravity stream JSON over stdio and keeps the conversation ID for resume.
-- Reports captured per round: Both GPT and Gemini work reports capture the final agent message of the turn, not concatenated turn text. Non-success Gemini results preserve the last agent response in `reports/<lane>-r<n>.partial.md` and never overwrite full reports. Transport error text does not replace captured partial work. Failed rounds expose that path in their ledger record and terminal feed when no full report exists. Failure notes contain the reason and partial path, not the report markdown.
-- Gemini retries transient transport failures once and 503 capacity errors through the existing six-step backoff. One fallback round may continue on the configured 3.8 fallback model. Quota refusals and cancellations end the round. If recovery ends without a gate or review failure, start a fresh lane from its partial report.
-- Gemini capacity notice: Every Gemini spawn, resume, and review prints the current time in both clocks, Riyadh and US Pacific (Google's serving day), and says whether it falls in the daily 503 peak (17:00-21:00 Riyadh, 07:00-11:00 US Pacific) or the midday bump (12:00-14:00 Riyadh), with the quiet window (21:00-12:00 Riyadh) as the recommended time. The same line is part of every outage wake and of `cdx doctor`. The windows come from the 265 first-attempt 503s in cdx's logs up to 2026-09-16.
-- Gemini admission projects remaining calls across running lanes using observed uncached input plus output per call. Queued rounds wait until reset without starting an engine. Hooks request a handoff below 10 percent and at call 240, then terminate at 250. A partial report survives every process stop.
-- Replayed-error detection: Antigravity can return the previous turn's error verbatim on a resumed conversation even though the new turn finished. When the error equals the lane's last recorded error and the turn produced a final agent message, the round finalizes as success with feed line `ignored replayed agy error: <text>`. Transport errors stay on the transport retry path.
-- Strict report contract: A completed work turn needs a qualifying report. Without one, the round fails with `no final report`, and cdx skips the acceptance gate. A Gemini round whose final response is the agy cancellation template ("User initiated cancellation", "Execution stopped per your cancellation request") finalizes failed with note "agy returned its cancellation template as the report; no qualifying report", and the gate does not run.
-- Both engines return structured review findings. GPT reviews use app-server with per-call usage and steering. Re-reviews receive only the fix diff and prior findings. A second reviewer for the same HEAD and tree is refused; a P3-only verdict closes the loop.
-- Stall detection: A lane quiet for five minutes writes a feed warning, repeated at most every ten minutes, with an active-again line when events resume.
+`--scope-policy ask|extend|stop`, default `extend`, is stored on the lane and added to the ground rules at spawn and resume:
+
+- `extend`: the lane edits what the outcome needs and lists each file outside its Files section under `## Scope extensions` in its report. The gate receipt records those items as `scopeExtensions`.
+- `stop`: the lane does not edit outside Files; it names the file and the reason in its report and ends the round.
+- `ask`: the lane asks the head.
+
+Under extend and stop, a `cdx ask` that reads as a scope-permission question ("may I edit outside my files") gets an immediate answer from cdx. The question is stored as answered and the head is not woken. The classifier is keyword-based.
+
+A no-op gate is refused when the repository has `.cdx-gate`, at spawn and at `cdx gate`: `true`, `:`, `exit`, `exit 0`, `/bin/true`, `/usr/bin/true`, and a bare `echo ...`.
+
+The brief's `Ground rules:` block is a pointer, not a copy: the role's lane home AGENTS.md, `Project rules: read <repo>/.cdx-rules.md` when that file exists, and the [context digest](#context-digest) for HEAD or one of the last 20 commits, with older digests listed as stale. A sample work lane went from 3,291 injected bytes to 156.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `cdx spawn <lane> [--engine gpt\|gemini] [--model M] [--supervisor] "<brief>"` | Start a worker in its own lane |
+| `cdx spawn <lane> "<brief>"` | Start a work lane under the brief contract |
 | `cdx resume <lane> --fix gate\|review "<instructions>"` | Repair failed evidence at the same HEAD |
-| `cdx gate <lane> "<cmd>"` | Set or replace an inactive lane's acceptance gate |
-| `cdx send <lane> "<text>"` | Deliver in-turn steers via hooks or queue follow-up turns |
-| `cdx ask "<question>"` | Ask the owning liaison from inside a work lane and wait for its answer |
-| `cdx reply <lane> "<answer>"` | Answer the oldest open question from the lane's current round, or select one with `--id` |
-| `cdx questions [lane]` | List current-round open questions across all lanes or one lane |
-| `cdx events` | Read pending owned feed events without advancing the cursor (`--peek`) or advance the delivery cursor |
-| `cdx msg <target> "<text>"` | Send a feed message to a full session id or a lane's owning session |
-| `cdx inbox` | Print messages addressed to the calling Claude session |
-| `cdx review <lane> [--engine gpt\|gemini]` | Review a lane's diff in a fresh session |
-| `cdx consult <lane> [--engine gpt\|gemini] [--supervisor]` | Run a read-only advisory consult or supervisor helper |
-| `cdx status` | Show lane state, tool steps, dirty file count, stage, timing, and last action; `--line` renders a 100-character status line |
-| `cdx usage` | Codex and Gemini quota table, observed burn, projections and account picks; --totals adds ledger totals |
-| `cdx usage --line` | Status line rows: each Codex account's weekly window, then Gemini's windows, from stored readings |
-| `cdx wait <lane\|job>...` | Block until lanes or jobs finish; exit 1 if any failed; `--report` prints the reports too |
-| `cdx job <name> --cd /repo "<cmd>"` | Run a shell command detached: one log, one feed line on exit; `wait`, `kill`, and `status` know it |
-| `cdx tail <lane>` / `cdx tail -f` | Rendered event log, or live transcripts of every running lane |
-| `cdx feed` | Replay recent completion and stall lines from the feed |
-| `cdx report <lane>` | Print a lane's final report |
-| `cdx kill <lane>` | Stop a running lane: SIGTERM the runner, force-finalize if it hangs |
-| `cdx doctor --probe` | Health check with remedies, hooks and model checks, and live engine round-trips |
-| `cdx adopt <lane> <sessionId> [--engine gpt\|gemini]` | Record an existing session as a lane |
-| `cdx land <lane>` | Commit, merge, push, remove the managed worktree and branch, and close after a green receipt |
-| `cdx ask --cd /repo "<question>"` | Synchronous read-only Gemini answer without a lane |
-| `cdx close` · `cdx clean` · `cdx log [--transcript]` · `cdx brief` | Bookkeeping |
+| `cdx review <lane>` | Review a diff read-only in a fresh session |
+| `cdx consult <lane> "<question>"` | Read-only advisor lane |
+| `cdx panel <name> --cd D "<question>"` | Astra, Sol and Claude Fable answer; one merged report |
+| `cdx context <repo>` | Build the repo's context digest for HEAD |
+| `cdx shots grade <dir> --rubric F` | Grade screenshots; `verdict.json` and failed screens only |
+| `cdx land <lane>` / `cdx land --batch <lane>...` | Gate the merge result once, advance the base, push, clean up, close |
+| `cdx gate <lane> "<cmd>"` / `--clear` | Set or clear an inactive lane's gate |
+| `cdx gate-receipt <lane> [--json]` | Content proof for the latest work round |
+| `cdx send <lane> "<text>"` | Steer the active turn, or queue a follow-up turn |
+| `cdx ask "<question>"` | Inside a lane: ask the head and wait for the answer |
+| `cdx ask --cd /repo "<question>"` | From the head: synchronous read-only Gemini answer, no lane |
+| `cdx reply <lane> "<answer>"` / `cdx questions [lane]` | Answer or list open questions |
+| `cdx msg <lane\|full-session-id> "<text>"` / `cdx inbox` | Message the head or a session; read messages |
+| `cdx events` | Unread actionable events for the calling session |
+| `cdx status` | Open lanes with stage, steps, dirty files, timing and last action |
+| `cdx wait <lane\|job>...` | Block until lanes or jobs finish (terminals and supervisors only) |
+| `cdx job <name> --cd D "<cmd>"` | Detached shell job with one log and an event on exit |
+| `cdx usage` | Quota windows, observed burn, projections, account picks, outcome totals |
+| `cdx tail`, `cdx report`, `cdx log`, `cdx feed` | Read transcripts, reports, logs and recent events |
+| `cdx kill`, `cdx close`, `cdx clean` | Stop, close, prune |
+| `cdx doctor`, `cdx migrate`, `cdx brief` | Diagnose, import 9.x state, print the session brief (`--head` makes this session the head) |
 
 <details>
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate "<cmd>"] [--gate-baseline-check] [--pre "<cmd>"] [--max-runtime MIN] ("<brief>" | -)
-cdx resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] ("<fix instructions>" | -)
-cdx gate   <lane> ("<cmd>" | --clear)
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--pre CMD] [--max-runtime MIN] [--expect MIN] ("<brief>" | -)
+cdx resume  <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] [--expect MIN] ("<fix instructions>" | -)
+cdx review  <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
+cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... ("<question>" | -)
+cdx panel   <name> --cd D [--pack F] [--bg] ("<question>" | -)
+cdx context <repo> [--model M]
+cdx shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]
+cdx land    <lane> | cdx land --batch <lane>...
+cdx gate    <lane> ("<cmd>" | --clear)
 cdx gate-receipt <lane> [--json]
-cdx send   <lane> ("<text>" | -)
-cdx ask    [--timeout MIN] "<question>"  # inside a lane: ask the liaison
-cdx ask    --cd /repo "<question>"       # from the head: ask Gemini
-cdx land   <lane>
-cdx reply  <lane> [--id SEQ] ("<answer>" | -)
+cdx send    <lane> ("<text>" | -)
+cdx ask     [--timeout MIN] "<question>"   # inside a lane
+cdx ask     --cd /repo "<question>"        # from the head
+cdx reply   <lane> [--id SEQ] ("<answer>" | -)
 cdx questions [lane]
-cdx events [--json] [--peek]
-cdx msg    <lane|full-session-id> ("<text>" | -)
-cdx inbox  [-n N]
-cdx takeover <lane|full-session-id>
-cdx review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
-cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] ("<question>" | -)
-cdx adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
-cdx view [--port N] [--open]
-cdx status [--all] [--json | --brief | --line | --watch [--interval S]]
-cdx usage  [--json] [--totals]
-cdx usage  --line
-cdx wait   <lane>... [--timeout S] [--json] [--report]
-cdx tail   <lane> [-n N]
-cdx tail   -f [lane]
-cdx feed   [-n N]
-cdx report <lane> [round]
-cdx log    <lane> [round] [--transcript | --tools]
-cdx kill   <lane> ["note"]
-cdx close  <lane> [--remove-worktree | --keep-worktree] ["note" | -]
-cdx job    <name> --cd D ("<cmd>" | -)
-cdx clean  [--days N]
-cdx doctor [--fix] [--probe]
+cdx msg     <lane|full-session-id> ("<text>" | -)
+cdx inbox   [-n N]
+cdx events  [--json] [--peek] [--snapshot]
+cdx status  [--all] [--json | --brief | --line | --watch [--interval S]]
+cdx wait    <lane|job>... [--timeout S] [--json] [--report]
+cdx usage   [--json] [--totals] | cdx usage --line
+cdx tail    <lane> [-n N] | cdx tail -f [lane]
+cdx feed    [-n N]
+cdx report  <lane> [round]
+cdx log     <lane> [round] [--transcript | --tools]
+cdx kill    <lane|job> ["note"]
+cdx close   <lane> [--remove-worktree | --keep-worktree] ["note" | -]
+cdx job     <name> --cd D ("<cmd>" | -) | cdx job
+cdx clean   [--days N]
+cdx doctor  [--fix] [--probe] [--days N]
+cdx migrate
 cdx brief
 ```
 
-`review` with a target flag selects that Git diff. Both engines use the same adversarial frame and findings schema in fresh sessions. GPT uses app-server. The report and findings are saved separately. Reviews keep shell access; a tree fingerprint check detects accidental changes. They must leave the reviewed tree unchanged. Re-reviews receive the fix diff and prior findings; P3-only verdicts close the loop.
+Every command taking free text accepts `-` to read it from stdin: `spawn`, `resume`, `consult`, `review` (intent), `panel`, `send`, `reply`, `msg`, `job` and `close`. An empty stdin fails with the command's usage line. `msg`, `send`, `ask` and `reply` replace CR and LF with spaces. Headless agy expands `/skill-name ...` at the start of a prompt, so a Gemini brief may open with a project skill the workspace ships under `.agents/skills`.
 
-`cdx consult` accepts `--engine gpt|gemini` and `--supervisor`. A Gemini consult is a read-only helper. A consult with `--supervisor` may start only owned read-only Gemini consult helpers; it cannot spawn writable workers, GPT children, or grandchildren.
-
-GPT work rounds own one `codex app-server` child. cdx starts it with approval policy `never` and full workspace access. Gemini work rounds own one `agy` child with stream JSON input and output, `gemini-3.8-flash-high`, the configured `cdx-lane` agent, and every lane directory passed through `--add-dir`. cdx removes `CODEX_HOME` from the Gemini environment. It stores the Antigravity `conversation_id` as the lane session ID and passes it through `--conversation` on resume. Each engine writes its raw events to the round JSONL log and stderr to a separate log. `--schema` reaches either engine. `--image` is GPT-only. Gemini always runs `gemini-3.8-flash-high` and `--effort` does not change its effort. Gemini agents have explicit tool allowlists and exclude default components. A missing agent or default-agent fallback refuses the round. cdx pins the Gemini model and agent name into the round spec at launch, so the detached runner (which starts without the config file) runs what the liaison configured. The brief rules are described under Configuration. Plain workers cannot drive other lanes. A GPT supervisor can drive its own children and cannot create another supervisor.
-
-When a round fails, cdx writes the engine error to the lane note and completion feed line.
-
-### Communication channels
-
-`cdx send <lane> "<text>"` appends a control record with the text, send time, and optional sender session id. GPT steers the active turn when possible and starts a follow-up turn otherwise. `cdx doctor --fix` installs a `cdx` entry into `~/.gemini/config/hooks.json` with PreToolUse and PreInvocation commands. `cdx hook pre-invocation` delivers pending `cdx send` records into the running turn (feed line `steer delivered mode=in-turn`). Without the hook entry, Gemini sends fall back to follow-up turns (`mode=follow-up-turn`). cdx never consumes a control record before delivery. `send` refuses review lanes.
-
-A worker can run `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND`, and `CDX_OWNER` to both engines, so `ask` can identify its lane and owner. Brief and liaison replies govern project and skill guidance within runtime constraints; if paused, workers identify the exact conflicting instruction. Workers make reasonable assumptions for reversible work, and ask through `cdx ask` only for missing decisions about outcome or authorization. The command writes `$CDX_HOME/questions/<lane>-r<round>-<seq>.json` with the question, ask time, and `answered: false`. It posts a `QUESTION` line with the lane owner's full session id and polls for an answer. The default and maximum timeout is 30 minutes. A larger value is clamped to 30 and prints a note. `cdx reply <lane> "<answer>"` answers the oldest open question in the lane's current round by default. Add `--id <seq>` to select a specific question. `cdx questions [lane]` lists open questions only from each lane's current round. Round completion and failure close every remaining question from that round with `expired: round ended`, so a later reply cannot match it by default. While a question remains open, `cdx status` shows `waiting on question #<seq>`. On timeout, `ask` exits 0. Timeout is not approval; the worker reports the unresolved dependency and stops only the work that depends on it, continuing independent authorized work without guessing. A timed-out question does not fail the round.
-
-Claude sessions can run `cdx msg <lane|full-session-id> "<text>"`. A lane resolves to its owning head through the persisted takeover binding. Recipient and sender ids are stored as fields in a structured event. Message text never determines routing. Eight-character addresses are rejected. `cdx inbox [-n N]` prints only messages addressed to the caller, newest last, with a default of 20. `msg`, `send`, `ask`, and `reply` replace CR and LF with spaces before writing records.
-
-`spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in a private snapshot of the lane checkout. The receipt names the captured HEAD and full Git tree. Ignored dependencies and generated files are copied using copy on write when available, with an ordinary-copy fallback. A source write after capture cannot change the tested checkout. The gate runs with `<cwd>/node_modules/.bin` prepended to PATH, retaining the original PATH. Nested packages still need their own script or explicit runner. The first fatal diagnostic determines the cause: typecheck, lint, assertion, architecture, formatter, spec cap, missing spec, stale generated, dirty tree, setup, or tool crash. The lane note and report keep that diagnostic before a bounded output tail, with secrets redacted. The report records every gate exit; nonzero exits fail the round. Work resumes rerun the stored gate. Reviews never run one. The gate is the harness's own verification, so a worker's optimistic done claim cannot finalize green.
-
-When a work round changes no files, the gate still decides: cdx runs it as usual, the report gains a "## Harness note" saying no files changed, the feed line carries `diff=empty`, and status shows "no tree change". An unchanged tree is evidence for the liaison, not a verdict; a verification-only task or a supervisor whose children worked in their own worktrees legitimately changes nothing.
-
-Only `--gate-baseline-check` runs the gate on the untouched baseline tree before worker startup, including worktrees. Worktree spawns do not run baseline checks by default. A baseline failure stops the round as `gate-invalid` and identifies the gate command as the defect. A final gate failure that had no baseline check suggests `--gate-baseline-check` for the next run.
-
-`cdx gate <lane> "<cmd>"` sets or replaces the stored gate. `cdx gate <lane> --clear` removes it. Both forms print the old and new value and refuse to change an active lane. A supervisor cannot change a child's gate through `cdx gate`, `resume --gate`, or `spawn`; the gate is the liaison's acceptance check. Omitting `--gate` on a supervised respawn preserves the existing gate. `resume --gate "<cmd>"` replaces the stored gate before that work round and keeps it for later resumes.
-
-`spawn --pre "<cmd>"` runs setup before reserving a round. A nonzero exit refuses launch. Fix resumes reuse the stored setup command; they cannot replace it.
-
-`resume <lane> --fix gate|review` repairs failed evidence at the same HEAD. Review fixes require a review on the work lane itself; a separately named review does not attach its findings to that lane. It retains the work conversation after a review. New scope, a changed HEAD, a successful gate, or a closed review requires a fresh lane seeded from the prior report. A fix cannot change the stored gate, setup or directories. Gemini still enforces its configured work-round cap. Rules are resent only when changed. Account failover retains the task and prior evidence in a fresh account session.
-
-
-`status` reports lane progress, outcome, and directory from its work record. Active lanes show round tool steps, git dirty file count skipping non-git directories, stage as working, gate running with elapsed time, or reporting, and last action age. Running jobs display their final non-empty log line capped at 80 characters, skipping blank tail lines. A review does not replace work outcome. When a lane has review history, `status` prints the review outcome on a separate review line. Consult lanes use their review record for the main state, timing, and report, with `consult` as the role. `status --brief` prints only running lanes and caller-owned jobs, formatted as one line each under 100 characters. `status --line` renders at most 100 characters for the UI status slot, showing owned running lanes, jobs, open questions, and Gemini quota blocks. It outputs an empty string when the caller owns no active work. `status --watch [--interval S]` re-renders the brief view in place read-only until stopped with Ctrl-C, using a default interval of 2 seconds. `--json` cannot combine with `--brief`, `--line`, or `--watch`. `status --json` emits a name-to-record map.
-
-`kill` sends SIGTERM to the runner, which reaps its engine child and finalizes the round with a signal note. A runner still silent after 10 seconds gets SIGKILL, and cdx finalizes the ledger with note `killed`. `--max-runtime MIN` uses the same signal sequence on either engine child.
-
-`close` removes a recorded worktree and its lane branch only when the worktree still names that branch, the branch is merged into local `main`, and the worktree is clean. Otherwise it refuses before marking the lane closed. `--remove-worktree` remains accepted and uses the same checks. Worktree removal is never forced. After the explicit local-main ancestry check, branch deletion uses `-D` so another primary HEAD or upstream cannot reject that proof. `--keep-worktree` closes the ledger entry without touching the worktree or branch and prints guarded manual cleanup commands. Use it for abandoned, dirty or unmerged lanes. It cannot combine with `--remove-worktree`. Lanes without worktrees close as before.
-
-A brief of `-` reads the brief from stdin (`cdx spawn big-task --engine gemini --bg - < brief.md`), so long prompts with quotes and backticks never fight the shell. Every command taking free text accepts `-` to read from stdin: `spawn`, `resume`, `consult`, `review` (intent), `send`, `reply`, `msg`, `job`, and `close`. An empty stdin fails with the command's usage line. Headless agy expands `/skill-name ...` at the start of a prompt, so a brief may open with a project skill invocation such as `/hyperscale-change ...` when the workspace ships that skill under `.agents/skills`.
-
-`spawn --worktree <path>` creates a git worktree at that path on a new branch `lane/<lane>` from the repo at `--cd` (or the current directory; the native tools run in the session directory, and a reused lane name keeps its old repository only while its directory still exists), runs the optional `worktreeSetup` command from config inside it, and runs the lane there. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit. The worktree and branch are recorded in the ledger and shown by `status`; `close` performs the guarded cleanup described above. An existing target is reused only if it is the exact worktree root in the same repository, on `lane/<lane>`, and clean, including untracked files. Reuse skips setup commands. This gives each parallel worker exclusive files without sharing a dirty tree.
-
-For multiple targets, text-mode `wait` names the targets at the start and prints each completion with its name, state, and report path as the existing five-second poll observes it. Jobs use their log path. After all targets finish, it prints a summary, then report bodies when `--report` is set. A question still returns exit 2 immediately; a timeout names unfinished targets. Single-target report output stays immediate.
-
-`wait --json` prints one JSON object per finished lane, in completion order: `work` and `review` records, roundState, exit code, tokens, report path, note, session ID.
+Inside a lane, workers cannot run spawn, resume, review, consult, panel, context, shots, land, kill, close, clean, gate, reply, job or migrate. A supervisor may run spawn, resume, review, consult, panel, kill, close, gate and reply on its own children, and land its children into its own branch.
 
 </details>
 
-### Required gates and content receipts
+## Sandbox
 
-Put the required repository checks in `.cdx-gate` in the primary checkout. The file is a nonempty shell command, for example `bun run check`. cdx resolves the shared Git directory to find that checkout, reads the file before spawn, resume, and pins the command in the round spec. Keep the primary checkout policy under the head's control. Repositories with a separate Git directory or bare layout must place `.cdx-gate` beside that common Git directory. The file is optional; without it, the existing lane gate applies.
+Every lane runs sandboxed. cdx builds the writable roots once and hands them to each engine.
 
-Parent rounds run the required command followed by their lane gate in separate shells. Children run only their assigned lane gate. An exact duplicate runs once. If the lane command begins with the exact baseline followed by ` && `, cdx strips that prefix and prints a one-line notice. It does not deduplicate other shell syntax. `cdx gate --clear` clears only the lane command. Reviews do not run gates. `--gate-baseline-check` is separate: it optionally executes the composed gate before work to detect an already broken baseline. It does not define required coverage and it costs a second gate run. Use it only to diagnose a suspected baseline failure.
+| Role | Writable | Notes |
+|---|---|---|
+| Codex work lane | lane cwd, each `--add-dir`, /tmp and TMPDIR, `${CDX_HOME}/state`, `${CDX_HOME}/control`, the spill dir `logs/<lane>-r<round>.out` | `workspace-write`, network on, `.git` read-only so lanes cannot commit |
+| Codex review, consult, consult supervisor | nothing, /tmp included | commands and network still work |
+| Gemini lane | the same roots, plus `~/.gemini/antigravity-cli`, TMPDIR and /dev | agy runs under `sandbox-exec`, without `--dangerously-skip-permissions` |
+| Gemini review | state, control and spill dirs, the round's partial report and progress log | Gemini hooks run inside agy and write them |
+| Claude panel member | `~/.claude`, `~/.claude.json`, TMPDIR, `/tmp/claude-<uid>` | `sandbox-exec`; tools Read, Grep, Glob, Bash |
 
-`cdx gate-receipt <lane> --json` and `mcp__cdx__gate-receipt` return a version 1 envelope with `lane`, work `state`, `workExitCode`, `usable`, and `receipt`. A refusal includes `reason` and exits 1. The receipt contains `version`, `round`, `cwd`, `command`, `exitCode`, `finishedAt`, `head`, `tree`, `valid`, and an optional `reason`. Ledger v5 gains optional `gateReceipt` and `additionalDirectories` fields. Old rows remain readable but cannot claim content proof. A new work round or gate change invalidates the old receipt; a read-only review preserves it.
+Nothing else under `~/.cdx` is writable from a lane: not `config.json`, not hooks, not the cdx source. Head-side `cdx ask` uses the read-only Gemini profile. Gates run outside the sandbox in their snapshot.
 
-cdx uses a temporary Git index with `read-tree HEAD`, `add --all`, and `write-tree`. It leaves the real index untouched. The digest covers the whole repository's tracked and untracked nonignored files. Ignored files, external inputs, tool versions and environment variables are outside this proof. Submodules and embedded repositories refuse content proof. Non-Git lanes retain their shell gate verdict, but the receipt command refuses content proof for them. At gate start, cdx prints one notice naming other running lanes in the same Git working tree, including lanes in subdirectories, and records their names in the receipt as `sharedTreeLanes`. Separate worktrees do not trigger this notice. The notice does not change the gate verdict. cdx captures HEAD and tree before and after the gate. If the fingerprint changes, the receipt is invalid and names the changed paths; cdx never reruns the command automatically. Prepare generated files and formatting before the gate. A failed command or Git snapshot also fails the round. The log remains `<lane>-r<n>.gate.log`. The receipt records Git's canonical tree bytes, including configured clean filters, rather than a hash of raw filesystem bytes.
+Supervisors run from their own Codex home, `<account>/cdx-supervisor`, which holds `rules/cdx.rules` with one exec-policy rule, `prefix_rule(pattern = ["cdx"], decision = "allow")`. Codex runs a matching `cdx ...` call outside the sandbox, because Seatbelt does not nest and each child lane needs its own sandbox. Everything that call writes (specs, briefs, logs, reports, `usage.json`, git state for land) comes from that unsandboxed process. Codex skips the rule for commands with a redirect, `$(...)`, an env assignment or a wildcard, so supervisors call `cdx` plainly and leave git writes to cdx.
 
-Consumers must compare the receipt's tree with the tree they will land, verify the expected HEAD and cwd, and require `usable`, work exit 0 and gate exit 0. A receipt is historical evidence, not a lock against later edits. Arc's `lane-land` should call this command instead of reading ledger.json, capture the candidate tree, and require exact equality before merging. Legacy rows need a new gated work round; timestamps are not a content-proof fallback.
+### Output caps
 
-### Jobs, restart and completion
+Every role gets the caps, reviews and supervisors included. Shell output over 4,096 bytes reaches the model as the first 2 KB and the last 1.5 KB, with a notice naming the total byte count and the spill file under `logs/<lane>-r<round>.out/`. Codex cuts through a PreToolUse hook that cdx trusts at thread start; Gemini through the pre-tool hook's `overwrite` field. Read-only Codex lanes cannot write the spill file and see the head and tail plus a note to narrow the command. Commands that invoke `cdx` are not wrapped.
 
-`cdx job <name> --cd /absolute/repo "<command>"` requires an explicit directory. Relative paths resolve against the caller's cwd; absolute paths avoid that dependency. The native job tool requires `cd` too. Listing jobs still needs no directory. Jobs have no implicit lane target and cdx does not guess a repo from shell text.
+Lanes have no MCP servers: Codex ignores hook rewrites and per-tool limits for MCP output, so codegraph runs through the shell as `perl -e 'alarm 60; exec @ARGV' codegraph explore "<question>"`. On timeout (exit 142) or failure, lanes fall back to rg and file reads and say so.
 
-Fix resumes retain the stored directories. Add directories on a fresh spawn when the task scope changes.
+All GPT threads disable memories, plugins, apps, the skills catalogue and native subagents. GPT work lanes get `model_auto_compact_token_limit` (default 150000) and `tool_output_token_limit` (default 6000).
 
-Lane completion events include state, engine exit, `verdict`, log path, report path, gate exit and gate log. Job completion includes state, exit, verdict and log path, with `report=-` and `gateExit=not-applicable`. The verdict is the harness result and failure reason, not a model claim or an arbitrary final log line. Read the report once for review; finite `tail -n`, `status --brief`, and `questions` remain useful for diagnosis. The head should end its turn after dispatch and consume completion or question events. Supervisors keep `cdx wait` to join their own children. Finite unquoted literal-list `for` batches may read reports or briefs and launch work. Status polling, arithmetic loops and generated-range loops remain blocked.
+## Lane homes and rules
 
-## Orchestration patterns
+Standing lane rules live in a Codex lane home per role under each account home: `cdx-lane`, `cdx-supervisor`, `cdx-review` and `cdx-review-supervisor`. Each has an AGENTS.md cdx renders at launch, with the owner `rules` from config and the test-run limit included, and shares the account's auth, config and sessions without rewriting the interactive home. Gemini's static rules live in `agents/cdx-lane/agent.md` and `agents/cdx-review/agent.md`; Gemini briefs still inline the owner rules and test-run limit. `cdx doctor` compares the work lane home against the rendered instructions.
 
-**Single lane, report on completion.** Run `cdx spawn` in the foreground from a background shell. The harness prints a summary line plus the full report at exit, so one notification carries everything.
+The rules give lanes the codegraph-first rule, forbid commits, pushes, deploys and extra servers, and limit a work lane to one typecheck (`vp check --no-fmt` or the equivalent named in `.cdx-rules.md`) and one run of each touched spec. The lane gate owns the suite. The brief and liaison replies outrank project and skill guidance; a lane blocked by a file names its path and quotes the instruction.
 
-**Fan-out.** Fire each lane with `--bg` (they detach and survive the shell), then one `cdx wait a b c` blocks until the wave lands. `wait` exits 1 when any lane failed and exits 2 the moment a waited lane asks a question, printing the question and the `cdx reply` to answer it, so neither side idles for the 30-minute ask timeout. Give each lane `--worktree` when they touch the same repo, so no worker sees another's dirty files.
+## Gates, receipts and landing
 
-**Follow live.** `cdx tail -f <lane>` streams one worker's transcript and exits with the lane's outcome. `cdx tail -f` shows all running lanes with `[lane]` prefixes and follows new rounds and lanes. Any terminal or agent session can use either form against the shared state, which is how parallel Claude sessions see each other's workers.
+### Gates
 
-**Steer or resume.** `send` corrects a running lane via in-turn steering or a follow-up turn. `resume --fix gate|review` repairs failed evidence in the work conversation at the same HEAD.
+`spawn --gate "<cmd>"` stores an acceptance gate on the lane. After a work round exits 0 with a report, cdx runs the command with `/bin/sh -lc` in a private snapshot of the lane checkout, with `<cwd>/node_modules/.bin` prepended to PATH. Nonzero fails the round. The first fatal diagnostic sets the cause: typecheck, lint, assertion, architecture, formatter, spec cap, missing spec, stale generated, dirty tree, setup, or tool crash. A red gate sends its last 60 lines into one repair turn in the same conversation; cdx reruns the gate once before publishing the result. Work resumes rerun the stored gate; reviews never run one. When a work round changes no files, the gate still runs, the report gains a `## Harness note`, and the terminal line carries `diff=empty`.
 
-**Consult when the design is open.** `cdx consult design "<question>"` runs a read-only Astra lane framed as a senior advisor to the caller (either the Astra driver or the owner's liaison) with full freedom to challenge the premise, scope, and technical direction: ranked recommendation, rejected alternatives, evidence from the tree, and a closing "Decisions for the caller" list. `cdx consult helper --engine gemini "<question>"` runs a read-only Gemini helper. Adding `--supervisor` lets the consult start owned read-only Gemini helpers only. `cdx resume design "<follow-up>"` keeps the conversation going, still read-only. Status shows it as `consult`. A consult lane needs a fresh name and can never be respawned as a work lane, so its resume stays read-only. Skip the consult when the caller already has a settled design.
+Put the repository's mandatory checks in `.cdx-gate` in the primary checkout, for example `bun run check`. cdx finds that checkout through the shared Git directory, reads the file at spawn and resume, and pins the command in the round spec. Parent rounds run it followed by their lane gate in separate shells; children run only their lane gate. An exact duplicate runs once, and a lane command that starts with the baseline plus ` && ` has that prefix stripped.
 
-**Supervisor tree.** `cdx spawn plan --supervisor "<brief>"` hands one Astra lane a multi-part change. It briefs bounded parts to Sol children, or Gemini children for mechanical sweeps, with `cdx spawn --bg`, waits with `cdx wait --report`, reviews with `cdx review`, and reports once. The liaison sees the children under `parent=plan` in `cdx status` and kills the whole tree with `cdx kill plan`.
+`cdx gate <lane> "<cmd>"` sets or replaces the stored gate and `--clear` removes it; both refuse an active lane. A supervisor cannot change a child's gate through `gate`, `resume --gate` or respawn. `spawn --pre "<cmd>"` runs a setup check in the lane cwd before the round opens; nonzero refuses the launch and records nothing.
 
-**Retest briefs and pass claims.** A verification brief requires candidate identity, item IDs under test, success or refusal obligation per item, one observable assertion per item, currently closed findings that could reopen, and an owned evidence directory. The completion report maps each pass to the new attempt and captured result. A refusal under a success obligation is failed or blocked, never passed. Old evidence may guide procedure, but it cannot establish a fresh attempt. Re-evaluate a closed finding against the current candidate before blocking on it. The liaison reads the actual result body before accepting a pass; schema validation proves register consistency, not fulfillment. Example:
+### Receipts
 
-```
-Candidate: commit 5a2b1c (staging build).
-Evidence directory: /tmp/evidence/run-42.
-Items under test:
-- ITEM-101: obligation=success. Assertion: POST /transfers returns HTTP 200 with status "settled". Closed finding: BUG-12 (must confirm transfer settles before passing; HTTP 403 or 500 is failure, not pass).
-- ITEM-102: obligation=refusal. Assertion: POST /transfers with negative amount returns HTTP 400 with code "invalid_amount". Rejection of the payload proves the test; an HTTP 200 is failure.
-```
+`cdx gate-receipt <lane> --json` and `mcp__cdx__gate-receipt` return a version 1 envelope with `lane`, work `state`, `workExitCode`, `usable` and `receipt`. The receipt holds `round`, `cwd`, `command`, `exitCode`, `finishedAt`, `head`, `tree`, `valid`, an optional `reason`, `scopeExtensions` from the report, and `sharedTreeLanes` when other running lanes shared the Git working tree at gate start. cdx computes the tree with a temporary index (`read-tree HEAD`, `add --all`, `write-tree`) over tracked and untracked nonignored files and leaves the real index alone. It captures HEAD and tree before and after the gate; a moved fingerprint makes the receipt invalid and names the changed paths. Submodules, embedded repositories and non-Git lanes cannot claim content proof.
 
-**Candidate preparation and proof.** The liaison finishes generation, packaging, and integration before naming the release candidate. No concurrent writer may touch the worktree during the proof run. If a fix changes the candidate, run fresh proof on the new commit and record why the previous proof no longer applies. A cancelled wall is not a green result. The liaison names one candidate, one gate result, and any later invalidating change. Production actions end at the owner.
+### Review proof
 
-**Narrow briefs and one review.** A brief needs the outcome, consumer, exclusive files, prohibited actions, candidate and inputs, exact gate, and the specific assertion separating success from an attractive wrong answer. Send evidence and unresolved decisions, not transcripts or keystrokes. A lane with a settled edit is a direct Sol lane, or Gemini for a mechanical sweep, not an Astra supervisor holding one child. Briefs longer than 1,500 words trigger a harness warning. Conduct one independent review per consequential diff, covering affected callers and contracts. Ask for severity, trigger, file location, and failure mechanism. Separate accepted defects, disputed findings, integration hygiene, and unverified candidates. A clean review is a result, not a reason for another review; a changed commit or a failed review justifies one more. The reviewer reads the recorded gate result and never runs the test suite.
+Review proof binds to content. A review lane that reviewed a lane's worktree or gated tree attests for it, whatever its name. Land refuses only when the lane was reviewed and the newest review of its current or gated tree has P1/P2 findings, or when it was reviewed but never at those trees. Unreviewed lanes land. `resume --fix review` works after a separately named review.
+
+### Land
+
+`cdx land <lane>` (or `mcp__cdx__land`) needs a managed worktree with a green receipt. It commits the lane checkout, builds the merge with the base in git (`git merge-tree --write-tree` plus `commit-tree`, no checkout needed), and runs the lane gate once on that merge commit in a frozen snapshot. When the merge tree equals the lane's green receipt tree (the base did not move and nobody edited), no gate runs. Head edits after the gate are covered by the merge gate instead of refused.
+
+cdx then advances the base: a fast-forward in whichever checkout holds the base branch, or `update-ref` when none does. A dirty base checkout blocks only when its dirty or untracked files overlap the merge. Push goes to the base branch's upstream; a branch without one, such as a supervisor's lane branch, is not pushed and land says so. Land removes the worktree and branch and closes the lane. It records progress so a failed push or cleanup can be retried, never force-pushes, and leaves merge conflicts for the head. The MCP call waits up to 65 minutes for the gate. One land runs per repository at a time under `<git-common-dir>/cdx-land.lock`, which holds the lander's pid; a lock left by a killed land is taken over by the next land, and `cdx doctor --fix` removes one left by a dead process.
+
+`cdx land --batch <lane>...` (MCP `lanes: [...]`) merges lanes from one repository and base branch in order under one gate and one push. A red batch bisects prefixes with at most log2 N extra gates, lands the green prefix, and names the lane whose merge turned it red. Bisection assumes prefix gates are monotonic.
+
+A supervisor merges green children into its own branch with `cdx land <child>` or `cdx land --batch <child>...` and may not land anywhere else. The head lands the supervisor's lane.
+
+### Worktrees and close
+
+`spawn --worktree <path>` creates a git worktree on branch `lane/<lane>` from the repo at `--cd`; a bare name resolves to `~/code/wt/<name>`. It runs the config `worktreeSetup` command, then the repository's executable `.cdx-worktree-setup` when present; a nonzero exit fails the spawn. A clean existing worktree on the expected branch is reused without setup. A work supervisor spawned without `--worktree` gets one named after the lane, and its children get their own worktree by default, branched from the supervisor's branch.
+
+`cdx close <lane>` removes a clean worktree even when its branch is unmerged, and keeps the branch; it refuses a dirty worktree. `--keep-worktree` (native `keepWorktree: true`) closes without touching the worktree and prints guarded manual cleanup commands. `cdx doctor` lists cdx worktrees idle past `--days N` (default 7): merged ones lose worktree and branch, those of closed or unrecorded lanes lose the worktree and keep an unmerged branch. `--fix` removes them; git refuses dirty trees.
+
+## Reviews, consults and panels
+
+`cdx review <lane>` runs an adversarial review in a fresh read-only session over a private snapshot of the recorded HEAD and dirty tree. A target flag (`--uncommitted`, `--base B`, `--commit SHA`) selects that diff; otherwise the intent does, optionally limited by `--scope`. Both engines return structured findings with severity, file, line and failure mechanism. cdx hashes the review tree before and after the round; a moved hash fails the round with "review tree changed despite the read-only sandbox". A second reviewer for the same tree is refused, re-reviews receive only the fix diff and prior findings, and a P3-only verdict closes the loop. Snapshots symlink ignored entries such as `node_modules`; the sandbox blocks writes through those links. `cdx doctor --fix` removes crash leftovers.
+
+`cdx consult <lane> "<question>"` runs a read-only Astra advisor that may challenge the premise and closes with decisions for the caller. `--engine gemini` makes a Gemini helper, and `--supervisor` lets the consult start owned read-only Gemini helpers only. A consult lane keeps its name for consults; a follow-up uses a fresh consult. `consult` and `review` accept `--image F` on gpt.
+
+### Panel
+
+`cdx panel <name> --cd <repo> [--pack <file>] [--bg] ("<question>" | -)` asks Astra (`gpt-6-astra`), Sol (`gpt-6-sol`) and Claude Fable (`claude-fable-5-1`) the same question as read-only consult lanes `<name>-astra`, `<name>-sol` and `<name>-fable`. Each member gets one frozen prompt with the question, the pack path, and a fixed answer shape: recommendation, claims (`- verified|inferred | path:line or number | claim`), dissent, confidence. `--pack` is copied to `briefs/<name>-pack.md` so every member reads the same text.
+
+- `reports/<name>-<member>.md` holds each raw answer.
+- `reports/<name>.md` is the merged report, under 60 lines: coverage, per-member tokens, the three recommendations, dissent, and claims grouped by cited path (3/3, 2/3, 1/3). cdx checks each cited file:line against the repo and marks a line that does not exist with `!`.
+- When at least two members answered, one Astra consult (`<name>-verdict`) rules on the contradictions only and appends a `## Verdict` of at most 8 lines.
+- One completion line: `[cdx] panel=<name> coverage=3/3|incomplete report=<path> astra: ... | sol: ... | fable: ...`. In the foreground it prints; with `--bg` it reaches the head as a `panel` event, or a calling supervisor's control file. Member events never reach the head, and member lanes are closed and archived when the panel finishes.
+
+cdx refuses a panel from a panel member, a second panel in one supervisor round, a second open panel, question plus pack over 20,000 chars, and a launch when Astra's best light-demand account or the active Claude account's tightest weekly window (`cca status --json`) has under 10% left. When cca gives no answer, cdx warns and skips that check. Each member runs at most 15 minutes; a member that fails or times out leaves the panel `incomplete` with the answers that arrived. The MCP `panel` tool (`name`, `question`, `cd`, optional `pack`) always runs with `--bg`.
+
+The `claude` engine calls the real binary (PATH `claude`, else `~/.local/bin/claude`, never `cca claude`) with `-p --model <m> --effort <e> --output-format json --safe-mode --no-session-persistence --tools Read,Grep,Glob,Bash --permission-mode dontAsk`. Tokens come from `modelUsage`, with cache reads and writes counted in input; the list-price cost shows in the lane's last action. Usage history skips claude rounds.
+
+### Context digest
+
+`cdx context <repo> [--model M]` builds `.cdx/context/<HEAD commit>.md` in the repo's main checkout with one read-only gpt consult (Sol by default; Gemini is refused). The digest holds a repo map, commands, the gate, and rule pointers as `path#anchor`, under 6,000 chars; a longer one is refused and not written. `.cdx/` goes into `.git/info/exclude`. An existing digest for HEAD is reused. Lane briefs point at the digest for HEAD or one of the last 20 commits.
+
+### Screenshot grading
+
+`cdx shots grade <dir> --rubric <file> [--engine gpt|gemini] [--model M] [--downscale]` grades every png or jpg in `<dir>` in sequential consults of at most 8 shots, each on a fresh lane `shots-<dir>-<n>` (Sol by default, images attached for gpt). It writes one `<dir>/verdict.json` (per screen: pass or fail and one line; `reports` lists each batch's report) and prints `failed: ...` and `verdict: <path>`. A screen the grader skips fails, and a failed batch fails its screens. `--downscale` writes 1000 px copies of failed shots to `<dir>/downscaled/` with `sips -Z 1000`. `context` and `shots` are refused inside lanes.
+
+## Questions, steering and messages
+
+A worker runs `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND` and `CDX_OWNER` so `ask` finds its lane. The question lands in the database, a `question` event wakes the head, and `ask` polls for the answer; the default and maximum timeout is 30 minutes. On timeout `ask` exits 0: the worker reports the unresolved dependency and continues independent work. `cdx reply <lane> "<answer>"` answers the oldest open question of the lane's current round, or `--id <seq>` a specific one. Round completion expires every remaining question of that round. While a question is open, `cdx status` shows `waiting on question #<seq>`.
+
+`cdx send <lane> "<text>"` appends a control record. GPT steers the active turn when possible and starts a follow-up turn otherwise. Gemini receives it through the `cdx hook pre-invocation` entry `doctor --fix` installs in `~/.gemini/config/hooks.json`; without the hook, sends become follow-up turns. `send` refuses review lanes.
+
+`cdx msg <lane> "<text>"` addresses the head; `cdx msg <full-session-id> "<text>"` addresses that session. Eight-character prefixes are rejected. `cdx inbox [-n N]` lists messages to the caller or the head, newest last, default 20.
+
+## Events and delivery
+
+State has one owner. A Claude session is a delivery cursor, not an owner: among the sessions that polled within 30 s, the one that most recently drove cdx (spawn, resume, send, review, consult, reply, land, or `cdx brief --head`) is the head and receives events. With no active driver the longest-running active session is the head, so a teammate, a headless `claude -p` or a second terminal never takes the wakes by starting. Owner events have one cursor that moves only after a head received them, so a change of head never skips one. Other sessions receive only messages addressed to their full session id and can read everything with `cdx feed`. `cdx brief` prints running lanes, the five newest finished lanes awaiting attention, open questions, and recent jobs, and prints nothing when the same text ran within 10 minutes.
+
+`cdx events` returns only kinds the head acts on: question, stalled, terminal, job-exit, message, thrash, overrun, outage and panel. All carry `wake: true`. Events for a supervisor's children go to the supervisor, never to the head. `--peek` leaves the cursor in place; `--json --snapshot` adds the live rows the mod draws.
+
+A terminal event is at most five lines: the verdict line with state, exit, gate exit, report path and counters, then up to four lines of failure evidence or the report head, 200 characters each. The same digest goes into a supervisor's control file. The report body stays on disk. Job exits carry state, exit, verdict and log path.
+
+Round progress (steers delivered or rejected, auto-continues, agy retries, gate start, kill requests, answered questions) goes to `logs/<lane>-r<round>.progress.log`, not the event table. A lane quiet for five minutes emits one `stalled` event. The thrash detector wakes once per round when the same command fails `visibility.failureRepeats` times in a row (default 5), or when test runs pass `visibility.testRuns` (default 3); it reads structured failures and exit codes, never free text. `--expect MIN` on spawn, resume and job sets the expected duration (default: the median of recent matching rounds, at least `expectMinutes`); passing it emits one `overrun` event.
+
+## Status, jobs and wait
+
+`cdx status` reads open lanes only. Each block shows state, round, `started by <session prefix> from <cwd>`, round tool steps, git dirty file count, stage (working, gate with elapsed time, reporting, stalled), last action age, tokens, and review outcome on its own line. Consult lanes show `consult`. `--all` and `--json --all` include the archive. `--brief` prints running lanes and jobs one line each under 100 characters, `--line` renders at most 100 characters for a status slot, and `--watch [--interval S]` re-renders the brief view until Ctrl-C.
+
+`cdx job <name> --cd /abs/repo "<cmd>"` runs a detached shell command with one log and a `job-exit` event. `wait`, `kill` and `status` know jobs. The native job tool requires `cd`.
+
+`cdx wait <lane|job>...` blocks until targets finish, prints each completion as the five-second poll sees it, and with `--report` prints report bodies. It exits 1 when a target failed and 2 the moment a waited lane asks a question. `--json` prints one object per finished lane. Supervisors join children with it; the head never does.
+
+`cdx kill` sends SIGTERM to the runner, which reaps its engine child and finalizes the round; a runner silent after 10 seconds gets SIGKILL. `--max-runtime MIN` uses the same sequence. Killing a supervisor stops its tree.
 
 ## Claude Code integration
 
-cdx 7.0.0 integrates natively with Claude Code through a function hooks mod.
-The mod loads from `~/.claude/skills/cdx` with configuration in `hooks/hooks.json` specifying `modules: ["./register.ts"]`.
-Classic process hooks and polling side channels are removed in favor of in-process execution.
-The mod runs inside the Claude Code runtime and communicates with cdx through `$.process.run`.
-
-### Enable function hooks
-
-Function hooks are an early access feature in Claude Code.
-Enable them by adding the flag to `~/.claude/settings.json`:
+The mod loads from `~/.claude/skills/cdx`. `hooks/hooks.json` declares `modules: ["./register.ts"]`, and the mod calls the CLI through `$.process.run`. Function hooks are early access; enable them in `~/.claude/settings.json`:
 
 ```json
 {
@@ -365,111 +360,71 @@ Enable them by adding the flag to `~/.claude/settings.json`:
 }
 ```
 
-You can also export `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in your shell environment before launching Claude Code.
+Vendored type definitions in `hooks/types/claude-code.d.ts` name their source version on line 1.
 
 ### Registered tools
 
-The mod registers native tools under the prefix `mcp__cdx__`:
-
 | Tool | Required | Optional | Description |
 |---|---|---|---|
-| `mcp__cdx__spawn` | `lane, brief, cd` | `engine, model, supervisor, cd, worktree, gate, pre, effort, maxRuntime, account, addDirs, schema, images` | Spawn a new lane with a brief. The brief passes via stdin using `--bg -`. Quotes and newlines remain intact. Completion arrives as a `[cdx]` event. |
-| `mcp__cdx__resume` | `lane, followUp, fix` | `effort, maxRuntime` | Repair a gate or review failure at the same HEAD. |
-| `mcp__cdx__land` | `lane` | (none) | Commit, merge, push, clean up and close a green managed worktree. |
-| `mcp__cdx__ask` | `cd, question` | (none) | Synchronous read-only Gemini answer without a lane. |
-| `mcp__cdx__consult` | `lane, question, cd` | `engine, supervisor, model, effort, account` | Start a read-only consultation lane via `--bg -`. |
-| `mcp__cdx__review` | `lane, cd` | `engine, model, effort, uncommitted, base, commit, scope, intent` | Start an independent code review lane via `--bg`. Intent passes via stdin with `-` when provided. |
-| `mcp__cdx__events` | (none) | (none) | Every owned event not yet delivered: the mod's buffer, then the feed (`events --json`). |
-| `mcp__cdx__send` | `lane, text` | (none) | Deliver steering instructions to a running lane via stdin (`send <lane> -`). |
-| `mcp__cdx__reply` | `lane, answer` | `id` | Answer an open question asked by a lane via stdin (`reply <lane> [--id N] -`). |
-| `mcp__cdx__questions` | (none) | `lane` | List open questions across all lanes or for a specific lane. |
-| `mcp__cdx__status` | (none) | `all` | Show active lane status (`status [--all]`). |
-| `mcp__cdx__report` | `lane` | (none) | Read the final report written by a finished lane. |
-| `mcp__cdx__tail` | `lane` | `lines` | Inspect latest execution log lines (`tail <lane> [-n N]`). |
-| `mcp__cdx__close` | `lane` | `note, keepWorktree` | Close a completed lane. Note passes via stdin with `-` when provided. |
-| `mcp__cdx__kill` | `lane` | (none) | Terminate a running lane process immediately. |
-| `mcp__cdx__gate` | `lane` | `cmd, clear` | Set or clear the verification gate command for a lane. |
-| `mcp__cdx__gate-receipt` | `lane` | (none) | Read the latest work round's gate proof as JSON. |
-| `mcp__cdx__job` | `name, cmd, cd` | | Launch a detached background job command via stdin (`job <name> --cd D -`). |
-| `mcp__cdx__msg` | `target, text` | (none) | Send a notification message via stdin (`msg <target> -`). |
-| `mcp__cdx__inbox` | (none) | `lines` | Read incoming messages sent to this session (`inbox [-n N]`). |
-| `mcp__cdx__usage` | (none) | (none) | Quota rows, observed burn, projections and GPT account picks. Optional `json` and `totals`. |
-| `mcp__cdx__takeover` | `target` | (none) | Claim ownership of a lane or session. |
-| `mcp__cdx__doctor` | (none) | `fix, probe` | Diagnose plugin installation, engine accounts, and background workers. Timeout is 120 seconds. |
+| `mcp__cdx__spawn` | `lane, brief, cd` | `outcome, files, acceptance, outOfScope, children, scopePolicy, engine, model, supervisor, worktree, gate, pre, effort, maxRuntime, expect, account, addDirs, schema, images` | Spawn a work lane. Contract fields render as sections ahead of `brief`, which goes through stdin. |
+| `mcp__cdx__resume` | `lane, followUp, fix` | `effort, maxRuntime, expect` | Repair a gate or review failure at the same HEAD. |
+| `mcp__cdx__review` | `lane, cd` | `engine, model, effort, uncommitted, base, commit, scope, intent` | Start a read-only review. |
+| `mcp__cdx__consult` | `lane, question, cd` | `engine, supervisor, model, effort, account` | Start a read-only consult. |
+| `mcp__cdx__panel` | `name, question, cd` | `pack` | Three-model read-only panel, always `--bg`. |
+| `mcp__cdx__land` | `lane` or `lanes` | | Land one lane, or a batch under one gate. Waits up to 65 minutes. |
+| `mcp__cdx__ask` | `cd, question` | | Synchronous read-only Gemini answer within 90 seconds, no lane. |
+| `mcp__cdx__events` | | | Actionable events not yet delivered. |
+| `mcp__cdx__send` | `lane, text` | | Steer a running lane. |
+| `mcp__cdx__reply` | `lane, answer` | `id` | Answer an open question. |
+| `mcp__cdx__questions` | | `lane` | List open questions. |
+| `mcp__cdx__status` | | `all, brief` | Lane status. |
+| `mcp__cdx__report` | `lane` | | A lane's final report. |
+| `mcp__cdx__tail` | `lane` | `lines` | Latest log lines. |
+| `mcp__cdx__close` | `lane` | `note, keepWorktree` | Close a lane. |
+| `mcp__cdx__kill` | `lane` | | Stop a running lane or job. |
+| `mcp__cdx__gate` | `lane` | `cmd, clear` | Set or clear a lane gate. |
+| `mcp__cdx__gate-receipt` | `lane` | | Gate proof as JSON. |
+| `mcp__cdx__job` | `name, cmd, cd` | `expect` | Detached shell job. |
+| `mcp__cdx__msg` | `target, text` | | Message the head or a session. |
+| `mcp__cdx__inbox` | | `lines` | Messages to this session or the head. |
+| `mcp__cdx__usage` | | `totals, json` | Quota rows, burn, projections, picks, outcome totals. |
+| `mcp__cdx__doctor` | | `fix, probe` | Diagnose; 120 second timeout. |
+
+Required fields must be nonempty; a missing value never becomes the string `undefined`. Nonzero exits return tool errors. Native tool output above 20 KB is kept in full under `~/.cdx/logs` and returned as its path with bounded head and tail excerpts. Tool commands run in the session directory, which follows the last shell `cd`; that is why `spawn`, `review`, `consult`, `panel` and `ask` require `cd`.
 
 ### Never block
 
-Owner ruling, 2026-09-15: the head never blocks on a lane.
-There is no `mcp__cdx__wait` tool.
-The head spawns a lane, keeps working or ends its turn, and the mod wakes it when events occur.
-`cdx wait` stays in the CLI for supervisors and terminal operators.
-Mid-turn checks use `mcp__cdx__events` or `mcp__cdx__status`.
-The mod enforces this: a Bash call of `cdx wait`, `cdx status --watch`, a `while`/`until`/`for` loop polling cdx, a sleep chain polling cdx, or follow-tail on cdx logs is denied with the same guidance, the way raw `codex` and `agy` calls are. Spawn `--bg` and `job` output tells the head to end its turn; inside a lane the same lines still point at `cdx wait`.
+Owner ruling, 2026-09-15: the head never blocks on a lane. The mod denies a Bash call of `cdx wait`, `cdx status --watch`, `cdx tail -f`, a `while`/`until`/`for` loop polling cdx, or a sleep chain polling cdx, the same way it denies raw `codex` and `agy` calls. It also denies a shell `cdx <subcommand>` that has a native tool (owner ruling 2026-09-17). Commands without a tool (brief, clean, feed, log, migrate, context, shots) stay available through Bash.
 
-### Slash command
+### Delivery in the session
 
-The mod registers the `/lanes` slash command in Claude Code.
-Running `/lanes` without arguments opens a live Pane with each running lane or job and recent transcript lines. The Pane works on terminal, desktop, mobile, and VS Code surfaces when the surface accepts it.
-Running `/lanes <args>` passes the arguments directly to the cdx CLI.
-The `/cdx` slash command remains the user skill that loads `SKILL.md`.
+The mod polls `cdx events --json --snapshot` every 2 seconds. One call returns the session's events and a snapshot of running lanes and jobs for the band, the status line and the `/lanes` Pane. Each new wake event shows an 8-second toast.
 
-### Status line and toasts
+- Idle wake: with no turn running and a wake event pending, the mod holds it 15 seconds so a burst costs one prompt, then submits a prompt that starts with `[cdx]`.
+- Mid-turn: after each non-subagent tool call that was not denied, pending events are added as context under `[cdx] events`. Typed prompts receive them too.
+- Prompt budget: Claude Code refuses a plugin's prompt after 50 in one session. The mod then stops submitting, keeps events for the next tool result or typed prompt, puts each fresh wake in the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. A new session restores wakes.
+- Head rollover: the mod counts compactions of the head's own conversation per session. The first Stop after the second compaction blocks once with: update BATCH.md, push the owner "roll session", end the turn.
 
-The mod polls `cdx events --json --snapshot` every 2 seconds. One cdx process returns session events and a snapshot of all running lanes and jobs. The snapshot updates the live band and `$.ui.status`. The band groups supervisor children under their parent and clears when work ends. Claude Code 2.1.281 raises `AbovePrompt` on terminal and desktop; use `/lanes` to open the Pane on mobile or VS Code. The status line shows the lane count, busiest stage, elapsed round time, and current action. It clears when work ends.
-For each new event marked `wake: true`, the mod displays an 8-second toast notification through `$.ui.toast`.
-When running in headless mode (`surface === null`), UI status, toasts, and UI logs are skipped while background polling, prompt submission, and context attachment proceed.
+In headless mode UI status, toasts and logs are skipped; polling and delivery continue.
 
-### Event delivery
+### Codegraph hook
 
-Events flow into Claude Code through two delivery paths:
-- Progress events remain available through `mcp__cdx__events`. They do not wake the head or enter its context. Questions, terminal events, stalls, thrash, outages, failures, and peer messages still reach the head.
-- Idle wake: when no turn is running and the pending buffer contains at least one wake event, the mod holds it for 15 seconds so a burst of lane events costs one prompt, then drains the buffer into `$.prompt.submit`. The prompt starts with `[cdx]` followed by the event lines.
-- Prompt budget: Claude Code refuses a plugin's `$.prompt.submit` after 50 in one session. On that refusal the mod stops submitting for the session, logs one notice, keeps the events for the next tool result or typed prompt, puts each fresh wake into the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. A new session restores wakes. Any other refusal is retried after the coalesce window and logged once per message.
-- Mid-turn context: when a turn is active, pending events stay buffered. After each non-subagent tool call completes without a denial, the mod drains the buffer into additional context under `[cdx] events`. User prompt submissions also receive pending buffered events as context.
-Subagent tool calls never drain events.
+`hooks/codegraph-nudge.sh` is the head's codegraph PreToolUse hook; the installed copy lives at `~/.claude/hooks/codegraph-nudge.sh`. In a repository with `.codegraph/` it denies clear source exploration once per turn when no explore ran for that repository. It never blocks when the codegraph binary is missing, the repo is unindexed, or an explore already ran that turn, including a failed or timed-out one. Both engines record `codegraphCalls` and `codeSearchesBeforeGraph` per round, shown in status and terminal events.
 
-### Doctor checks
+### Doctor checks for the mod
 
-`cdx doctor` verifies the function hooks mod:
-- Confirms `~/.claude/skills/cdx` resolves to the current repository root.
-- Verifies `hooks/hooks.json` declares `modules: ["./register.ts"]` and no classic hook definitions.
-- Verifies the calling session has polled within 15 seconds. If stale, doctor warns to verify `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` in `~/.claude/settings.json` env and run `/reload-plugins`.
-- Warns when `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` is missing from the environment and settings.
-
-### Early access notes
-
-The Claude Code function hooks API is early access.
-Vendored type definitions in `hooks/types/claude-code.d.ts` name their source version on line 1 (`Claude Code 2.1.270`).
-
-### Ownership and takeover
-
-Full session ids determine ownership. Directories, session titles, and id prefixes do not. `resume`, `send`, `reply`, `gate`, `close`, `kill`, review, and replacement of an existing lane refuse a caller from another head. Supervisors retain the owning head and may mutate only their own children. Inherited `CDX_OWNER=terminal` stays terminal even if the environment also contains a Claude session id.
-
-A new Claude session must explicitly run `cdx takeover <lane|full-session-id>` before driving another head's work. A lane target claims that lane and its existing supervisor children, whether they were terminal-owned or owned by another head; future children inherit the claim, and the previous owner keeps everything else. A session target moves that head's whole group, including jobs and peer messages, through a persisted binding that redirects already-running producers without changing their saved specs. The previous head then loses mutation authority and delivery. Reusing the same full session id reconnects without takeover. A new session never claims work automatically. Terminal jobs cannot be claimed by lane.
-
-Takeover replays no history. It sets the caller's delivery cursor to the latest event and prints the owned summary: lanes awaiting attention, open questions, and jobs. `cdx feed` and `cdx inbox` show earlier scoped events on demand. `cdx adopt` still imports an engine session; adopting over an existing lane needs ownership of that lane like any other mutation.
-
-`brief`, `questions`, `feed`, `inbox`, and running-job summaries are scoped to the caller. An ordinary terminal sees terminal-owned work through those readers. The explicit dashboard and status remain shared diagnostic views.
-
-### Journal and rollout
-
-`feed.log` contains JSON records with monotonic ids, timestamps, event kinds, full owner or recipient ids, lane and round or job identity, and message text. Old free-text lines are ignored by every reader and removed by `cdx clean`. They are not guessed into ownership. `sessions.json` stores the sequence, takeover bindings, and session delivery cursors. Journal append, cursor updates, and cleanup use the same event lock. Cleanup keeps the latest 2000 records plus records pending for connected sessions. An inactive session can therefore retain older records.
-
-Cursor acknowledgement follows stdout emission. A crash between those steps can replay an event; Claude provides no durable delivery acknowledgment. Compaction recovery reads the ledger and open questions even if a notification was already emitted.
-
-Before rollout, stop older cdx writers and restart Claude Code sessions after setting `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1`. The lane ledger remains version 5.
-
-Verify the mod with `cdx doctor`. Start work in a session, leave the head idle, and have a worker ask a question. The session receives an automatic `[cdx]` prompt. Verify that foreign mutations fail, then explicitly take over with `cdx takeover` and confirm future events route to the new head.
+`cdx doctor` confirms `~/.claude/skills/cdx` resolves to this repository, `hooks/hooks.json` declares only the module, the calling session polled within 15 seconds, and `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1` is set. A stale poll means: set the flag and run `/reload-plugins`.
 
 ## Configuration
 
-Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/config.json`:
+State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the state root for every command. Only cdx's own runners carry it; lane shells, gates and jobs get the root as `CDX_HOME`, so a lane-side `CDX_HOME=/tmp/x cdx ...` stays in `/tmp/x`. The optional `$CDX_HOME/config.json`:
 
 ```json
 {
   "model": "gpt-6-sol",
   "thinkerModel": "gpt-6-astra",
   "models": { "astra": "gpt-6-astra", "sol": "gpt-6-sol" },
+  "repoRouting": {},
   "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
   "effortCaps": { "gpt-6-astra": "medium", "gpt-6-sol": "high" },
@@ -481,30 +436,31 @@ Everything lives under `$CDX_HOME`, default `~/.cdx`. The optional `$CDX_HOME/co
     "agent": "cdx-lane",
     "reviewAgent": "cdx-review",
     "maxRounds": 2,
+    "maxRuntimeMins": 90,
     "outageFallbackModel": "gemini-3.8-flash-medium"
   },
   "visibility": {
-    "heartbeatMinutes": 10,
     "failureRepeats": 5,
-    "fileEdits": 20,
     "testRuns": 3
   }
 }
 ```
 
-That is a working example, not the built-in defaults. Without a config file cdx uses model `gpt-6-sol`, thinkerModel `gpt-6-astra`, efforts `low`, `medium`, `high` with `medium` as the default, the caps below, the built-in `astra` and `sol` aliases, no rules, and the Gemini and visibility values shown.
+The values shown are the defaults except `worktreeSetup`, which has none. Unknown keys refuse, and malformed JSON stops the command with a message naming the file; `cdx events` falls back to defaults so delivery continues.
 
-- Existing top-level keys configure GPT. `model` is the Codex model for work lanes. `thinkerModel` is the model for head-launched review, consult and supervisor lanes; it must be a nonempty string. `models` maps `--model` aliases to model ids on top of the built-in `astra` and `sol` (optional; a raw id always works). `efforts` is the GPT `--effort` allowlist. `defaultEffort` applies when the flag is absent.
-- `effortCaps` maps a Codex model id to the highest effort it may run at, checked on spawn, resume, review, consult, and the doctor probe after alias resolution. Shipped defaults cap `gpt-6-astra` at `medium` and `gpt-6-sol` at `high`. Config may raise or lower either cap and add caps for other models. An explicit effort above its configured cap fails with the allowed list. An inherited effort above the cap clamps with a note, and the clamped value travels with every turn, including review turns over app-server. `efforts` must stay within the ladder `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Codex 0.156 also offers `ultra`, which delegates through native sub-agents; cdx disables those, so it refuses `ultra`.
-- `expectMinutes` sets the floor of the expected duration for lanes and jobs, default 15. A longer median from matching history raises it; an explicit expected duration replaces it.
-- `gemini` is optional. Its shown values are the defaults. `gemini.maxRounds` sets the round cap for Gemini lanes, default 2. `cdx resume` on a Gemini lane whose work rounds already equal the cap fails with: `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. Review rounds do not count toward the cap. GPT lanes are not capped. cdx pins the model and agent into each round spec at launch. Gemini always records effort `high`; its effort is not configurable.
-- `visibility` is optional. Its shown values are the defaults. `heartbeatMinutes` must be a positive finite number defaulting to 10; it sets the interval for quiet progress digests when owned work runs. `failureRepeats` must be a positive integer defaulting to 5; it sets consecutive identical command failures before a thrash wake. `fileEdits` must be a positive integer defaulting to 20; it sets the maximum edits to the same file in a round before a thrash wake. `testRuns` defaults to 3 and sets the threshold for a test repetition notice. A second matching read with unchanged observed file content also triggers the same wake and supervisor `CDX NOTICE`. All triggers share one notice per round and never terminate the worker. Reads use file content hashes. Tools do not take Git snapshots; unchanged-tree command repetition is not inferred from unavailable measurements. Missing hashes or start events cannot prove repetition. Gemini rules require a changed hypothesis before repeating either operation.
-- `rules` entries are appended to every injected brief, followed by `.cdx-rules.md` from the lane's working directory when that file exists. This is where house style, tooling mandates, and per-project law live.
-- `worktreeSetup` (optional) is a shell command run inside every new `--worktree` before the lane starts, typically a dependency install. A nonzero exit aborts the spawn and leaves the worktree in place for inspection. A repository may ship an executable `.cdx-worktree-setup` at its root; `spawn --worktree` runs it after the global `worktreeSetup` command and fails the spawn on nonzero exit.
+- `model` is the Codex model for work lanes; `thinkerModel` for head-launched review, consult and supervisor lanes. `models` adds `--model` aliases. `efforts` is the allowlist within `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; cdx refuses Codex's `ultra` because it delegates through native subagents.
+- `effortCaps` maps a model id to its highest effort, checked after alias resolution on spawn, resume, review, consult and the doctor probe. An explicit effort above the cap fails; an inherited one clamps with a note.
+- `repoRouting` maps absolute canonical repository paths to `{ "model": ... }`. Default `{}`.
+- `expectMinutes` is the floor of the expected duration for lanes and jobs.
+- `rules` are rendered into each lane home's AGENTS.md; the lane's `.cdx-rules.md` follows as a pointer.
+- `worktreeSetup` runs inside each new `--worktree` before the lane starts; nonzero aborts the spawn and leaves the worktree for inspection.
+- `gemini.maxRounds` caps Gemini work rounds per lane; resume past it fails with `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. `outageFallbackModel` must stay in the gemini-3.8 family; empty disables the fallback round.
+- `visibility.failureRepeats` and `visibility.testRuns` must be positive integers.
+- `model_auto_compact_token_limit` and `tool_output_token_limit` apply to GPT work lanes only.
 
-### Accounts: earliest reset first, with headroom
+### Accounts and admission
 
-Each account needs its own Codex home. cdx sets `CODEX_HOME` for each Codex process so login data and session files stay tied to that account. Log a new home in with `CODEX_HOME=~/.codex-3 codex login`, then add it here.
+Each Codex account needs its own home; cdx sets `CODEX_HOME` per process. Log a home in with `CODEX_HOME=~/.codex-3 codex login`, then add it:
 
 ```json
 {
@@ -516,138 +472,62 @@ Each account needs its own Codex home. cdx sets `CODEX_HOME` for each Codex proc
 }
 ```
 
-With or without an accounts map, `cdx usage` and launch admission share one decision:
+`cdx usage` and launch admission share one decision:
 
-1. Spend the account whose spendable window resets first. Observed exhaustion before reset makes an account light-only and ranks it behind accounts with runway. With no burn sample, reset time still orders accounts, but projections remain unknown. Work and supervisor lanes require their sampled demand cost in every live window, with 3% as the fallback; light lanes require positive capacity. Exhausted accounts cannot take a lane. Automatic admission and `advice.picks` use the same ranking; an explicit account or eligible resume affinity remains pinned.
-2. Active rounds hold 3% against their assigned account during execution. Admission subtracts active holds before evaluating remaining headroom.
-3. Dead runner release: admission reconciles crashed runners and releases their holds while preserving live child holds.
-4. Consuming round completion invalidates the account usage snapshot, forcing fresh probes on subsequent rounds.
-5. `--account NAME` pins that account and admits it under the light rule: any known positive capacity, not the demand sizing. The owner spends a named account until the quota error itself arrives (ruling 2026-09-20). Only an exhausted or invalidated account refuses the launch.
-6. Automatic GPT quota failover recovers exhausted accounts across work, review, and consult rounds. When Codex hits quota exhaustion, the runner marks the account exhausted with its reset time and starts a fresh round on an eligible alternate account. The recovery prompt transfers the original brief, round history, and latest report or partial report. If no alternate account is eligible, the lane fails with reset details.
+1. Spend the account whose spendable window resets first. Observed exhaustion before reset makes an account light-only. Work and supervisor lanes need their sampled demand cost in every live window, with 3% as the fallback; light lanes need positive capacity. Exhausted accounts take nothing.
+2. Active rounds hold 3% against their account; admission subtracts holds first. Crashed runners release their holds.
+3. `--account NAME` pins that account under the light rule; the owner spends a named account until the quota error arrives (ruling 2026-09-20).
+4. A GPT quota failure fails over to an eligible account in a fresh round carrying the brief, round history and latest report or partial report. Without one, the lane fails with reset details.
 
-Work and supervisor sizing uses the median input-plus-output tokens from at least five complete successful GPT rounds of that demand retained in the ledger, converts it through each window's observed tokens-per-percent, and falls back to 3% where evidence is sparse; the median is a sizing hint, never a completion guarantee.
+Demand sizing uses the median input-plus-output tokens of at least five complete successful GPT rounds of that demand, drawn from open lanes and the 200 newest archived lanes, converted through each window's observed tokens-per-percent. Thresholds guide placement; they do not guarantee completion.
 
-Snapshot thresholds and demand holds guide placement and concurrency control. They do not guarantee full completion within quota, and there is no guarantee unknown capacity will finish.
+Usage readings cache for 30 minutes unless a window reset; failed probes cache for 5. `usage` prints one row per Codex or Gemini weekly window (account, window, used, left, resets in, burn/h, at reset, empty in, holds), the head's Claude seats from `cca status --json`, and the GPT picks. Burn is the percentage-point increase per hour over the last four hours of readings in `usage-history.json` (capped at 2,048). `--totals` adds token totals and outcome lines per engine role (`sol direct`, `astra supervisor`, `gemini child`, ...) and per repo: lanes, green, landed, count and share green on round 1 and landed, and mean rounds to green, over live and archived work lanes, excluding consults, reviews and running lanes. `usage --json` always carries `outcomes: {byEngine, byRepo}`. `usage --line` prints status-line rows from stored snapshots in about 30 ms.
 
-Usage readings cache for 30 minutes unless a window has reset or the reading lacks per-window data. Failed probes cache for 5 minutes. A failed probe with no usable reading leaves capacity unknown. Exhaustion markers carry provenance (recorded time, window length, reason) and reconcile against fresh usage probes; a marker clears only when no window of that account is exhausted, while a live block on any window stays. `cdx usage` advice reads the reconciled standings.
+Reset credits within three days of expiry print a red CRITICAL line in usage, doctor and every GPT launch. Redeem through that home's codex TUI `/usage`; cdx cannot. Keep each account name tied to one home, and never swap auth files inside a home while lanes run.
 
-`usage` prints one row per Codex or Gemini window: account, window, used, left, resets in, burn/h, at reset, empty in, and holds. `left` is the last observed remaining percentage; admission subtracts holds from the smallest live window. `at reset` is the percentage projected to be forfeited at the observed burn. `empty in` appears only when exhaustion precedes reset. Gemini's five-hour quota block replaces its reset countdown while blocked; the blocked row remains with unknown percentages when no usage snapshot exists. Red starts at 95% used and yellow at 75%. Two lines below the table show GPT picks and account exceptions. `--totals` adds all-time ledger totals; JSON always includes them.
+### Gemini
 
-`usage --line` prints status line rows. A `codex` row shows each Codex account's weekly window as used percent and time to reset (`→ codex-1 52% ↻3d3h`). A green `→` marks the account cdx would give the next work lane, the same `picks.work` that `cdx usage` and account selection compute from cached standings. A `gemini` row shows Gemini's weekly and five-hour windows. It reads only the stored snapshots, never probes, and takes about 30ms, so a status line can call it on every render. A window past its reset shows `0%`, and an account with no reading shows `?`. It prints 256-color ANSI into a pipe, because status lines read it that way, unless `NO_COLOR` is set. Each row starts with a colored chip, steel blue for `codex` and periwinkle for `gemini`. Healthy percentages are soft green, turning amber at 75% and red at 95%, reset timers are bold sky blue, and a reset less than a day away turns into a yellow chip. The palette matches `cca line`.
+Gemini retries a transport failure once and 503 capacity errors through a six-step backoff, then may run one fallback round on `outageFallbackModel`. Quota refusals and cancellations do not retry. Every Gemini launch prints the time in Riyadh and US Pacific and whether it falls in the daily 503 peak (17:00-21:00 Riyadh). Admission projects remaining calls across running lanes and queues rounds until reset; hooks ask for a handoff below 10% quota and at call 240 and end the round at 250. A partial report at `reports/<lane>-r<n>.partial.md` survives every stop. cdx refuses Gemini launches while `gemini-quota.json` records an exhausted five-hour window.
 
-Each successful probe writes one reading per window to `~/.cdx/usage-history.json`, capped at 2,048 readings under a shared lock. Cached and failed probes add nothing. Burn is the percentage-point increase per hour between the earliest and latest readings within the last four hours, for the same account, window length and reset instant. A percentage decrease starts a new segment. Fewer than two distinct timestamps, an expired window or an old sample means no burn estimate, shown as `?`. Zero observed growth is zero burn. Projections include time elapsed since the latest reading; they assume that observed burn continues.
-
-`tokens/%` appears only with a positive percentage delta and complete, nondecreasing per-round ledger token deltas across the sample. Counters use input plus output tokens; cached tokens are not added again. Missing rounds or incomplete counters suppress the estimate. This is recorded cdx traffic, not all account traffic, and is an estimate for lane sizing. JSON also includes `estimatedRemainingTokens` before holds. Probes are the only samples; no background process collects history.
-
-`usage --json` preserves `advice.picks`, `remainingPercent`, reset times, raw engine snapshots, ledger totals, credit counts and expiries. Its shared `windows` array contains every table column, `checkedAt`, `historyWindow`, `burnMethod` as `observed` or `none`, `burnPerHour`, `projectedRemainingAtReset`, and `hoursToExhaustion`. `advice.accounts` includes reasons, projections and per-demand sizing evidence. `paceToEmpty` and `forfeitRate` were removed: neither represented observed burn or projected forfeiture. Consumers must use the new fields rather than interpret a per-day pace as burn. Window reset and block times use Unix seconds; legacy top-level Codex row reset times remain ISO strings.
-
-Reset credits are recommended only for an exhausted account or observed exhaustion before reset. Low remaining percentage and credit expiry alone do not justify redemption. Credits inside three days of expiry remain in text and JSON alerts, doctor and launch notices even when quota evidence is stale. Redeem through that home's codex TUI `/usage`; cdx cannot redeem credits.
-
-A GPT review of a Gemini lane selects an account when it has no affinity. A Gemini review preserves the GPT work account. Gemini work rejects `--account`. Adopts record `--account` or the primary home without consuming quota. Incomplete account records fail explicitly; migrated rows without affinity pass admission.
-
-Shared config keys are `model`, `personality`, `service_tier`, `model_reasoning_effort`, `features`, `agents`, and `mcp_servers`. Sync preserves unshared values but may reformat TOML. It refuses malformed TOML, inline MCP credentials, and hardcoded MCP `env.CODEX_HOME`. Store HTTP credentials through `env_http_headers` or `bearer_token_env_var`; doctor checks that referenced variables are set without printing values. cdx passes its environment to the selected account process.
-
-Stop older cdx runners before the first 5.0 write; mixed-version ledger writers are unsupported.
-
-Keep each account name tied to one home. Use a new name when a home path changes so its cached usage cannot belong to the previous login.
-
-Do not swap authentication files inside one Codex home while parallel lanes run. A lane can then resume a session under the wrong login.
-
-If `config.json` is absent, the defaults above apply. Malformed JSON or an inconsistent shape stops the command with a message that names the file.
-
-> [!IMPORTANT]
-> Work lanes can edit files and run shell commands without approval. The injected brief forbids commits, pushes, deploys, and extra servers. Review and consult lanes have the same full access. A review of either engine fails its round if the before-and-after tree check finds a change. Point cdx only at code you would let either engine edit.
-
-<details>
-<summary><b>What the harness injects</b></summary>
-
-cdx injects the role, report contract, and engine rules. Every lane receives the codegraph-first rule, including review lanes. Gemini uses shell codegraph for code questions; its whole-file reading rule applies to permitted non-code reads. Native tool output retains the 20 KB transport bound; there is no shell-output prose rule. These built-in rules are followed by `config.json` rules and `.cdx-rules.md`. GPT lanes resolve routine choices, follow steering, and carry authorized work through verification. Only an Astra supervisor delegates, to Sol or Gemini children; workers on either engine execute without further delegation.
-
-The brief and liaison replies outrank project and skill guidance within runtime constraints. A blocking instruction must be named and quoted. Questions are for missing decisions that affect outcome or authorization; timeout is not approval. Workers continue independent work and report unresolved dependencies.
-
-Reports name the outcome, changed files, and remaining risks. The runner owns the test suite after the report; workers, supervisors, and reviewers do not run it. The gate gets one rerun only after its automatic repair turn; changes to owned paths invalidate the receipt. Remove duplicated and implementation-mirroring tests.
-
-GPT work uses the configured compaction and tool-output trial limits. Other round kinds retain engine defaults.
-
-</details>
-
-<details>
-<summary><b>State layout</b></summary>
+## State layout
 
 ```
 $CDX_HOME/
-  ledger.json    version 5 envelope with lanes, work/review records, sessions, tokens, and account holds; lanes track roundSteps, stage, stageStartedAt, and lastActionAt
-  .ledger-version rejects older writers after the first migration
-  logs/          raw engine events and stderr for each round
-  reports/       final report per round
-  briefs/        audit trail of every injected prompt
-  specs/         the runner inputs recorded for each round
-  control/       queued steering records, one JSONL file per round
-  questions/     worker questions and their answer or timeout state
-  feed.log       structured lane events and peer messages
-  sessions.json  ownership bindings, session delivery cursors, and event sequence
+  state/cdx.db    lanes, archive, events, sessions, jobs, questions, panels (SQLite, WAL)
+  state/legacy/   9.x files moved there by cdx migrate
+  config.json     optional policy
+  usage*.json, gemini-quota.json   usage snapshots and history
+  logs/           raw engine events, stderr, gate logs, progress logs, spill dirs
+  reports/        final and partial report per round
+  briefs/         every injected prompt
+  specs/          runner inputs per round
+  control/        queued steers and supervisor digests, one JSONL file per round
 ```
 
-Everything is plain files. `cdx feed` and `cdx inbox` render scoped events. `cdx clean` retains the latest 2000 records and undelivered records for connected sessions.
+Every process (CLI, runner, hooks) opens the database directly with a 30 s `busy_timeout` and writes under `BEGIN IMMEDIATE`; there is no daemon. Closed lanes live in the archive table, which active reads never load. `usage.json` writes serialize on the database write lock and land through a temp file and rename. Under `bun test` (`NODE_ENV=test`) or with `CDX_TEST` set, cdx refuses to run when the state root is the real `~/.cdx`.
 
-</details>
+`cdx clean [--days N]` (default 14) prunes archived lanes older than the cutoff with their logs, reports, briefs, specs, control files, events and questions, then events and idle sessions older than the cutoff.
 
-`cdx log <lane> [round] --tools` reads normalized `cdx_tool` and `cdx_round_end` JSON records from the existing round log. Without flags, `log` still prints the log path. Each completed tool identity gets one measurement record with its canonical tool kind, sorted-argument SHA-256, read-file SHA-256 hashes, completion timestamp, output bytes, and tool token deltas when reported. Original engine events retain arguments and output. Token totals reported only at turn level stay in those original events; cdx does not assign them to a tool.
+## Measurements
 
-`outputBytesSource` distinguishes captured output from an engine size summary. Missing output sizes are null. These bytes measure tool payloads, not model context or hydrated history. Per-tool `treeBefore` and `treeAfter` are null. Telemetry never invokes gate-proof machinery or scans the repository for a tool event. `readFilesAfter` records file hashes that changed during a read. `inputObservedBefore` distinguishes complete observations from completion-only events. Buffered events or concurrent writers can obscure which bytes a read consumed.
+`cdx log <lane> [round] --tools` prints the normalized `cdx_tool` and `cdx_round_end` records from a round log: canonical tool kind, sorted-argument SHA-256, read-file hashes, output bytes and per-tool token deltas when reported. `cdx_round_end` links the gate receipt as `<lane>:r<round>`. Round logs also record account percentages at start and end and prompt bytes by source. Token accounting counts total input including cached reads for both engines. These are measurements; cdx never skips a gate because of them.
 
-At round end, `cdx_round_end` records the existing round-start snapshot kind and fingerprint separately from Git tree hashes, and stores the existing gate receipt once and links it with `gateReceiptId` as `<lane>:r<round>`, or null when no gate ran. The receipt's command, tree and validity identify the verified gate content without treating a failed or invalid receipt as reusable proof. cdx does not skip gates based on these measurements.
+cdx redacts known secret environment values, provider key shapes, key and token shell assignments, and Authorization headers before it stores or shows protocol events, gate and job output, reports, questions or lane text. Pass secrets through environment lookups; pattern matching cannot catch every secret.
 
 ## Testing
 
-`bun run check` is the acceptance gate for changes to cdx. It type-checks the CLI and the hooks module, builds the CLI, and runs every test file:
+`bun run check` is the acceptance gate for changes to cdx:
 
 ```bash
-tsc --noEmit && tsc -p hooks --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test
+tsc --noEmit && tsc -p hooks --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test --preload ./test-state.ts && python3 hooks/codegraph-nudge.test.py
 ```
 
-The tests cover ownership routing, feed parsing, flag parsing, the delivery buffer, and the tool definitions without spawning processes, sleeping, using fake engines, or creating temporary homes. Keep the run within about two seconds. After a change to `hooks/`, also run `claude plugin validate .` and one headless smoke with `claude -p ... --debug-file <path>`, then grep the log for `hook failed` and `refused`.
+Tests are small and pure: no spawned engines, no sleeps, no fake engines. The one exception is the state-layer fault suite (`state-faults.test.ts`), which runs in about 0.35 s. `test-state.ts` points every test at a fresh state root. The owner removed the 135 end-to-end tests after a 226-second run; do not rebuild that suite. After a change to `hooks/`, also run `claude plugin validate .` and one headless smoke with `claude -p ... --debug-file <path>`, then grep the log for `hook failed` and `refused`.
 
-The owner removed the 135 end-to-end tests after a run took 226 seconds. Process lifecycle, engine integration, question timeouts, gate execution, and browser behavior no longer have automated end-to-end coverage. Do not rebuild that suite. The lane gate runs after the report, without automatic reruns; workers and reviewers reuse its result.
+The CLI entrypoint is `cdx.ts`; the [module map](docs/modules.md) names the files that own state, engines, commands and presentation.
 
 ## License
 
 Copyright (c) 2026 Amir Ayub.
 
 cdx is free software: you can redistribute it and/or modify it under the terms of the GNU Affero General Public License as published by the Free Software Foundation, version 3. Full text in [LICENSE](LICENSE).
-
-### Safe output and retained tool results
-
-cdx redacts known secret environment values, provider key shapes, key/token shell assignments, and Authorization headers before storing protocol events, gate and job output, captured reports, questions, or ledger text, and before displaying terminal or browser text. Pass secrets through environment lookups, not literal command arguments. Pattern matching cannot identify every arbitrary secret or reconstruct credentials split across protocol events. Historical archives are unchanged.
-
-Native tools retain output above 20 KB under `~/.cdx/logs`, or `$CDX_HOME/logs`, and return its path with bounded head and tail excerpts. Successful Gemini reads with identical arguments and file hashes keep their first transcript body; later bodies become `unchanged since step N` without waking the head. Measurements keep original byte counts. The pre-tool hook denies unchanged covered reads before they execute.
-
-The terminal uses its small text mark; it has no PNG encoder, inline graphics, or demo animation. Native commands select a fallback directory only after an ENOENT cwd lookup before launch; execution errors never retry the command.
-
-## Lane efficiency and landing
-
-The injected work rule permits one typecheck, `vp check --no-fmt` or the repository equivalent named in `.cdx-rules.md`, and each touched spec once for mutation proof. Workers never run the suite or wall. The parent runs the repository baseline. Each gate fingerprints only the lane's touched paths. A red gate sends its last 60 lines into one repair turn in the same conversation; cdx reruns that gate once before publishing the result. A changing tree invalidates the receipt without repair.
-
-The config keys `model_auto_compact_token_limit` and `tool_output_token_limit` default to `150000` and `6000`. Only GPT work lanes receive them. All GPT threads disable memories, plugins, apps, the skills catalogue, native subagents and the unused computer-use, node_repl, context7, codex_apps and codex-security servers. CodeGraph remains available.
-
-After independent review, the head calls `cdx land <lane>` or native `land`. The lane must own a managed worktree with a green receipt. The base checkout must be clean and on the recorded base branch. cdx commits the proved tree, merges with `--no-ff`, pushes, removes the worktree, deletes the branch and closes the lane. It records commit progress so a failed push or cleanup can be retried. Merge conflicts remain for the head to resolve; cdx never force-pushes or forces worktree removal. Workers and supervisors cannot call land.
-
-Native `ask` requires `cd` and `question`. It returns a Gemini answer within 90 seconds and creates no lane. It requires macOS sandbox-exec, which denies writes to the repository and common Git directory. Lane-side `cdx ask` still asks the liaison.
-
-Child terminals go to the supervisor's control stream. Terminal payloads include report text below 10000 bytes and at most 40 failure lines. Larger reports stay at the named path. Native results still retain the full safe text before returning the 20 KB bound introduced in 7.9.
-
-Round logs record account percentages at start and end, prompt bytes by source, tool output size and source, agent-load evidence and linked answers. Provider-injected prompt size and unavailable model-visible output are null. Jobs retain start/end tree fingerprints; land records its merge commit. These are measurements, not inferred pass claims.
-
-Token accounting uses total input including cached reads for both engines. Gemini output already includes thinking. The first ledger access in 9.4.0 migrates token totals under the writer lock and records `tokenAccounting: 1` on the document and each lane, retaining ledger version 5. A marked lane is skipped even if an older writer drops the document marker. Finish older Gemini runners before upgrading so they cannot append deltas with the old input convention. Homogeneous Gemini lanes add their cached input once. Mixed lanes add only cached input from retained Gemini round logs; missing evidence is marked incomplete, with uncached input kept at a non-negative lower bound. Original round logs remain unchanged.
-
-Reviews run in a private detached snapshot of the recorded HEAD and dirty tree. The runner removes it after the round; `cdx doctor` finds crash leftovers and `cdx doctor --fix` removes them. No agent permission restrictions are added. Bare `--worktree name` resolves to `~/code/wt/name`. If a green managed lane changes before `land`, cdx runs its stored gate once on the new snapshot and records a fresh receipt before landing.
-
-`spawn`, `resume`, and `job` accept `--expect MIN`; their native tools accept `expect`. The default is the median of recent completed rounds of the same lane kind, or the previous job with the same name, and never less than `expectMinutes` (15 minutes). One `overrun` event wakes the head with elapsed time, last activity, and the log path. Test and full-suite invocation counts include the gate and appear in status and terminal events. The fourth run emits one test `thrash` notice with the default `visibility.testRuns` of 3.
-
-### Codegraph-first accounting
-
-In a repository with `.codegraph/`, use `codegraph explore` or `codegraph_explore` before text tools for every code question. Literal sweeps, non-code assets, logs, and file-existence checks remain exceptions.
-
-Both engines record `codegraphCalls` and `codeSearchesBeforeGraph` in each round. Status, progress digests, and terminal feed events show `codegraph` and `code-before-graph`. The first probable source search before explore emits one codegraph notice per round to the lane and the head. Counting follows shell order and repository identity, deduplicates tool phases, and resets each round. It exempts recognized literal, non-code, log, and existence searches. It counts explore calls, not successful responses. Ambiguous commands are skipped. These counters measure first-call ordering; they cannot identify every new code question within a round.
-
-`hooks/codegraph-nudge.sh` is the standalone head hook source. It and its pure unit tests use Python 3 from the system, with no added Python packages. The installed copy at `~/.claude/hooks/codegraph-nudge.sh` uses the current transcript turn and permits listed exceptions. It denies clear source exploration at most once per turn when no prior explore call exists for that repository. Unknown intent or unavailable transcript evidence passes. Existing Bash matchers determine which calls reach this hook; this does not cover all file-read tools.

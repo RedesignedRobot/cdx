@@ -2,6 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 // Engine installation, account configuration checks, and diagnostic probes.
 
 import { installLaneHome, laneCodexHome, retiredLaneRule } from "./account-sync.ts";
+import { laneInstructions } from "./prompts.ts";
 import {
   accountChoices, adviceLines, cachedAccountStandings, configuredAccountSnapshots, defaultCodexHome,
   exhausting, formatAccountUsage, primaryAccount, refreshUsageSnapshot, resetCreditAlerts, shouldRedeemCredit,
@@ -10,7 +11,7 @@ import {
 import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
 import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
 import { formatGeminiStanding, geminiQuotaState, readGeminiUsageSnapshot, refreshGeminiUsage } from "./gemini-usage.ts";
-import { type AccountChoice, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
+import { type AccountChoice, archivedWorktreeRepos, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
 import { legacyStatePending } from "./migrate.ts";
 import { DB_PATH } from "./store.ts";
 import { readJsonLines } from "./reports.ts";
@@ -21,10 +22,9 @@ import {
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
 import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
-import { removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
+import { landLockHolder, landLockOf, removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync,
-  writeFileSync, renameSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, rmSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -538,11 +538,11 @@ export async function doctorCommand(argv: string[]) {
     }
   }
 
-  const laneInstructions = readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8");
+  const instructions = laneInstructions();
   for (const [name, home] of Object.entries(config.accounts ?? { default: defaultCodexHome() })) {
     try {
-      if (parsed.bools.has("fix")) installLaneHome(home, laneInstructions);
-      if (readFileSync(`${laneCodexHome(home)}/AGENTS.md`, "utf8") !== laneInstructions) throw new Error("stale lane instructions");
+      if (parsed.bools.has("fix")) installLaneHome(home, instructions);
+      if (readFileSync(`${laneCodexHome(home)}/AGENTS.md`, "utf8") !== instructions) throw new Error("stale lane instructions");
       good(`${name}: lane home ${laneCodexHome(home)}`);
     } catch (error) { bad(name, String(error), "run cdx doctor --fix"); }
   }
@@ -703,13 +703,21 @@ export async function doctorCommand(argv: string[]) {
   }
   if (staleSnapshots.length && !parsed.bools.has("fix")) warn("run `cdx doctor --fix` to remove stale review snapshots");
   const worktreeDays = Number(parsed.flags.days ?? 7);
-  const staleTrees = staleWorktrees(readLedger(), worktreeDays);
+  const staleTrees = staleWorktrees(readLedger(), worktreeDays, archivedWorktreeRepos());
   for (const item of staleTrees) {
     warn(`worktree: ${item.action === "remove" ? "merged" : "abandoned"} ${item.branch} at ${displayPath(item.path)}, idle ${Math.floor(item.ageDays)}d`);
     if (!parsed.bools.has("fix")) continue;
     try { good(`fixed: ${removeStaleWorktree(item)}`); } catch (error) { warn(String(error instanceof Error ? error.message : error)); }
   }
   if (staleTrees.length && !parsed.bools.has("fix")) warn(`run \`cdx doctor --fix\` to remove cdx worktrees idle over ${worktreeDays} days (--days N)`);
+  const repos = [...Object.values(readLedger()).map((entry) => entry.worktreeRepo), ...archivedWorktreeRepos()];
+  const locks = new Set(repos.flatMap((repo) => { try { return repo && existsSync(repo) ? [landLockOf(repo)] : []; } catch { return []; } }));
+  for (const lock of [...locks].filter((path) => existsSync(path) && !pidAlive(landLockHolder(path)))) {
+    warn(`land: stale lock ${displayPath(lock)} from a land that died`);
+    if (!parsed.bools.has("fix")) { warn("run `cdx doctor --fix` to remove it"); continue; }
+    rmSync(lock, { recursive: true, force: true });
+    good(`fixed: removed ${displayPath(lock)}`);
+  }
   const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {
     const orphan = pidAlive(entry.codexPid) ? ` and its codex child (pid ${entry.codexPid}) is STILL RUNNING` : "";

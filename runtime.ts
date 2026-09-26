@@ -37,7 +37,7 @@ export const SELF = import.meta.path.replace(/\/runtime\.ts$/, "/cdx.ts");
 
 export const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
 
-export const VERSION = "9.5.0";
+export const VERSION = "10.0.0";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined
@@ -58,9 +58,14 @@ export const color = {
   cyan: style(36),
 };
 
+// CDX_STATE_HOME beats CDX_HOME, so only cdx's own runners carry it. Every
+// other child (engines, lane shells, gates, setup scripts) gets the state
+// root as CDX_HOME, which a lane-side "CDX_HOME=/tmp/x cdx ..." overrides
+// instead of silently writing the live store.
 export function uncoloredChildEnv(codexHome?: string, stateHome?: string): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1" };
+  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1", CDX_HOME: ROOT };
   delete env.FORCE_COLOR;
+  delete env.CDX_STATE_HOME;
   if (codexHome !== undefined) env.CODEX_HOME = codexHome;
   if (stateHome !== undefined) env.CDX_STATE_HOME = stateHome;
   return env;
@@ -79,7 +84,6 @@ interface LaneEnvironment {
 export function laneChildEnv(codexHome: string | undefined, context: LaneEnvironment, engine: Engine = "gpt") {
   const env: Record<string, string | undefined> = {
     ...uncoloredChildEnv(codexHome),
-    CDX_HOME: ROOT,
     CDX_LANE: context.lane,
     CDX_ROUND: String(context.round),
     CDX_OWNER: context.owner ?? "terminal",
@@ -131,11 +135,11 @@ export function pidAlive(pid?: number): boolean {
 
 // Flag parsing
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect", "pack"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect", "scope-policy", "rubric", "pack"]);
 
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 
-const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "gate-baseline-check", "transcript", "tools", "supervisor", "open", "brief", "watch", "line", "peek", "snapshot", "totals"]);
+const BOOL_FLAGS = new Set(["bg", "json", "uncommitted", "fix", "probe", "follow", "all", "report", "remove-worktree", "keep-worktree", "clear", "transcript", "tools", "supervisor", "brief", "watch", "line", "peek", "snapshot", "totals", "downscale", "head"]);
 
 // A flag missing from these sets fails as "unknown flag" even when the
 // command allows it; cdx.test.ts checks every parseArgs allow-list.
