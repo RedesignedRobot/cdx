@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  citationProblem, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
-  parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
+  answerPath, citationProblem, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
+import { reportPathOf } from "./reports.ts";
 
 const cwd = "/repo";
 const answer = (member: string, claims: string[], recommendation = `${member} says keep it`) => parseAnswer(member, [
@@ -105,7 +106,7 @@ const admitted = { callerIsMember: false, callerIsConsultSupervisor: false, supe
 
 test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal(admitted)).toBeUndefined();
-  expect(panelRefusal({ ...admitted, claudeHeadroom: undefined })).toBeUndefined();
+  expect(panelRefusal({ ...admitted, claudeHeadroom: "cca is not on PATH" })).toBe("cca is not on PATH");
   expect(panelRefusal({ ...admitted, callerIsMember: true })).toBe("a panel member cannot start a panel");
   expect(panelRefusal({ ...admitted, supervisorAskedThisRound: true })).toContain("once per round");
   expect(panelRefusal({ ...admitted, callerIsConsultSupervisor: true })).toContain("a consult supervisor cannot start a panel");
@@ -114,6 +115,12 @@ test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();
   expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("Astra's account has 9% left; a panel needs 10%");
   expect(panelRefusal({ ...admitted, claudeHeadroom: 4 })).toBe("the Claude weekly quota has 4% left; a panel needs 10%");
+});
+
+test("panel files never share a path with a lane report or another panel's files", () => {
+  expect(panelReportPath("foo-r2")).not.toBe(reportPathOf("foo", 2));
+  expect(panelReportPath("foo-astra")).not.toBe(answerPath("foo", "astra"));
+  expect(answerPath("foo", "astra")).not.toBe(reportPathOf("foo-astra", 1));
 });
 
 test("claude headroom reads the active account's tightest weekly window", () => {
