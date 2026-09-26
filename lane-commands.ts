@@ -373,13 +373,15 @@ export function reviewBaseTarget(cwd: string, base: string, run = gitOutput): st
   return `Review git diff ${commit}...HEAD.`;
 }
 
-// Reviews dedupe on the checkout's tree plus this key, so two commits or two
-// bases reviewed from one checkout are two reviews.
-export function reviewTargetKey(cwd: string, flags: { base?: string; commit?: string }, run = gitOutput): string | undefined {
-  const resolve = (ref: string) => run(cwd, "rev-parse", "--verify", "--end-of-options", `${ref}^{commit}`);
-  if (flags.base !== undefined) return `base ${resolve(flags.base)}`;
-  if (flags.commit !== undefined) return `commit ${resolve(flags.commit)}`;
-  return undefined;
+// Reviews dedupe on the checkout's tree plus the target, so two commits or
+// two bases reviewed from one checkout are two reviews. A base diff ends at
+// HEAD, a commit at its own tree.
+export function reviewTarget(cwd: string, flags: { base?: string; commit?: string }, run = gitOutput): Pick<GateTree, "target" | "targetTree"> {
+  const resolve = (ref: string, kind: "commit" | "tree") => run(cwd, "rev-parse", "--verify", "--end-of-options", `${ref}^{${kind}}`);
+  if (flags.base !== undefined) return { target: `base ${resolve(flags.base, "commit")}`, targetTree: resolve("HEAD", "tree") };
+  if (flags.commit === undefined) return {};
+  const commit = resolve(flags.commit, "commit");
+  return { target: `commit ${commit}`, targetTree: resolve(commit, "tree") };
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
@@ -445,8 +447,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
     : parsed.flags.commit ? `Review git show ${parsed.flags.commit}.` : intent;
   const snapshotTree = !opts.consult ? captureGateTree(cwd) : undefined;
   if (!opts.consult && !snapshotTree) fail("review requires a git tree snapshot");
-  const reviewTarget = snapshotTree && reviewTargetKey(cwd, parsed.flags);
-  const reviewTree = snapshotTree && { ...snapshotTree, ...(reviewTarget ? { target: reviewTarget } : {}) };
+  const reviewTree = snapshotTree && { ...snapshotTree, ...reviewTarget(cwd, parsed.flags) };
   const previous = existing?.reviewTree;
   let prior = "";
   if (!opts.consult && existing?.review?.report && existsSync(existing.review.report)) prior = readFileSync(existing.review.report, "utf8");

@@ -10,10 +10,11 @@
 ### Review
 
 - Review dedup keys on the target. A `--commit` or `--base` review records the resolved commit beside the checkout's HEAD and tree, so reviews of two commits from one checkout are no longer refused as duplicates. A same-lane review of a new target starts fresh instead of checking a fix diff.
+- A `--commit` or `--base` review attests only when its target ends at the checkout's tree: the commit's own tree for `--commit`, HEAD's tree for `--base` (so a dirty checkout gets no attestation). Otherwise it records no attestation and the runner prints `review <lane> attests no tree: ...`. Before, a `--commit` review of an older commit attested the checkout's current tree, which land then accepted as reviewed.
 
 ### Worktrees
 
-- `cdx doctor --fix` removes a stale worktree's ignored directories only when they are `node_modules` or `.codegraph`. Any other ignored directory keeps the worktree: an ignored `data/` counted as copied whenever the primary checkout had a `data/`, so a lane's only `data/local.sqlite` was deleted.
+- `cdx doctor --fix` removes a stale worktree's ignored directories only when they are `node_modules` or `.codegraph`. Any other ignored directory keeps the worktree: an ignored `data/` counted as copied whenever the primary checkout had a `data/`, so a lane's only `data/local.sqlite` was deleted. Side effect: a stale lane with an ignored `dist/`, `.venv` or other build output is now kept with a `kept ...` line; remove it by hand once you have checked it.
 
 ## 10.0.1 (2026-09-26)
 

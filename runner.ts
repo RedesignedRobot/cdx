@@ -1448,10 +1448,11 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
       const verdict = JSON.parse(readFileSync(`${ROOT}/reports/${lane}-r${round}.findings.json`, "utf8"));
       const closed = reviewLoopClosed(verdict.findings);
       const root = reviewRoot(entry.review!.cwd);
-      withLedger((ledger) => {
+      const skipped = withLedger((ledger) => {
         ledger[lane]!.reviewClosed = closed;
-        attestReview(ledger, lane, closed, existsSync(reportPath) ? reportPath : undefined, root);
+        return attestReview(ledger, lane, closed, existsSync(reportPath) ? reportPath : undefined, root);
       });
+      if (skipped) console.log(`cdx: ${skipped}`);
     } catch { /* absent verdict cannot close the loop */ }
   }
   const finalRoundState = activeStateOf(entry);

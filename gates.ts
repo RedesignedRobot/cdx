@@ -69,9 +69,14 @@ export function reviewAttests(entry: Lane): boolean {
 }
 
 export function attestReview(ledger: Ledger, reviewer: string, closed: boolean, report: string | undefined, root: string | undefined,
-  real = realpathOrUndefined): void {
+  real = realpathOrUndefined): string | undefined {
   const tree = ledger[reviewer]?.reviewTree;
   if (!tree) return;
+  // A --commit or --base review read a commit, not the checkout, so it
+  // proves the checkout's tree only when the target ends at that tree.
+  if (tree.target && tree.targetTree !== tree.tree) {
+    return `review ${reviewer} attests no tree: ${tree.target} ends at tree ${tree.targetTree?.slice(0, 12) ?? "?"}, the checkout is at ${tree.tree.slice(0, 12)}`;
+  }
   const attestation: ReviewAttestation = { tree: tree.tree, head: tree.head, reviewer, closed, ...(report ? { report } : {}), at: new Date().toISOString() };
   for (const name of reviewedLanes(ledger, reviewer, tree, root, real)) (ledger[name]!.reviewAttestations ??= []).push(attestation);
 }

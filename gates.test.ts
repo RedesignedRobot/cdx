@@ -31,7 +31,7 @@ import type { GateTree, Lane, Ledger } from "./ledger.ts";
 import { join } from "node:path";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { reviewBaseTarget, reviewTargetKey } from "./lane-commands.ts";
+import { reviewBaseTarget, reviewTarget } from "./lane-commands.ts";
 import { reviewerForTree } from "./prompts.ts";
 
 test("bare worktree names resolve under the managed directory", () => {
@@ -165,14 +165,17 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 test("two --commit reviews from one checkout get different dedup keys", () => {
-  const resolved: Record<string, string> = { "5b3b660db^{commit}": "5".repeat(40), "162b2aadb^{commit}": "1".repeat(40), "main^{commit}": "m".repeat(40) };
-  const key = (flags: { base?: string; commit?: string }) => reviewTargetKey("/repo", flags, (_cwd, ...args) => resolved[args.at(-1)!]!);
+  const [c5, c1, main] = ["5".repeat(40), "1".repeat(40), "m".repeat(40)];
+  const resolved: Record<string, string> = {
+    "5b3b660db^{commit}": c5, "162b2aadb^{commit}": c1, "main^{commit}": main, [`${c5}^{tree}`]: "tree5", [`${c1}^{tree}`]: "tree1", "HEAD^{tree}": "t",
+  };
+  const key = (flags: { base?: string; commit?: string }) => reviewTarget("/repo", flags, (_cwd, ...args) => resolved[args.at(-1)!]!);
   const checkout = { head: "b253d0fd5867", tree: "t" };
-  const [first, second] = [key({ commit: "5b3b660db" }), key({ commit: "162b2aadb" })];
-  expect(first).toBe(`commit ${"5".repeat(40)}`);
+  const [first, second] = [key({ commit: "5b3b660db" }).target, key({ commit: "162b2aadb" }).target];
+  expect(key({ commit: "5b3b660db" })).toEqual({ target: `commit ${c5}`, targetTree: "tree5" });
   expect(first).not.toBe(second);
-  expect(key({ base: "main" })).toBe(`base ${"m".repeat(40)}`);
-  expect(key({})).toBeUndefined();
+  expect(key({ base: "main" })).toEqual({ target: `base ${main}`, targetTree: "t" });
+  expect(key({})).toEqual({});
   const ledger = { "burn-arc-ship-review": { reviewTree: { ...checkout, target: first } } } as unknown as Ledger;
   expect(reviewerForTree(ledger, { ...checkout, target: second })).toBeUndefined();
   expect(reviewerForTree(ledger, { ...checkout })).toBeUndefined();
@@ -201,6 +204,18 @@ test("a review by any lane name attests to the tree it saw and gates land by con
   expect(reviewRefusal(work.reviewAttestations, ["edited", "gated"])).toBeUndefined();
   expect(reviewRefusal(work.reviewAttestations, ["worker-fix"])).toContain("not at its current or gated tree");
   expect(reviewRefusal(undefined, ["any"])).toBeUndefined();
+});
+
+test("a --commit review attests only when its commit's tree is the checkout's tree", () => {
+  const work = { work: { state: "done" }, worktreePath: "/wt/feature", gateReceipt: { tree: "gated" } } as Lane;
+  const reviewer = (targetTree: string) => ({ work: { state: "adopted" }, reviewTree: { head: "h", tree: "gated", target: "commit c", targetTree } } as Lane);
+  const ledger: Ledger = { feature: work, "commit-audit": reviewer("older") };
+  expect(attestReview(ledger, "commit-audit", true, undefined, "/wt/feature", (path) => path))
+    .toBe("review commit-audit attests no tree: commit c ends at tree older, the checkout is at gated");
+  expect(work.reviewAttestations).toBeUndefined();
+  ledger["commit-audit"] = reviewer("gated");
+  expect(attestReview(ledger, "commit-audit", true, undefined, "/wt/feature", (path) => path)).toBeUndefined();
+  expect(work.reviewAttestations?.map((item) => item.tree)).toEqual(["gated"]);
 });
 
 test("land gates only a merge result that no green receipt already proves", () => {

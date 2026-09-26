@@ -99,8 +99,10 @@ export type ReviewState = "running" | "done" | "failed";
 export interface GateTree {
   head: string;
   tree: string;
-  // A --base or --commit review's resolved commit, part of its dedup key.
+  // A --base or --commit review's resolved commit, part of its dedup key,
+  // and the tree that target ends at.
   target?: string;
+  targetTree?: string;
 }
 
 export interface ReviewAttestation { tree: string; head: string; reviewer: string; closed: boolean; report?: string; at: string }

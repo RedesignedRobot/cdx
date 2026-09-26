@@ -277,7 +277,7 @@ Put the repository's mandatory checks in `.cdx-gate` in the primary checkout, fo
 
 ### Review proof
 
-Review proof binds to content. A review lane that reviewed a lane's worktree or gated tree attests for it, whatever its name. Land refuses only when the lane was reviewed and the newest review of its current or gated tree has P1/P2 findings, or when it was reviewed but never at those trees. Unreviewed lanes land. A lane migrated from 9.x with an open review (`reviewClosed: false`) and no attestations is refused until a review of its current tree runs. Only a review round that finished attests; a failed or killed one proves nothing. A spawn that reuses a closed lane's name starts with no attestations, review state or landed commit. `resume --fix review` works after a separately named review.
+Review proof binds to content. A review lane that reviewed a lane's worktree or gated tree attests for it, whatever its name. Land refuses only when the lane was reviewed and the newest review of its current or gated tree has P1/P2 findings, or when it was reviewed but never at those trees. Unreviewed lanes land. A lane migrated from 9.x with an open review (`reviewClosed: false`) and no attestations is refused until a review of its current tree runs. Only a review round that finished attests; a failed or killed one proves nothing. A `--commit` or `--base` review attests only when its target ends at the checkout's tree (the commit's tree, or HEAD's for `--base`); otherwise it attests nothing and says so. A spawn that reuses a closed lane's name starts with no attestations, review state or landed commit. `resume --fix review` works after a separately named review.
 
 ### Land
 
