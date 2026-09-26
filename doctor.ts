@@ -9,26 +9,35 @@ import {
   standingOf, type AccountStanding,
 } from "./accounts.ts";
 import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
-import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
+import { type AppTurn, appThreadParams, geminiCapacityNotice, inputText } from "./engines.ts";
+import { codexSandbox, reviewSandboxRefusal } from "./sandbox.ts";
 import { formatGeminiStanding, geminiQuotaState, readGeminiUsageSnapshot, refreshGeminiUsage } from "./gemini-usage.ts";
-import { type AccountChoice, archivedWorktreeRepos, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
+import { type AccountChoice, archivedWorktreeRepos, type Spec, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
 import { legacyStatePending } from "./migrate.ts";
 import { DB_PATH } from "./store.ts";
 import { readJsonLines } from "./reports.ts";
 import { failActiveRound } from "./round-state.ts";
 import {
-  color, CONFIG_PATH, displayPath, HOME, parseArgs, pidAlive, REPO_ROOT, SELF, singleLine,
+  color, CONFIG_PATH, displayPath, HOME, parseArgs, pidAlive, REPO_ROOT, ROOT, SELF, singleLine,
   uncoloredChildEnv, VERSION,
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
 import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
 import { landLockHolder, landLockOf, removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync, rmSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync, renameSync, rmSync,
 } from "node:fs";
 import { join } from "node:path";
 
-async function probeAppServer(account?: AccountChoice): Promise<{ reply: string; usage: string }> {
+// The probe runs a review thread with the exact review params in a scratch
+// directory and has the model try one write there. Live account configs set
+// danger-full-access, so this proves the review profile outranks it.
+const DOCTOR_WRITE = "cdx-doctor-write";
+
+export async function probeAppServer(account?: AccountChoice): Promise<{ reply: string; usage: string }> {
+  const scratch = mkdtempSync(join(ROOT, "doctor-review-"));
+  const reviewSpec = { mode: "spawn", engine: "gpt", cwd: scratch, reviewDir: scratch, model: config.model,
+    codexHome: account?.home ?? defaultCodexHome() } as Spec;
   const proc = Bun.spawn({
     cmd: ["codex", "app-server", "--listen", "stdio://"],
     cwd: "/tmp",
@@ -93,22 +102,18 @@ async function probeAppServer(account?: AccountChoice): Promise<{ reply: string;
       capabilities: { experimentalApi: true },
     });
     write({ method: "initialized" });
-    const started = await request("thread/start", {
-      model: config.model,
-      cwd: "/tmp",
-      approvalPolicy: "never",
-      sandbox: "read-only",
-      ephemeral: true,
-    });
+    const started = await request("thread/start", { ...appThreadParams(reviewSpec), ephemeral: true });
     const threadId = started?.thread?.id;
     if (typeof threadId !== "string") throw new Error("thread/start returned no thread id");
+    const refusal = reviewSandboxRefusal(started, reviewSpec);
+    if (refusal) throw new Error(refusal);
     const completion = new Promise<AppTurn>((resolve, reject) => { turnResolve = resolve; turnReject = reject; });
     await request("turn/start", {
       threadId,
-      input: [inputText("Reply with the single word OK and nothing else.")],
-      cwd: "/tmp",
+      input: [inputText(`This is a sandbox check. Call your shell tool exactly once with the command sh -c 'echo x > ${DOCTOR_WRITE}', then reply with only its exit code.`)],
+      cwd: scratch,
       approvalPolicy: "never",
-      sandboxPolicy: { type: "readOnly", networkAccess: false },
+      ...codexSandbox(reviewSpec).turn,
       model: config.model,
       effort: resolveEffort("gpt", config.model),
     });
@@ -119,6 +124,10 @@ async function probeAppServer(account?: AccountChoice): Promise<{ reply: string;
     await Promise.race([proc.exited, Bun.sleep(3000).then(() => { try { proc.kill(); } catch { /* already gone */ } })]);
     await Promise.all([reader, stderr]);
     if (!reply.trim()) throw new Error("turn completed without an agent message");
+    if (existsSync(join(scratch, DOCTOR_WRITE))) throw new Error(`the review sandbox let a write into ${scratch}`);
+    // The model may run the write through code mode, which emits no command item.
+    const writeExit = Number(reply.trim());
+    if (!Number.isInteger(writeExit) || writeExit === 0) throw new Error(`the probe reported no refused write: ${JSON.stringify(reply.trim())}`);
     return { reply, usage };
   } catch (error) {
     try { proc.stdin.end(); } catch { /* already closed */ }
@@ -127,6 +136,7 @@ async function probeAppServer(account?: AccountChoice): Promise<{ reply: string;
     throw error;
   } finally {
     clearTimeout(killer);
+    rmSync(scratch, { recursive: true, force: true });
   }
 }
 

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { capNotice, CAP_BYTES, cappedCommand, codexPreTool, geminiOverwrite, invokesCdx, utf8Boundary } from "./cap.ts";
-import { codexSandbox, geminiProfile, resolvedPath, REVIEW_PROFILE, reviewSandboxRefusal, spillDirOf } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, indexIgnoreFingerprint, plantedPermissionLayers, resolvedPath, REVIEW_PROFILE, reviewSandboxRefusal, spillDirOf } from "./sandbox.ts";
 import { houseRules, laneInstructions, withCodegraphFact } from "./prompts.ts";
 import { ROOT } from "./runtime.ts";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -74,13 +74,49 @@ test("a worktree lane or review queries its primary checkout's index, which it m
   } finally { rmSync(base, { recursive: true, force: true }); }
 });
 
-test("a review thread fails unless it runs the cdx-review profile without write access to the checkout", () => {
-  const limited = { type: "workspaceWrite", writableRoots: ["/repo/.codegraph", "/var/tmp/T"] };
-  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: limited }, "/repo")).toBeUndefined();
-  expect(reviewSandboxRefusal({ activePermissionProfile: null, sandbox: { type: "dangerFullAccess" } }, "/repo")).toContain("profile none");
-  expect(reviewSandboxRefusal({ activePermissionProfile: { id: ":workspace" }, sandbox: limited }, "/repo")).toContain(":workspace");
-  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { type: "dangerFullAccess" } }, "/repo")).toContain("may write /repo");
-  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { type: "workspaceWrite", writableRoots: ["/"] } }, "/repo/src")).toContain("may write");
+test("a review thread fails unless it runs the cdx-review profile writing only the index and TMPDIR", () => {
+  const spec = { cwd: "/repo", reviewDir: "/repo" };
+  const limited = { type: "workspaceWrite", writableRoots: [resolvedPath(tmpdir())] };
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: limited }, spec)).toBeUndefined();
+  expect(reviewSandboxRefusal({ activePermissionProfile: null, sandbox: { type: "dangerFullAccess" } }, spec)).toContain("profile none");
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: ":workspace" }, sandbox: limited }, spec)).toContain(":workspace");
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { type: "dangerFullAccess" } }, spec)).toContain("may write beyond");
+  // A root a planted project config merged into the profile, such as the checkout itself.
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { ...limited, writableRoots: [...limited.writableRoots, "/repo"] } }, spec)).toContain("may write beyond");
+});
+
+test("reviews keep the tracked index .gitignore read-only and notice when it moves", () => {
+  const base = mkdtempSync(join(tmpdir(), "cdx-index-"));
+  try {
+    mkdirSync(join(base, ".git"));
+    mkdirSync(join(base, ".codegraph"));
+    writeFileSync(join(base, ".codegraph", "codegraph.db"), "");
+    const ignore = join(resolvedPath(join(base, ".codegraph")), ".gitignore");
+    const spec = { cwd: base, reviewDir: base };
+    expect(codexSandbox(spec).config).toMatchObject({ permissions: { [REVIEW_PROFILE]: { filesystem: { [ignore]: "read" } } } });
+    expect(geminiProfile(spec)).toEndWith(`(deny file-write* (literal ${JSON.stringify(ignore)}))`);
+    const absent = indexIgnoreFingerprint(spec);
+    writeFileSync(ignore, "*\n!.gitignore\n");
+    const tracked = indexIgnoreFingerprint(spec);
+    expect(tracked).not.toBe(absent);
+    writeFileSync(ignore, "*\n!.gitignore\n!planted.ts\n");
+    expect(indexIgnoreFingerprint(spec)).not.toBe(tracked);
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("a project .codex/config.toml that sets permissions blocks a review up to the checkout root", () => {
+  const files: Record<string, string> = {
+    "/repo/.git": "",
+    "/repo/.codex/config.toml": "[permissions.cdx-review.filesystem]\n\"/repo\" = \"write\"\n",
+    "/repo/src/.codex/config.toml": "model = \"x\"\n",
+    "/.codex/config.toml": "[permissions.x]\n",
+  };
+  const exists = (path: string) => path in files, read = (path: string) => files[path]!;
+  expect(plantedPermissionLayers("/repo/src/lib", exists, read)).toEqual(["/repo/.codex/config.toml"]);
+  files["/repo/src/.codex/config.toml"] = "not [toml";
+  expect(plantedPermissionLayers("/repo/src", exists, read)).toEqual(["/repo/src/.codex/config.toml", "/repo/.codex/config.toml"]);
+  delete files["/repo/.codex/config.toml"];
+  expect(plantedPermissionLayers("/repo", exists, read)).toEqual([]);
 });
 
 test("supervisor cdx calls are single-quoted so the exec-policy rule matches", () => {

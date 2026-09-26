@@ -1,5 +1,5 @@
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
-import { codexSandbox, geminiProfile, LANE_TOOL_ENV, prepareSandboxDirs, reviewSandboxRefusal } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, indexIgnoreFingerprint, LANE_TOOL_ENV, plantedPermissionLayers, prepareSandboxDirs, reviewSandboxRefusal } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
 import { geminiTokens } from "./tokens.ts";
 import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome } from "./account-sync.ts";
@@ -218,12 +218,15 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   spec = { ...spec, prompt: withCodegraphFact(spec.prompt, spec.cwd) };
   if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), spec.laneInstructions!, role);
   prepareSandboxDirs(spec);
+  const planted = role.review && !gemini ? plantedPermissionLayers(spec.cwd) : [];
+  if (planted.length) throw new CmdError(`review refused: ${planted.join(", ")} sets permissions, which Codex would merge into the review profile`);
   const reportPath = reportPathOf(lane, round);
   try { unlinkSync(`${ROOT}/reports/${lane}-r${round}.findings.json`); } catch { /* ignore if missing */ }
   const treeProbe = Bun.spawnSync({ cmd: ["git", "-C", spec.cwd, "rev-parse", "--show-toplevel"] });
   const treeCwd = treeProbe.success ? treeProbe.stdout.toString().trim() : spec.cwd;
   // The sandbox keeps a review read-only; this tree hash pair is only evidence.
   const reviewTreeStart = startingLane?.kind === "review" && !startingLane.consult ? treeHash(treeCwd) : undefined;
+  const indexIgnoreStart = role.review ? indexIgnoreFingerprint(spec) : undefined;
   const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(treeCwd) : undefined;
   const hooksInstalled = gemini ? hookInstallState().state === "current" : false;
   withLedger((ledger) => {
@@ -1118,7 +1121,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       });
       threadId = threadResult?.thread?.id;
       if (typeof threadId !== "string") throw new Error(`${method} returned no thread id`);
-      const sandboxRefusal = role.review ? reviewSandboxRefusal(threadResult, spec.cwd) : undefined;
+      const sandboxRefusal = role.review ? reviewSandboxRefusal(threadResult, spec) : undefined;
       if (sandboxRefusal) throw new Error(sandboxRefusal);
       touchLedger((item) => { item.sessionId = threadId; item.lastEventAt = new Date().toISOString(); }, true);
       const firstTurnId = await startTurn(threadId, spec.prompt, true);
@@ -1222,15 +1225,15 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   process.off("SIGINT", onInt);
 
   flushLedger();
-  return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
+  return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
-export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
   treeCwd: string;
   preparedGate?: ReturnType<typeof verifyGate>;
   spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
   logPath: string; reportPath: string;
-  reviewTreeStart?: string;
+  reviewTreeStart?: string; indexIgnoreStart?: string;
   workTreeStartSnapshot?: ReturnType<typeof captureReviewTree>;
   exitCode: number; turnFailureReason?: string; receivedSignal?: "SIGTERM" | "SIGINT";
   maxRuntimeHit: boolean; geminiContinuations: number; roundCleanupWarning?: string;
@@ -1262,7 +1265,8 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
   const fallbackRound = ladderExhausted && !receivedSignal && !maxRuntimeHit
     && Boolean(geminiPolicy.outageFallbackModel) && spec.model !== geminiPolicy.outageFallbackModel && Boolean(beforeFinalize?.sessionId);
   const reviewTreeEnd = reviewTreeStart ? treeHash(treeCwd) : undefined;
-  const reviewTreeMoved = Boolean(reviewTreeStart && reviewTreeEnd && reviewTreeEnd !== reviewTreeStart);
+  const indexIgnoreMoved = indexIgnoreStart !== undefined && indexIgnoreFingerprint(spec) !== indexIgnoreStart;
+  const reviewTreeMoved = Boolean(reviewTreeStart && reviewTreeEnd && reviewTreeEnd !== reviewTreeStart) || indexIgnoreMoved;
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(treeCwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
   // An unchanged tree is evidence for the report, never a verdict: a
@@ -1339,7 +1343,8 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
     // launch with mode "spawn" but must never become the resume target.
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     let roundNote: string | undefined;
-    if (reviewTreeMoved) roundNote = `review tree changed despite the read-only sandbox: ${reviewTreeStart} -> ${reviewTreeEnd}`;
+    if (indexIgnoreMoved) roundNote = "review changed a codegraph index .gitignore, which the checkout tracks";
+    else if (reviewTreeMoved) roundNote = `review tree changed despite the read-only sandbox: ${reviewTreeStart} -> ${reviewTreeEnd}`;
     else if (orphanedChildren.length > 0 && !receivedSignal && !maxRuntimeHit) roundNote = `supervisor ended with running children: ${orphanedChildren.join(", ")} (stopped)`;
     else if (gateFailed && gateExit === 0) roundNote = gateReceipt?.reason ?? "gate receipt unavailable";
     else if (gateFailed) {
