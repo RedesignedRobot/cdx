@@ -164,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewRefusal } from "./gates.ts";
-import { childWorktreeTarget, firstRedPrefix, landLockHolder, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
 import { briefContractRefusal } from "./brief-contract.ts";
 
@@ -227,6 +227,14 @@ test("doctor removes merged worktrees and keeps unmerged branches of abandoned l
   expect(staleWorktreeAction({ ...old, merged: false, closed: false }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, running: true }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, ageDays: 2 }, 7)).toBeUndefined();
+});
+
+test("a migrated 9.x lane with an open review cannot land until a review attests its tree", () => {
+  const lane = { work: { state: "done", round: 1, exitCode: 0 }, worktreePath: "/wt/a", worktreeRepo: "/repo", branch: "lane/a",
+    gateReceipt: { valid: true, round: 1, exitCode: 0, head: "h", tree: "t" }, reviewClosed: false } as Lane;
+  expect(landRefusal(lane)).toContain("9.x review has unresolved P1/P2");
+  expect(landRefusal({ ...lane, reviewClosed: true })).toBeUndefined();
+  expect(landRefusal({ ...lane, reviewAttestations: [{ tree: "t", head: "h", reviewer: "a", closed: true, at: "" }] })).toBeUndefined();
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {

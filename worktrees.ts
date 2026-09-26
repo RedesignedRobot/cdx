@@ -161,9 +161,12 @@ function gitOk(cwd: string, ...args: string[]): boolean {
   return Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] }).success;
 }
 
+// A 9.x review recorded only reviewClosed; migrate carries it over without
+// attestations, so an open one still blocks until a review of the tree.
 export function landRefusal(entry: Lane): string | undefined {
   if (laneRunning(entry)) return "lane is still running";
   if (!entry.worktreePath || !entry.worktreeRepo || !entry.branch) return "lane has no managed worktree";
+  if (!entry.reviewAttestations?.length && entry.reviewClosed === false) return "its 9.x review has unresolved P1/P2 findings; review the current tree with any review lane";
   return receiptRefusal(entry.gateReceipt, entry.work);
 }
 
