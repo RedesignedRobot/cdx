@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { safeJSON, safeText } from "./safe-text.ts";
@@ -67,24 +67,30 @@ test("stream redaction holds split assignments and UTF-8 before persistence", as
   expect(stored).toBe("é CONTEXT7_API_KEY=[redacted]\nlast TOKEN=[redacted]");
 });
 
-import { installLaneHome, laneHooks, retiredLaneRule } from "./account-sync.ts";
+import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome, laneHooks, retiredLaneRule, SUPERVISOR_RULES, withCapHook } from "./account-sync.ts";
 
 test("lane home installation is idempotent and preserves the interactive instruction source", () => {
   const home = mkdtempSync(join(tmpdir(), "cdx-lane-home-"));
   try {
     writeFileSync(join(home, "AGENTS.md"), "interactive instructions");
     writeFileSync(join(home, "config.toml"), 'model = "fixture"\n');
-    const original = { hooks: [{ command: "codegraph prompt-hook" }, { command: "unrelated-hook" }] };
+    const original = { hooks: { UserPromptSubmit: [{ hooks: [{ type: "command", command: "codegraph prompt-hook" }] }],
+      PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "unrelated-hook" }] }] } };
     writeFileSync(join(home, "hooks.json"), JSON.stringify(original));
     const lane = installLaneHome(home, "lane instructions");
     expect(installLaneHome(home, "lane instructions")).toBe(lane);
     expect(readFileSync(join(home, "AGENTS.md"), "utf8")).toBe("interactive instructions");
     expect(readFileSync(join(lane, "AGENTS.md"), "utf8")).toBe("lane instructions");
     expect(readFileSync(join(lane, "config.toml"), "utf8")).toBe('model = "fixture"\n');
-    expect(JSON.parse(readFileSync(join(lane, "hooks.json"), "utf8"))).toEqual(laneHooks(original));
+    const installed = JSON.parse(readFileSync(join(lane, "hooks.json"), "utf8"));
+    expect(installed).toEqual(withCapHook(laneHooks(original)));
+    expect(installed.hooks.PreToolUse.map((group: any) => group.hooks[0].command)).toEqual(["unrelated-hook", CAP_HOOK_COMMAND]);
+    expect(existsSync(join(lane, "rules"))).toBe(false);
+    const supervisor = installLaneHome(home, "lane instructions", true);
+    expect(supervisor).toBe(laneCodexHome(home, true));
+    expect(readFileSync(join(supervisor, "rules", "cdx.rules"), "utf8")).toBe(SUPERVISOR_RULES);
     expect(laneHooks(laneHooks(original))).toEqual(laneHooks(original));
-    expect(laneHooks(original).hooks[0].command).toContain('CDX_LANE');
-    expect(laneHooks(original).hooks[1].command).toBe("unrelated-hook");
+    expect(laneHooks(original).hooks.UserPromptSubmit[0].hooks[0].command).toContain('CDX_LANE');
     expect(retiredLaneRule("Read the repository's AGENTS.md and CLAUDE.md before starting")).toBe(true);
   } finally { rmSync(home, { recursive: true, force: true }); }
 });

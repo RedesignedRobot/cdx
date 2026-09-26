@@ -319,12 +319,6 @@ export function captureReviewTree(cwd: string): ReviewTreeSnapshot {
   };
 }
 
-export function changedReviewPath(before: ReviewTreeSnapshot, after: ReviewTreeSnapshot): string | undefined {
-  if (before.kind === after.kind && before.fingerprint === after.fingerprint) return undefined;
-  const paths = [...new Set([...before.paths, ...after.paths])].sort();
-  return paths.find((path) => before.pathFingerprints[path] !== after.pathFingerprints[path]) ?? ".";
-}
-
 export function finishInvalidBaseline(lane: string, round: number, command: string, cwd: string, result: GateResult): void {
   const checkedAt = new Date().toISOString();
   const reportPath = reportPathOf(lane, round);

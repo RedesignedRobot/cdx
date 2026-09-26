@@ -10,7 +10,7 @@ import { existsSync, readFileSync } from "node:fs";
 // Standing rules live here; task briefs supply the outcome and owned files.
 const LANE_ROLE = "Claude is the owner's liaison for briefs, answers, review, and merging; your final report is its handoff.";
 const WORK_LIMITS = "Never commit, push, deploy, or start servers beyond tests; the liaison integrates after independent review.";
-const READ_ONLY = "Leave the reviewed tree unchanged for its before/after check; commands, network, and scratch writes outside it are allowed.";
+const READ_ONLY = "The sandbox makes this lane read-only: commands and network work, but every file write fails, scratch files in /tmp included.";
 const WORK_REPORT = "Report the outcome, changed files, risks, child outcomes, and report paths in plain prose and short lists, without em dashes, filler, or praise.";
 const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and short lists, without em dashes or filler.";
 const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';

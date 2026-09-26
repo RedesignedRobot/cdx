@@ -7,6 +7,7 @@ import { type GeminiUsageSnapshot, refreshGeminiUsage, writeGeminiQuota } from "
 import { feedEvent, type Lane, readLedger, type Spec, type Tokens, withLedger } from "./ledger.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { HOME, ROOT, singleLine } from "./runtime.ts";
+import { codexSandbox } from "./sandbox.ts";
 import { isFiniteCount, parseQuotaResetDelayMs } from "./usage-store.ts";
 import { roundProgress, toolObservation, type VisibilityConfig } from "./visibility.ts";
 import { createHash } from "node:crypto";
@@ -224,19 +225,21 @@ export function inputText(text: string): AppInput {
   return { type: "text", text };
 }
 
-// Lanes keep only codegraph. Codex 0.156 rejects an override for a server the
-// account does not define (no transport), so cdx disables what config.toml names.
-const LANE_MCP_SERVERS = new Set(["codegraph"]);
+// Lanes run no MCP servers. Codex 0.156 applies neither a PostToolUse
+// updatedMCPToolOutput nor a per-tool output_token_limit override, so MCP output
+// would bypass the 4 KB cap; lanes use shell codegraph, which the cap wraps.
+// Codex rejects an override for a server the account does not define (no
+// transport), so cdx disables what config.toml names.
 
 export function configuredMcpServers(configText: string): string[] {
   const parsed = Bun.TOML.parse(configText) as { mcp_servers?: Record<string, unknown> };
   return Object.keys(parsed.mcp_servers ?? {});
 }
 
-function unusedMcpServers(codexHome: string): Record<string, { enabled: false }> {
+function laneMcpServers(codexHome: string): Record<string, { enabled: false }> {
   const configPath = `${codexHome}/config.toml`;
   const names = existsSync(configPath) ? configuredMcpServers(readFileSync(configPath, "utf8")) : [];
-  return Object.fromEntries(names.filter((name) => !LANE_MCP_SERVERS.has(name)).map((name) => [name, { enabled: false }]));
+  return Object.fromEntries(names.map((name) => [name, { enabled: false }]));
 }
 
 export function appThreadParams(spec: Spec): Record<string, unknown> {
@@ -245,21 +248,17 @@ export function appThreadParams(spec: Spec): Record<string, unknown> {
     features: { multi_agent: false, multi_agent_v2: false, memories: false, plugins: false, apps: false },
     memories: { use_memories: false, generate_memories: false },
     skills: { include_instructions: false },
-    mcp_servers: unusedMcpServers(spec.codexHome || process.env.CODEX_HOME || `${HOME}/.codex`),
+    mcp_servers: laneMcpServers(spec.codexHome || process.env.CODEX_HOME || `${HOME}/.codex`),
     service_tier: "default",
+    // Every role, reviews and supervisors included, gets the same caps.
+    model_auto_compact_token_limit: spec.model_auto_compact_token_limit ?? 150_000,
+    tool_output_token_limit: spec.tool_output_token_limit ?? 6_000,
   };
-  if (!spec.reviewDir && !spec.supervisor) {
-    configOverrides.model_auto_compact_token_limit = spec.model_auto_compact_token_limit ?? 150_000;
-    configOverrides.tool_output_token_limit = spec.tool_output_token_limit ?? 6_000;
-  }
-  if (spec.additionalDirectories?.length) {
-    configOverrides.sandbox_workspace_write = { writable_roots: spec.additionalDirectories };
-  }
   return {
     ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
     cwd: spec.cwd,
     approvalPolicy: "never",
-    sandbox: "danger-full-access",
+    sandbox: codexSandbox(spec).mode,
     config: configOverrides,
   };
 }
