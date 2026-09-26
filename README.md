@@ -416,7 +416,7 @@ In headless mode UI status, toasts and logs are skipped; polling and delivery co
 
 ## Configuration
 
-State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the state root for every command. The optional `$CDX_HOME/config.json`:
+State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the state root for every command. Only cdx's own runners carry it; lane shells, gates and jobs get the root as `CDX_HOME`, so a lane-side `CDX_HOME=/tmp/x cdx ...` stays in `/tmp/x`. The optional `$CDX_HOME/config.json`:
 
 ```json
 {

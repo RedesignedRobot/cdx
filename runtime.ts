@@ -58,9 +58,14 @@ export const color = {
   cyan: style(36),
 };
 
+// CDX_STATE_HOME beats CDX_HOME, so only cdx's own runners carry it. Every
+// other child (engines, lane shells, gates, setup scripts) gets the state
+// root as CDX_HOME, which a lane-side "CDX_HOME=/tmp/x cdx ..." overrides
+// instead of silently writing the live store.
 export function uncoloredChildEnv(codexHome?: string, stateHome?: string): Record<string, string | undefined> {
-  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1" };
+  const env: Record<string, string | undefined> = { ...process.env, NO_COLOR: "1", CDX_HOME: ROOT };
   delete env.FORCE_COLOR;
+  delete env.CDX_STATE_HOME;
   if (codexHome !== undefined) env.CODEX_HOME = codexHome;
   if (stateHome !== undefined) env.CDX_STATE_HOME = stateHome;
   return env;
@@ -79,7 +84,6 @@ interface LaneEnvironment {
 export function laneChildEnv(codexHome: string | undefined, context: LaneEnvironment, engine: Engine = "gpt") {
   const env: Record<string, string | undefined> = {
     ...uncoloredChildEnv(codexHome),
-    CDX_HOME: ROOT,
     CDX_LANE: context.lane,
     CDX_ROUND: String(context.round),
     CDX_OWNER: context.owner ?? "terminal",

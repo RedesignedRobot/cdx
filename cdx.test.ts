@@ -20,7 +20,7 @@ import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
 import { electHead, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
-import { registeredFlag } from "./runtime.ts";
+import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
 
 // Keep tests pure: selection is a filter over rows passed in, so these
 // tests never read user files, spawn engines, or wait on timers.
@@ -418,6 +418,16 @@ test("6.6.0: a cdx-authored control record is announced as a notice, a head stee
   expect(controlText({ text: "child lane x failed", sentAt: "2026-09-13T20:00:00Z", from: "cdx" })).toBe("CDX NOTICE (sent 2026-09-13T20:00:00Z): child lane x failed");
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z", from: "head-session" })).toBe("stop and report");
   expect(controlText({ text: "stop and report", sentAt: "2026-09-13T20:00:00Z" })).toBe("stop and report");
+});
+
+test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_HOME; runners keep it", () => {
+  expect(process.env.CDX_STATE_HOME).toBe(ROOT);
+  const lane = laneChildEnv("/codex", { lane: "w", round: 1 });
+  for (const env of [lane, gateEnv("/repo")]) {
+    expect(env.CDX_STATE_HOME).toBeUndefined();
+    expect(env.CDX_HOME).toBe(ROOT);
+  }
+  expect(runnerEnv(undefined).CDX_STATE_HOME).toBe(ROOT);
 });
 
 test("Rank 2: gateEnv prepends local bin to PATH and classifyGateFailure distinguishes setup vs assertion failures", () => {

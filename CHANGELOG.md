@@ -10,7 +10,7 @@ Breaking. Stop every lane and job, install 10.0, then run `cdx migrate` once. Re
 - One owner. A Claude session is a delivery cursor: the active session that most recently drove cdx (spawn, resume, send, review, consult, reply, land, or `cdx brief --head`) is the head and receives events; a session that only started never takes them. Owner events have one cursor that moves only after a head received them. Other sessions get only messages addressed to their full id. `cdx msg <lane>` addresses the head.
 - `cdx events` returns only the kinds the head acts on: question, stalled, terminal, job-exit, message, thrash, overrun, outage. A terminal event is at most five lines of 200 characters: the verdict with the report path, then failure evidence or the report head. Supervisors get the same digest for their children, whose events never reach the head.
 - Round progress (steers, auto-continues, agy retries, gate start, kill requests, answered questions) goes to `logs/<lane>-r<round>.progress.log` instead of the feed.
-- `CDX_STATE_HOME` overrides the state root for every command. Under `bun test` or with `CDX_TEST` set, cdx refuses to run against the real `~/.cdx`. A fault suite covers the state layer.
+- `CDX_STATE_HOME` overrides the state root for every command. Lane shells, gates and jobs never inherit it; they get the root as `CDX_HOME`, which a lane-side proof can override. Under `bun test` or with `CDX_TEST` set, cdx refuses to run against the real `~/.cdx`. A fault suite covers the state layer.
 
 ### Sandbox
 
