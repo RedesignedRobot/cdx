@@ -1330,6 +1330,20 @@ test("terminal events carry a five-line digest and child terminals never wake th
   expect(selectEvents([{ ...event, supervisor: undefined }], "head", 0, 0)).toHaveLength(1);
 });
 
+test("failure evidence keeps error text from protocol logs and skips the job header", () => {
+  const delta = JSON.stringify({ method: "item/agentMessage/delta", params: { threadId: "t", delta: "Checking the gate" } });
+  const usage = JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "t", tokenUsage: { total: 12 } } });
+  const failed = JSON.stringify({ method: "turn/completed", params: { turn: { status: "failed", error: { message: "unexpected status 401 Unauthorized" } } } });
+  const warning = JSON.stringify({ method: "warning", params: { threadId: "t", message: "Falling back to HTTPS transport" } });
+  const retry = JSON.stringify({ method: "error", params: { error: { message: "Reconnecting... 2/5" }, willRetry: true } });
+  expect(terminalText("failed log=/tmp/l", undefined, [delta, usage, retry, warning, delta, failed].join("\n")).split("\n"))
+    .toEqual(["failed log=/tmp/l", "Reconnecting... 2/5", "Falling back to HTTPS transport", "unexpected status 401 Unauthorized"]);
+  expect(terminalText("failed log=/tmp/l", undefined, [delta, usage, delta].join("\n"))).toBe("failed log=/tmp/l");
+  const job = "# cdx job ctx\n# cwd /repo\n# cmd bun cdx.ts context\n# started 2026-09-26T16:08:22.088Z\ncdx: digest is 6434 chars, over 6000; not written";
+  expect(terminalText("failed log=/tmp/j", undefined, job)).toBe("failed log=/tmp/j\ncdx: digest is 6434 chars, over 6000; not written");
+  expect(terminalText("failed", undefined, "Expected: { a: 1 }\n{ a: 2 }")).toBe("failed\nExpected: { a: 1 }\n{ a: 2 }");
+});
+
 
 test("doctor treats hooks without the call-cap callback as stale", () => {
   const hooks = desiredHookEntry("bun /cdx.ts");

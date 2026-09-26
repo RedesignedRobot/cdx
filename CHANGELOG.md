@@ -4,6 +4,11 @@
 
 - `hooks/codegraph-nudge.sh` no longer denies the first semantic source search of each turn in an indexed repo. That denial forced one `codegraph explore` per turn, about 6.6k tokens each in the `~/code` index. The hook now lets the search run and adds a note of under 50 words, once per session, keyed by the session id. The classifier is unchanged, so literal sweeps, log and non-code searches and file listings stay silent. The transcript turn parsing that served the per-turn denial is deleted.
 
+### Delivery
+
+- Failure evidence in a terminal or job-exit event no longer carries raw engine protocol records. A failed lane's digest read its JSONL engine log, so its four evidence lines were JSON such as `{"method":"thread/tokenUsage/updated",...}`. Only the error and warning messages inside those records are kept now, and a digest with none shows the verdict line alone. On ten failed lane events from 2026-09-26, each event shrinks from 900 to 1,400 characters to its 270 to 590 character verdict line.
+- A failed job's digest skips the four `#` header lines cdx writes atop the job log. They filled all four evidence lines, so a context job that failed with `cdx: digest is 6434 chars, over 6000; not written` showed only its cwd and command.
+
 ## 10.0.8 (2026-09-27)
 
 ### Band

@@ -392,8 +392,28 @@ const TERMINAL_LINES = 5;
 
 const DIGEST_LINE_CHARS = 200;
 
+const JOB_LOG_HEADER = /^# (?:cdx job|cwd|cmd|started) /;
+
+// Lane logs are engine protocol records, one JSON object per line. Of those,
+// only error and warning messages read as evidence; the rest is dropped, as
+// is the header cdx writes atop a job log.
+function evidence(log: string): string {
+  return log.split(/\r?\n/).map(evidenceLine).filter((line) => line.trim()).join("\n");
+}
+
+function evidenceLine(line: string): string {
+  if (JOB_LOG_HEADER.test(line)) return "";
+  if (!line.startsWith("{")) return line;
+  let record: any;
+  try { record = JSON.parse(line); } catch { return line; }
+  const params = record?.params;
+  const text = params?.error?.message ?? params?.turn?.error?.message ?? record?.error?.message
+    ?? (record?.method === "warning" ? params?.message : undefined);
+  return typeof text === "string" ? text : "";
+}
+
 export function terminalText(message: string, report: string | undefined, failure: string | undefined): string {
-  const source = failure ? failureDigest(failure).split("\n") : (report ?? "").split("\n").filter((line) => !/^\s*#/.test(line));
+  const source = failure ? failureDigest(evidence(failure)).split("\n") : (report ?? "").split("\n").filter((line) => !/^\s*#/.test(line));
   const digest = source.map(singleLine).filter(Boolean).slice(0, TERMINAL_LINES - 1)
     .map((line) => Array.from(line).slice(0, DIGEST_LINE_CHARS).join(""));
   return safeText([singleLine(message), ...digest].join("\n"));
