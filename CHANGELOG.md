@@ -1,3 +1,10 @@
+## 10.0.4 (2026-09-26)
+
+### Delivery
+
+- A session's band, Pane, status line, brief and `cdx events --snapshot` rows list only the lanes and jobs whose events reach it: its own while it is live, plus, on the head, those owned by `terminal`, by a session that never polled, or by a gone session. Before, every live session showed every running lane and job, so one head's band and per-turn brief carried another head's lanes. The rule is the one events route by, so view and routing agree.
+- `cdx status` still lists every lane and marks one owned by another live session with `owned by another live session` on its `started by` line. `cdx status --all`, `cdx feed` and `cdx brief` from the terminal are unfiltered.
+
 ## 10.0.3 (2026-09-26)
 
 ### Delivery

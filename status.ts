@@ -14,7 +14,7 @@ import {
 } from "./jobs.ts";
 import {
   type AccountChoice, activeStateOf, type Lane, laneEngine, type LaneOutage, laneRunning,
-  type Ledger, readAllLanes, readLedger, roundEngine, roundExitCodeOf, roundNoteOf,
+  type Ledger, ownedElsewhere, readAllLanes, readLedger, roundEngine, roundExitCodeOf, roundNoteOf,
   roundReportOf, type Tokens, workCwdOf,
 } from "./ledger.ts";
 import { questionOpen, type QuestionRecord, readQuestions } from "./questions.ts";
@@ -76,14 +76,16 @@ function recentTranscript(name: string, round: number): string[] {
   } catch { return []; }
 }
 
-export function liveRows(now = Date.now()): LiveRow[] {
+// visible narrows the rows to one session's view (ownerView); cdx status
+// and the other explicit queries list everything.
+export function liveRows(now = Date.now(), visible: (owner: string | undefined) => boolean = () => true): LiveRow[] {
   const detailDeadline = Date.now() + 200;
   const files = new Map<string, number | undefined>();
   const rows: LiveRow[] = [];
   const ledger = readLedger();
   const questions = readQuestions();
   for (const [name, entry] of Object.entries(ledger)) {
-    if (!laneRunning(entry)) continue;
+    if (!laneRunning(entry) || !visible(entry.ownerSession)) continue;
     const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
     if (!files.has(cwd)) {
       const remaining = detailDeadline - Date.now();
@@ -99,7 +101,7 @@ export function liveRows(now = Date.now()): LiveRow[] {
       transcript: Date.now() < detailDeadline ? recentTranscript(name, entry.rounds) : [] });
   }
   for (const [name, job] of Object.entries(readJobs())) {
-    if (!jobRunning(job)) continue;
+    if (!jobRunning(job) || !visible(job.ownerSession)) continue;
     rows.push({ name, kind: "job", engine: "job", stage: "working", startedAt: job.startedAt,
       steps: 0, action: Date.now() < detailDeadline ? jobPhase(job.log) || "running" : "running" });
   }
@@ -143,9 +145,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
   const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.consult ? "consult" : "work"}${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
-  // Provenance only: every lane belongs to the one owner.
+  const elsewhere = ownedElsewhere(entry.ownerSession, Date.now()) ? `  ${color.yellow("owned by another live session")}` : "";
   const owner = entry.ownerCwd || entry.ownerSession
-    ? `${entry.ownerSession?.slice(0, 8) ?? "terminal"}  from ${entry.ownerCwd ? displayPath(entry.ownerCwd) : "-"}` : "-";
+    ? `${entry.ownerSession?.slice(0, 8) ?? "terminal"}  from ${entry.ownerCwd ? displayPath(entry.ownerCwd) : "-"}${elsewhere}` : "-";
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
     : `finished ${fmtAge(record.updatedAt ?? entry.updatedAt)} ago`;

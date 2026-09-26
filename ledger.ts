@@ -44,9 +44,7 @@ export function requireOwnChild(lane: string, entry: Lane | undefined): void {
   const supervisor = supervisorLane();
   if (entry && supervisor && entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
   const owner = entry?.ownerSession;
-  if (!owner || takeover || process.env.CDX_LANE) return;
-  const caller = callerSession();
-  if (caller === "terminal" || caller === owner || !sessionLive(readSession(owner), Date.now())) return;
+  if (takeover || process.env.CDX_LANE || callerSession() === "terminal" || !ownedElsewhere(owner, Date.now())) return;
   fail(`lane "${lane}" belongs to live Claude session ${owner}; drive it from that session, or pass --force (force: true on the tool) to take it over`);
 }
 
@@ -553,9 +551,37 @@ const HEAD = Symbol("head");
 function eventTarget(event: FeedEvent, sessions: ReadonlyMap<string, SessionRow>, now: number): string | typeof HEAD | undefined {
   if (event.recipient) return event.recipient;
   const owner = sessions.get(event.owner);
-  if (!owner) return HEAD;
-  if (event.id <= owner.cursor) return undefined;
-  return sessionLive(owner, now) ? owner.session : HEAD;
+  if (owner && event.id <= owner.cursor) return undefined;
+  return ownerTarget(event.owner, sessions, now);
+}
+
+// The session that answers for work with this owner: the owner while it is
+// live, the head otherwise. Events route by it and each session's view shows
+// the lanes and jobs that land on it, so a session sees exactly the work
+// whose events it receives.
+function ownerTarget(owner: string | undefined, sessions: ReadonlyMap<string, SessionRow>, now: number): string | typeof HEAD {
+  const row = owner ? sessions.get(owner) : undefined;
+  return row && sessionLive(row, now) ? row.session : HEAD;
+}
+
+// Whether a lane or job with this owner belongs in the session's own view:
+// the band, the status line and the brief. The terminal has no view of its
+// own and sees everything.
+export function ownerView(session: string, now: number): (owner: string | undefined) => boolean {
+  if (session === "terminal") return () => true;
+  const rows = db().query<SessionRow, []>("SELECT * FROM sessions").all();
+  const sessions = new Map(rows.map((row) => [row.session, row]));
+  const head = electHead(rows, now);
+  return (owner) => {
+    const target = ownerTarget(owner, sessions, now);
+    return target === session || (target === HEAD && head === session);
+  };
+}
+
+// An owner other than the caller that still polls: explicit views mark its
+// lanes, and requireOwnChild refuses to drive them without --force.
+export function ownedElsewhere(owner: string | undefined, now: number): boolean {
+  return owner !== undefined && owner !== callerSession() && sessionLive(readSession(owner), now);
 }
 
 // Which events reach a session: actionable kinds only, never a child's

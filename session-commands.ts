@@ -5,7 +5,7 @@ import { markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts
 import { markOverrun, overrunNotice } from "./duration.ts";
 import {
   activeStateOf, callerSession, deliverEvents, feedEvent, laneRunning,
-  markBrief, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
+  markBrief, ownerView, readLedger, readSession, recentEvents, renderEvent, roundReportOf, startSession,
   withLedger,
 } from "./ledger.ts";
 import { questionOpen, readQuestions } from "./questions.ts";
@@ -33,7 +33,7 @@ export async function eventsCommand(argv: string[]): Promise<void> {
     if (json) {
       let rows: ReturnType<typeof liveRows> | undefined;
       if (parsed.bools.has("snapshot")) {
-        try { rows = liveRows(now); } catch { /* Events still return when display state is unavailable. */ }
+        try { rows = liveRows(now, ownerView(session, now)); } catch { /* Events still return when display state is unavailable. */ }
       }
       console.log(JSON.stringify({ session, events, ...(rows ? { rows, now } : {}) }));
     } else if (events.length > 0) {
@@ -75,11 +75,12 @@ const BRIEF_FINISHED_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // The brief lands in the head's context on every session start, resume and
 // compaction, so it carries the running lanes and only the few most recent
 // finished ones; a session that never closed forty old lanes used to reread
-// all forty each time.
+// all forty each time. It lists only the work in the session's view
+// (ownerView): another live session's lanes and jobs are that session's.
 const BRIEF_FINISHED_SHOWN = 5;
 
-function sessionSummary(): string {
-  const ledger = readLedger();
+function sessionSummary(visible: (owner: string | undefined) => boolean): string {
+  const ledger = Object.fromEntries(Object.entries(readLedger()).filter(([, entry]) => visible(entry.ownerSession)));
   const open = Object.entries(ledger).sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
   const finished = open.filter(([, entry]) => !laneRunning(entry));
   const hidden = Math.max(0, finished.length - BRIEF_FINISHED_SHOWN);
@@ -92,7 +93,7 @@ function sessionSummary(): string {
       lines.push(`lane=${record.lane} r${record.round} QUESTION #${record.seq}: ${record.question}; cdx reply ${record.lane} --id ${record.seq} "<answer>"`);
     }
   }
-  for (const [name, job] of summaryJobs(readJobs(), BRIEF_FINISHED_SHOWN, BRIEF_FINISHED_JOB_MAX_AGE_MS)) lines.push(renderJobLine(name, job));
+  for (const [name, job] of summaryJobs(Object.fromEntries(Object.entries(readJobs()).filter(([, job]) => visible(job.ownerSession))), BRIEF_FINISHED_SHOWN, BRIEF_FINISHED_JOB_MAX_AGE_MS)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
 }
 
@@ -123,7 +124,7 @@ export function briefCommand(argv: string[]) {
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
   const session = callerSession();
   if (session !== "terminal") startSession(session, Date.now(), parsed.bools.has("head"));
-  const summary = sessionSummary();
+  const summary = sessionSummary(ownerView(session, Date.now()));
   if (summary && !briefRepeated(session, summary)) console.log(summary);
 }
 
