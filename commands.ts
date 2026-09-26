@@ -24,7 +24,7 @@ import { statusCommand, usageCommand, waitCommand } from "./status.ts";
 import { contextCommand } from "./context.ts";
 import { panelCommand, runPanel } from "./panel.ts";
 import { shotsCommand } from "./shots.ts";
-import { landCommand, runLandJob, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
+import { landCommand, landingRefusal, runLandJob, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
 import { existsSync, readFileSync } from "node:fs";
 
 const USAGE = `cdx tracks Codex and Gemini execution lanes
@@ -236,6 +236,8 @@ switch (command) {
     const entry = readLane(lane);
     requireOwnChild(lane, entry);
     if (laneRunning(entry) && (pidAlive(entry.pid) || pidAlive(entry.codexPid))) fail(`lane "${lane}" is running; kill it first`);
+    const landing = landingRefusal(entry);
+    if (landing) fail(`lane "${lane}" ${landing}`);
     if (!keepWorktree && entry.worktreePath && existsSync(entry.worktreePath)) removeWorktree(entry);
     withLedger((ledger) => {
       const item = ledger[lane]!;

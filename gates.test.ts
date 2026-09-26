@@ -292,6 +292,58 @@ test("a batch merge gate borrows installs from the lane that changed a lockfile"
   expect(landJobName("feat.x")).toBe("land-feat-x");
 });
 
+import { detachLand, landingRefusal, mergeNeedsGate, runLandJob } from "./worktrees.ts";
+import { readLane, recentEvents, storeLane } from "./ledger.ts";
+import { readJobs, storeJob } from "./jobs.ts";
+
+test("a merge gates unless one lane's receipt already proves the merge tree", () => {
+  const proven = { entry: { gateReceipt: { tree: "t1" } } as Lane };
+  expect(mergeNeedsGate([], undefined)).toBe(false);
+  expect(mergeNeedsGate([proven], "t1")).toBe(false);
+  expect(mergeNeedsGate([proven], "t2")).toBe(true);
+  expect(mergeNeedsGate([proven, proven], "t1")).toBe(true);
+});
+
+test("a live lander guards the lane from everyone but its own job", () => {
+  const entry = { landing: { pid: 4242, job: "land-a" } };
+  const alive = (pid: number) => pid === 4242;
+  expect(landingRefusal(entry, undefined, alive)).toBe("is landing in job land-a (pid 4242); wait for its job-exit event");
+  expect(landingRefusal(entry, "land-b", alive)).toContain("land-a");
+  expect(landingRefusal(entry, "land-a", alive)).toBeUndefined();
+  expect(landingRefusal(entry, undefined, () => false)).toBeUndefined();
+  expect(landingRefusal({}, undefined, alive)).toBeUndefined();
+});
+
+const landLane = (landing?: Lane["landing"]) => {
+  const at = new Date().toISOString();
+  return { engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [], tokenAccounting: 1,
+    work: { state: "done", cwd: "/repo", updatedAt: at }, createdAt: at, updatedAt: at, ...(landing ? { landing } : {}) } as unknown as Lane;
+};
+
+test("detachLand starts cdx _land and hands the job and the lane mark to the child pid", () => {
+  storeLane("detach-a", landLane({ pid: process.pid, job: "land-detach-a" }));
+  let started: string[] = [];
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (line: string) => { lines.push(line); };
+  try { detachLand(["detach-a"], "/repo", ["detach-a"], "land-detach-a", (args) => { started = args; return 4242; }); }
+  finally { console.log = log; }
+  expect(started).toEqual(["_land", "land-detach-a", "detach-a"]);
+  expect(readJobs()["land-detach-a"]).toMatchObject({ state: "running", pid: 4242, cmd: "cdx land detach-a" });
+  expect(readLane("detach-a").landing).toEqual({ pid: 4242, job: "land-detach-a" });
+  expect(lines[0]).toContain("job=land-detach-a pid=4242");
+});
+
+test("runLandJob records a failed land and emits its refusal as the job-exit event", () => {
+  storeJob("land-ghost", { cmd: "cdx land ghost", cwd: "/repo", log: "/tmp/land-ghost.log", startedAt: new Date().toISOString(), state: "running", pid: process.pid });
+  const error = console.error;
+  console.error = () => {};
+  try { expect(runLandJob("land-ghost", ["ghost"])).toBe(1); } finally { console.error = error; }
+  expect(readJobs()["land-ghost"]).toMatchObject({ state: "failed", exitCode: 1 });
+  expect(recentEvents(1)[0]).toMatchObject({ kind: "job-exit", job: "land-ghost" });
+  expect(recentEvents(1)[0]!.message).toContain("job=land-ghost state=failed exit=1");
+});
+
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {
   const dir = mkdtempSync(join(tmpdir(), "cdx-land-lock-"));
   const lock = join(dir, "cdx-land.lock");

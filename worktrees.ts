@@ -179,6 +179,39 @@ export function landRefusal(entry: Lane): string | undefined {
   return receiptRefusal(entry.gateReceipt, entry.work);
 }
 
+// A detached land gates long after its caller returns. Until the lander's pid
+// dies, no round, close or other land may touch the lane; its own job may.
+export function landingRefusal(entry: Pick<Lane, "landing"> | undefined, job?: string, alive: (pid: number) => boolean = pidAlive): string | undefined {
+  const landing = entry?.landing;
+  if (!landing || landing.job === job || !alive(landing.pid)) return;
+  return `is landing in job ${landing.job} (pid ${landing.pid}); wait for its job-exit event`;
+}
+
+// Marks the lanes under the ledger lock, so the running check and the mark
+// cannot interleave with an openRound. Returns the entries as marked.
+function claimLanes(lanes: string[], job: string, detachedJob?: string): Lane[] {
+  return withLedger((ledger) => lanes.map((lane) => {
+    const item = ledger[lane]!;
+    const refusal = landingRefusal(item, detachedJob);
+    if (refusal) fail(`cannot land ${lane}: it ${refusal}`);
+    if (laneRunning(item)) fail(`cannot land ${lane}: lane is still running`);
+    item.landing = { pid: process.pid, job };
+    return structuredClone(item);
+  }));
+}
+
+// Moves marks held by pid `from` to `to`; `to` undefined releases them.
+function passLanding(lanes: string[], from: number, to?: number): void {
+  withLedger((ledger) => {
+    for (const lane of lanes) {
+      const item = ledger[lane];
+      if (item?.landing?.pid !== from) continue;
+      if (to) item.landing.pid = to;
+      else delete item.landing;
+    }
+  });
+}
+
 // Prefix gates are assumed monotonic: once a merge breaks the gate, longer
 // prefixes stay red. The caller knows the full prefix is red.
 export function firstRedPrefix(count: number, green: (prefix: number) => boolean): number {
@@ -309,13 +342,15 @@ function pushBranch(repo: string, branch: string): string {
   return `pushed to ${remote}`;
 }
 
-function retireLane(lane: string, entry: Lane, repo: string, baseRef: string, note: string): void {
+function retireLane(lane: string, repo: string, baseRef: string, note: string): void {
+  const entry = readLane(lane);
   if (entry.worktreePath && existsSync(entry.worktreePath)) git(repo, "worktree", "remove", entry.worktreePath);
   if (entry.branch && gitOk(repo, "merge-base", "--is-ancestor", `refs/heads/${entry.branch}`, baseRef)) git(repo, "branch", "-D", entry.branch);
   withLedger((ledger) => {
     const item = ledger[lane]!;
     item.work.state = "closed";
     item.work.note = note;
+    delete item.landing;
     item.updatedAt = new Date().toISOString();
   });
 }
@@ -344,11 +379,11 @@ function planLand(lanes: string[], entries: Lane[], repo: string, baseBranch: st
   return { repo, baseBranch, baseHead, pending, merged, merges, checkout };
 }
 
-function mergeNeedsGate(plan: LandPlan): boolean {
-  return plan.pending.length > 0 && !receiptProves(plan.pending, git(plan.repo, "rev-parse", `${plan.merges.at(-1)}^{tree}`));
+export function mergeNeedsGate(pending: Array<Pick<LandLane, "entry">>, mergeTree: string | undefined): boolean {
+  return pending.length > 0 && !receiptProves(pending, mergeTree ?? "");
 }
 
-function landLanes(plan: LandPlan, lanes: string[], entries: Lane[]): void {
+function landLanes(plan: LandPlan): void {
   const { repo, baseBranch, baseHead, pending, merged, merges, checkout } = plan;
   const baseRef = `refs/heads/${baseBranch}`;
   let candidate = merges.at(-1) ?? baseHead;
@@ -368,6 +403,8 @@ function landLanes(plan: LandPlan, lanes: string[], entries: Lane[]): void {
     candidate = red > 1 ? merges[red - 2]! : baseHead;
   }
   if (candidate !== baseHead) {
+    const started = landed.find((target) => laneRunning(readLane(target.lane)));
+    if (started) fail(`cannot land ${started.lane}: a round started while its merge gated; nothing landed`);
     if (!checkout) git(repo, "update-ref", baseRef, candidate, baseHead);
     else {
       refuseOverlap(checkout, repo, baseHead, candidate);
@@ -377,7 +414,7 @@ function landLanes(plan: LandPlan, lanes: string[], entries: Lane[]): void {
   }
   const retiring = [...merged, ...landed.map((target) => target.lane)];
   const pushed = retiring.length ? pushBranch(repo, baseBranch) : "nothing pushed";
-  for (const lane of retiring) retireLane(lane, entries[lanes.indexOf(lane)]!, repo, baseRef, `landed ${candidate}`);
+  for (const lane of retiring) retireLane(lane, repo, baseRef, `landed ${candidate}`);
   if (retiring.length) console.log(`cdx: landed ${retiring.join(", ")} on ${baseBranch} as ${candidate}; ${pushed}; removed worktrees and branches, closed`);
   if (culprit) fail(`${culprit}${landed.length ? "" : "; nothing landed"}`);
 }
@@ -385,37 +422,56 @@ function landLanes(plan: LandPlan, lanes: string[], entries: Lane[]): void {
 // A merge gate can outlast the ten minute ceiling of the plugin's
 // process.run, so a land that must gate runs detached; a supervisor waits in
 // its own shell instead. A receipt-proven land needs no gate and stays inline.
-export function landCommand(argv: string[], detached = false): void {
+export function landCommand(argv: string[], detachedJob?: string): void {
   const batch = argv[0] === "--batch";
   const lanes = batch ? argv.slice(1) : argv;
   if (!lanes.length || !batch && lanes.length > 1 || lanes.some((lane) => lane.startsWith("-"))) fail("usage: cdx land <lane> | cdx land --batch <lane>...");
   if (new Set(lanes).size !== lanes.length) fail("cdx land --batch names a lane twice");
-  const entries = lanes.map((lane) => {
+  const read = lanes.map((lane) => {
     const entry = readLane(lane);
     requireOwnChild(lane, entry);
     return entry;
   });
-  const repo = entries[0]!.worktreeRepo;
-  const baseBranch = entries[0]!.baseBranch ?? "main";
+  const repo = read[0]!.worktreeRepo;
+  const baseBranch = read[0]!.baseBranch ?? "main";
   if (!repo) fail(`cannot land ${lanes[0]}: lane has no managed worktree`);
-  if (entries.some((entry) => entry.worktreeRepo !== repo || (entry.baseBranch ?? "main") !== baseBranch)) fail("cdx land --batch needs lanes from one repository and base branch");
+  if (read.some((entry) => entry.worktreeRepo !== repo || (entry.baseBranch ?? "main") !== baseBranch)) fail("cdx land --batch needs lanes from one repository and base branch");
   const supervisor = supervisorLane();
   if (supervisor && readLane(supervisor).branch !== baseBranch) fail(`supervisor ${supervisor} lands children only into its own worktree branch; the liaison lands the rest`);
+  const job = detachedJob ?? landJobName(lanes[0]!);
   const lock = landLockOf(repo);
   takeLandLock(lock);
+  let detach = false;
   try {
-    const plan = planLand(lanes, entries, repo, baseBranch);
-    if (detached || supervisor || !mergeNeedsGate(plan)) return landLanes(plan, lanes, entries);
-  } finally { rmSync(lock, { force: true }); }
-  detachLand(argv, repo, lanes);
+    const plan = planLand(lanes, claimLanes(lanes, job, detachedJob), repo, baseBranch);
+    const mergeTree = plan.merges.length ? git(repo, "rev-parse", `${plan.merges.at(-1)}^{tree}`) : undefined;
+    detach = !detachedJob && !supervisor && mergeNeedsGate(plan.pending, mergeTree);
+    if (!detach) return landLanes(plan);
+  } finally {
+    rmSync(lock, { force: true });
+    if (!detach) passLanding(lanes, process.pid);
+  }
+  try { detachLand(argv, repo, lanes, job); } catch (error) {
+    passLanding(lanes, process.pid);
+    throw error;
+  }
 }
 
 export function landJobName(lane: string): string {
   return `land-${lane}`.replace(/[^A-Za-z0-9_-]/g, "-").slice(0, 64);
 }
 
-function detachLand(argv: string[], repo: string, lanes: string[]): void {
-  const name = landJobName(lanes[0]!);
+type StartLand = (args: string[], out: number) => number | undefined;
+
+const startLand: StartLand = (args, out) => {
+  const child = spawn(process.execPath, [SELF, ...args], { detached: true, env: uncoloredChildEnv(undefined, ROOT), stdio: ["ignore", out, out] });
+  child.unref();
+  return child.pid;
+};
+
+// The caller has marked the lanes with its pid; the child's pid takes the
+// mark over, so the lanes stay guarded after this process exits.
+export function detachLand(argv: string[], repo: string, lanes: string[], name: string, start = startLand): void {
   const log = `${ROOT}/logs/job-${name}.log`;
   const ownerSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
   mkdirSync(`${ROOT}/logs`, { recursive: true });
@@ -425,14 +481,16 @@ function detachLand(argv: string[], repo: string, lanes: string[]): void {
     storeJob(name, { cmd: `cdx land ${argv.join(" ")}`, cwd: repo, log, startedAt: new Date().toISOString(), state: "running", pid: process.pid, ...(ownerSession ? { ownerSession } : {}) });
   });
   const out = openSync(log, "w");
-  const child = spawn(process.execPath, [SELF, "_land", name, ...argv], { detached: true, env: uncoloredChildEnv(undefined, ROOT), stdio: ["ignore", out, out] });
-  child.unref();
+  const pid = start(["_land", name, ...argv], out);
+  closeSync(out);
+  if (!pid) fail(`could not start land job ${name}; see ${log}`);
   // The child may finish first; its final record must survive this write.
   write(() => {
     const job = readJobs()[name];
-    if (job && jobRunning(job) && job.pid === process.pid) storeJob(name, { ...job, pid: child.pid });
+    if (job && jobRunning(job) && job.pid === process.pid) storeJob(name, { ...job, pid });
   });
-  console.log(`cdx: the merge of ${lanes.join(", ")} needs a gate, so land runs as job=${name} pid=${child.pid} log=${log}`);
+  passLanding(lanes, process.pid, pid);
+  console.log(`cdx: the merge of ${lanes.join(", ")} needs a gate, so land runs as job=${name} pid=${pid} log=${log}`);
   console.log(`cdx: the job-exit event carries the land result; ${settleHint(name)}`);
 }
 
@@ -440,7 +498,7 @@ function detachLand(argv: string[], repo: string, lanes: string[]): void {
 // the land result on success and the refusal on failure.
 export function runLandJob(name: string, argv: string[]): number {
   let exitCode = 0;
-  try { landCommand(argv, true); } catch (error) {
+  try { landCommand(argv, name); } catch (error) {
     console.error(`cdx: ${error instanceof Error ? error.message : String(error)}`);
     exitCode = 1;
   }
@@ -514,7 +572,7 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
       const committed = Number(Bun.spawnSync({ cmd: ["git", "-C", repo, "log", "-1", "--format=%ct", ref] }).stdout.toString().trim()) * 1000;
       const ageDays = (now - Math.max(committed || 0, entry ? Date.parse(entry.updatedAt) : 0)) / 86_400_000;
       const action = staleWorktreeAction({
-        running: Boolean(entry && laneRunning(entry)), closed: entry?.work.state === "closed",
+        running: Boolean(entry && (laneRunning(entry) || landingRefusal(entry))), closed: entry?.work.state === "closed",
         merged: bases.some((base) => gitOk(repo, "merge-base", "--is-ancestor", ref, base)), ageDays,
       }, days);
       if (action) stale.push({ repo, primary, path, branch, action, ageDays });

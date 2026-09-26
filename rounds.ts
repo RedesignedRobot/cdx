@@ -15,7 +15,7 @@ import {
 } from "./ledger.ts";
 import { CmdError, pidAlive } from "./runtime.ts";
 import { readUsageSnapshot } from "./usage-store.ts";
-import { type WorktreeInfo } from "./worktrees.ts";
+import { landingRefusal, type WorktreeInfo } from "./worktrees.ts";
 
 // Round lifecycle: open a round in the ledger, write its spec, run or detach.
 
@@ -59,6 +59,8 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       if (engine === "gpt" && accountChoices().some((choice) => readUsageSnapshot(choice)?.invalidatedAt)) return undefined;
       const existing = ledger[lane];
       if (process.argv[2] !== "_run") requireOwnChild(lane, existing);
+      const landing = landingRefusal(existing);
+      if (landing) throw new CmdError(`lane "${lane}" ${landing}`);
       if (existing && laneRunning(existing) && (pidAlive(existing.pid) || pidAlive(existing.codexPid))
         && !((existing.switchingAccount || existing.outageFallbackPending) && existing.pid === process.pid)) {
         throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
