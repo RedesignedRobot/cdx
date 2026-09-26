@@ -81,8 +81,8 @@ Before you look at any screenshot, run `cdx shots grade <dir> --rubric <file>`. 
 ## What lanes can do
 
 - Work lanes write only their cwd, `addDirs`, /tmp and cdx state. `.git` is read-only, so lanes cannot commit. A lane that must write elsewhere needs the directory in `addDirs`.
-- Reviews and consults are read-only, /tmp included. Anything they produce comes back in the report.
-- Shell output over 4 KB reaches the model as the first 2 KB and last 1.5 KB plus a spill-file path. Lanes have no MCP servers; codegraph runs through the shell with a 60 s deadline, and a worktree lane queries its primary checkout's index with `-p`. Codex reviews and consults cannot open a codegraph index. Chromium in a lane needs `--single-process`, which work lane rules state.
+- Reviews and consults cannot write the checkout; they write only TMPDIR and the codegraph index. Anything they produce comes back in the report.
+- Shell output over 4 KB reaches the model as the first 2 KB and last 1.5 KB plus a spill-file path. Lanes have no MCP servers; codegraph runs through the shell with a 60 s deadline, and a worktree lane queries its primary checkout's index with `-p`. Reviews and consults use codegraph too. Chromium in a lane needs `--single-process`, which work lane rules state.
 
 ## Gates and lifecycle
 

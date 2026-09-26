@@ -31,7 +31,7 @@ Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open 
 
 ### Sandbox
 
-- Lane codegraph lookups stop at the checkout root instead of climbing into a parent index such as `~/code/.codegraph`. A worktree with no index borrows its primary checkout's, the lane brief names `codegraph explore -p <primary>`, and that `.codegraph` dir is writable for work and Gemini lanes. Codex reviews and consults cannot open an index and are told to use rg.
+- Lane codegraph lookups stop at the checkout root instead of climbing into a parent index such as `~/code/.codegraph`. A worktree with no index borrows its primary checkout's, the lane brief names `codegraph explore -p <primary>`, and that `.codegraph` dir is writable for work and Gemini lanes. Codex reviews and consults now run a `cdx-review` permissions profile, set through the `default_permissions` config override: read everywhere, write only TMPDIR and the codegraph index dirs. They can query codegraph and still cannot write the checkout.
 - Supervisor rules say codegraph cannot open a child worktree's index from their sandbox, so they review child trees with git and file reads, and run `codegraph sync .` after `cdx land` when their tree has its own index.
 - Lane shells get `BUN_INSTALL_CACHE_DIR` under TMPDIR; the sandbox denied `~/.bun/install/cache`.
 - Codex work lane rules say Chromium needs `--single-process` in the sandbox.
