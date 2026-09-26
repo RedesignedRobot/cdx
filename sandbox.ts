@@ -55,12 +55,30 @@ export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
   return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
 }
 
-// claude runs only read-only consults. It writes its own state under
-// ~/.claude and ~/.claude.json (plus backups), and its Bash tool needs a
-// scratch directory at /tmp/claude-<uid>; the checkout stays read-only.
-export function claudeProfile(uid = process.getuid?.() ?? 0): string {
-  const subpaths = [join(HOME, ".claude"), tmpdir(), `/tmp/claude-${uid}`, "/dev"].map(resolvedPath);
-  const config = `^${resolvedPath(HOME).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/\\.claude\\.json`;
-  const rules = [...subpaths.map((path) => `(subpath ${JSON.stringify(path)})`), `(regex #"${config}")`];
-  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
+const regexQuote = (path: string) => path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Scratch state `claude -p` writes, found with --debug-file under a profile
+// that denied all of ~/.claude: shell snapshots for the Bash tool, the
+// session env and registry, and ~/.claude.json with its backups.
+const CLAUDE_SCRATCH = ["shell-snapshots", "session-env", "sessions", "backups"];
+// Owner configuration and live cdx state (~/.cdx links into ~/.claude). The
+// denies come last so they win over any allow above them.
+const CLAUDE_PROTECTED = ["codex-harness", "hooks", "skills", "plugins", "CLAUDE.md"];
+
+// claude runs only read-only consults. Its Bash tool writes a scratch dir and
+// a cwd file under /tmp/claude-*; the checkout stays read-only.
+export function claudeProfile(): string {
+  const claudeDir = resolvedPath(join(HOME, ".claude"));
+  const allowed = [tmpdir(), "/dev", ...CLAUDE_SCRATCH.map((dir) => join(claudeDir, dir))].map(resolvedPath);
+  const allowRules = [
+    ...allowed.map((path) => `(subpath ${JSON.stringify(path)})`),
+    `(regex #"^${regexQuote(resolvedPath("/tmp"))}/claude-")`,
+    `(regex #"^${regexQuote(resolvedPath(HOME))}/\\.claude\\.json")`,
+  ];
+  const denied = [...new Set([ROOT, ...CLAUDE_PROTECTED.map((entry) => join(claudeDir, entry))].map(resolvedPath))];
+  const denyRules = [
+    ...denied.map((path) => `(subpath ${JSON.stringify(path)})`),
+    `(regex #"^${regexQuote(claudeDir)}/settings[^/]*\\.json$")`,
+  ];
+  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${allowRules.join(" ")})(deny file-write* ${denyRules.join(" ")})`;
 }

@@ -44,11 +44,15 @@ test("claude result parsing separates answers from failures", () => {
   expect(parseClaudeResult(JSON.stringify({ ...result, result: "  " })).failure).toBe("claude returned an empty result");
 });
 
-test("claude profile denies writes outside claude state", () => {
-  const profile = claudeProfile(501);
-  expect(profile).toContain("(deny file-write*)");
-  expect(profile).toContain('"/private/tmp/claude-501"');
-  expect(profile).toMatch(/\.claude"\)/);
-  expect(profile).toContain("\\.claude\\.json");
+test("claude profile allows only claude scratch state and denies owner config", () => {
+  const profile = claudeProfile();
+  const [allow, deny] = profile.split(")(deny file-write* ");
+  expect(profile.startsWith("(version 1)(allow default)(deny file-write*)(allow file-write* ")).toBe(true);
+  for (const dir of ["shell-snapshots", "session-env", "sessions", "backups"]) expect(allow).toContain(`/.claude/${dir}"`);
+  expect(allow).toContain('(regex #"^/private/tmp/claude-")');
+  expect(allow).toContain("\\.claude\\.json");
+  expect(allow).not.toMatch(/\.claude"\)/);
+  for (const entry of ["codex-harness", "hooks", "skills", "plugins", "CLAUDE.md"]) expect(deny).toContain(`/.claude/${entry}"`);
+  expect(deny).toContain("/settings[^/]*\\.json$");
   expect(profile).not.toContain(process.cwd());
 });
