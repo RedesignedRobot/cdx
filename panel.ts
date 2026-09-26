@@ -17,7 +17,7 @@ import { db, write } from "./store.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import { appendFileSync, copyFileSync, existsSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, relative, resolve } from "node:path";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 export const PANEL_MEMBERS = [
   { member: "astra", engine: "gpt", model: THINKER_MODEL },
@@ -137,7 +137,7 @@ function openPanelName(records: PanelRecord[], alive = pidAlive): string | undef
 export function panelPrompt(question: string, cwd: string, pack?: string): string {
   return [
     "You are one member of a three-model panel (Astra, Sol, Claude Fable). Every member gets this same prompt and answers independently; cdx merges the answers by the file paths you cite.",
-    `Read only: do not edit files, run tests, or start cdx lanes. The repository is ${cwd}. When it has .codegraph/, run \`codegraph explore -p ${cwd} "<question>"\` in the shell before grep or reading files.`,
+    `Read only: do not edit files, run tests, or start cdx lanes. The repository is ${cwd}. If you have a shell and it has .codegraph/, run \`codegraph explore -p ${cwd} "<question>"\` before grep or reading files.`,
     `Question:\n${question}`,
     pack ? `Context pack: ${pack} (read it first).` : "No context pack.",
     [
@@ -332,6 +332,8 @@ async function startLane(panel: PanelRecord, lane: string, engine: Engine, model
   const entry = withLane(lane, (item) => { item!.panel = panel.name; return item!; });
   const spec: Spec = {
     effort, engine, model, mode: "spawn", lane, round, cwd: panel.cwd, reviewDir: panel.cwd, prompt, taskPrompt: prompt,
+    // The claude member's file tools see only the checkout and these.
+    ...(engine === "claude" && panel.pack ? { additionalDirectories: [dirname(panel.pack)] } : {}),
     maxRuntimeMins, accountHomes: config.accounts,
     model_auto_compact_token_limit: config.model_auto_compact_token_limit ?? 150_000,
     tool_output_token_limit: config.tool_output_token_limit ?? 6_000,

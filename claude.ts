@@ -13,8 +13,10 @@ import { join } from "node:path";
 
 export const CLAUDE_MODEL = "claude-fable-5-1";
 
-// Bash stays for shell codegraph; the sandbox denies its writes.
-const CLAUDE_TOOLS = "Read,Grep,Glob,Bash";
+// No shell: a consult reads, and --restricted drops every code-running tool.
+const CLAUDE_TOOLS = "Read,Grep,Glob";
+// Per member round; the first real panel answer cost $0.44 at list price.
+export const CLAUDE_BUDGET_USD = 2;
 
 export function claudeLaneRefusal(engine: Engine, kind: "work" | "review", consult: boolean): string | undefined {
   if (engine !== "claude" || (kind === "review" && consult)) return undefined;
@@ -30,10 +32,19 @@ export function claudeBinary(): string {
 
 // --safe-mode keeps the owner's hooks, CLAUDE.md, plugins and MCP servers out
 // of a headless member: the interactive Stop hook and push rules would steer
-// it. dontAsk refuses any tool outside the allowed read-only set.
-export function claudeArgs(model: string, effort: string): string[] {
-  return ["-p", "--model", model, "--effort", effort, "--output-format", "json", "--safe-mode",
-    "--no-session-persistence", "--tools", CLAUDE_TOOLS, "--allowedTools", CLAUDE_TOOLS, "--permission-mode", "dontAsk"];
+// it. --restricted ignores user settings and confines the file tools to the
+// checkout plus readDirs; dontAsk refuses any tool outside the read-only set.
+export function claudeArgs(model: string, effort: string, readDirs: string[] = []): string[] {
+  return ["-p", "--model", model, "--effort", effort, "--output-format", "json", "--safe-mode", "--restricted",
+    "--strict-mcp-config", "--no-session-persistence", "--tools", CLAUDE_TOOLS, "--allowedTools", CLAUDE_TOOLS,
+    "--permission-mode", "dontAsk", "--max-budget-usd", String(CLAUDE_BUDGET_USD), ...readDirs.flatMap((dir) => ["--add-dir", dir])];
+}
+
+// What the sandbox lets the member exec: itself, the keychain tool its
+// login reads, and git, which it runs for repository status.
+export function claudeExecutables(binary = claudeBinary()): string[] {
+  const git = Bun.which("git");
+  return [binary, "/usr/bin/security", ...(git ? [git] : [])];
 }
 
 export interface ClaudeResult {
@@ -89,7 +100,7 @@ export async function runClaudeRound(lane: string, round: number, spec: Spec): P
     item.lastAction = `claude ${spec.model ?? CLAUDE_MODEL} answering`;
   });
   const proc = Bun.spawn({
-    cmd: ["sandbox-exec", "-p", claudeProfile(), claudeBinary(), ...claudeArgs(spec.model ?? CLAUDE_MODEL, spec.effort)],
+    cmd: ["sandbox-exec", "-p", claudeProfile(claudeExecutables()), claudeBinary(), ...claudeArgs(spec.model ?? CLAUDE_MODEL, spec.effort, spec.additionalDirectories)],
     cwd: spec.cwd,
     env: laneChildEnv(undefined, { lane, round, owner: spec.ownerSession }, "claude"),
     stdin: "pipe", stdout: "pipe", stderr: "pipe",

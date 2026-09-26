@@ -55,30 +55,15 @@ export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
   return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
 }
 
-const regexQuote = (path: string) => path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-// Scratch state `claude -p` writes, found with --debug-file under a profile
-// that denied all of ~/.claude: shell snapshots for the Bash tool, the
-// session env and registry, and ~/.claude.json with its backups.
-const CLAUDE_SCRATCH = ["shell-snapshots", "session-env", "sessions", "backups"];
-// Owner configuration and live cdx state (~/.cdx links into ~/.claude). The
-// denies come last so they win over any allow above them.
-const CLAUDE_PROTECTED = ["codex-harness", "hooks", "skills", "plugins", "CLAUDE.md"];
-
-// claude runs only read-only consults. Its Bash tool writes a scratch dir and
-// a cwd file under /tmp/claude-*; the checkout stays read-only.
-export function claudeProfile(): string {
-  const claudeDir = resolvedPath(join(HOME, ".claude"));
-  const allowed = [tmpdir(), "/dev", ...CLAUDE_SCRATCH.map((dir) => join(claudeDir, dir))].map(resolvedPath);
-  const allowRules = [
-    ...allowed.map((path) => `(subpath ${JSON.stringify(path)})`),
-    `(regex #"^${regexQuote(resolvedPath("/tmp"))}/claude-")`,
-    `(regex #"^${regexQuote(resolvedPath(HOME))}/\\.claude\\.json")`,
-  ];
-  const denied = [...new Set([ROOT, ...CLAUDE_PROTECTED.map((entry) => join(claudeDir, entry))].map(resolvedPath))];
-  const denyRules = [
-    ...denied.map((path) => `(subpath ${JSON.stringify(path)})`),
-    `(regex #"^${regexQuote(claudeDir)}/settings[^/]*\\.json$")`,
-  ];
-  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${allowRules.join(" ")})(deny file-write* ${denyRules.join(" ")})`;
+// claude runs only read-only consults with Read, Grep and Glob. Probed with
+// --debug-file: `claude -p` answers with every write outside TMPDIR denied
+// (it logs and skips its ~/.claude and ~/.claude.json bookkeeping), and it
+// execs only itself, the keychain `security` tool for auth, and git. The
+// state root is denied even when it sits inside TMPDIR.
+export function claudeProfile(executables: string[]): string {
+  const writable = [tmpdir(), "/dev"].map((path) => `(subpath ${JSON.stringify(resolvedPath(path))})`);
+  const runnable = [...new Set(executables.flatMap((path) => [path, resolvedPath(path)]))].map((path) => `(literal ${JSON.stringify(path)})`);
+  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${writable.join(" ")})`
+    + `(deny file-write* (subpath ${JSON.stringify(resolvedPath(ROOT))}))`
+    + `(deny process-exec*)(allow process-exec* ${runnable.join(" ")})`;
 }

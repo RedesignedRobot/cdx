@@ -1,6 +1,10 @@
 import { expect, test } from "bun:test";
 import { claudeArgs, claudeLaneRefusal, claudeTokens, parseClaudeResult } from "./claude.ts";
 import { claudeProfile } from "./sandbox.ts";
+import { HOME, ROOT } from "./runtime.ts";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 test("claude runs consult lanes only", () => {
   expect(claudeLaneRefusal("claude", "review", true)).toBeUndefined();
@@ -15,7 +19,10 @@ test("claude args stay headless and read-only", () => {
   expect(args).toContain("--safe-mode");
   expect(args[args.indexOf("--output-format") + 1]).toBe("json");
   expect(args[args.indexOf("--permission-mode") + 1]).toBe("dontAsk");
-  expect(args[args.indexOf("--tools") + 1]).not.toMatch(/Edit|Write/);
+  expect(args[args.indexOf("--tools") + 1]).toBe("Read,Grep,Glob");
+  expect(args).toContain("--restricted");
+  expect(args[args.indexOf("--max-budget-usd") + 1]).toBe("2");
+  expect(claudeArgs("m", "low", ["/state/briefs"]).slice(-2)).toEqual(["--add-dir", "/state/briefs"]);
 });
 
 const result = {
@@ -44,15 +51,25 @@ test("claude result parsing separates answers from failures", () => {
   expect(parseClaudeResult(JSON.stringify({ ...result, result: "  " })).failure).toBe("claude returned an empty result");
 });
 
-test("claude profile allows only claude scratch state and denies owner config", () => {
-  const profile = claudeProfile();
-  const [allow, deny] = profile.split(")(deny file-write* ");
-  expect(profile.startsWith("(version 1)(allow default)(deny file-write*)(allow file-write* ")).toBe(true);
-  for (const dir of ["shell-snapshots", "session-env", "sessions", "backups"]) expect(allow).toContain(`/.claude/${dir}"`);
-  expect(allow).toContain('(regex #"^/private/tmp/claude-")');
-  expect(allow).toContain("\\.claude\\.json");
-  expect(allow).not.toMatch(/\.claude"\)/);
-  for (const entry of ["codex-harness", "hooks", "skills", "plugins", "CLAUDE.md"]) expect(deny).toContain(`/.claude/${entry}"`);
-  expect(deny).toContain("/settings[^/]*\\.json$");
-  expect(profile).not.toContain(process.cwd());
+// A real seatbelt probe: bash opens each path for append under the
+// profile. ": >>" leaves an existing file's bytes alone; a probe file the
+// profile wrongly let through is removed before the test fails.
+test.skipIf(process.platform !== "darwin")("claude profile denies every write outside TMPDIR and every foreign exec", () => {
+  const profile = claudeProfile(["/bin/bash"]);
+  mkdirSync(ROOT, { recursive: true });
+  const attempt = (path: string) => {
+    const existed = existsSync(path);
+    const ok = Bun.spawnSync(["sandbox-exec", "-p", profile, "/bin/bash", "-c", ': >> "$1"', "bash", path], { stderr: "pipe" }).success;
+    if (ok && !existed) rmSync(path, { force: true });
+    return ok;
+  };
+  const probe = `cdx-probe-${process.pid}`;
+  const denied = [
+    join(HOME, ".claude.json"), join(HOME, ".claude", "settings.json"), join(HOME, ".claude", "shell-snapshots", probe),
+    join(HOME, ".claude", "session-env", probe), join(HOME, ".claude", "hooks", probe), join(HOME, ".claude", "codex-harness", probe),
+    join(HOME, ".claude", "skills", probe), `/tmp/claude-${process.getuid!()}/${probe}`, `/tmp/${probe}`, join(ROOT, probe), join(process.cwd(), probe),
+  ];
+  expect(denied.filter(attempt)).toEqual([]);
+  expect(attempt(join(tmpdir(), probe))).toBe(true);
+  expect(Bun.spawnSync(["sandbox-exec", "-p", profile, "/bin/bash", "-c", "/usr/bin/true"]).success).toBe(false);
 });
