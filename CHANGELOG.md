@@ -1,3 +1,68 @@
+## 10.0.0
+
+Breaking. Stop every lane and job, install 10.0, then run `cdx migrate` once. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; they are now unknown keys and refuse.
+
+### State
+
+- All lane, event, session, job and question state lives in one SQLite file, `~/.cdx/state/cdx.db`, in WAL mode. Every process (CLI, runner, hooks) opens it directly with `busy_timeout` and writes under `BEGIN IMMEDIATE`. There is no daemon. `ledger.json`, `.ledger-version`, `feed.log`, `jobs.json`, `sessions.json`, `questions/*.json` and the `.lock`, `.events.lock` and `.jobs.lock` files are gone as live state.
+- `cdx migrate` imports version 5 ledger lanes, feed events, jobs and questions in one transaction and moves the old files to `state/legacy/`. It refuses a second run. On a copy of live state it imported 743 lanes, 3,286 events, 727 jobs and 477 questions in 0.2 s, dropping 4,553 lifecycle events. Nothing migrates on read: until it runs, `cdx status` prints a hint and `cdx doctor` warns.
+- Closed lanes move to an archive table that active paths never load. `cdx status` fell from 86 ms to a 27 ms median on the same 743 lanes. `status --all` and commands that name a lane (resume, review, report, wait, close) still reach archived lanes. `cdx clean [--days N]` (default 14) prunes archived lanes with their files, events and questions, then events and idle sessions past the cutoff.
+- One owner. A Claude session is a delivery cursor: the newest session that ran `cdx brief` and polled within 30 s is the head and receives events. An older session gets only messages addressed to its full id. `cdx msg <lane>` addresses the head.
+- `cdx events` returns only the kinds the head acts on: question, stalled, terminal, job-exit, message, thrash, overrun, outage. A terminal event is at most five lines of 200 characters: the verdict with the report path, then failure evidence or the report head. Supervisors get the same digest for their children, whose events never reach the head.
+- Round progress (steers, auto-continues, agy retries, gate start, kill requests, answered questions) goes to `logs/<lane>-r<round>.progress.log` instead of the feed.
+- `CDX_STATE_HOME` overrides the state root for every command. Under `bun test` or with `CDX_TEST` set, cdx refuses to run against the real `~/.cdx`. A fault suite covers the state layer.
+
+### Sandbox
+
+- Codex work lanes run `workspace-write`. Writable roots: the lane cwd, each `--add-dir`, /tmp and TMPDIR, `state/`, `control/` and the lane spill directory. `.git` stays read-only, so lanes cannot commit. Reviews, consults and consult supervisors run read-only, /tmp included.
+- Gemini lanes run agy under a `sandbox-exec` profile built from the same roots, and agy no longer gets `--dangerously-skip-permissions`.
+- Supervisors run from their own Codex home, `cdx-supervisor`, whose exec-policy rule lets a plain `cdx ...` call run outside the sandbox, because Seatbelt does not nest and each child needs its own sandbox. Calls with a redirect, `$(...)`, env prefix or wildcard do not match the rule.
+- Output caps apply to every role, reviews and supervisors included. Shell output over 4,096 bytes reaches the model as the first 2 KB and last 1.5 KB with a spill-file path under `logs/<lane>-r<round>.out/`. Codex cuts through a trusted PreToolUse hook, Gemini through the pre-tool hook's `overwrite` field.
+- Lanes run without MCP servers: 88% of lane MCP outputs were over 4 KB, and Codex ignores hook rewrites for MCP output. Codegraph runs through the shell.
+- Reviews hash the tree before and after the round; a moved hash fails the round with "review tree changed despite the read-only sandbox". The after-the-fact write detection is gone.
+
+### Landing
+
+- Review proof binds to the tree, not the lane name. Any review that saw a lane's worktree or gated tree attests for it. Land refuses only when the newest review of the current or gated tree has P1/P2 findings, or when the lane was reviewed but never at those trees. Unreviewed lanes still land.
+- `cdx land` commits the lane, builds the merge with `git merge-tree --write-tree`, and gates that merge commit once in a frozen snapshot. When the merge tree equals the green receipt tree, no gate runs. Head edits after the gate no longer refuse.
+- `cdx land --batch <lane>...` (MCP `lanes: [...]`) merges lanes in order under one gate and one push. A red batch bisects with at most log2 N extra gates, lands the green prefix, and names the lane whose merge turned it red.
+- A dirty base checkout blocks only when its dirty files overlap the merge. The base need not be checked out; land updates the ref directly. Push goes to the base branch's upstream and is skipped without one.
+- Supervisor children get their own worktree by default, branched from the supervisor's branch. A supervisor lands children only into its own branch.
+- `cdx close` removes a clean worktree even when its branch is unmerged, and keeps the branch. `cdx doctor --days N` (default 7) lists idle cdx worktrees; `--fix` removes them.
+
+### Contract
+
+- A work spawn, respawns included, needs `## Outcome`, `## Files`, `## Acceptance` and `## Out of scope` sections with bodies, plus a gate from `--gate` or `.cdx-gate`. `--supervisor` also needs `## Children` with two or more child file sets. Consults and reviews are exempt. One refusal line names everything missing. The MCP `spawn` tool takes `outcome`, `files`, `acceptance`, `outOfScope`, `children` and `scopePolicy` fields.
+- `--scope-policy ask|extend|stop`, default `extend`. Extend edits outside Files and lists each file under `## Scope extensions`, which the gate receipt records as `scopeExtensions`. Stop ends the round. Under extend and stop, cdx answers scope-permission asks itself without waking the head.
+- A no-op gate (`true`, `:`, `exit`, `exit 0`, `/bin/true`, `/usr/bin/true`, a bare `echo`) is refused when the repo has `.cdx-gate`, at spawn and at `cdx gate`.
+- `cdx usage --totals` adds outcome lines per engine role and per repo: lanes, green, landed, green on round 1 and landed, and mean rounds to green, over live and archived work lanes. `usage --json` carries `outcomes`.
+- Routing: Sol is the default in every repo. `repoRouting` defaults to `{}`; the shipped portals-to-Astra route is gone. A Gemini work lane prints a warning that Gemini is reserved for read-only work.
+
+### Context
+
+- Standing lane rules moved out of the brief into a Codex lane home per role (`cdx-lane`, `cdx-supervisor`, `cdx-review`, `cdx-review-supervisor`) with an AGENTS.md cdx renders at launch. Gemini's static rules live in its agent files. The injected brief for a sample work lane fell from 3,291 to 156 bytes, a supervisor from 4,562 to 162.
+- `cdx context <repo> [--model M]` writes `.cdx/context/<HEAD>.md` in the main checkout with one read-only consult (Sol by default, Gemini refused): repo map, commands, gate and rule pointers, capped at 6,000 chars. Lane briefs point at the digest for HEAD or one of the last 20 commits.
+- `cdx shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]` grades png and jpg shots in consults of at most 8 (Sol with images by default), writes `<dir>/verdict.json`, and prints only failed screens. `--downscale` writes 1000 px copies of failed shots.
+- `cdx consult` and `cdx review` accept `--image F` on gpt.
+- Every codegraph call cdx suggests runs under a 60 s deadline; on timeout or failure lanes fall back to text search and say so. The head's codegraph hook never blocks when codegraph is missing, the repo is unindexed, or an explore already ran that turn.
+- The mod counts the head's compactions per session. The first Stop after the second compaction blocks once and tells the head to update `BATCH.md`, push the owner "roll session" and end the turn.
+
+### Panel
+
+- `cdx panel <name> --cd D [--pack F] [--bg] ("<question>" | -)` and the MCP `panel` tool ask Astra, Sol and Claude Fable the same question as read-only consult lanes `<name>-astra`, `<name>-sol` and `<name>-fable`. cdx merges the answers into `reports/<name>.md` under 60 lines, grouping claims by cited path (3/3, 2/3, 1/3) and marking citations to lines that do not exist. When two or more members answered, one Astra consult appends a verdict of at most 8 lines on the contradictions. One `panel` event reaches the head; member events do not.
+- Refusals: a panel from a panel member, a second panel per supervisor round, a second open panel, question plus pack over 20,000 chars, under 10% left on Astra's best account or on the active Claude account's tightest weekly window. Each member runs at most 15 minutes; a missing answer marks the panel incomplete.
+- A `claude` engine runs panel members and read-only consults only, calling the real `claude` binary with `--safe-mode`, read tools and `--permission-mode dontAsk` under a sandbox-exec profile. `--engine` on spawn and consult still accepts only gpt and gemini.
+
+### Removed
+
+- `cdx takeover` and the MCP `takeover` tool, session bindings, ownership refusals between sessions, and the pid heads map.
+- `cdx adopt`, `cdx view` and its browser dashboard, the TUI and `CDX_TUI`, `cdx lanes`, and `cdx events --watch`.
+- `--gate-baseline-check` and baseline gate runs.
+- The file-edit thrash detector and the `visibility.fileEdits` and `visibility.heartbeatMinutes` keys; `visibility` holds `failureRepeats` and `testRuns`. The progress heartbeat digest.
+- Feed kinds `started`, `active`, `progress`, `gate-started` and `report-written`.
+- Shared-tree children, `danger-full-access` lanes, lane MCP servers, and the cap exemption for reviews and supervisors.
+- `agents/codex-lane.md`, the `landingCommit` lane field, and the land refusals "worktree differs from its green receipt" and "base checkout is dirty".
+
 ## 9.5.0
 
 - New head-launched work lanes use `repoRouting` before the default work model. The shipped portal route selects `gpt-6-astra` for `/Users/mas/code/hyperscale-portals`, including linked worktrees. Explicit model or Gemini selections win; retained models and the child-Astra rule stay in force. Spawn prints the selection reason.
