@@ -1,5 +1,5 @@
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
-import { codexSandbox, geminiProfile, LANE_TOOL_ENV, laneCodegraphRoot, prepareSandboxDirs } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, LANE_TOOL_ENV, prepareSandboxDirs } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
 import { geminiTokens } from "./tokens.ts";
 import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome } from "./account-sync.ts";
@@ -511,7 +511,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   };
 
   const trackTools = roundTools(spec.cwd, spec.visibility ?? VISIBILITY_DEFAULTS,
-    (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } }, spec.gate, laneCodegraphRoot(spec));
+    (path) => { try { return createHash("sha256").update(readFileSync(path)).digest("hex"); } catch { return null; } }, spec.gate);
   // Files this round's own tool calls wrote, for the shared-worktree check below.
   const writtenPaths = new Set<string>();
   const commandTrees = new Map<string, ReturnType<typeof captureReviewTree>>();
@@ -1018,7 +1018,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         input,
         cwd: spec.cwd,
         approvalPolicy: "never",
-        sandboxPolicy: codexSandbox(spec).policy,
+        ...codexSandbox(spec).turn,
         ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
         effort: spec.effort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),

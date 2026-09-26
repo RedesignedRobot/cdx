@@ -1284,7 +1284,7 @@ test("every GPT role receives the caps and a sandbox, and every thread sheds unu
     features: { memories: false, plugins: false, apps: false }, skills: { include_instructions: false } });
   expect(work.mcp_servers.context7.enabled).toBe(false);
   expect(appThreadParams(base).sandbox).toBe("workspace-write");
-  for (const [patch, sandbox] of [[{ reviewDir: "/repo" }, "read-only"], [{ supervisor: true }, "workspace-write"]] as const) {
+  for (const [patch, sandbox] of [[{ reviewDir: "/repo" }, undefined], [{ supervisor: true }, "workspace-write"]] as const) {
     const params = appThreadParams({ ...base, ...patch });
     expect(params.sandbox).toBe(sandbox);
     expect(params.config).toMatchObject({ model_auto_compact_token_limit: 150000, tool_output_token_limit: 6000 });
