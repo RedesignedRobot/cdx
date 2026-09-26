@@ -1,3 +1,42 @@
+## 10.0.1 (2026-09-26)
+
+Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses.
+
+### Landing
+
+- A land that must run its merge gate detaches. It commits, builds the merge and runs every refusal first, then records job `land-<first lane>`, runs `cdx _land` detached, prints the job and log, and exits 0. The `job-exit` event carries the land result or refusal. A receipt-proven land and a supervisor's land stay inline. The native `land` tool no longer dies at the ten-minute tool ceiling.
+- The batch merge gate takes its installs from the lane that changed a lockfile, not the first lane. A batch with two lockfile lanes is refused.
+- Land refuses a lane migrated from 9.x with an open review (`reviewClosed: false`) and no attestations.
+- A spawn that reuses a closed lane's name drops its review attestations, review state and landed commit.
+- After a review closed with P3 findings only, a changed tree gets a fresh review; the same tree is refused with "reuse its report".
+- Only a finished review round attests; a failed or killed one proves nothing.
+- Worktree setup (`worktreeSetup`, `.cdx-worktree-setup`) runs in the lane's runner before the engine, not in `cdx spawn`. Output goes to `logs/<lane>-r<round>.setup.log`, and a failure fails the round with the last line and the log path. Spawn no longer prints setup output.
+- `cdx doctor --fix` keeps a stale worktree whose ignored files have no copy in the primary checkout (a lane's `.env`) and says `kept ...`. A `lane/*` branch cdx has no record of no longer counts as a closed lane; its worktree goes only when the branch is merged.
+
+### Panel
+
+- `cdx panel` always detaches and returns the report path; `--bg` is gone and refused.
+- Files moved to `reports/panels/<name>/`: `panel.md` is the merged report, `astra.md`, `sol.md` and `fable.md` the answers. A panel named `foo-r2` can no longer overwrite lane foo's round 2 report.
+- `cdx wait <panel>` blocks until the panel settles and prints its completion line; a supervisor's launch hint names that command.
+- A panel refuses when `cca` is not on PATH or gives no weekly quota, and when its name is taken by a panel, lane or job. The name and open-panel guards run inside the transaction that records the panel.
+- Member rounds carry the review lane rules. Every 10.0.0 panel failed to start its Codex members without them.
+
+### Delivery
+
+- Only a session that drove cdx can be head. The mod runs `cdx brief --head` at an interactive session start, so a new session beside an older idle one takes the wakes at once; a headless start never claims. With no driver, events wait for one.
+- `cdx shots grade` runs as job `shots-<dir>`, and its `job-exit` is the one wake. Terminal events of the consults that `shots grade` and `cdx context` start no longer reach the head; their questions still do.
+- The rollover Stop block runs the settings Stop hooks first, the owner's push guard included, and joins their block text with its own.
+- Native tools run under the ten-minute `$.process.run` ceiling instead of the engine's 30 s default, unless they name a shorter bound (`ask` 100 s, `doctor` 120 s).
+- `land` refuses a call with neither `lane` nor `lanes`, with both, or with a bad `lanes` item, instead of running `cdx land undefined`. `gate` refuses a call with neither `cmd` nor `clear`. A null `maxRuntime` or `expect` is dropped, and an unknown tool name returns an error.
+
+### Sandbox
+
+- Lane codegraph lookups stop at the checkout root instead of climbing into a parent index such as `~/code/.codegraph`. A worktree with no index borrows its primary checkout's, the lane brief names `codegraph explore -p <primary>`, and that `.codegraph` dir is writable for work and Gemini lanes. Codex reviews and consults cannot open an index and are told to use rg.
+- Lane shells get `BUN_INSTALL_CACHE_DIR` under TMPDIR; the sandbox denied `~/.bun/install/cache`.
+- Codex work lane rules say Chromium needs `--single-process` in the sandbox.
+- Supervisor rules single-quote every brief, gate and question. A double-quoted brief with backticks missed the `prefix_rule(["cdx"])` exec-policy match and ran sandboxed.
+- Job git trees are computed outside the database write lock.
+
 ## 10.0.0
 
 Breaking. Stop every lane and job, install 10.0, run `cdx migrate` once, then restart every open Claude Code session (or `/reload-plugins` in each) before the first spawn; a session still holding the 9.x mod calls removed tools and lands with a 120 s timeout. Remove `visibility.heartbeatMinutes` and `visibility.fileEdits` from `config.json`; they are now unknown keys and refuse.

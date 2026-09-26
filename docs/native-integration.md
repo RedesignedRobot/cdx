@@ -6,8 +6,8 @@ The historical 7.0 design below explains the module boundary between `cdx.ts` an
 
 - Events are rows in the `events` table of `state/cdx.db` (bun:sqlite, WAL). The CLI, runners and the mod open the database directly; there is no feed file and no daemon.
 - A Claude session is a delivery cursor, not an owner. Every lane belongs to the one owner, and any session may act on any lane.
-- `cdx brief` registers the calling session. The mod runs it at session start, and runs `cdx brief --head` after `/clear` and `/resume`. It writes a session row with the session's own cursor at the newest event.
-- The head is the session, among those that polled within 30 seconds, that most recently drove cdx: spawn, resume, send, review, consult, panel, reply, land, or `cdx brief --head`. With no active driver, the longest-running active session is the head. A session that only started and polled never takes the wakes.
+- `cdx brief` registers the calling session. The mod runs `cdx brief --head` at an interactive session start and after `/clear` and `/resume`, and plain `cdx brief` at a headless start. It writes a session row with the session's own cursor at the newest event.
+- The head is the session, among those that polled within 30 seconds, that most recently drove cdx: spawn, resume, send, review, consult, panel, reply, land, or `cdx brief --head`. With no active driver there is no head and events wait. A headless session that only started and polled never takes the wakes; Agent-tool subagents and in-process teammates fire no session start of their own.
 - Owner events have one cursor, `owner_cursor` in the meta table, which moves only after a head received them. When the head changes, the new head picks up every owner event no head has received. Each session's own cursor covers only messages addressed to its full session id. `cdx feed` shows every event to any session.
 - Only actionable kinds reach a session: `question`, `stalled`, `terminal`, `job-exit`, `message`, `thrash`, `overrun`, `outage`, `panel`. Lifecycle kinds stay in the table for `cdx feed` and never wake a head. There is no heartbeat event; round progress goes to `logs/<lane>-r<round>.progress.log`.
 - A terminal event carries at most 5 lines of 200 characters plus the report path, never the report body. A child's terminal goes to its supervisor, not the head.
@@ -18,14 +18,14 @@ The historical 7.0 design below explains the module boundary between `cdx.ts` an
 
 | Tool | Required input | Behavior |
 | --- | --- | --- |
-| `land` | `lane` or `lanes` | Gates the merge result once unless a green receipt already covers that tree, then commits, fast-forwards the base, pushes, removes worktrees and branches, and closes. `lanes` lands a batch; a red batch names the lane that broke it and lands the green prefix |
+| `land` | `lane` or `lanes` | Gates the merge result once unless a green receipt already covers that tree, then commits, fast-forwards the base, pushes, removes worktrees and branches, and closes. `lanes` lands a batch; a red batch names the lane that broke it and lands the green prefix. A land that must gate detaches into job `land-<lane>` and returns; its `job-exit` event carries the result |
 | `ask` | `question`, `cd` | Synchronous read-only Gemini answer, no lane, 90-second limit, macOS sandbox-exec required |
-| `panel` | `name`, `question`, `cd` | Always `--bg`. Astra, Sol and Claude Fable answer as read-only consult lanes; one `panel` event carries the merged report path, the three recommendations and coverage. Member events never reach a session. The head and work supervisors may call it, a consult supervisor may not. A supervisor's panel lanes are its children: its kill or round end stops them, and its Astra member is an owner-approved exception (2026-09-26) to the no-Astra-child rule |
+| `panel` | `name`, `question`, `cd` | Always detached; the report is `reports/panels/<name>/panel.md`. Astra, Sol and Claude Fable answer as read-only consult lanes; one `panel` event carries the merged report path, the three recommendations and coverage. Member events never reach a session. The head and work supervisors may call it, a consult supervisor may not. A supervisor's panel lanes are its children: its kill or round end stops them, and its Astra member is an owner-approved exception (2026-09-26) to the no-Astra-child rule |
 | `resume` | `lane`, `followUp`, `fix` | `fix` is `gate` or `review`; same HEAD and failed evidence required |
 
 The tool set is `land`, `ask`, `spawn`, `resume`, `consult`, `panel`, `review`, `events`, `send`, `reply`, `questions`, `status`, `report`, `tail`, `close`, `kill`, `gate`, `gate-receipt`, `job`, `msg`, `inbox`, `usage` and `doctor`.
 
-All required fields are validated before argv conversion. Missing values cannot become the string `undefined`. Nonzero command exits return `isError: true`. Native tool output over 20,000 bytes is cut to its head and tail with the path of a file that holds the full text.
+All required fields are validated before argv conversion. Missing values cannot become the string `undefined`. Nonzero command exits and unknown tool names return `isError: true`. Every tool runs under the ten-minute `$.process.run` ceiling unless it names a shorter bound (`ask` 100 s, `doctor` 120 s). Native tool output over 20,000 bytes is cut to its head and tail with the path of a file that holds the full text.
 
 Reload the Claude plugin after updating to register the new tools. Existing lane processes keep the code and account configuration they started with.
 
