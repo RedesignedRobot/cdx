@@ -37,7 +37,7 @@ export const SELF = import.meta.path.replace(/\/runtime\.ts$/, "/cdx.ts");
 
 export const REPO_ROOT = SELF.replace(/\/cdx\.ts$/, "");
 
-export const VERSION = "10.0.1";
+export const VERSION = "10.0.2";
 
 const COLOR_ENABLED = process.argv[2] !== "_run" && process.env.NO_COLOR === undefined
   && (process.env.FORCE_COLOR !== undefined

@@ -1,3 +1,20 @@
+## 10.0.2 (2026-09-26)
+
+### Panel
+
+- The panel quota guard checks the account its Codex members run on. The light-demand pick spends the account nearest its reset first; when that pick has under 10% free, the panel takes the fullest eligible account instead and pins the Astra, Sol and verdict lanes to it. Before, one account near its reset refused every panel while the others had 60% or more left.
+- The refusal names the account and the holds: `codex-1, the fullest Codex account, has 2% free after 15% held by running lanes; a panel needs 10%`. The number is free quota after the 3% each running lane holds, not usage.
+- `cdx help` no longer lists `--bg` for `cdx panel`, which refuses it.
+- `cdx wait <panel>` blocks until the panel settles. It returned at once with no output, even for a failed panel, and a wait on lanes plus a panel stopped when the lanes finished.
+
+### Review
+
+- Review dedup keys on the target. A `--commit` or `--base` review records the resolved commit beside the checkout's HEAD and tree, so reviews of two commits from one checkout are no longer refused as duplicates. A same-lane review of a new target starts fresh instead of checking a fix diff.
+
+### Worktrees
+
+- `cdx doctor --fix` removes a stale worktree's ignored directories only when they are `node_modules` or `.codegraph`. Any other ignored directory keeps the worktree: an ignored `data/` counted as copied whenever the primary checkout had a `data/`, so a lane's only `data/local.sqlite` was deleted.
+
 ## 10.0.1 (2026-09-26)
 
 Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open Claude Code session: the 10.0.0 mod still passes `--bg` to `cdx panel`, which 10.0.1 refuses. A reload leaves the head where it was.

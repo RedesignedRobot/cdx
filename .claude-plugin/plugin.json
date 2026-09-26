@@ -1,6 +1,6 @@
 {
   "name": "cdx",
-  "version": "10.0.1",
+  "version": "10.0.2",
   "types": "./hooks/contract.d.ts",
   "description": "Run OpenAI Codex and Google Antigravity execution lanes from Claude Code with background event delivery, status tracking, and raw command protection.",
   "author": {
