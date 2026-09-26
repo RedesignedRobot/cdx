@@ -1,5 +1,5 @@
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
-import { codexSandbox, geminiProfile, LANE_TOOL_ENV, prepareSandboxDirs } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, LANE_TOOL_ENV, prepareSandboxDirs, reviewSandboxRefusal } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
 import { geminiTokens } from "./tokens.ts";
 import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome } from "./account-sync.ts";
@@ -31,7 +31,7 @@ import {
   activeStateOf, feedEvent, findLane, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
   type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLane, withLedger,
 } from "./ledger.ts";
-import { sharedTreeLanes, reviewLoopClosed } from "./prompts.ts";
+import { sharedTreeLanes, reviewLoopClosed, withCodegraphFact } from "./prompts.ts";
 import {
   type ControlRecord, controlText, expireRoundQuestions, notifyParent, readDeliveredCount,
   writeDeliveredCount,
@@ -215,6 +215,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     writeFileSync(logPath, `${safeJSON(setup)}\n`);
     throw new CmdError(`worktree setup failed in ${spec.cwd} (log ${setup.log}): ${setup.tail?.split("\n").at(-1) ?? ""}`);
   }
+  spec = { ...spec, prompt: withCodegraphFact(spec.prompt, spec.cwd) };
   if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), spec.laneInstructions!, role);
   prepareSandboxDirs(spec);
   const reportPath = reportPathOf(lane, round);
@@ -1117,6 +1118,8 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       });
       threadId = threadResult?.thread?.id;
       if (typeof threadId !== "string") throw new Error(`${method} returned no thread id`);
+      const sandboxRefusal = role.review ? reviewSandboxRefusal(threadResult, spec.cwd) : undefined;
+      if (sandboxRefusal) throw new Error(sandboxRefusal);
       touchLedger((item) => { item.sessionId = threadId; item.lastEventAt = new Date().toISOString(); }, true);
       const firstTurnId = await startTurn(threadId, spec.prompt, true);
       await queueControlDrain();

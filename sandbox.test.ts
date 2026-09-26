@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { capNotice, CAP_BYTES, cappedCommand, codexPreTool, geminiOverwrite, invokesCdx, utf8Boundary } from "./cap.ts";
-import { codexSandbox, geminiProfile, resolvedPath, REVIEW_PROFILE, spillDirOf } from "./sandbox.ts";
-import { houseRules, laneInstructions } from "./prompts.ts";
+import { codexSandbox, geminiProfile, resolvedPath, REVIEW_PROFILE, reviewSandboxRefusal, spillDirOf } from "./sandbox.ts";
+import { houseRules, laneInstructions, withCodegraphFact } from "./prompts.ts";
 import { ROOT } from "./runtime.ts";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -62,9 +62,25 @@ test("a worktree lane or review queries its primary checkout's index, which it m
     expect((codexSandbox({ cwd: lane, lane: "w", round: 1 }).turn as { sandboxPolicy: { writableRoots: string[] } }).sandboxPolicy.writableRoots).toContain(index);
     expect(codexSandbox({ cwd: lane, reviewDir: lane }).config).toMatchObject({ permissions: { [REVIEW_PROFILE]: { filesystem: { [index]: "write" } } } });
     expect(geminiProfile({ cwd: lane, reviewDir: lane })).toContain(`(subpath ${JSON.stringify(index)})`);
-    expect(houseRules(lane, false, "gpt")).toContain(`codegraph explore -p ${primary} "<question>"`);
-    expect(houseRules(lane, true, "gpt")).toContain(`codegraph explore -p ${primary} "<question>"`);
+    expect(withCodegraphFact("brief", lane)).toContain(`codegraph explore -p ${primary} "<question>"`);
+    expect(houseRules(lane, false, "gpt")).not.toContain("codegraph");
+    // Worktree setup runs `codegraph init .` in the runner, after spawn built the brief.
+    mkdirSync(join(lane, ".codegraph"));
+    writeFileSync(join(lane, ".codegraph", "codegraph.db"), "");
+    expect(withCodegraphFact("brief", lane)).toBe("brief");
+    const roots = (codexSandbox({ cwd: lane, lane: "w", round: 1 }).turn as { sandboxPolicy: { writableRoots: string[] } }).sandboxPolicy.writableRoots;
+    expect(roots).toContain(resolvedPath(join(lane, ".codegraph")));
+    expect(roots).not.toContain(index);
   } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("a review thread fails unless it runs the cdx-review profile without write access to the checkout", () => {
+  const limited = { type: "workspaceWrite", writableRoots: ["/repo/.codegraph", "/var/tmp/T"] };
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: limited }, "/repo")).toBeUndefined();
+  expect(reviewSandboxRefusal({ activePermissionProfile: null, sandbox: { type: "dangerFullAccess" } }, "/repo")).toContain("profile none");
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: ":workspace" }, sandbox: limited }, "/repo")).toContain(":workspace");
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { type: "dangerFullAccess" } }, "/repo")).toContain("may write /repo");
+  expect(reviewSandboxRefusal({ activePermissionProfile: { id: REVIEW_PROFILE }, sandbox: { type: "workspaceWrite", writableRoots: ["/"] } }, "/repo/src")).toContain("may write");
 });
 
 test("supervisor cdx calls are single-quoted so the exec-policy rule matches", () => {

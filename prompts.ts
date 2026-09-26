@@ -9,7 +9,7 @@ import { specPathOf } from "./reports.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { codegraphRoot } from "./sandbox.ts";
 import { existsSync, readFileSync } from "node:fs";
-import { relative } from "node:path";
+import { relative, resolve } from "node:path";
 
 // Standing rules live in the lane home: Codex loads $CODEX_HOME/AGENTS.md into
 // every thread and agy loads the agent file, so the brief carries only a pointer
@@ -109,6 +109,14 @@ export function sharedTreeLanes(lane: string, cwd: string, ledger: Ledger, treeR
     && treeRoot(entry.kind === "review" ? entry.review!.cwd : workCwdOf(entry)) === root).map(([name]) => name).sort();
 }
 
+// The runner adds this after worktree setup, which may build the worktree's
+// own index; the sandbox makes writable the same index this names.
+export function withCodegraphFact(prompt: string, cwd: string): string {
+  const index = codegraphRoot(cwd);
+  if (!index || !relative(index, resolve(cwd)).startsWith("..")) return prompt;
+  return `${prompt}\n\nCodegraph: this worktree has no index of its own; run \`${CODEGRAPH_EXPLORE} -p ${index} "<question>"\`. It answers from the primary checkout at ${index}, so read files you changed from the worktree.`;
+}
+
 export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
   const role = { review: reviewOnly, supervisor: Boolean(opts.supervisor) && engine === "gpt" };
   const facts = [engine === "gpt"
@@ -117,10 +125,6 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
   if (engine !== "gpt") facts.push(...ownerRules(), ...(reviewOnly ? [] : [testRunRule()]));
   const projectRules = `${cwd}/.cdx-rules.md`;
   if (existsSync(projectRules) && readFileSync(projectRules, "utf8").trim()) facts.push(`Project rules: read ${projectRules} before starting.`);
-  const index = codegraphRoot(cwd);
-  if (index && relative(index, cwd).startsWith("..")) {
-    facts.push(`Codegraph: this worktree has no index of its own; run \`${CODEGRAPH_EXPLORE} -p ${index} "<question>"\`. It answers from the primary checkout at ${index}, so read files you changed from the worktree.`);
-  }
   const digest = digestLine(contextDigest(cwd));
   if (digest) facts.push(digest);
   return facts.map((fact) => `- ${fact}`).join("\n");

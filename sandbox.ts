@@ -22,10 +22,13 @@ type SandboxSpec = Pick<Spec, "cwd" | "additionalDirectories" | "reviewDir"> & {
 // so lane shells keep their package cache under TMPDIR, which every role may write.
 export const LANE_TOOL_ENV = { BUN_INSTALL_CACHE_DIR: join(tmpdir(), "cdx-bun-cache") };
 
+// An index counts only at or below the enclosing checkout; a cwd outside any
+// checkout gets none, so no lane reaches a shared parent index such as ~/code.
 function indexedAncestor(start: string, exists: (path: string) => boolean): { index?: string; checkout?: string } {
+  let index: string | undefined;
   for (let path = start; ; path = dirname(path)) {
-    if (exists(join(path, ".codegraph", "codegraph.db"))) return { index: path };
-    if (exists(join(path, ".git"))) return { checkout: path };
+    index ??= exists(join(path, ".codegraph", "codegraph.db")) ? path : undefined;
+    if (exists(join(path, ".git"))) return { index, checkout: path };
     if (dirname(path) === path) return {};
   }
 }
@@ -37,8 +40,7 @@ function gitPointer(path: string): string | undefined {
 // The index codegraph should answer from for a lane cwd. Codegraph counts a
 // directory only when .codegraph/codegraph.db exists (cdx tracks a bare
 // .codegraph/.gitignore) and would climb past the checkout into an unrelated
-// parent index such as ~/code, so the lookup stops at the checkout root. A
-// linked worktree without its own index borrows the primary checkout's index
+// parent index such as ~/code. A linked worktree without its own index borrows the primary checkout's index
 // at the same relative path.
 export function codegraphRoot(cwd: string, exists: (path: string) => boolean = existsSync, readGit = gitPointer): string | undefined {
   const start = resolve(cwd);
@@ -85,6 +87,18 @@ export const REVIEW_PROFILE = "cdx-review";
 // 0.156 fails every turn with "failed to load workspace requirements" when the
 // profile is selected through the thread/start or turn/start `permissions`
 // field, so the profile comes from the default_permissions config override.
+// The review profile arrives only through a config override that an account
+// config could outrank, so the runner checks what thread/start or thread/resume
+// reports and refuses a thread that could write the checkout.
+export function reviewSandboxRefusal(thread: { activePermissionProfile?: { id?: string } | null; sandbox?: { type?: string; writableRoots?: string[] } }, cwd: string): string | undefined {
+  const profile = thread.activePermissionProfile?.id;
+  if (profile !== REVIEW_PROFILE) return `review thread runs permissions profile ${profile ?? "none"}, not ${REVIEW_PROFILE}`;
+  const at = resolvedPath(cwd);
+  const writesCwd = thread.sandbox?.type === "dangerFullAccess" || thread.sandbox?.type === "externalSandbox"
+    || (thread.sandbox?.writableRoots ?? []).some((root) => !relative(resolvedPath(root), at).startsWith(".."));
+  return writesCwd ? `review thread may write ${cwd}: ${JSON.stringify(thread.sandbox)}` : undefined;
+}
+
 export function codexSandbox(spec: SandboxSpec) {
   if (spec.reviewDir) {
     const filesystem = { ":root": "read", ":tmpdir": "write", ...Object.fromEntries(codegraphDirs(spec).map((dir) => [dir, "write"])) };
