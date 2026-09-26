@@ -1,0 +1,113 @@
+import { expect, test } from "bun:test";
+import {
+  citationProblem, claudeHeadroom, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
+} from "./panel.ts";
+
+const cwd = "/repo";
+const answer = (member: string, claims: string[], recommendation = `${member} says keep it`) => parseAnswer(member, [
+  "## Recommendation", recommendation, "", "## Claims", ...claims, "", "## Dissent", "Someone could split it.", "", "## Confidence", "medium, read two files",
+].join("\n"), cwd);
+
+test("answers parse into recommendation, marked claims, dissent and confidence", () => {
+  const parsed = answer("sol", [
+    "- verified | ledger.ts:12 | lanes live in SQLite",
+    "- [inferred] | `/repo/runner.ts:40-44` | the runner finalizes",
+    "- verified | 3 | three members",
+    "- not a claim line",
+  ]);
+  expect(parsed.recommendation).toBe("sol says keep it");
+  expect(parsed.dissent).toBe("Someone could split it.");
+  expect(parsed.confidence).toBe("medium, read two files");
+  expect(parsed.claims).toEqual([
+    { member: "sol", mark: "verified", evidence: "ledger.ts:12", path: "ledger.ts", line: 12, text: "lanes live in SQLite" },
+    { member: "sol", mark: "inferred", evidence: "/repo/runner.ts:40-44", path: "runner.ts", line: 40, endLine: 44, text: "the runner finalizes" },
+    { member: "sol", mark: "verified", evidence: "3", text: "three members" },
+  ]);
+});
+
+test("claims group by cited path into three, two and one member agreement", () => {
+  const groups = groupClaims([
+    answer("astra", ["- verified | a.ts:1 | x", "- verified | a.ts:2 | y", "- verified | b.ts:1 | z"]),
+    answer("sol", ["- inferred | a.ts:3 | x", "- verified | b.ts:1 | z", "- verified | 7 | n"]),
+    answer("fable", ["- verified | a.ts:1 | x", "- verified | c.ts:9 | w"]),
+  ]);
+  expect(groups.map((group) => [group.path, group.agreement])).toEqual([["a.ts", 3], ["b.ts", 2], ["c.ts", 1]]);
+  expect(groups[0]!.claims.astra).toHaveLength(2);
+});
+
+test("citation checks catch missing files and lines past the end", () => {
+  const lines = (path: string) => path === "a.ts" ? 10 : undefined;
+  const [inside, past, missing, range, number] = answer("fable", [
+    "- verified | a.ts:10 | ok", "- verified | a.ts:11 | past", "- verified | nope.ts:1 | missing", "- verified | a.ts:9-12 | range", "- verified | 42 | n",
+  ]).claims;
+  expect(citationProblem(inside!, lines)).toBeUndefined();
+  expect(citationProblem(past!, lines)).toBe("fable a.ts:11 (file has 10 lines)");
+  expect(citationProblem(missing!, lines)).toBe("fable nope.ts:1 (no such file)");
+  expect(citationProblem(range!, lines)).toBe("fable a.ts:9-12 (file has 10 lines)");
+  expect(citationProblem(number!, lines)).toBeUndefined();
+});
+
+test("the merged report stays under 60 lines with many paths and flags bad citations", () => {
+  const many = (member: string) => answer(member, Array.from({ length: 20 }, (_, index) => `- verified | ${member}-${index}.ts:1 | c`));
+  const answers: MemberAnswer[] = [many("astra"), many("sol"), answer("fable", ["- verified | astra-0.ts:99 | bad line"])];
+  const report = renderPanelReport({
+    name: "p1", question: "q?", answers, lines: () => 5,
+    outcomes: [
+      { member: "astra", state: "done", tokens: { input: 1000, cached: 500, output: 100 } },
+      { member: "sol", state: "done" }, { member: "fable", state: "done" },
+    ],
+  });
+  const lines = report.trimEnd().split("\n");
+  expect(lines.length).toBeLessThanOrEqual(REPORT_LINES);
+  expect(REPORT_LINES + 3 + VERDICT_LINES).toBeLessThan(60);
+  expect(report).toContain("Coverage: 3/3");
+  expect(report).toContain("| 2/3 | astra-0.ts | 1v | - | 99v! |");
+  expect(report).toMatch(/\(\d+ more paths in the answers\)/);
+  expect(report).toContain("fable astra-0.ts:99 (file has 5 lines)");
+});
+
+test("a missing member leaves the report and the completion line incomplete", () => {
+  const answers = [answer("astra", []), answer("fable", [])];
+  const report = renderPanelReport({
+    name: "p2", question: "q", answers, lines: () => undefined,
+    outcomes: [{ member: "astra", state: "done" }, { member: "sol", state: "failed", note: "max runtime" }, { member: "fable", state: "done" }],
+  });
+  expect(report).toContain("Coverage: 2/3");
+  expect(report).toContain("sol failed: max runtime");
+  expect(report).toContain("- sol: no answer");
+  const line = completionLine({ name: "p2" }, "/r/p2.md", answers);
+  expect(line).toBe("[cdx] panel=p2 coverage=incomplete report=/r/p2.md astra: astra says keep it | sol: no answer | fable: fable says keep it");
+});
+
+const admitted = { callerIsMember: false, supervisorAskedThisRound: false, inputChars: 100, astraHeadroom: 50, claudeHeadroom: 50 };
+
+test("panel guards refuse recursion, repeats, size and low quota", () => {
+  expect(panelRefusal(admitted)).toBeUndefined();
+  expect(panelRefusal({ ...admitted, claudeHeadroom: undefined })).toBeUndefined();
+  expect(panelRefusal({ ...admitted, callerIsMember: true })).toBe("a panel member cannot start a panel");
+  expect(panelRefusal({ ...admitted, supervisorAskedThisRound: true })).toContain("once per round");
+  expect(panelRefusal({ ...admitted, openPanel: "p0" })).toContain("panel p0 is still open");
+  expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS + 1 })).toContain("the cap is 20000");
+  expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();
+  expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("Astra's account has 9% left; a panel needs 10%");
+  expect(panelRefusal({ ...admitted, claudeHeadroom: 4 })).toBe("the Claude weekly quota has 4% left; a panel needs 10%");
+});
+
+test("claude headroom reads the active account's tightest weekly window", () => {
+  const status = { active: "xa", accounts: [
+    { name: "dev", limits: [{ label: "week", percent: 99 }] },
+    { name: "xa", limits: [{ label: "5h", percent: 95 }, { label: "week", percent: 35 }, { label: "Fable wk", percent: 80 }] },
+  ] };
+  expect(claudeHeadroom(status)).toBe(20);
+  expect(claudeHeadroom({ active: "xa", accounts: [{ name: "xa", limits: [{ label: "5h", percent: 10 }] }] })).toBeUndefined();
+  expect(claudeHeadroom({})).toBeUndefined();
+});
+
+test("every member gets the same frozen prompt with the answer shape", () => {
+  const prompt = panelPrompt("Why SQLite?", cwd, "/state/briefs/p-pack.md");
+  expect(prompt).toContain("Why SQLite?");
+  expect(prompt).toContain("Context pack: /state/briefs/p-pack.md");
+  for (const heading of ["## Recommendation", "## Claims", "## Dissent", "## Confidence"]) expect(prompt).toContain(heading);
+  expect(prompt).toContain(`codegraph explore -p ${cwd}`);
+});

@@ -61,6 +61,7 @@ describe("tool rules", () => {
       spawn: { cd: "/repo", lane: "test-lane", brief: "test brief" },
       resume: { lane: "test-lane", fix: "gate", followUp: "test follow-up" },
       consult: { cd: "/repo", lane: "test-lane", question: "test question" },
+      panel: { cd: "/repo", name: "test-panel", question: "test question" },
       review: { cd: "/repo", lane: "test-lane", intent: "test review" },
       events: {},
       send: { lane: "test-lane", text: "test text" },

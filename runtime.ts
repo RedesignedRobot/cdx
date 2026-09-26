@@ -131,7 +131,7 @@ export function pidAlive(pid?: number): boolean {
 
 // Flag parsing
 
-const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect"]);
+const VALUE_FLAGS = new Set(["engine", "effort", "cd", "scope", "schema", "base", "commit", "timeout", "days", "n", "note", "account", "worktree", "gate", "max-runtime", "id", "model", "port", "pre", "interval", "expect", "pack"]);
 
 const LIST_FLAGS = new Set(["add-dir", "image"]);
 

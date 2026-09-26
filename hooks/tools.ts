@@ -131,6 +131,26 @@ export const TOOLS: ToolDefinition[] = [
     },
   },
   {
+    name: "panel",
+    description: "Ask Astra, Sol and Claude Fable the same read-only question. cdx merges the three answers by cited path into reports/<name>.md, keeps disagreement, and sends one completion line.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        name: { type: "string", description: "Panel name; the member lanes become <name>-astra, <name>-sol, <name>-fable" },
+        question: { type: "string", description: "Question every member answers; question plus pack stays under 20k chars" },
+        cd: { type: "string", description: "Absolute path of the repository the members read" },
+        pack: { type: "string", description: "Absolute path of a small context pack every member reads first" },
+      },
+      required: ["name", "question", "cd"],
+    },
+    run: (input) => {
+      const argv = ["panel", String(input.name), "--cd", String(input.cd)];
+      if (input.pack) argv.push("--pack", String(input.pack));
+      argv.push("--bg", "-");
+      return { argv, stdin: String(input.question) };
+    },
+  },
+  {
     name: "review",
     description: "Start an independent code review lane. Two exclusive modes: intent reviews the working tree; uncommitted, base or commit chooses a Git diff target. Passing intent with a target flag is refused.",
     inputSchema: {

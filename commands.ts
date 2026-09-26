@@ -25,6 +25,7 @@ import { runRound } from "./runner.ts";
 import { CONFIG_PATH, fail, parseArgs, pidAlive, resolveBrief, singleLine } from "./runtime.ts";
 import { briefCommand, eventsCommand, feedCommand } from "./session-commands.ts";
 import { migrateCommand } from "./migrate.ts";
+import { panelCommand, runPanel } from "./panel.ts";
 import { statusCommand, tailView, targetView, usageCommand, waitCommand } from "./status.ts";
 import { renderView, tuiEnabled } from "./tui.ts";
 import { viewCommand } from "./view.ts";
@@ -42,6 +43,7 @@ ${ENGINE_PICKER}
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only advisor
+  panel  <name> --cd D [--pack F] [--bg] ("<question>" | -)  # Astra, Sol and Claude Fable answer; one merged report
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
@@ -82,12 +84,12 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "review", "consult", "adopt", "land",
+  "spawn", "resume", "review", "consult", "panel", "adopt", "land",
   "kill", "close", "clean", "gate", "reply", "job", "migrate",
 ]);
 
 // A supervisor drives its children with these; each mutation checks ownership.
-const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "kill", "close", "gate", "reply"]);
+const SUPERVISOR_COMMANDS = new Set(["spawn", "resume", "review", "consult", "panel", "kill", "close", "gate", "reply"]);
 
 export async function dispatch(command: string | undefined, argv: string[]) {
   if (process.env.CDX_LANE && command && REFUSED_INSIDE_LANE.has(command)) {
@@ -103,6 +105,7 @@ switch (command) {
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
+  case "panel": await panelCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "send": await sendCommand(argv); break;
   case "ask": await (process.env.CDX_LANE ? askCommand(argv) : codeQuestionCommand(argv)); break;
@@ -115,6 +118,11 @@ switch (command) {
     const [lane, round] = argv;
     if (!lane || !round) fail("internal: _run <lane> <round>");
     process.exit(await runRound(lane, Number(round)));
+  }
+  case "_panel": {
+    const [name] = argv;
+    if (!name) fail("internal: _panel <name>");
+    process.exit(await runPanel(name));
   }
   case "adopt": {
     const parsed = parseArgs(argv, ["engine", "cd", "account", "model"]);
