@@ -2,6 +2,7 @@
 // every command it runs; agy runs whole under a sandbox-exec profile built from
 // the same roots. Seatbelt does not nest, so supervisors reach cdx through a
 // Codex exec-policy rule instead (account-sync.ts).
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
@@ -80,28 +81,57 @@ export function prepareSandboxDirs(spec: SandboxSpec): void {
 
 export const REVIEW_PROFILE = "cdx-review";
 
+// The tracked .gitignore that keeps an index out of commits. Codex and
+// seatbelt both let this more specific path override its writable index dir.
+const indexIgnores = (spec: SandboxSpec) => codegraphDirs(spec).map((dir) => join(dir, ".gitignore"));
+
+// Evidence for the runner: a changed index .gitignore could surface files a
+// review wrote into the index dir in the owner's next commit.
+export function indexIgnoreFingerprint(spec: SandboxSpec): string {
+  return indexIgnores(spec).map((path) => {
+    try { return `${path}:${createHash("sha256").update(readFileSync(path)).digest("hex")}`; } catch { return `${path}:absent`; }
+  }).join("\n");
+}
+
+// Codex deep-merges trusted project layers (.codex/config.toml from the cwd up
+// to its checkout) into the thread config, so a reviewed tree could add write
+// entries to the review profile. Probed on 0.156: a planted entry widened it.
+export function plantedPermissionLayers(cwd: string, exists: (path: string) => boolean = existsSync, read = (path: string) => readFileSync(path, "utf8")): string[] {
+  const planted: string[] = [];
+  for (let path = resolve(cwd); ; path = dirname(path)) {
+    const layer = join(path, ".codex", "config.toml");
+    if (exists(layer)) {
+      try { if ("permissions" in Bun.TOML.parse(read(layer))) planted.push(layer); } catch { planted.push(layer); }
+    }
+    if (exists(join(path, ".git")) || dirname(path) === path) return planted;
+  }
+}
+
+// The profile arrives only through a config override, so the runner checks
+// what thread/start or thread/resume reports. The legacy sandbox field omits
+// the cwd even when a profile writes it, so any root beyond the ones cdx
+// granted fails the thread too.
+export function reviewSandboxRefusal(thread: { activePermissionProfile?: { id?: string } | null; sandbox?: { type?: string; writableRoots?: string[] } }, spec: SandboxSpec): string | undefined {
+  const profile = thread.activePermissionProfile?.id;
+  if (profile !== REVIEW_PROFILE) return `review thread runs permissions profile ${profile ?? "none"}, not ${REVIEW_PROFILE}`;
+  const granted = new Set([...codegraphDirs(spec), resolvedPath(tmpdir())]);
+  const extra = (thread.sandbox?.writableRoots ?? []).map(resolvedPath).filter((root) => !granted.has(root));
+  const open = thread.sandbox?.type === "dangerFullAccess" || thread.sandbox?.type === "externalSandbox";
+  return open || extra.length ? `review thread may write beyond the index and TMPDIR: ${JSON.stringify(thread.sandbox)}` : undefined;
+}
+
 // Spread into thread/start (thread), turn/start (turn) and the thread config
 // overrides (config). A lane with reviewDir set is read-only: reviews, consults,
 // and consult supervisors. Every sandbox mode writes the cwd, so reviews use a
-// permissions profile that writes only TMPDIR and the codegraph index. Codex
-// 0.156 fails every turn with "failed to load workspace requirements" when the
-// profile is selected through the thread/start or turn/start `permissions`
-// field, so the profile comes from the default_permissions config override.
-// The review profile arrives only through a config override that an account
-// config could outrank, so the runner checks what thread/start or thread/resume
-// reports and refuses a thread that could write the checkout.
-export function reviewSandboxRefusal(thread: { activePermissionProfile?: { id?: string } | null; sandbox?: { type?: string; writableRoots?: string[] } }, cwd: string): string | undefined {
-  const profile = thread.activePermissionProfile?.id;
-  if (profile !== REVIEW_PROFILE) return `review thread runs permissions profile ${profile ?? "none"}, not ${REVIEW_PROFILE}`;
-  const at = resolvedPath(cwd);
-  const writesCwd = thread.sandbox?.type === "dangerFullAccess" || thread.sandbox?.type === "externalSandbox"
-    || (thread.sandbox?.writableRoots ?? []).some((root) => !relative(resolvedPath(root), at).startsWith(".."));
-  return writesCwd ? `review thread may write ${cwd}: ${JSON.stringify(thread.sandbox)}` : undefined;
-}
-
+// permissions profile that writes only TMPDIR and the codegraph index, never
+// the index .gitignore. Codex 0.156 fails every turn with "failed to load
+// workspace requirements" when the profile is selected through the
+// thread/start or turn/start `permissions` field, so the profile comes from
+// the default_permissions config override.
 export function codexSandbox(spec: SandboxSpec) {
   if (spec.reviewDir) {
-    const filesystem = { ":root": "read", ":tmpdir": "write", ...Object.fromEntries(codegraphDirs(spec).map((dir) => [dir, "write"])) };
+    const filesystem = { ":root": "read", ":tmpdir": "write", ...Object.fromEntries(codegraphDirs(spec).map((dir) => [dir, "write"])),
+      ...Object.fromEntries(indexIgnores(spec).map((path) => [path, "read"])) };
     return { thread: {}, turn: {}, config: { default_permissions: REVIEW_PROFILE,
       permissions: { [REVIEW_PROFILE]: { filesystem, network: { enabled: true } } } } };
   }
@@ -111,7 +141,8 @@ export function codexSandbox(spec: SandboxSpec) {
     networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } } };
 }
 
-// agy writes its home, TMPDIR, the codegraph index, and the files named by the
+// agy writes its home, TMPDIR, the codegraph index (never its tracked
+// .gitignore; the later deny wins), and the files named by the
 // caller. Gemini hooks run inside agy and write cdx state and spilled output, so
 // read-only lanes keep those too; only work lanes get the checkout and /tmp.
 export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
@@ -119,7 +150,9 @@ export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
   const subpaths = [AGY_HOME, tmpdir(), "/dev", ...laneStateDirs(spec), ...codegraphDirs(spec), ...work].map(resolvedPath);
   const rules = [...subpaths.map((path) => `(subpath ${JSON.stringify(path)})`),
     ...files.map((path) => `(literal ${JSON.stringify(resolvedPath(path))})`)];
-  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
+  const ignores = indexIgnores(spec).map((path) => `(literal ${JSON.stringify(path)})`);
+  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`
+    + (ignores.length ? `(deny file-write* ${ignores.join(" ")})` : "");
 }
 
 // claude runs only read-only consults with Read, Grep and Glob. Probed with
