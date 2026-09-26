@@ -11,7 +11,7 @@ import {
 import { questionOpen, readQuestions } from "./questions.ts";
 import { fail, parseArgs, ROOT } from "./runtime.ts";
 import { liveRows } from "./status.ts";
-import { write } from "./store.ts";
+import { db, write } from "./store.ts";
 import { createHash } from "node:crypto";
 
 export async function eventsCommand(argv: string[]): Promise<void> {
@@ -24,6 +24,11 @@ export async function eventsCommand(argv: string[]): Promise<void> {
 
   const now = Date.now();
   if (!peek) monitorOverruns(now);
+  // Only a running panel loads panel.ts, which the poll otherwise never needs
+  // (and which imports back into this module through claude.ts).
+  if (!peek && db().query("SELECT 1 FROM panels WHERE json_extract(data, '$.state') = 'running' LIMIT 1").get()) {
+    (await import("./panel.ts")).reapPanels();
+  }
   deliverEvents(session, now, peek, (events) => {
     if (json) {
       let rows: ReturnType<typeof liveRows> | undefined;

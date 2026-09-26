@@ -3,10 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  answerPath, citationProblem, memberSpec, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  answerPath, citationProblem, memberSpec, readPanel, reapPanels, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
   panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
-import type { Lane } from "./ledger.ts";
+import { eventsAfter, latestEventId, type Lane } from "./ledger.ts";
 import { laneInstructions } from "./prompts.ts";
 import { reportPathOf } from "./reports.ts";
 import { db } from "./store.ts";
@@ -158,7 +158,15 @@ test("cdx wait on a panel returns its record once it finishes, or a failure once
   const store = (data: object) => db().query("INSERT OR REPLACE INTO panels (name, data) VALUES (?, ?)").run("wait-p", JSON.stringify(data));
   store(record);
   expect(settledPanel("wait-p", () => true)).toBeUndefined();
+  const since = latestEventId();
   expect(settledPanel("wait-p", () => false)?.state).toBe("failed");
+  expect(readPanel("wait-p")?.state).toBe("failed");
+  // The next poll finds nothing left to fail: one panel event per death.
+  reapPanels(() => false);
+  expect(eventsAfter(since).map((event) => event.kind)).toEqual(["panel"]);
+  db().query("INSERT OR REPLACE INTO panels (name, data) VALUES (?, ?)").run("reap-p", JSON.stringify({ ...record, name: "reap-p" }));
+  reapPanels(() => false);
+  expect(readPanel("reap-p")?.summary).toContain("panel=reap-p state=failed runner died");
   store({ ...record, state: "done", summary: "[cdx] panel=wait-p coverage=3/3" });
   expect(settledPanel("wait-p", () => true)?.summary).toBe("[cdx] panel=wait-p coverage=3/3");
   expect(settledPanel("missing", () => true)).toBeUndefined();

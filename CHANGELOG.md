@@ -18,6 +18,7 @@ Closes the risks logged in the 10.0 review. Run `/reload-plugins` in every open 
 - `cdx panel` always detaches and returns the report path; `--bg` is gone and refused.
 - Files moved to `reports/panels/<name>/`: `panel.md` is the merged report, `astra.md`, `sol.md` and `fable.md` the answers. A panel named `foo-r2` can no longer overwrite lane foo's round 2 report.
 - `cdx wait <panel>` blocks until the panel settles and prints its completion line; a supervisor's launch hint names that command.
+- A panel whose runner throws or is killed is stored as failed and its one `panel` event delivered, by the runner itself, the head's next events poll or `cdx wait`, whichever sees it first.
 - A panel refuses when `cca` is not on PATH or gives no weekly quota, and when its name is taken by a panel, lane or job. The name and open-panel guards run inside the transaction that records the panel.
 - Member rounds carry the review lane rules. Every 10.0.0 panel failed to start its Codex members without them.
 
