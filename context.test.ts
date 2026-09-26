@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextDigest, digestLine, RECENT_ANCESTORS } from "./context.ts";
 import { houseRules, laneInstructions } from "./prompts.ts";
+import { parseVerdicts } from "./shots.ts";
 
 const commits = Array.from({ length: RECENT_ANCESTORS + 1 }, (_, index) => index.toString(16).padStart(40, "0"));
 const git = (_cwd: string, ...args: string[]) => args[0] === "rev-parse" ? "/repo/.git" : commits.join("\n");
@@ -32,4 +33,14 @@ test("a work lane brief carries a pointer and per-lane facts; standing rules liv
     expect(laneInstructions({ review: true })).toContain("read-only");
     expect(laneInstructions({ review: true })).not.toContain("Workers cannot drive");
   } finally { rmSync(repo, { recursive: true, force: true }); }
+});
+
+test("every screen gets a verdict, and a skipped or mangled one fails", () => {
+  const report = 'Done.\n{"screens":[{"name":"a.png","verdict":"pass","reason":"ok"},{"name":"b.png","verdict":"maybe","reason":"cut\\noff"},{"name":"x.png","verdict":"pass"}]}';
+  expect(parseVerdicts(report, ["a.png", "b.png", "c.png"])).toEqual([
+    { name: "a.png", verdict: "pass", reason: "ok" },
+    { name: "b.png", verdict: "fail", reason: "cut" },
+    { name: "c.png", verdict: "fail", reason: "grader returned no verdict for this screen" },
+  ]);
+  expect(parseVerdicts("no json", ["a.png"])[0]!.verdict).toBe("fail");
 });

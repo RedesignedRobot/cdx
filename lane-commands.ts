@@ -360,7 +360,7 @@ export async function resumeCommand(argv: string[]) {
 // as an advisor rather than a hostile reviewer. Further questions use a fresh consult.
 // A head consult may opt into --supervisor to spawn read-only Gemini helpers.
 export async function consultCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "model", "effort", "cd", "bg", "account", "supervisor", "image"]);
   const [lane, questionArg] = parsed.rest;
   const usage = 'usage: cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--effort E] [--cd <dir>] [--bg] "<question>"';
   const question = await resolveBrief(questionArg, usage);
@@ -385,7 +385,7 @@ export function reviewBaseTarget(cwd: string, base: string, run = (cwd: string, 
 }
 
 export async function reviewCommand(argv: string[], opts: { consult?: boolean; supervisor?: boolean } = {}) {
-  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor"]);
+  const parsed = parseArgs(argv, ["engine", "effort", "cd", "bg", "uncommitted", "base", "commit", "scope", "account", "model", "supervisor", "image"]);
   const engine = engineOf(parsed, "review");
   const [lane, intentArg] = parsed.rest;
   const usage = 'usage: cdx review <lane> [--uncommitted | --base <branch> | --commit <sha>] [--scope "<files>"] ["<intent>"]';
@@ -428,6 +428,8 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   }
   const cwd = parsed.flags.cd ?? (existing ? workCwdOf(existing) : process.cwd());
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
+  if (engine !== "gpt" && parsed.lists.image) fail("--image needs --engine gpt; agy takes no image attachments");
+  const images = (parsed.lists.image ?? []).map((image) => existsSync(image) ? realpathSync(image) : fail(`--image does not exist: ${image}`));
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const targets = [parsed.bools.has("uncommitted") ? "--uncommitted" : "", parsed.flags.base ? "base" : "", parsed.flags.commit ? "commit" : ""].filter(Boolean);
   if (targets.length > 1) fail("pick exactly one of --uncommitted, --base, --commit");
@@ -460,6 +462,7 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   if (selection) announceAccountSelection(lane, selection);
   return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief,
     ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
+    ...(images.length ? { images } : {}),
     ...(engine === "gpt" ? accountSpec(account) : {}), ...ownershipSpec(owner) }, fullBrief, parsed.bools.has("bg"));
 }
 
