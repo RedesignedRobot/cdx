@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contextDigest, digestLine, laneName, RECENT_ANCESTORS } from "./context.ts";
+import { contextDigest, contextJobName, digestLine, laneName, RECENT_ANCESTORS } from "./context.ts";
 import { houseRules, laneInstructions } from "./prompts.ts";
 import { batchShots, gradeJobName, parseVerdicts, SHOTS_PER_CONSULT } from "./shots.ts";
 
@@ -56,4 +56,10 @@ test("shots split into ordered consult batches of at most eight", () => {
 
 test("a grade runs as a job whose name drops the dots a directory slug may carry", () => {
   expect(gradeJobName(laneName("shots", "run.v1.2"))).toBe("shots-run-v1-2");
+});
+
+test("a context digest runs as a job named apart from its consult lane, within the job name limit", () => {
+  const lane = laneName("context", `${"r".repeat(70)}.git-0123abcd`);
+  expect(contextJobName(lane)).not.toBe(lane);
+  expect(contextJobName(lane)).toMatch(/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/);
 });
