@@ -176,6 +176,9 @@ export interface Lane {
   consult?: true;
   // Panel this consult answers for; its events go to the panel, not the head.
   panel?: string;
+  // The cdx command (shots grade, context) that ran this consult and reports
+  // for it; its terminal event goes to the batch, not the head.
+  batch?: string;
   account?: string;
   codexHome?: string;
   ownerSession?: string;
@@ -287,6 +290,9 @@ export interface Spec {
 
 export type Ledger = Record<string, Lane>;
 
+// runConsult names its batch to the consult it starts through this variable.
+export const BATCH_ENV = "CDX_BATCH";
+
 type EventKind = "question" | "stalled" | "partial" | "account" | "terminal" | "job-exit" | "message" | "thrash" | "overrun" | "outage" | "gate-finished" | "panel";
 
 export interface FeedEvent {
@@ -381,7 +387,7 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
       message = terminalText(message, report, failed ? read(gateLog !== "-" && gateLog ? gateLog : log) : undefined);
     } else message = singleLine(message);
     const at = new Date().toISOString();
-    const supervisor = lane?.panel ? `panel:${lane.panel}` : terminal ? lane?.parent : undefined;
+    const supervisor = lane?.panel ? `panel:${lane.panel}` : terminal && lane?.batch ? `batch:${lane.batch}` : terminal ? lane?.parent : undefined;
     if (supervisor && lane?.parentRound) {
       const parent = findLane(supervisor);
       if (parent && laneRunning(parent) && parent.rounds === lane.parentRound && parent.steerOpen !== false) {

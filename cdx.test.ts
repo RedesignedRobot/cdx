@@ -18,7 +18,7 @@ import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktr
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
-import { electHead, validLane } from "./ledger.ts";
+import { electHead, eventsAfter, feedEvent, latestEventId, type Lane, storeLane, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
 import { logProgress, progressLogPathOf } from "./reports.ts";
@@ -40,6 +40,20 @@ test("an addressed message reaches its session whether or not it is the head", (
   expect(selectEvents(records, "older", 0).map((event) => event.id)).toEqual([1]);
   expect(selectEvents(records, "head", 0, 0).map((event) => event.id)).toEqual([2]);
   expect(selectEvents(records, "head", 0, 0)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
+});
+
+test("a batch consult's terminal stays off the head's wakes, a panel member's too; a batch consult's question still wakes it", () => {
+  const since = latestEventId();
+  const at = "2026-09-26T12:00:00.000Z";
+  const consult = (extra: Partial<Lane>) => ({ engine: "gpt", kind: "review", consult: true, effort: "medium", rounds: 1, reports: [], tokenAccounting: 1,
+    work: { state: "closed", cwd: "/repo", updatedAt: at }, review: { state: "running", cwd: "/repo", round: 1, updatedAt: at },
+    createdAt: at, updatedAt: at, ...extra }) as unknown as Lane;
+  storeLane("shots-home-1", consult({ batch: "shots-home" }));
+  storeLane("pq-astra", consult({ panel: "pq" }));
+  feedEvent("terminal", "[cdx] lane=shots-home-1 round=1 state=done report=-", "head", { lane: "shots-home-1", round: 1 });
+  feedEvent("terminal", "[cdx] lane=pq-astra round=1 state=done report=-", "head", { lane: "pq-astra", round: 1 });
+  feedEvent("question", "[cdx] lane=shots-home-1 round=1 question #1", "head", { lane: "shots-home-1", round: 1 });
+  expect(selectEvents(eventsAfter(since), "head", since, since).map((event) => event.kind)).toEqual(["question"]);
 });
 
 test("a headless session never steals the wakes; a fresh interactive start takes them from an idle head", () => {

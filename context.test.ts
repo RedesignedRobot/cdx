@@ -2,9 +2,9 @@ import { expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { contextDigest, digestLine, RECENT_ANCESTORS } from "./context.ts";
+import { contextDigest, digestLine, laneName, RECENT_ANCESTORS } from "./context.ts";
 import { houseRules, laneInstructions } from "./prompts.ts";
-import { batchShots, parseVerdicts, SHOTS_PER_CONSULT } from "./shots.ts";
+import { batchShots, gradeJobName, parseVerdicts, SHOTS_PER_CONSULT } from "./shots.ts";
 
 const commits = Array.from({ length: RECENT_ANCESTORS + 1 }, (_, index) => index.toString(16).padStart(40, "0"));
 const git = (_cwd: string, ...args: string[]) => args[0] === "rev-parse" ? "/repo/.git" : commits.join("\n");
@@ -52,4 +52,8 @@ test("shots split into ordered consult batches of at most eight", () => {
   expect(batches.flat()).toEqual(shots);
   expect(batchShots(shots.slice(0, SHOTS_PER_CONSULT))).toHaveLength(1);
   expect(batchShots([])).toEqual([]);
+});
+
+test("a grade runs as a job whose name drops the dots a directory slug may carry", () => {
+  expect(gradeJobName(laneName("shots", "run.v1.2"))).toBe("shots-run-v1-2");
 });
