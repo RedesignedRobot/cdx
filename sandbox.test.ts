@@ -56,6 +56,13 @@ test("supervisor cdx calls are single-quoted so the exec-policy rule matches", (
   expect(laneInstructions({ supervisor: true })).toContain("cdx spawn <child> --bg --gate '<cmd>' '<brief with the four headings>'");
 });
 
+test("supervisors review child trees without codegraph and sync their own index after landing", () => {
+  const rules = laneInstructions({ supervisor: true });
+  expect(rules).toContain("Codegraph cannot open a child worktree's index");
+  expect(rules).toContain("`codegraph sync .`");
+  expect(laneInstructions({})).not.toContain("child worktree's index");
+});
+
 test("the cap wraps lane shell commands except cdx calls", () => {
   expect(invokesCdx("cdx spawn a 'brief'")).toBe(true);
   expect(invokesCdx("cd x && cdx status")).toBe(true);
