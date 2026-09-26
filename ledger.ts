@@ -263,6 +263,8 @@ export interface Lane {
 
 export interface Spec {
   expectMinutes?: number;
+  // Copied from config at launch; the runner reads no config file.
+  fullAccess?: boolean;
   promptBytes?: Record<string, number>;
   model_auto_compact_token_limit?: number;
   tool_output_token_limit?: number;

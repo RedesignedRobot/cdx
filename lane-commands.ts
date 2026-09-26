@@ -54,6 +54,7 @@ function gitCommonDir(cwd: string): string | undefined {
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
   spec.accountHomes = config.accounts;
+  spec.fullAccess = config.fullAccess === true;
   spec.model_auto_compact_token_limit = config.model_auto_compact_token_limit ?? 150_000;
   spec.tool_output_token_limit = config.tool_output_token_limit ?? 6_000;
   spec.visibility = config.visibility ?? VISIBILITY_DEFAULTS;
