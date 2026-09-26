@@ -18,6 +18,10 @@ export const spillDirOf = (lane: string, round: number) => join(ROOT, "logs", `$
 
 type SandboxSpec = Pick<Spec, "cwd" | "additionalDirectories" | "reviewDir"> & { lane?: string; round?: number };
 
+// Probed under both sandboxes: bun install fails with EPERM on ~/.bun/install/cache,
+// so lane shells keep their package cache under TMPDIR, which every role may write.
+export const LANE_TOOL_ENV = { BUN_INSTALL_CACHE_DIR: join(tmpdir(), "cdx-bun-cache") };
+
 function indexedAncestor(start: string, exists: (path: string) => boolean): { index?: string; checkout?: string } {
   for (let path = start; ; path = dirname(path)) {
     if (exists(join(path, ".codegraph", "codegraph.db"))) return { index: path };

@@ -1,5 +1,5 @@
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
-import { codexSandbox, geminiProfile, laneCodegraphRoot, prepareSandboxDirs } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, LANE_TOOL_ENV, laneCodegraphRoot, prepareSandboxDirs } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
 import { geminiTokens } from "./tokens.ts";
 import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome } from "./account-sync.ts";
@@ -253,7 +253,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round), progressLogPathOf(lane, round)]), ...geminiArgs]
       : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
-    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
+    env: { ...laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine), ...LANE_TOOL_ENV },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
