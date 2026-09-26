@@ -1,7 +1,7 @@
 // Pure progress accounting. Runner memory owns tool identities and repetition state.
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { codegraphActions } from "./codegraph-policy.ts";
+import { CODEGRAPH_EXPLORE, codegraphActions } from "./codegraph-policy.ts";
 
 export interface VisibilityConfig { heartbeatMinutes: number; failureRepeats: number; fileEdits: number; testRuns: number }
 export const VISIBILITY_DEFAULTS: VisibilityConfig = { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 };
@@ -129,7 +129,7 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
           codeSearchesBeforeGraph++;
           if (!graphWarned) {
             graphWarned = true;
-            codegraphThrash = `codegraph-first: use codegraph explore before code questions in ${repo}. Exceptions: fixed-string or existence searches, non-code files, logs.`;
+            codegraphThrash = `codegraph-first: use codegraph explore before code questions in ${repo}, as \`${CODEGRAPH_EXPLORE} "<question>"\`; if it times out or fails, use text search. Exceptions: fixed-string or existence searches, non-code files, logs.`;
           }
         }
       }

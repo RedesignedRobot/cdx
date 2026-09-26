@@ -46,6 +46,9 @@ class HookRules(unittest.TestCase):
             (root / ".codegraph").mkdir(parents=True)
             (root / "src").mkdir()
             (root / "src" / "handler.ts").touch()
+        which = patch.object(hook.shutil, "which", return_value="/usr/local/bin/codegraph")
+        which.start()
+        self.addCleanup(which.stop)
 
     def test_targets_flags_and_order(self):
         repo = str(self.repo)
@@ -114,16 +117,27 @@ class HookRules(unittest.TestCase):
                                                [user("Find handler")]), (False, None))
 
     def test_completed_explore_matches_exact_tool_and_root(self):
-        valid = [("mcp__codegraph__codegraph_explore", {"query": "handler"}), ("mcp__codegraph__codegraph_explore", {"projectPath": str(self.repo)}), ("Bash", {"command": f"cd {self.repo} && codegraph explore handler"})]
+        valid = [("mcp__codegraph__codegraph_explore", {"query": "handler"}), ("mcp__codegraph__codegraph_explore", {"projectPath": str(self.repo)}), ("Bash", {"command": f"cd {self.repo} && codegraph explore handler"}),
+                 ("Bash", {"command": f"cd {self.repo} && {hook.EXPLORE} 'where is handler'"})]
         invalid = [("mcp__other__codegraph_explore", {"projectPath": str(self.repo)}), ("mcp__codegraph__codegraph_explore", {"projectPath": str(self.other)}), ("Bash", {"command": f"cd {self.other} && codegraph explore handler"}), ("Bash", {"command": "echo codegraph explore"})]
         for name, args in valid + invalid:
             records = [user("Find handler"), call(name, args, str(self.repo)), result()]
             with self.subTest(name=name, args=args):
                 self.assertEqual(hook.completed_explore(records, str(self.repo), self.repo.resolve()), ("turn", (name, args) in valid))
                 self.assertEqual(hook.completed_explore(records[:-1], str(self.repo), self.repo.resolve()), ("turn", False))
-                self.assertEqual(hook.completed_explore(records[:-1] + [result(True)], str(self.repo), self.repo.resolve()), ("turn", False))
+                # A failed or timed-out explore counts: the text search is the fallback.
+                self.assertEqual(hook.completed_explore(records[:-1] + [result(True)], str(self.repo), self.repo.resolve()), ("turn", (name, args) in valid))
         self.assertEqual(hook.completed_explore([user("Find"), call(*valid[0], cwd=str(self.repo)), result(), user("Next", "next")], str(self.repo), self.repo.resolve()), ("next", False))
         self.assertEqual(hook.completed_explore([user("Find"), call("mcp__codegraph__codegraph_explore", {"query": "handler"}, str(self.other)), result()], str(self.repo), self.repo.resolve()), ("turn", False))
+
+    def test_deadline_wrapper_and_missing_binary(self):
+        repo = str(self.repo)
+        self.assertFalse(hook.command_search(f"{hook.EXPLORE} handler && rg handleRequest src", repo))
+        self.assertTrue(hook.command_search(f"rg handleRequest src && {hook.EXPLORE} handler", repo))
+        payload = {"cwd": repo, "tool_input": {"command": "rg handleRequest src"}}
+        self.assertEqual(hook.decision(payload, [user("Find handler")]), (True, "turn"))
+        with patch.object(hook.shutil, "which", return_value=None):
+            self.assertEqual(hook.decision(payload, [user("Find handler")]), (False, None))
 
     def test_bounded_transcript_fails_open_without_turn(self):
         path = self.base / "history.jsonl"
