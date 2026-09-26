@@ -37,7 +37,7 @@ cdx policy: model ${config.model}${modelAliases() ? ` (aliases ${modelAliases()}
 Engines:
 ${ENGINE_PICKER}
 
-  land <lane>                              Commit, merge, push, remove worktree and branch, close
+  land <lane> | land --batch <lane>...     Gate the merge result once, fast-forward the base, push, remove worktrees and branches, close
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--gate-baseline-check] [--max-runtime MIN] "<brief>"
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
@@ -68,7 +68,7 @@ ${ENGINE_PICKER}
   close  <lane> [--remove-worktree | --keep-worktree] ["note"]       clean [--days N]
   job    <name> --cd D "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
   job                     # list jobs
-  doctor [--fix] [--probe]
+  doctor [--fix] [--probe] [--days N]
   migrate                 # one-shot import of the 9.x JSON state into state/cdx.db
   brief                   # makes this session the head; lanes, completed work awaiting attention, and open questions
 

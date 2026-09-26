@@ -104,6 +104,8 @@ interface GateBaseline {
 
 export interface GateTree { head: string; tree: string }
 
+export interface ReviewAttestation { tree: string; head: string; reviewer: string; closed: boolean; report?: string; at: string }
+
 export interface GateReceipt {
   paths?: string[];
   sharedTreeLanes?: string[];
@@ -155,10 +157,12 @@ export interface Lane {
   quotaWrapSent?: boolean;
   touchedPaths?: string[];
   landedCommit?: string;
-  landingCommit?: string;
   baseBranch?: string;
   reviewTree?: GateTree;
   reviewClosed?: boolean;
+  // Reviews of this lane's tree by any review lane, oldest first. Land and
+  // fix resumes read these, never the reviewer's name.
+  reviewAttestations?: ReviewAttestation[];
   accountPercentStart?: Record<string, number>;
   accountPercentEnd?: Record<string, number>;
   agentLoaded?: boolean;

@@ -2,8 +2,8 @@ import { safeText } from "./safe-text.ts";
 // Gate execution, content receipts, review tree snapshots, and gate commands.
 
 import {
-  feedEvent, type GateReceipt, type GateTree, laneRunning, readLane, requireOwnChild, type RoundRecord,
-  supervisorLane, withLedger,
+  feedEvent, type GateReceipt, type GateTree, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
+  type RoundRecord, supervisorLane, withLedger,
 } from "./ledger.ts";
 import { reportPathOf, tailOutput } from "./reports.ts";
 import {
@@ -11,7 +11,7 @@ import {
 } from "./runtime.ts";
 import { createHash } from "node:crypto";
 import {
-  existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, rmdirSync, unlinkSync,
+  existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmdirSync, unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -42,6 +42,40 @@ export function receiptRefusal(receipt: GateReceipt | undefined, work: Pick<Roun
   if (work.state !== "done" && work.state !== "closed") return `work state is ${work.state}`;
   if (work.exitCode !== 0) return "work did not exit successfully";
   if (!receipt.valid || receipt.exitCode !== 0 || !receipt.head || !receipt.tree) return receipt.reason ?? "invalid gate receipt";
+}
+
+// A review attests to content: it attaches to the reviewer and to every open
+// worktree lane whose checkout it ran in or whose green receipt it saw.
+export function reviewedLanes(ledger: Ledger, reviewer: string, tree: GateTree, root: string | undefined,
+  real: (path: string) => string | undefined): string[] {
+  return Object.entries(ledger).filter(([name, item]) => name === reviewer || item.work.state !== "closed" && item.worktreePath
+    && (item.gateReceipt?.tree === tree.tree || root !== undefined && real(item.worktreePath) === root)).map(([name]) => name);
+}
+
+export function realpathOrUndefined(path: string): string | undefined {
+  try { return realpathSync(path); } catch { return undefined; }
+}
+
+export function reviewRoot(cwd: string): string | undefined {
+  const top = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--show-toplevel"] });
+  return top.success ? realpathOrUndefined(top.stdout.toString().trim()) : undefined;
+}
+
+export function attestReview(ledger: Ledger, reviewer: string, closed: boolean, report: string | undefined, root: string | undefined,
+  real = realpathOrUndefined): void {
+  const tree = ledger[reviewer]?.reviewTree;
+  if (!tree) return;
+  const attestation: ReviewAttestation = { tree: tree.tree, head: tree.head, reviewer, closed, ...(report ? { report } : {}), at: new Date().toISOString() };
+  for (const name of reviewedLanes(ledger, reviewer, tree, root, real)) (ledger[name]!.reviewAttestations ??= []).push(attestation);
+}
+
+// Review is optional, but once a lane was reviewed the newest review of its
+// current tree, or of the gated tree the head edited, decides.
+export function reviewRefusal(attestations: ReviewAttestation[] | undefined, trees: string[]): string | undefined {
+  if (!attestations?.length) return;
+  const covering = attestations.findLast((item) => trees.includes(item.tree));
+  if (!covering) return `the lane was reviewed at ${attestations.at(-1)!.tree.slice(0, 12)}, not at its current or gated tree; review the current tree with any review lane`;
+  if (!covering.closed) return `review ${covering.reviewer} has unresolved P1/P2 findings on tree ${covering.tree.slice(0, 12)}`;
 }
 
 export function composeGate(required: string | undefined, requested: string | undefined, notice = console.error): string | undefined {

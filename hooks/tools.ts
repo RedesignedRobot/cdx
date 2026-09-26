@@ -17,9 +17,10 @@ export interface ToolDefinition {
 
 export const TOOLS: ToolDefinition[] = [
   {
-    name: "land", description: "Commit a green lane, merge into its base, push, remove the worktree and branch, and close. Refuses dirty base checkouts and stale or red receipts.",
-    inputSchema: { type: "object", properties: { lane: { type: "string" } }, required: ["lane"] },
-    run: (input) => ({ argv: ["land", String(input.lane)], timeoutMs: 120_000 }),
+    name: "land", description: "Commit green lanes, gate the merge result once unless a receipt already proves it, fast-forward the base, push, remove worktrees and branches, and close. Pass lanes for a batch; a red batch names the lane that broke it and lands the green prefix.",
+    inputSchema: { type: "object", properties: { lane: { type: "string" }, lanes: { type: "array", items: { type: "string" }, description: "Land several lanes with one gate" } } },
+    // The merge gate may run up to its own 60 minute limit.
+    run: (input) => ({ argv: Array.isArray(input.lanes) ? ["land", "--batch", ...input.lanes.map(String)] : ["land", String(input.lane)], timeoutMs: 65 * 60_000 }),
   },
   {
     name: "ask", description: "Ask Gemini a synchronous read-only code question without creating a lane. Returns file and line evidence within 90 seconds.",

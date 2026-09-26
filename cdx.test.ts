@@ -926,12 +926,11 @@ test("worktree reuse needs the exact lane branch, repository and clean files", (
 });
 
 test("cleanup refuses dirty, unmerged or switched worktrees including main", () => {
-  expect(cleanupRefusal("lane/a", "lane/a", true, true)).toBeUndefined();
-  expect(cleanupRefusal("lane/a", "lane/a", false, true)).toBeDefined();
-  expect(cleanupRefusal("lane/a", "lane/a", true, false)).toBeDefined();
-  expect(cleanupRefusal("lane/a", "lane/b", true, true)).toBeDefined();
-  expect(cleanupRefusal("main", "main", true, true)).toBeDefined();
-  expect(cleanupRefusal(undefined, "lane/a", true, true)).toBeDefined();
+  expect(cleanupRefusal("lane/a", "lane/a", true)).toBeUndefined();
+  expect(cleanupRefusal("lane/a", "lane/a", false)).toBeDefined();
+  expect(cleanupRefusal("lane/a", "lane/b", true)).toBeDefined();
+  expect(cleanupRefusal("main", "main", true)).toBeDefined();
+  expect(cleanupRefusal(undefined, "lane/a", true)).toBeDefined();
 });
 
 test("completion verdict includes failure reason on one bounded line", () => {
@@ -973,12 +972,12 @@ test("close can keep an abandoned worktree without selecting cleanup", () => {
   expect(() => closeKeepsWorktree(new Set(["remove-worktree", "keep-worktree"]))).toThrow("cannot be combined");
   const commands = worktreeCleanupCommands({ worktreeRepo: "/repo", worktreePath: "/repo-wt", branch: "lane/fix" });
   expect(commands[0]).toContain("worktree remove '/repo-wt'");
-  expect(commands[1]).toContain("merge-base --is-ancestor 'refs/heads/lane/fix' refs/heads/main &&");
+  expect(commands[1]).toContain("merge-base --is-ancestor 'refs/heads/lane/fix' 'refs/heads/main' &&");
   expect(TOOLS_BY_NAME.get("close")!.run({ lane: "lane", keepWorktree: true, note: "abandoned" }))
     .toEqual({ argv: ["close", "lane", "--keep-worktree", "-"], stdin: "abandoned" });
 });
 
-test("cleanup uses proven main ancestry when primary HEAD and upstream lack the lane commit", () => {
+test("cleanup deletes only branches proven merged into the base and keeps unmerged ones", () => {
   const entry = { worktreeRepo: "/repo", worktreePath: "/wt", branch: "lane/fix" };
   const run = (merged: boolean) => {
     let present = true;
@@ -992,22 +991,18 @@ test("cleanup uses proven main ancestry when primary HEAD and upstream lack the 
         proved = merged && args[2] === "refs/heads/lane/fix" && args[3] === "refs/heads/main";
         success = proved;
       }
-      if (args[0] === "worktree") {
-        expect(proved).toBe(true);
-        present = false;
-      }
+      if (args[0] === "worktree") present = false;
       if (args[0] === "branch") {
         success = proved && args[1] === "-D";
         if (success) branchPresent = false;
       }
       return { success, stdout, stderr: "not merged into primary HEAD or upstream" };
     };
-    if (merged) removeWorktree(entry, git, () => {});
-    else expect(() => removeWorktree(entry, git, () => {})).toThrow("not merged into local main");
+    removeWorktree(entry, git, () => {});
     return { present, branchPresent };
   };
   expect(run(true)).toEqual({ present: false, branchPresent: false });
-  expect(run(false)).toEqual({ present: true, branchPresent: true });
+  expect(run(false)).toEqual({ present: false, branchPresent: true });
 });
 
 test("gate tree refuses a gitlink outside the lane subdirectory", () => {
@@ -1252,14 +1247,15 @@ test("only GPT work receives the compaction trial and every GPT thread sheds unu
 });
 
 test("resume requires failed evidence at the same HEAD and reviews close after P3 only", () => {
-  const entry = { gateReceipt: { head: "head", exitCode: 1 }, reviewTree: { head: "head", tree: "old" }, review: {}, reviewClosed: false } as any;
+  const entry = { gateReceipt: { head: "head", exitCode: 1 }, reviewTree: { head: "head", tree: "old" }, reviewAttestations: [{ head: "head", tree: "old", closed: false }] } as any;
   expect(resumeRefusal("gate", entry, "head")).toBeUndefined();
   expect(resumeRefusal(undefined, entry, "head")).toContain("fresh lane");
   expect(resumeRefusal("gate", entry, "other")).toContain("HEAD changed");
   expect(resumeRefusal("gate", { ...entry, gateReceipt: { head: "head", exitCode: 0, valid: true } }, "head")).toContain("no failed gate");
   expect(resumeRefusal("review", entry, "head")).toBeUndefined();
-  const missingReview = resumeRefusal("review", { ...entry, review: undefined, reviewTree: undefined }, "head");
-  expect(missingReview).toContain("work lane");
+  expect(resumeRefusal("review", { ...entry, reviewAttestations: [{ head: "head", tree: "old", closed: true }] }, "head")).toContain("no blocking review");
+  const missingReview = resumeRefusal("review", { ...entry, reviewAttestations: undefined }, "head");
+  expect(missingReview).toContain("No review is attached");
   expect(missingReview).not.toContain("HEAD changed");
   expect(reviewLoopClosed([{ severity: "P3" }])).toBe(true);
   expect(reviewLoopClosed([{ severity: "P2" }, { severity: "P3" }])).toBe(false);
@@ -1280,15 +1276,14 @@ test("Gemini admission reserves remaining work across running lanes and queues t
   expect(geminiAdmission(usage, { busy }, now + 3_600_001).queuedUntil).toBeUndefined();
 });
 
-test("land refuses dirty bases, red receipts, and edits after an interrupted commit", () => {
+test("land refuses running lanes and red receipts but not base dirt or tree drift", () => {
   const tree = { head: "h", tree: "t" };
   const entry = { engine: "gpt", kind: "work", work: { round: 1, state: "done", exitCode: 0 }, worktreePath: "/lane", worktreeRepo: "/repo", branch: "lane/a",
     gateReceipt: makeGateReceipt(1, "/lane", "check", 0, "now", tree, tree) } as any;
-  expect(landRefusal(entry, false, tree)).toBeUndefined();
-  expect(landRefusal(entry, true, tree)).toContain("dirty");
-  expect(landRefusal({ ...entry, gateReceipt: { ...entry.gateReceipt, exitCode: 1 } }, false, tree)).toBeDefined();
-  expect(landRefusal({ ...entry, landingCommit: "committed" }, false, { head: "committed", tree: "t" })).toBeUndefined();
-  expect(landRefusal({ ...entry, landingCommit: "committed" }, false, { head: "committed", tree: "unverified" })).toBeDefined();
+  expect(landRefusal(entry)).toBeUndefined();
+  expect(landRefusal({ ...entry, gateReceipt: { ...entry.gateReceipt, exitCode: 1 } })).toBeDefined();
+  expect(landRefusal({ ...entry, work: { ...entry.work, state: "running" } })).toContain("running");
+  expect(landRefusal({ ...entry, worktreePath: undefined })).toContain("no managed worktree");
 });
 
 test("terminal events carry a five-line digest and child terminals never wake the head", () => {
