@@ -159,7 +159,7 @@ export const TOOLS: ToolDefinition[] = [
   },
   {
     name: "panel",
-    description: "Ask Astra, Sol and Claude Fable the same read-only question. cdx merges the three answers by cited path into reports/<name>.md, keeps disagreement, and sends one completion line.",
+    description: "Ask Astra, Sol and Claude Fable the same read-only question. cdx merges the three answers by cited path into reports/panels/<name>/panel.md, keeps disagreement, and sends one completion line.",
     inputSchema: {
       type: "object",
       properties: {
