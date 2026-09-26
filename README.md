@@ -1,6 +1,6 @@
 <div align="center">
 
-# cdx 9.4.0
+# cdx 9.5.0
 
 **A native Claude Code plugin that runs OpenAI Codex and Google Antigravity as execution lanes.**
 
@@ -8,7 +8,7 @@ Claude is the head. cdx keeps the books and wakes the head when a lane needs it.
 
 [![Claude Code native plugin](https://img.shields.io/badge/Claude_Code-native_plugin-d97757?logo=claude&logoColor=white)](#native-in-claude-code)
 [![Function hooks](https://img.shields.io/badge/function_hooks-native_tools-d97757)](#registered-tools)
-[![Version](https://img.shields.io/badge/version-9.4.0-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-9.5.0-blue)](CHANGELOG.md)
 [![Runtime: Bun](https://img.shields.io/badge/runtime-Bun-f9f1e1?logo=bun&logoColor=black)](https://bun.sh)
 [![Dependencies: zero](https://img.shields.io/badge/dependencies-zero-3fb950)](cdx.ts)
 [![License](https://img.shields.io/github/license/RedesignedRobot/cdx?color=blue)](LICENSE)
@@ -57,7 +57,7 @@ There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and pe
 
 ## Setup in 60 seconds
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.4.0:
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. Then install cdx 9.5.0:
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
@@ -92,7 +92,18 @@ Violet orbits mark GPT, teal scanlines mark Gemini, and amber tickers mark jobs.
 
 `--engine` is optional on spawn, review, and adopt and defaults to `gpt`; omitting it prints `cdx: engine gpt (default)`. `--engine gemini` is the opt-in engine for mechanical sweeps. Resume inherits the lane engine. Gemini always runs `gemini-3.8-flash-high`; cdx ignores `--effort` for Gemini with a note. A Gemini lane gets a 90-minute `--max-runtime` unless the flag says otherwise (`gemini.maxRuntimeMins` in the config); Codex lanes have no default cap.
 
-Without `--model`, a gpt work lane runs the config `model`, default `gpt-6-sol`. Head-launched thinking lanes (review, consult, and `spawn --supervisor`) run `thinkerModel`, default `gpt-6-astra`. `--model M` overrides either with an alias or a raw model id. The built-in aliases are `astra` for `gpt-6-astra` and `sol` for `gpt-6-sol`; the `models` config map adds more. The lane keeps its work model across resume, and status shows it. A review round runs Astra unless `--model` says otherwise and records `reviewModel` beside the lane's `model`, which stays the work thread's model; status shows the review round's model. A child lane can never run `gpt-6-astra` and falls back to Sol. The refusal is checked on the resolved model (explicit `--model`, alias such as `astra`, config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog. Account probes request `model/list` with hidden models included and retain the complete catalog. Admission refuses only when a complete cached catalog excludes the resolved model, with the model and account named. A missing catalog admits the lane without a fallback probe. Account selection and sizing stay unchanged. The protocol is documented in [OpenAI's app-server model listing](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
+Without `--model`, a new head-launched gpt work lane uses `repoRouting` for its repository, then the config `model`, default `gpt-6-sol`. Head-launched thinking lanes (review, consult, and `spawn --supervisor`) run `thinkerModel`, default `gpt-6-astra`. `--model M` overrides either with an alias or a raw model id. The built-in aliases are `astra` for `gpt-6-astra` and `sol` for `gpt-6-sol`; the `models` config map adds more. The lane keeps its work model across resume, and status shows it. A review round runs Astra unless `--model` says otherwise and records `reviewModel` beside the lane's `model`, which stays the work thread's model; status shows the review round's model. A child lane can never run `gpt-6-astra` and falls back to Sol. The refusal is checked on the resolved model (explicit `--model`, alias such as `astra`, config default, retained resume), before any account probe or process start. Head-launched Astra stays allowed. Before opening a GPT round, cdx checks the resolved model against the selected account's cached model catalog. Account probes request `model/list` with hidden models included and retain the complete catalog. Admission refuses only when a complete cached catalog excludes the resolved model, with the model and account named. A missing catalog admits the lane without a fallback probe. Account selection and sizing stay unchanged. The protocol is documented in [OpenAI's app-server model listing](https://learn.chatgpt.com/docs/app-server#list-models-modellist).
+
+`repoRouting` maps absolute repository paths to work models. The shipped route sends `/Users/mas/code/hyperscale-portals` to `gpt-6-astra`, following the owner's portal UI ruling. Linked worktrees and subdirectories use the main repository identity. Spawn prints the selection reason. Omitting `repoRouting` uses the shipped map; an explicit object replaces it, and `{}` disables routing. An explicit `--model` or `--engine gemini` wins. Existing lanes retain their work model, and supervisor children never receive Astra from a route. Gemini remains available for mechanical portal follow-up. See the Model routing table in `~/.agents/GLOBAL.md`.
+
+```json
+{
+  "repoRouting": {
+    "/Users/mas/code/hyperscale-portals": { "model": "gpt-6-astra" }
+  }
+}
+```
+
 
 `--supervisor` lets a GPT lane drive its own children through spawn, resume, review, consult, send, reply, kill, and close. Children run Sol on the default gpt engine, or Gemini for mechanical sweeps; read-only consults are also available. Native Codex subagents are disabled in every cdx-launched GPT session (owner ruling 2026-09-12). Every child is a tracked cdx lane with its own cost and gate.
 
@@ -550,7 +561,7 @@ If `config.json` is absent, the defaults above apply. Malformed JSON or an incon
 <details>
 <summary><b>What the harness injects</b></summary>
 
-cdx injects the role, report contract, and engine rules. Gemini reads files under 800 lines whole once and uses shell codegraph. Native tool output retains the 20 KB transport bound; there is no shell-output prose rule. These built-in rules are followed by `config.json` rules and `.cdx-rules.md`. GPT lanes resolve routine choices, follow steering, and carry authorized work through verification. Only an Astra supervisor delegates, to Sol or Gemini children; workers on either engine execute without further delegation.
+cdx injects the role, report contract, and engine rules. Every lane receives the codegraph-first rule, including review lanes. Gemini uses shell codegraph for code questions; its whole-file reading rule applies to permitted non-code reads. Native tool output retains the 20 KB transport bound; there is no shell-output prose rule. These built-in rules are followed by `config.json` rules and `.cdx-rules.md`. GPT lanes resolve routine choices, follow steering, and carry authorized work through verification. Only an Astra supervisor delegates, to Sol or Gemini children; workers on either engine execute without further delegation.
 
 The brief and liaison replies outrank project and skill guidance within runtime constraints. A blocking instruction must be named and quoted. Questions are for missing decisions that affect outcome or authorization; timeout is not approval. Workers continue independent work and report unresolved dependencies.
 
@@ -632,3 +643,11 @@ Token accounting uses total input including cached reads for both engines. Gemin
 Reviews run in a private detached snapshot of the recorded HEAD and dirty tree. The runner removes it after the round; `cdx doctor` finds crash leftovers and `cdx doctor --fix` removes them. No agent permission restrictions are added. Bare `--worktree name` resolves to `~/code/wt/name`. If a green managed lane changes before `land`, cdx runs its stored gate once on the new snapshot and records a fresh receipt before landing.
 
 `spawn`, `resume`, and `job` accept `--expect MIN`; their native tools accept `expect`. The default is the median of recent completed rounds of the same lane kind, or the previous job with the same name, and never less than `expectMinutes` (15 minutes). One `overrun` event wakes the head with elapsed time, last activity, and the log path. Test and full-suite invocation counts include the gate and appear in status and terminal events. The fourth run emits one test `thrash` notice with the default `visibility.testRuns` of 3.
+
+### Codegraph-first accounting
+
+In a repository with `.codegraph/`, use `codegraph explore` or `codegraph_explore` before text tools for every code question. Literal sweeps, non-code assets, logs, and file-existence checks remain exceptions.
+
+Both engines record `codegraphCalls` and `codeSearchesBeforeGraph` in each round. Status, progress digests, and terminal feed events show `codegraph` and `code-before-graph`. The first probable source search before explore emits one codegraph notice per round to the lane and the head. Counting follows shell order and repository identity, deduplicates tool phases, and resets each round. It exempts recognized literal, non-code, log, and existence searches. It counts explore calls, not successful responses. Ambiguous commands are skipped. These counters measure first-call ordering; they cannot identify every new code question within a round.
+
+`hooks/codegraph-nudge.sh` is the standalone head hook source. It and its pure unit tests use Python 3 from the system, with no added Python packages. The installed copy at `~/.claude/hooks/codegraph-nudge.sh` uses the current transcript turn and permits listed exceptions. It denies clear source exploration at most once per turn when no prior explore call exists for that repository. Unknown intent or unavailable transcript evidence passes. Existing Bash matchers determine which calls reach this hook; this does not cover all file-read tools.

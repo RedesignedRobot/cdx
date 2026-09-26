@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import {
   closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
 
 const GEMINI_TRANSPORT_RETRIES = 1;
 
@@ -531,8 +531,18 @@ function canonicalHash(value: unknown): string {
 
 // Engine events remain the source for arguments and output. Only derived measurements
 // go into cdx_tool, once per completed identity, beside those original events.
-export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null, gate?: string) {
-  const progress = roundProgress(cwd, limits, gate);
+export function codegraphRoot(cwd: string, exists: (path: string) => boolean = existsSync): string | undefined {
+  let path = resolve(cwd);
+  for (;;) {
+    if (exists(`${path}/.codegraph`)) return path;
+    // A nested checkout must not borrow its parent's index.
+    if (exists(`${path}/.git`) || dirname(path) === path) return;
+    path = dirname(path);
+  }
+}
+
+export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null, gate?: string, indexedRoot = codegraphRoot) {
+  const progress = roundProgress(cwd, limits, gate, indexedRoot);
   const reads = new Map<string, number>();
   const starts = new Map<string, { kind: string; argumentHash: string; readFiles: Record<string, string | null> }>();
   const completed = new Set<string>();
@@ -578,6 +588,7 @@ export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (pat
     const usage = step?.usage;
     const tokenDelta = geminiTokens(usage);
     const record = { type: "cdx_tool", id, timestamp, toolKind: before.kind, argumentHash: before.argumentHash,
+      codegraphCalls: count.codegraphCalls, codeSearchesBeforeGraph: count.codeSearchesBeforeGraph,
       ...(Object.keys(before.readFiles).length ? { readFiles: before.readFiles } : {}),
       step: step?.step_index, failed: observation.failed === true,
       ...(before.kind === "read" ? { readRange: { start: args?.startLine ?? 1, end: args?.endLine ?? null } } : {}),

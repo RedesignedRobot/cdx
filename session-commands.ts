@@ -144,7 +144,7 @@ function sessionProgress(session: string, now: number): ProgressSample[] {
     const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
     const gateAge = stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)} ` : "";
     samples.push({ key: `lane=${name}`, round: entry.rounds, steps: entry.roundSteps ?? 0, files: files.get(cwd), stage,
-      action: `${entry.roundTestRuns ? `tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"} ` : ""}${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
+      action: `codegraph=${entry.roundCodegraphCalls ?? 0} code-before-graph=${entry.roundCodeSearchesBeforeGraph ?? 0} ${entry.roundTestRuns ? `tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"} ` : ""}${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
   }
   for (const [name, job] of Object.entries(readJobs())) {
     if (jobRunning(job) && owned(job.ownerSession, undefined, session, state)) {

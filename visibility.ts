@@ -1,10 +1,11 @@
 // Pure progress accounting. Runner memory owns tool identities and repetition state.
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
+import { codegraphActions } from "./codegraph-policy.ts";
 
 export interface VisibilityConfig { heartbeatMinutes: number; failureRepeats: number; fileEdits: number; testRuns: number }
 export const VISIBILITY_DEFAULTS: VisibilityConfig = { heartbeatMinutes: 10, failureRepeats: 5, fileEdits: 20, testRuns: 3 };
-export interface ToolObservation { id?: string; completed: boolean; command?: string; failed?: boolean; files: string[]; output?: string }
+export interface ToolObservation { id?: string; completed: boolean; command?: string; toolName?: string; cwd?: string; args?: unknown; failed?: boolean; files: string[]; output?: string }
 const object = (value: any): any => value && typeof value === "object" ? value : {};
 
 export function toolObservation(event: any): ToolObservation | undefined {
@@ -22,6 +23,9 @@ export function toolObservation(event: any): ToolObservation | undefined {
       id: step.step_index == null ? undefined : `${step.conversation_id ?? ""}:${step.step_index}`,
       completed: ["DONE", "ERROR", "FAILED"].includes(step.state),
       command: params.CommandLine ?? params.command ?? params.cmd,
+      toolName: name,
+      cwd: params.Cwd ?? params.cwd,
+      args: params,
       failed: typeof exit === "number" ? exit !== 0 : ["ERROR", "FAILED"].includes(step.state) || info.is_error === true || Boolean(info.error)
         ? true : undefined,
       files: /^(write_to_file|replace_file_content|multi_replace_file_content|edit_file|write_file|apply_patch)$/.test(name)
@@ -33,10 +37,16 @@ export function toolObservation(event: any): ToolObservation | undefined {
   if (!item || !["item/started", "item/completed", "item.started", "item.completed"].includes(event.method ?? event.type)) return;
   if (!["commandExecution", "command_execution", "fileChange", "file_change", "mcpToolCall", "mcp_tool_call", "dynamicToolCall", "webSearch", "web_search", "imageView"].includes(item.type)) return;
   const exit = item.exitCode ?? item.exit_code;
+  let args = item.arguments ?? item.input;
+  if (typeof args === "string") { try { args = JSON.parse(args); } catch { /* Keep unstructured arguments uncertain. */ } }
   return {
     id: item.id == null ? undefined : `${event.params?.turnId ?? ""}:${item.id}`,
     completed: ["item/completed", "item.completed"].includes(event.method ?? event.type),
     command: typeof item.command === "string" ? item.command : undefined,
+    toolName: item.type === "mcpToolCall" || item.type === "mcp_tool_call"
+      ? (item.server ? `${item.server}/${item.tool}` : item.tool) : item.tool ?? item.type,
+    cwd: item.cwd,
+    args,
     failed: typeof exit === "number" ? exit !== 0 : ["failed", "declined"].includes(item.status) || Boolean(item.error) ? true : undefined,
     files: ["fileChange", "file_change"].includes(item.type)
       ? (Array.isArray(item.changes) ? item.changes : []).map((change: any) => change.path).filter((path: any) => typeof path === "string") : [],
@@ -86,11 +96,16 @@ export function testCommands(command: string, gate?: string): { command: string;
   return runs;
 }
 
-export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: string) {
+export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: string, indexedRoot: (cwd: string) => string | undefined = () => undefined) {
   const seen = new Set<string>();
   const completed = new Set<string>();
   const countedTests = new Set<string>();
   const edits = new Map<string, number>();
+  const graphRepos = new Set<string>();
+  const countedGraph = new Set<string>();
+  let codegraphCalls = 0;
+  let codeSearchesBeforeGraph = 0;
+  let graphWarned = false;
   let steps = 0;
   let previousCommand = "";
   let failures = 0;
@@ -99,8 +114,26 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
   let testSuites = 0;
   let testStatus: "running" | "passed" | "failed" | undefined;
   let testWarned = false;
-  return (observation: ToolObservation): { steps: number; thrash?: string; testRuns: number; testSuites: number; testStatus?: "running" | "passed" | "failed"; testThrash?: string } => {
+  return (observation: ToolObservation): { steps: number; thrash?: string; testRuns: number; testSuites: number; testStatus?: "running" | "passed" | "failed"; testThrash?: string; codegraphCalls: number; codeSearchesBeforeGraph: number; codegraphThrash?: string } => {
     const id = observation.id;
+    let codegraphThrash: string | undefined;
+    const hasDetails = !!observation.command?.trim() || !!(observation.args && typeof observation.args === "object" && Object.keys(observation.args).length);
+    if ((id ? !countedGraph.has(id) : observation.completed) && (observation.completed || hasDetails)) {
+      if (id) countedGraph.add(id);
+      for (const action of codegraphActions(observation, cwd)) {
+        const root = indexedRoot(action.cwd);
+        if (!root) continue;
+        const repo = resolve(root);
+        if (action.kind === "graph") { codegraphCalls++; graphRepos.add(repo); }
+        else if (!graphRepos.has(repo)) {
+          codeSearchesBeforeGraph++;
+          if (!graphWarned) {
+            graphWarned = true;
+            codegraphThrash = `codegraph-first: use codegraph explore before code questions in ${repo}. Exceptions: fixed-string or existence searches, non-code files, logs.`;
+          }
+        }
+      }
+    }
     // Without an identity, count only the final observation rather than both phases.
     if (id ? !seen.has(id) : observation.completed) {
       steps++;
@@ -115,7 +148,7 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
     }
     const testThrash = !testWarned && testRuns > limits.testRuns ? `tests run ${testRuns}x this round` : undefined;
     if (testThrash) testWarned = true;
-    if (!observation.completed || (id && completed.has(id))) return { steps, testRuns, testSuites, testStatus, testThrash };
+    if (!observation.completed || (id && completed.has(id))) return { steps, testRuns, testSuites, testStatus, testThrash, codegraphCalls, codeSearchesBeforeGraph, codegraphThrash };
     if (id) completed.add(id);
     if (runs.length || (id && countedTests.has(id))) testStatus = observation.failed === true ? "failed" : "passed";
     let reason: string | undefined;
@@ -131,9 +164,9 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
       edits.set(path, count);
       if (count > limits.fileEdits) reason ??= `file edited ${count}x: ${path.slice(-80)}`;
     }
-    if (!reason || warned) return { steps, testRuns, testSuites, testStatus, testThrash };
+    if (!reason || warned) return { steps, testRuns, testSuites, testStatus, testThrash, codegraphCalls, codeSearchesBeforeGraph, codegraphThrash };
     warned = true;
-    return { steps, thrash: reason, testRuns, testSuites, testStatus, testThrash };
+    return { steps, thrash: reason, testRuns, testSuites, testStatus, testThrash, codegraphCalls, codeSearchesBeforeGraph, codegraphThrash };
   };
 }
 

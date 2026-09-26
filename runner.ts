@@ -44,7 +44,7 @@ import { invalidateAccountUsage, isFiniteCount, readUsageSnapshot, recordCodexEx
 import { toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { createHash } from "node:crypto";
 import {
-  appendFileSync, closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync,
+  appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, statSync,
   unlinkSync, writeFileSync,
 } from "node:fs";
 import { resolve, relative } from "node:path";
@@ -503,15 +503,23 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       item.roundTestRuns = progress.testRuns;
       item.roundTestSuites = progress.testSuites;
       item.roundTestStatus = progress.testStatus;
+      item.roundCodegraphCalls = progress.codegraphCalls;
+      item.roundCodeSearchesBeforeGraph = progress.codeSearchesBeforeGraph;
       const record = item.kind === "review" ? item.review! : item.work;
       record.testRuns = progress.testRuns;
       record.testSuites = progress.testSuites;
       record.testStatus = progress.testStatus;
+      record.codegraphCalls = progress.codegraphCalls;
+      record.codeSearchesBeforeGraph = progress.codeSearchesBeforeGraph;
       item.lastActionAt = now;
       item.lastEventAt = now;
-    }, Boolean(progress.testThrash || progress.thrash));
-    if (progress.testThrash || progress.thrash) {
-      const reason = [progress.testThrash, progress.thrash].filter(Boolean).join("; ");
+    }, Boolean(progress.testThrash || progress.thrash || progress.codegraphThrash));
+    if (progress.codegraphThrash) {
+      mkdirSync(`${ROOT}/control`, { recursive: true });
+      appendFileSync(controlPathOf(lane, round), `${safeJSON({ from: "cdx", sentAt: now, text: progress.codegraphThrash })}\n`);
+    }
+    if (progress.testThrash || progress.thrash || progress.codegraphThrash) {
+      const reason = [progress.testThrash, progress.thrash, progress.codegraphThrash].filter(Boolean).join("; ");
       const notice = `[cdx] lane=${lane} round=${round} ${reason}; ${thrashAdvice(lane)}`;
       feedEvent("thrash", notice, spec.ownerSession, { lane, round });
       notifyParent(lane, notice);

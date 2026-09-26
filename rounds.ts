@@ -122,9 +122,9 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         pre: opts?.preservePre ? existing?.pre : opts?.pre,
         effort,
         work: kind === "work"
-          ? { state: workState, round: rounds, cwd: workCwd, startedAt: now, updatedAt: now, testRuns: 0, testSuites: 0 }
+          ? { state: workState, round: rounds, cwd: workCwd, startedAt: now, updatedAt: now, testRuns: 0, testSuites: 0, codegraphCalls: 0, codeSearchesBeforeGraph: 0 }
           : existing?.work ?? { state: workState, cwd: workCwd, startedAt: now },
-        review: kind === "review" ? { state: "running", cwd, round: rounds, startedAt: now, updatedAt: now, testRuns: 0, testSuites: 0 } : existing?.review,
+        review: kind === "review" ? { state: "running", cwd, round: rounds, startedAt: now, updatedAt: now, testRuns: 0, testSuites: 0, codegraphCalls: 0, codeSearchesBeforeGraph: 0 } : existing?.review,
         roundStartedAt: now,
         // Reserve the lane with the parent's pid so a concurrent launch is
         // rejected before the runner records its own pid.
@@ -135,7 +135,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         reports: existing?.reports ?? [],
         tokens: existing?.tokens,
         roundTokens: undefined,
-        roundSteps: 0, roundTestRuns: 0, roundTestSuites: 0, roundTestStatus: undefined, overrunSent: false,
+        roundSteps: 0, roundTestRuns: 0, roundTestSuites: 0, roundTestStatus: undefined, roundCodegraphCalls: 0, roundCodeSearchesBeforeGraph: 0, overrunSent: false,
         stage: "working", stageStartedAt: now, lastActionAt: undefined,
         steers: 0,
         steerOpen: true,

@@ -80,6 +80,7 @@ export interface Config {
   model: string;
   // Codex model for head-launched consults, reviews and supervisors.
   thinkerModel?: string;
+  repoRouting?: Record<string, { model: string }>;
   models?: Record<string, string>;
   efforts: string[];
   defaultEffort: string;
@@ -123,6 +124,8 @@ export interface GateReceipt {
 }
 
 export interface RoundRecord<S extends WorkState = WorkState> {
+  codegraphCalls?: number;
+  codeSearchesBeforeGraph?: number;
   testRuns?: number;
   testSuites?: number;
   testStatus?: "passed" | "failed" | "running";
@@ -210,6 +213,8 @@ export interface Lane {
   roundTokens?: Tokens;
   tokensIncomplete?: boolean;
   roundTestRuns?: number;
+  roundCodegraphCalls?: number;
+  roundCodeSearchesBeforeGraph?: number;
   roundTestSuites?: number;
   roundTestStatus?: "passed" | "failed" | "running";
   expectMinutes?: number;
@@ -387,7 +392,7 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
     if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
     const lane = identity.lane ? readLedger()[identity.lane] : undefined;
     const terminal = kind === "terminal" || kind === "job-exit";
-    if (kind === "terminal" && lane) message += ` tests=${lane.roundTestRuns ?? 0} suites=${lane.roundTestSuites ?? 0}${lane.roundTestStatus ? ` testStatus=${lane.roundTestStatus}` : ""}`;
+    if (kind === "terminal" && lane) message += ` tests=${lane.roundTestRuns ?? 0} suites=${lane.roundTestSuites ?? 0}${lane.roundTestStatus ? ` testStatus=${lane.roundTestStatus}` : ""} codegraph=${lane.roundCodegraphCalls ?? 0} code-before-graph=${lane.roundCodeSearchesBeforeGraph ?? 0}`;
     const read = (path?: string) => { try { return path && path !== "-" ? readFileSync(path, "utf8") : undefined; } catch { return undefined; } };
     if (terminal) {
       const report = read(/(?:^|\s)report=(\S+)/.exec(message)?.[1]);

@@ -1,6 +1,6 @@
 {
   "name": "cdx-lanes",
-  "version": "9.4.0",
+  "version": "9.5.0",
   "license": "AGPL-3.0-only",
   "type": "module",
   "bin": {
@@ -9,7 +9,7 @@
   "repository": "github:RedesignedRobot/cdx",
   "description": "OpenAI Codex and Google Antigravity execution lanes for Claude Code.",
   "scripts": {
-    "check": "tsc --noEmit && tsc -p hooks --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test --preload ./test-state.ts"
+    "check": "tsc --noEmit && tsc -p hooks --noEmit && bun build cdx.ts --target=bun --outfile=/tmp/cdx-check.js && bun test --preload ./test-state.ts && python3 hooks/codegraph-nudge.test.py"
   },
   "devDependencies": {
     "@types/bun": "^1.4.2",

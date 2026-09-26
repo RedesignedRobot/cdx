@@ -16,6 +16,7 @@ const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and sh
 const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
+const CODEGRAPH_RULE = "In a repository with .codegraph/, codegraph explore (CLI) or codegraph_explore (MCP) is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph fails, report the failure and resolve availability before continuing the code question.";
 const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
 const GPT_RULES = [
@@ -33,7 +34,7 @@ export const GEMINI_WORKER_RULES = [
   WORKER_BAN,
   "Deliver within your files; the parent owns design and scope.",
   ASK_RULE,
-  "Read files under 800 lines whole once; reread only after they change. Batch independent reads. Use shell codegraph explore, not the MCP transport.",
+  "Use shell codegraph explore for code questions. Batch independent queries. For permitted non-code reads, read files under 800 lines whole once; reread only after they change.",
   "Remove temporary diagnostics and report commands and scope separately from the gate verdict. End with Assumptions or 'none'.",
 ];
 const SUPERVISOR_RULES = [
@@ -91,6 +92,7 @@ export function sharedTreeLanes(lane: string, cwd: string, ledger: Ledger, treeR
 
 export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
   const builtIns = reviewOnly ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT] : [LANE_ROLE, WORK_LIMITS, WORK_REPORT];
+  builtIns.push(CODEGRAPH_RULE);
   if (!reviewOnly) {
     if (opts.supervisor && engine === "gpt") builtIns.push(...SUPERVISOR_RULES);
     else builtIns.push(...(engine === "gemini" ? GEMINI_WORKER_RULES : GPT_WORKER_RULES));

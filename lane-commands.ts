@@ -32,6 +32,7 @@ import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./repo
 import { failActiveRound } from "./round-state.ts";
 import { expectMinutes, historyMinutes } from "./duration.ts";
 import { openRound } from "./rounds.ts";
+import { chooseSpawnModel } from "./repo-routing.ts";
 import { runRound } from "./runner.ts";
 import {
   color, displayPath, fail, fmtAge, HOME, REPO_ROOT, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
@@ -43,6 +44,13 @@ import { spawn as nodeSpawn } from "node:child_process";
 import {
   existsSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
+
+function gitCommonDir(cwd: string): string | undefined {
+  const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+  if (!result.success) return undefined;
+  const path = result.stdout.toString().trim();
+  return path && existsSync(path) ? realpathSync(path) : undefined;
+}
 
 function launch(spec: Spec, brief: string, background: boolean): Promise<never> | never {
   spec.accountHomes = config.accounts;
@@ -154,10 +162,6 @@ export async function spawnCommand(argv: string[]) {
   if (existingLane && laneRunning(existingLane) && pidAlive(existingLane.pid)) {
     fail(`lane "${lane}" is already running (pid ${existingLane.pid}); pick a new name or wait`);
   }
-  // A respawn without --model keeps the lane's model; the config default is
-  // for new lanes only.
-  const model = existingLane && engine === "gpt" && parsed.flags.model === undefined ? laneModel(existingLane) : modelOf(parsed, engine, supervisor ? "think" : "work", Boolean(parent));
-  checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   requireEngineBinary(engine);
   if (engine === "gemini" && parsed.flags.account !== undefined) fail("--account is not supported for gemini");
   if (engine === "gemini") requireGeminiAgent((config.gemini ?? geminiConfig()).agent, parsed.flags.cd ?? process.cwd());
@@ -165,6 +169,17 @@ export async function spawnCommand(argv: string[]) {
   const roots = spawnRoots(parsed.flags.cd, existingLane, process.cwd(), existsSync);
   let cwd = roots.cwd;
   if (!existsSync(cwd)) fail(`cwd does not exist: ${cwd}`);
+  // A respawn without --model keeps the stored model. Fresh head work may
+  // instead use the repository route for the actual working directory.
+  const retained = Boolean(existingLane && engine === "gpt" && parsed.flags.model === undefined);
+  const baseModel = retained ? laneModel(existingLane) : modelOf(parsed, engine, supervisor ? "think" : "work", Boolean(parent));
+  const choice = chooseSpawnModel(baseModel, {
+    engine, cwd, routing: config.repoRouting, commonDir: () => gitCommonDir(cwd),
+    explicit: parsed.flags.model !== undefined, retained, thinking: supervisor,
+    child: Boolean(parent || existingLane?.parent),
+  });
+  const model = choice.model;
+  checkChildAstraRefusal(Boolean(parent || existingLane?.parent), engine, model);
   const effort = resolveEffort(engine, model, parsed.flags.effort);
   const maxRuntime = maxRuntimeOf(parsed) ?? defaultMaxRuntime(engine);
   if (parsed.flags.gate !== undefined && parsed.flags.gate.trim() === "") fail("--gate needs a nonempty command");
@@ -228,6 +243,7 @@ export async function spawnCommand(argv: string[]) {
     }
   }
   if (selection) announceAccountSelection(lane, selection);
+  console.log(`cdx: model selection ${engine === "gemini" ? (config.gemini ?? geminiConfig()).model : model} because ${choice.reason}`);
   const fullBrief = `Ground rules:\n${houseRules(cwd, false, engine, { supervisor })}\n\nTask:\n${brief}`;
   withLedger((ledger) => { ledger[lane]!.additionalDirectories = additionalDirectories; });
   const gateBaselineChecked = Boolean(!parent && effectiveGate && parsed.bools.has("gate-baseline-check"));

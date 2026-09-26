@@ -120,7 +120,9 @@ export function outageText(outage: LaneOutage, agyRetries: number | undefined, n
 export function laneProgress(entry: Lane, files: number | undefined, now = Date.now()): string {
   const stage = entry.stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)}` : entry.stage ?? "working";
   const tests = entry.roundTestRuns ? ` tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"}` : "";
-  return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`}${tests} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
+  const graph = entry.roundCodegraphCalls !== undefined || entry.roundCodeSearchesBeforeGraph !== undefined
+    ? ` codegraph=${entry.roundCodegraphCalls ?? 0} code-before-graph=${entry.roundCodeSearchesBeforeGraph ?? 0}` : "";
+  return `${entry.roundSteps ?? 0} steps${files === undefined ? "" : ` ${files} files`}${tests}${graph} ${stage} last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 160)}`;
 }
 
 function renderLaneBlock(lane: string, entry: Lane): string {

@@ -1,3 +1,9 @@
+## 9.5.0
+
+- New head-launched work lanes use `repoRouting` before the default work model. The shipped portal route selects `gpt-6-astra` for `/Users/mas/code/hyperscale-portals`, including linked worktrees. Explicit model or Gemini selections win; retained models and the child-Astra rule stay in force. Spawn prints the selection reason.
+- Both engines count probable source searches before the first codegraph explore call per indexed repository in a round. Round records, status, progress digests and terminal feed show the counts. One notice reaches the lane and the head per round. Recognized literal sweeps, non-code assets, logs and existence checks are exempt.
+- Every lane receives codegraph-first guidance. Gemini's whole-file reading rule now applies to non-code reads. The standalone head hook checks transcript turn history and blocks clear source exploration once per turn, allowing exceptions and uncertain cases.
+
 ## 9.4.0
 
 - Gemini input tokens now include cache reads, matching Codex; existing ledger rows migrate once with per-lane markers that survive older writers. This removes negative uncached input from `cdx usage --totals`.

@@ -13,6 +13,7 @@ const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 // Shipped ceilings. Configured caps may raise or lower either model's ceiling.
 const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6-sol": "high" };
+const DEFAULT_REPO_ROUTING = { "/Users/mas/code/hyperscale-portals": { model: "gpt-6-astra" } };
 
 // GPT-6 split (owner ruling 2026-09-23): Sol executes work lanes, Astra thinks.
 // Astra runs head-launched consults, reviews and supervisors; children never.
@@ -37,7 +38,7 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "thinkerModel", "models", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
+  const allowed = new Set(["model", "thinkerModel", "models", "repoRouting", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -48,6 +49,7 @@ export function parseConfig(text: string): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
+    repoRouting: DEFAULT_REPO_ROUTING,
     expectMinutes: 15,
     gemini: geminiConfig(),
   };
@@ -66,6 +68,25 @@ export function parseConfig(text: string): Config {
       if (typeof id !== "string" || !MODEL_ID.test(id)) configError(`models.${alias} must be a Codex model id`);
     }
     models = { ...(value as Record<string, string>) };
+  }
+
+  let repoRouting: Record<string, { model: string }> = { ...DEFAULT_REPO_ROUTING };
+  if (Object.hasOwn(input, "repoRouting")) {
+    const value = input.repoRouting;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      configError("repoRouting must be an object mapping canonical repository paths to model entries");
+    }
+    repoRouting = {};
+    for (const [path, entry] of Object.entries(value as Record<string, unknown>)) {
+      if (!isAbsolute(path) || resolve(path) !== path) configError(`repoRouting key "${path}" must be an absolute canonical path`);
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)
+        || Object.keys(entry).length !== 1 || !Object.hasOwn(entry, "model")) {
+        configError(`repoRouting.${path} must contain only a model`);
+      }
+      const model = (entry as { model: unknown }).model;
+      if (typeof model !== "string" || !MODEL_ID.test(model)) configError(`repoRouting.${path}.model must be a Codex model id`);
+      repoRouting[path] = { model };
+    }
   }
 
   const efforts = Object.hasOwn(input, "efforts") ? input.efforts : defaults.efforts;
@@ -198,7 +219,7 @@ export function parseConfig(text: string): Config {
   return {
     ...limits, visibility, expectMinutes,
     model, thinkerModel, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
-    ...(accounts ? { accounts } : {}), effortCaps, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
+    ...(accounts ? { accounts } : {}), effortCaps, repoRouting, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
   };
 }
 
@@ -210,6 +231,7 @@ function readConfig(skipFile = false): Config {
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
+    repoRouting: DEFAULT_REPO_ROUTING,
     expectMinutes: 15,
     gemini: geminiConfig(),
   };
