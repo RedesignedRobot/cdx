@@ -1,7 +1,7 @@
 import "./visibility.test.ts";
 import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
-import { readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { mkdirSync, readdirSync, readFileSync, rmdirSync, unlinkSync } from "node:fs";
 import {
   verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, toolLogRecords,
   checkRoundCap, summaryJobs, parseArgs, parseConfig, roundCapRefusal,
@@ -21,6 +21,7 @@ import { missingCodexModels, usageVerdict } from "./doctor.ts";
 import { electHead, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
+import { logProgress, progressLogPathOf } from "./reports.ts";
 
 // Keep tests pure: selection is a filter over rows passed in, so these
 // tests never read user files, spawn engines, or wait on timers.
@@ -428,6 +429,13 @@ test("lane shells and gates get the state root as CDX_HOME and never CDX_STATE_H
     expect(env.CDX_HOME).toBe(ROOT);
   }
   expect(runnerEnv(undefined).CDX_STATE_HOME).toBe(ROOT);
+});
+
+test("a progress note the sandbox cannot write never fails the command", () => {
+  const path = progressLogPathOf("sandboxed", 1);
+  mkdirSync(path, { recursive: true });
+  try { expect(() => logProgress("sandboxed", 1, "answered from scope policy extend")).not.toThrow(); }
+  finally { rmdirSync(path); }
 });
 
 test("Rank 2: gateEnv prepends local bin to PATH and classifyGateFailure distinguishes setup vs assertion failures", () => {
