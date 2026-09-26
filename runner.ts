@@ -7,6 +7,7 @@ import { defaultCodexHome } from "./accounts.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 import { drainGeminiControls } from "./gemini-controls.ts";
+import { scopeExtensions } from "./brief-contract.ts";
 // Round execution, engine event handling, account failover, and finalization.
 
 import { config, geminiConfig } from "./config.ts";
@@ -25,7 +26,7 @@ import {
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
+  activeStateOf, feedEvent, findLane, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
   type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLane, withLedger,
 } from "./ledger.ts";
 import { sharedTreeLanes, reviewLoopClosed } from "./prompts.ts";
@@ -879,6 +880,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         lines: (path) => readFileSync(path, "utf8").split("\n").filter((line) => line.trim()),
         deliveredCount: () => readDeliveredCount(lane, round),
         markDelivered: (count) => writeDeliveredCount(lane, round, count),
+        callLimitHit: () => Boolean(findLane(lane)?.callLimitHit),
         withLane: (action) => withLane(lane, action),
         deliver: (record) => {
           writeUserTurn(controlText(record));
@@ -1305,6 +1307,8 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
     : [];
   const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewTreeMoved && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
   if (gateReceipt) {
+    const extensions = existsSync(reportPath) ? scopeExtensions(readFileSync(reportPath, "utf8")) : [];
+    if (extensions.length) gateReceipt.scopeExtensions = extensions;
     const final = finishGateReceipt(gateReceipt, roundState);
     gateReceipt = final.receipt;
     appendFileSync(reportPath, final.report);
@@ -1329,9 +1333,8 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
       try { gateLogOutput = readFileSync(gateLogPath, "utf8"); } catch {}
       const failure = gateFailure(gateExit ?? 1, gateLogOutput);
       const kindLabel = `gate ${failure.kind} failed`;
-      roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}` : spec.gateBaselineChecked
-        ? `${kindLabel} after work; baseline passed (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`
-        : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath}); baseline was not checked, use --gate-baseline-check on spawn`;
+      roundNote = gateTimedOut ? `gate timed out after 60 minutes: ${spec.gate}`
+        : `${kindLabel} (exit ${gateExit}): ${spec.gate} (cwd=${spec.cwd}, log=${gateLogPath})`;
       roundNote = `${failure.diagnostic}\n${roundNote}`;
     } else if (maxRuntimeHit) roundNote = `max runtime exceeded (${spec.maxRuntimeMins}m)`;
     else if (receivedSignal) roundNote = `terminated by signal (exit ${exitCode}): cdx kill or a manual stop`;

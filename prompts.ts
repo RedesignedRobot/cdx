@@ -44,7 +44,7 @@ const SUPERVISOR_RULES = [
   "Never edit child-owned files. Put shared findings in a file referenced by child briefs and batch corrections into one send per child per review pass.",
   "Give writers exclusive files and each child an outcome, gate, and relevant facts; start independent children together. Every writer child gets its own worktree branched from your branch head at spawn, so children never share a tree.",
   "Merge green children into your branch with `cdx land <child>` or `cdx land --batch <child>...`; land a child whose work another child needs before spawning the dependent child, and land every green child before your report.",
-  "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs, adopt, and clean to it.",
+  "Drive only your children and answer promptly; ask the liaison about wrong gates without changing them, and leave jobs and clean to it.",
   "Join children and read reports and gate results without rerunning checks; ending stops active children and fails your round if any remained running.",
   "Send children one-sentence progress updates, keep reports short, and end your report with duplicated investigation or rework.",
 ];

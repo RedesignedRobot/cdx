@@ -1,3 +1,4 @@
+import { renderBrief } from "../brief-contract";
 import { safeText } from "../safe-text";
 // Table of tools exposed by the cdx mod. Pure definitions and argv builders.
 // Evaluated both in Claude Code hooks and in tests.
@@ -30,12 +31,18 @@ export const TOOLS: ToolDefinition[] = [
   {
     name: "spawn",
     description:
-      "Spawn a new cdx lane with a brief. The brief is delivered whole through stdin so quotes and newlines are safe; completion arrives as a [cdx] event.",
+      "Spawn a new cdx work lane. A work brief needs an outcome, owned files, acceptance, out-of-scope and a gate (gate or the repository's .cdx-gate); pass them as fields or as \"## Outcome\", \"## Files\", \"## Acceptance\", \"## Out of scope\" sections in brief. A supervisor also needs two or more children file sets. The brief is delivered whole through stdin; completion arrives as a [cdx] event.",
     inputSchema: {
       type: "object",
       properties: {
         lane: { type: "string", description: "Name for the new lane" },
-        brief: { type: "string", description: "Task brief for the lane" },
+        brief: { type: "string", description: "Task brief for the lane: context and constraints, plus any sections not passed as fields" },
+        outcome: { type: "string", description: "What must be true when the lane is done" },
+        files: { type: "array", items: { type: "string" }, description: "Files the lane owns" },
+        acceptance: { type: "string", description: "The assertion that separates success from a plausible wrong answer" },
+        outOfScope: { type: "string", description: "What the lane must not do or touch" },
+        children: { type: "array", items: { type: "string" }, description: "Supervisor only: one child file set per item, two or more" },
+        scopePolicy: { type: "string", enum: ["ask", "extend", "stop"], description: "Files outside the brief: extend edits and lists them (default), stop ends the round, ask asks the head" },
         engine: { type: "string", enum: ["gpt", "gemini"], description: "Execution engine" },
         model: { type: "string", description: "Model alias or id" },
         supervisor: { type: "boolean", description: "Run lane as supervisor" },
@@ -58,6 +65,7 @@ export const TOOLS: ToolDefinition[] = [
       if (input.engine) argv.push("--engine", String(input.engine));
       if (input.model) argv.push("--model", String(input.model));
       if (input.supervisor) argv.push("--supervisor");
+      if (input.scopePolicy) argv.push("--scope-policy", String(input.scopePolicy));
       if (input.cd) argv.push("--cd", String(input.cd));
       if (input.worktree) argv.push("--worktree", String(input.worktree));
       if (input.gate) argv.push("--gate", String(input.gate));
@@ -74,7 +82,11 @@ export const TOOLS: ToolDefinition[] = [
         for (const img of input.images) argv.push("--image", String(img));
       }
       argv.push("--bg", "-");
-      return { argv, stdin: String(input.brief) };
+      const list = (value: unknown) => Array.isArray(value) ? value.map(String) : undefined;
+      const text = (value: unknown) => typeof value === "string" ? value : undefined;
+      const brief = renderBrief({ outcome: text(input.outcome), files: list(input.files), acceptance: text(input.acceptance),
+        outOfScope: text(input.outOfScope), children: list(input.children) }, String(input.brief));
+      return { argv, stdin: brief };
     },
   },
   {

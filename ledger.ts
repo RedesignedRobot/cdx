@@ -4,6 +4,7 @@ import { safeText, safeJSON } from "./safe-text.ts";
 
 import { fail, ROOT, singleLine } from "./runtime.ts";
 import { db, write } from "./store.ts";
+import type { ScopePolicy } from "./brief-contract.ts";
 import { type VisibilityConfig } from "./visibility.ts";
 import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
@@ -94,20 +95,14 @@ type WorkState = "running" | "done" | "failed" | "gate-invalid" | "adopted" | "c
 
 export type ReviewState = "running" | "done" | "failed";
 
-interface GateBaseline {
-  round: number;
-  command: string;
-  cwd: string;
-  exitCode: number;
-  checkedAt: string;
-}
-
 export interface GateTree { head: string; tree: string }
 
 export interface ReviewAttestation { tree: string; head: string; reviewer: string; closed: boolean; report?: string; at: string }
 
 export interface GateReceipt {
   paths?: string[];
+  // Files the lane edited outside its brief's Files section, from its report.
+  scopeExtensions?: string[];
   sharedTreeLanes?: string[];
   version: 1;
   round: number;
@@ -229,7 +224,7 @@ export interface Lane {
   hooksActive?: boolean;
   // Acceptance gate command; work rounds rerun it at finalize, reviews never.
   gate?: string;
-  gateBaseline?: GateBaseline;
+  scopePolicy?: ScopePolicy;
   gateReceipt?: GateReceipt;
   additionalDirectories?: string[];
   // Pre-check command; runs in cwd before opening the round.
@@ -277,7 +272,6 @@ export interface Spec {
   ownerCwd?: string;
   sessionId?: string;
   gate?: string;
-  gateBaselineChecked?: true;
   reviewDir?: string;
   maxRuntimeMins?: number;
   supervisor?: true;
@@ -556,16 +550,16 @@ export function lanesUpdatedSince(iso: string): Ledger {
 }
 
 // The newest archived lanes, for statistics that need finished history.
-// Worktree repositories of closed lanes, without loading their records.
-export function archivedWorktreeRepos(): string[] {
-  return db().query<{ repo: string }, []>("SELECT DISTINCT json_extract(data, '$.worktreeRepo') AS repo FROM archive WHERE repo IS NOT NULL")
-    .all().map((row) => row.repo);
-}
-
 export function recentArchivedLanes(limit: number): Ledger {
   const lanes: Ledger = {};
   for (const row of db().query<LaneRow, [number]>("SELECT name, data FROM archive ORDER BY updated_at DESC LIMIT ?").all(limit)) lanes[row.name] = JSON.parse(row.data);
   return lanes;
+}
+
+// Worktree repositories of closed lanes, without loading their records.
+export function archivedWorktreeRepos(): string[] {
+  return db().query<{ repo: string }, []>("SELECT DISTINCT json_extract(data, '$.worktreeRepo') AS repo FROM archive WHERE repo IS NOT NULL")
+    .all().map((row) => row.repo);
 }
 
 // One write transaction over the active lanes. Only rows whose JSON changed

@@ -7,6 +7,7 @@ export function drainGeminiControls(path: string, turnActive: boolean, hooksInst
   lines: (path: string) => string[];
   deliveredCount: () => number;
   markDelivered: (count: number) => void;
+  callLimitHit: () => boolean;
   withLane: (action: (lane: GeminiControlLane | undefined) => void) => void;
   deliver: (record: ControlRecord) => void;
   now: () => string;
@@ -16,6 +17,9 @@ export function drainGeminiControls(path: string, turnActive: boolean, hooksInst
   // an active hooked turn waits for the turn to end without touching the lock.
   if (turnActive && hooksInstalled) return;
   if (!io.exists(path) || io.deliveredCount() >= io.lines(path).length) return;
+  // A lane past its call limit never delivers again, so its queued steers
+  // stay undelivered; check with a plain read before taking the write lock.
+  if (io.callLimitHit()) return;
   const toDeliver: ControlRecord[] = [];
   io.withLane((lane) => {
     if (lane?.callLimitHit || !io.exists(path)) return;

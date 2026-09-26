@@ -51,7 +51,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         && !((existing.switchingAccount || existing.outageFallbackPending) && existing.pid === process.pid)) {
         throw new CmdError(`lane "${lane}" is already running (pid ${existing.pid}); pick a new name or wait`);
       }
-      if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; use cdx adopt or spawn`);
+      if (opts?.requireSession && !opts.sessionOverride && !existing?.sessionId) throw new CmdError(`lane "${lane}" has no session id; spawn a fresh lane`);
       if (opts?.reviewTree) {
         const duplicate = reviewerForTree(ledger, opts.reviewTree);
         if (duplicate) throw new CmdError(`SHA ${opts.reviewTree.tree} already has reviewer ${duplicate}; reuse its report`);
