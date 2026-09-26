@@ -50,7 +50,7 @@ sequenceDiagram
 | `mcp__cdx__land`, `close`, `kill`, `gate`, `gate-receipt`, `job`, `ask`, `doctor` | Land, finish, stop, gate, run detached jobs, ask a code question, diagnose. |
 | `[cdx]` prompts and toasts | Wake events arrive as a prompt when the head is idle and as context on the next tool result mid-turn. |
 | `/lanes` | Opens a live Pane with lane details and recent transcript lines. Arguments forward to cdx. |
-| Live band and status line | This session's running lanes and jobs, refreshed every two seconds. The band is a table (NAME, KIND, ENGINE, STAGE, AGE, STEPS, FILES, NOW) with the stage coloured; a narrow terminal drops ENGINE, then KIND. The status line is one line. |
+| Live band and status line | This session's running lanes and jobs, refreshed every two seconds. The band is a table (NAME, KIND, ENGINE, EFFORT, STAGE, AGE, STEPS, FILES, NOW) with the stage coloured. EFFORT is the reasoning effort the lane's current round runs at. A narrow terminal drops EFFORT, then ENGINE, then KIND. The status line is one line. |
 
 There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and people at a terminal.
 

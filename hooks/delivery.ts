@@ -83,13 +83,14 @@ const BAND_COLUMNS: BandColumn[] = [
   { title: "NAME", value: (row) => `${row.parent ? "  " : ""}${row.name}`, style: () => ({ bold: true }), gap: 2, max: 28 },
   { title: "KIND", value: (row) => row.kind, style: plain, gap: 2 },
   { title: "ENGINE", value: (row) => row.kind === "job" ? "-" : row.model ?? row.engine, style: plain, gap: 2, max: 18 },
+  { title: "EFFORT", value: (row) => row.kind === "job" ? "-" : row.effort ?? "-", style: dim, gap: 2 },
   { title: "STAGE", value: (row) => row.stage, style: staged, gap: 2 },
   { title: "AGE", value: (row, now) => elapsed(row.startedAt, now), style: dim, gap: 2 },
   { title: "STEPS", value: (row) => row.kind === "job" ? "-" : String(row.steps), style: plain, gap: 2, right: true },
   { title: "FILES", value: (row) => row.files === undefined ? "-" : String(row.files), style: plain, gap: 2, right: true },
 ];
 
-// Below this many columns for NOW the band drops ENGINE, then KIND.
+// Below this many columns for NOW the band drops EFFORT, then ENGINE, then KIND.
 const NOW_MIN = 20;
 
 function width(text: string): number {
@@ -114,7 +115,7 @@ export function bandTable(rows: readonly LiveRow[], now: number, columns: number
     return { column, size: Math.min(widest, column.max ?? widest) };
   });
   const rest = () => columns - layout.reduce((sum, { column, size }) => sum + size + column.gap, 0);
-  for (const dropped of ["ENGINE", "KIND"]) {
+  for (const dropped of ["EFFORT", "ENGINE", "KIND"]) {
     if (rest() < NOW_MIN) layout = layout.filter(({ column }) => column.title !== dropped);
   }
   const nowSize = Math.max(0, rest());

@@ -4,6 +4,8 @@ export interface LiveRow {
   kind: "lane" | "job";
   engine: string;
   model?: string;
+  // The current round's effort as openRound stored it on the lane.
+  effort?: string;
   stage: string;
   startedAt: string;
   steps: number;

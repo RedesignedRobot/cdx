@@ -57,6 +57,7 @@ export interface LiveRow {
   kind: "lane" | "job";
   engine: string;
   model?: string;
+  effort?: string;
   stage: string;
   startedAt: string;
   steps: number;
@@ -93,7 +94,7 @@ export function liveRows(now = Date.now(), visible: (owner: string | undefined) 
     }
     const question = questions.find((record) => record.lane === name && record.round === entry.rounds && questionOpen(record));
     rows.push({ name, parent: entry.parent, kind: "lane", engine: roundEngine(entry),
-      model: entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.fallbackModel ?? entry.model,
+      model: entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.fallbackModel ?? entry.model, effort: entry.effort,
       stage: question ? "question" : entry.outage ? "outage" : entry.queuedUntil && Date.parse(entry.queuedUntil) > now ? "queued"
         : now - Date.parse(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt) >= 300_000 ? "stalled" : entry.stage ?? "working",
       startedAt: entry.roundStartedAt ?? entry.createdAt, steps: entry.roundSteps ?? 0,

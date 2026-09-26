@@ -1,3 +1,10 @@
+## 10.0.7 (2026-09-26)
+
+### Band
+
+- The band and the `/lanes` Pane have an EFFORT column after ENGINE: the reasoning effort the lane's current round runs at (`low`, `medium`, `high`, `xhigh`), dim like AGE. It is the value `openRound` stores on the lane when the round opens, after the brief's `--effort`, the config default and the model caps have resolved it, so the band shows what the runner launched rather than a recomputation. Jobs show `-`.
+- A narrow terminal drops EFFORT first, then ENGINE, then KIND, and no line is ever wider than the band.
+
 ## 10.0.6 (2026-09-26)
 
 ### Delivery
