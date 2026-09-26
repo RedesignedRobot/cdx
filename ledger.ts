@@ -153,6 +153,8 @@ export interface Lane {
   quotaWrapSent?: boolean;
   touchedPaths?: string[];
   landedCommit?: string;
+  // The lander that owns the lane while its merge gates; inert once pid dies.
+  landing?: { pid: number; job: string };
   baseBranch?: string;
   reviewTree?: GateTree;
   reviewClosed?: boolean;
