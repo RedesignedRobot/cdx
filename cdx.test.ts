@@ -1217,22 +1217,23 @@ import { configuredMcpServers } from "./engines.ts";
 import { mkdtempSync, readFileSync as readText, writeFileSync as writeText } from "node:fs";
 import { tmpdir } from "node:os";
 
-test("only GPT work receives the compaction trial and every GPT thread sheds unused context", () => {
+test("every GPT role receives the caps and a sandbox, and every thread sheds unused context", () => {
   const codexHome = mkdtempSync(`${tmpdir()}/cdx-home-`);
   writeText(`${codexHome}/config.toml`, '[mcp_servers.context7]\nurl = "x"\n[mcp_servers.context7.env_http_headers]\n[mcp_servers.codegraph]\ncommand = "codegraph"\n[mcp_servers."computer-use"]\n');
   const base = { engine: "gpt", mode: "spawn", cwd: "/repo", effort: "medium", codexHome } as any;
   const work = appThreadParams(base).config as any;
   // Codex 0.156 refuses overrides for undefined servers, so only configured ones are disabled
-  expect(work.mcp_servers).toEqual({ context7: { enabled: false }, "computer-use": { enabled: false } });
+  expect(work.mcp_servers).toEqual({ context7: { enabled: false }, codegraph: { enabled: false }, "computer-use": { enabled: false } });
   expect(configuredMcpServers("[mcp_servers.a]\n[mcp_servers.a.env]\n[other]\n")).toEqual(["a"]);
   expect(configuredMcpServers('[mcp_servers]\nb = { url = "x" }\n  [mcp_servers.c]\n')).toEqual(["b", "c"]);
   expect(work).toMatchObject({ model_auto_compact_token_limit: 150000, tool_output_token_limit: 6000,
     features: { memories: false, plugins: false, apps: false }, skills: { include_instructions: false } });
   expect(work.mcp_servers.context7.enabled).toBe(false);
-  for (const patch of [{ reviewDir: "/repo" }, { supervisor: true }]) {
-    const options = appThreadParams({ ...base, ...patch }).config as any;
-    expect(options.model_auto_compact_token_limit).toBeUndefined();
-    expect(options.tool_output_token_limit).toBeUndefined();
+  expect(appThreadParams(base).sandbox).toBe("workspace-write");
+  for (const [patch, sandbox] of [[{ reviewDir: "/repo" }, "read-only"], [{ supervisor: true }, "workspace-write"]] as const) {
+    const params = appThreadParams({ ...base, ...patch });
+    expect(params.sandbox).toBe(sandbox);
+    expect(params.config).toMatchObject({ model_auto_compact_token_limit: 150000, tool_output_token_limit: 6000 });
   }
   expect(parseConfig('{"tool_output_token_limit":4321}').tool_output_token_limit).toBe(4321);
   expect(() => parseConfig('{"model_auto_compact_token_limit":0}')).toThrow();

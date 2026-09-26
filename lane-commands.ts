@@ -41,6 +41,7 @@ import {
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { childWorktreeTarget, createWorktree, mergeDirectories, storedDirectories, type WorktreeInfo } from "./worktrees.ts";
+import { geminiProfile } from "./sandbox.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
   existsSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
@@ -505,11 +506,8 @@ export async function codeQuestionCommand(argv: string[]): Promise<void> {
   requireGeminiAgent(policy.reviewAgent, cwd);
   // Keep this request read-only even when its shell tool tries to write.
   if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
-  const common = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
-  const paths = [cwd, ...(common.success ? [common.stdout.toString().trim()] : [])];
-  const profile = `(version 1)(allow default)(deny file-write* ${paths.map((path) => `(subpath ${JSON.stringify(path)})`).join(" ")})`;
-  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", profile, "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
-    "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--dangerously-skip-permissions", "--print-timeout", "90s", "--add-dir", cwd],
+  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
+    "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--print-timeout", "90s", "--add-dir", cwd],
     cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);
   try {

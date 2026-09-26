@@ -35,6 +35,8 @@ function escapeIgnorePath(path: string): string {
 
 // Ignored dependencies stay shared. Linking the entire entry preserves package
 // and .bin link resolution without traversing large node_modules/generated trees.
+// Review lanes run in a read-only sandbox, so a write through these links fails
+// there. An APFS clone would cost about 13 s per snapshot for 90k files.
 export function linkIgnoredEntries(source: string, tree: string, entries: string[], io = {
   exists: existsSync,
   mkdir: (path: string) => { mkdirSync(path, { recursive: true }); },

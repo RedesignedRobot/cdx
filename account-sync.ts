@@ -26,8 +26,24 @@ function readText(path: string): string | undefined {
   return readFileSync(path, "utf8");
 }
 
-// Each account keeps its interactive instructions. New lane processes use this home.
-export function laneCodexHome(home: string): string { return join(home, "cdx-lane"); }
+// Each account keeps its interactive instructions. New lane processes use this
+// home; supervisors get their own so only they carry the cdx exec-policy rule.
+export function laneCodexHome(home: string, supervisor = false): string { return join(home, supervisor ? "cdx-supervisor" : "cdx-lane"); }
+
+// Seatbelt does not nest: a child lane started from a sandboxed supervisor could
+// not sandbox its own commands. Codex runs a command that matches an allow rule
+// outside the sandbox, so a supervisor's cdx calls start children normally.
+export const SUPERVISOR_RULES = 'prefix_rule(pattern = ["cdx"], decision = "allow", justification = "cdx starts each child lane in its own sandbox")\n';
+
+const quote = (value: string) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
+export const CAP_HOOK_COMMAND = `${quote(process.execPath)} ${quote(join(import.meta.dir, "cap.ts"))} codex-pre-tool`;
+
+export function withCapHook(value: any, command = CAP_HOOK_COMMAND): any {
+  const config = object(value) ? value : {};
+  const hooks = object(config.hooks) ? config.hooks : {};
+  const preToolUse = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : [];
+  return { ...config, hooks: { ...hooks, PreToolUse: [...preToolUse, { matcher: "Bash", hooks: [{ type: "command", command, timeout: 10 }] }] } };
+}
 
 export function laneHooks(value: any): any {
   if (Array.isArray(value)) return value.map(laneHooks);
@@ -37,8 +53,8 @@ export function laneHooks(value: any): any {
       ? `[ -n "$CDX_LANE" ] || ${item}` : laneHooks(item)]));
 }
 
-export function installLaneHome(home: string, instructions: string): string {
-  const target = laneCodexHome(home);
+export function installLaneHome(home: string, instructions: string, supervisor = false): string {
+  const target = laneCodexHome(home, supervisor);
   mkdirSync(target, { recursive: true });
   // Auth and conversation history stay on the account. Never copy credentials or databases.
   for (const name of ["auth.json", "config.toml", "sessions", "archived_sessions", "models_cache.json"]) {
@@ -51,10 +67,10 @@ export function installLaneHome(home: string, instructions: string): string {
   }
   if (readText(join(target, "AGENTS.md")) !== instructions) atomicWrite(join(target, "AGENTS.md"), instructions);
   const hooks = readText(join(home, "hooks.json"));
-  if (hooks) {
-    const text = JSON.stringify(laneHooks(JSON.parse(hooks)), null, 2) + "\n";
-    if (readText(join(target, "hooks.json")) !== text) atomicWrite(join(target, "hooks.json"), text);
-  }
+  const text = JSON.stringify(withCapHook(hooks ? laneHooks(JSON.parse(hooks)) : {}), null, 2) + "\n";
+  if (readText(join(target, "hooks.json")) !== text) atomicWrite(join(target, "hooks.json"), text);
+  const rules = join(target, "rules", "cdx.rules");
+  if (supervisor && readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
   return target;
 }
 

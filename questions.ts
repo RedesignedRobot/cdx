@@ -1,3 +1,4 @@
+import { geminiOverwrite } from "./cap.ts";
 import { safeJSON } from "./safe-text.ts";
 // Questions, steering delivery, peer messages, and the Gemini invocation hook.
 
@@ -295,6 +296,8 @@ export async function hookCommand(argv: string[]): Promise<void> {
     }
     if (subcommand === "pre-tool") {
       const call = input.toolCall;
+      const overwrite = geminiOverwrite(call, process.env);
+      if (overwrite) { console.log(JSON.stringify({ decision: "allow", overwrite })); return; }
       if (/^(view_file|read_file|read)$/.test(call?.name ?? "")) {
         const args = call.args ?? {};
         const file = args.AbsolutePath ?? args.TargetFile ?? args.file_path ?? args.path;

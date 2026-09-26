@@ -1,7 +1,8 @@
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
+import { codexSandbox, geminiProfile, prepareSandboxDirs } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
 import { geminiTokens } from "./tokens.ts";
-import { installLaneHome, laneCodexHome } from "./account-sync.ts";
+import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome } from "./account-sync.ts";
 import { defaultCodexHome } from "./accounts.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
@@ -19,7 +20,7 @@ import {
   shortGeminiReason, shouldRetryGeminiTransport,
 } from "./engines.ts";
 import {
-  captureGateTree, captureReviewTree, changedReviewPath, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
+  captureGateTree, captureReviewTree, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
   gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewRoot,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
@@ -154,6 +155,22 @@ export async function runRound(lane: string, round: number): Promise<number> {
   }
 }
 
+function treeHash(cwd: string): string | undefined {
+  try { return captureGateTree(cwd)?.tree; } catch { return undefined; }
+}
+
+// Codex runs a user hook only once the user config trusts its hash. The lane
+// home links the account config.toml, so the trust entry lands there, keyed on
+// the lane home's hooks.json. Other hooks keep whatever trust they had.
+async function trustCapHook(request: (method: string, params: Record<string, unknown>) => Promise<any>, cwd: string): Promise<boolean> {
+  const hooks = ((await request("hooks/list", { cwds: [cwd] }))?.data ?? []).flatMap((entry: any) => entry.hooks ?? [])
+    .filter((hook: any) => hook.command === CAP_HOOK_COMMAND);
+  const edits = hooks.filter((hook: any) => hook.trustStatus !== "trusted")
+    .map((hook: any) => ({ keyPath: `hooks.state.${JSON.stringify(hook.key)}.trusted_hash`, value: hook.currentHash, mergeStrategy: "replace" }));
+  if (edits.length) await request("config/batchWrite", { edits, reloadUserConfig: true });
+  return hooks.length > 0;
+}
+
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
   const entry = readLedger()[lane];
@@ -186,13 +203,15 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   const engine = spec.engine;
   const gemini = engine === "gemini";
   const jsonMode = true;
-  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"));
+  if (!gemini) installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"), Boolean(spec.supervisor));
+  prepareSandboxDirs(spec);
   const logPath = logPathOf(lane, round, jsonMode);
   const reportPath = reportPathOf(lane, round);
   try { unlinkSync(`${ROOT}/reports/${lane}-r${round}.findings.json`); } catch { /* ignore if missing */ }
   const treeProbe = Bun.spawnSync({ cmd: ["git", "-C", spec.cwd, "rev-parse", "--show-toplevel"] });
   const treeCwd = treeProbe.success ? treeProbe.stdout.toString().trim() : spec.cwd;
-  const reviewSnapshot = startingLane?.kind === "review" && !startingLane.consult ? captureReviewTree(treeCwd) : undefined;
+  // The sandbox keeps a review read-only; this tree hash pair is only evidence.
+  const reviewTreeStart = startingLane?.kind === "review" && !startingLane.consult ? treeHash(treeCwd) : undefined;
   const workTreeStartSnapshot = startingLane?.kind === "work" ? captureReviewTree(treeCwd) : undefined;
   const hooksInstalled = gemini ? hookInstallState().state === "current" : false;
   withLedger((ledger) => {
@@ -216,7 +235,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   const agyLogPath = `${ROOT}/logs/${lane}-r${round}.agy.log`;
   const geminiArgs = [
     "agy", "--input-format", "stream-json", "--output-format", "stream-json",
-    "--model", spec.model ?? geminiPolicy.model, "--dangerously-skip-permissions", "--add-dir", spec.cwd,
+    "--model", spec.model ?? geminiPolicy.model, "--add-dir", spec.cwd,
     ...(spec.additionalDirectories ?? []).flatMap((dir) => ["--add-dir", dir]),
     "--agent", spec.agent ?? (startingLane?.kind === "review" && !startingLane.consult ? geminiPolicy.reviewAgent : geminiPolicy.agent),
     ...(spec.sourceThreadId ? ["--conversation", spec.sourceThreadId] : []),
@@ -225,9 +244,11 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     "--log-file", agyLogPath,
   ];
   const proc = Bun.spawn({
-    cmd: gemini ? geminiArgs : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
+    cmd: gemini
+      ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round)]), ...geminiArgs]
+      : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
-    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome()), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
+    env: laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), Boolean(spec.supervisor)), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
@@ -568,7 +589,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     for (const file of observation.files) writtenPaths.add(resolve(spec.cwd, file));
     const toolType = (event.params?.item ?? event.item)?.type;
     if (observation.id && (observation.command !== undefined || ["mcpToolCall", "mcp_tool_call", "dynamicToolCall"].includes(toolType))) {
-      if (!observation.completed && !commandTrees.has(observation.id)) commandTrees.set(observation.id, captureReviewTree(treeCwd));
+      if (workTreeStartSnapshot && !observation.completed && !commandTrees.has(observation.id)) commandTrees.set(observation.id, captureReviewTree(treeCwd));
       if (observation.completed) {
         const before = commandTrees.get(observation.id);
         if (before) for (const path of changedPaths(before, captureReviewTree(treeCwd))) {
@@ -984,7 +1005,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         input,
         cwd: spec.cwd,
         approvalPolicy: "never",
-        sandboxPolicy: { type: "dangerFullAccess" },
+        sandboxPolicy: codexSandbox(spec).policy,
         ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
         effort: spec.effort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
@@ -1062,6 +1083,8 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         capabilities: { experimentalApi: true },
       });
       notify("initialized");
+      const capHook = await trustCapHook(request, spec.cwd).catch((error: Error) => { console.error(`cdx: output cap hook not trusted: ${error.message}`); return false; });
+      log.write(`${safeJSON({ type: "cdx_cap_hook", active: capHook })}\n`);
       const recordAccount = async (phase: "Start" | "End") => {
         try {
           const result = await request("account/rateLimits/read", {});
@@ -1183,16 +1206,15 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   process.off("SIGINT", onInt);
 
   flushLedger();
-  return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, writtenPaths, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
+  return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
-async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewSnapshot, workTreeStartSnapshot, writtenPaths, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
   treeCwd: string;
   preparedGate?: ReturnType<typeof verifyGate>;
   spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
   logPath: string; reportPath: string;
-  reviewSnapshot?: ReturnType<typeof captureReviewTree>;
-  writtenPaths: Set<string>;
+  reviewTreeStart?: string;
   workTreeStartSnapshot?: ReturnType<typeof captureReviewTree>;
   exitCode: number; turnFailureReason?: string; receivedSignal?: "SIGTERM" | "SIGINT";
   maxRuntimeHit: boolean; geminiContinuations: number; roundCleanupWarning?: string;
@@ -1222,11 +1244,8 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   const ladderExhausted = gemini && turnFailureReason === "gemini service unavailable (503)" && geminiContinuations >= GEMINI_OUTAGE_RETRIES;
   const fallbackRound = ladderExhausted && !receivedSignal && !maxRuntimeHit
     && Boolean(geminiPolicy.outageFallbackModel) && spec.model !== geminiPolicy.outageFallbackModel && Boolean(beforeFinalize?.sessionId);
-  const reviewEnd = reviewSnapshot ? captureReviewTree(treeCwd) : undefined;
-  const treeChange = reviewSnapshot && reviewEnd ? changedReviewPath(reviewSnapshot, reviewEnd) : undefined;
-  const reviewModifiedPath = reviewSnapshot && reviewEnd && beforeFinalize?.parent
-    ? changedPaths(reviewSnapshot, reviewEnd).find((path) => writtenPaths.has(resolve(treeCwd, path))) ?? (treeChange === "." ? "." : undefined)
-    : treeChange;
+  const reviewTreeEnd = reviewTreeStart ? treeHash(treeCwd) : undefined;
+  const reviewTreeMoved = Boolean(reviewTreeStart && reviewTreeEnd && reviewTreeEnd !== reviewTreeStart);
   const workTreeEndSnapshot = workTreeStartSnapshot ? captureReviewTree(treeCwd) : undefined;
   const workTreeUnchanged = Boolean(workTreeStartSnapshot && workTreeEndSnapshot && workTreeStartSnapshot.fingerprint === workTreeEndSnapshot.fingerprint);
   // An unchanged tree is evidence for the report, never a verdict: a
@@ -1284,7 +1303,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   const orphanedChildren = (beforeFinalize?.kind === "work" || beforeFinalize?.consult) && beforeFinalize.supervisor && !retryQuota && !fallbackRound
     ? await killChildren(lane, receivedSignal ? `supervisor ${lane} killed` : maxRuntimeHit ? `supervisor ${lane} hit max runtime` : `supervisor ${lane} round ${round} ended`)
     : [];
-  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewModifiedPath && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
+  const roundState: ReviewState = exitCode === 0 && reportOk && !gateFailed && !maxRuntimeHit && !reviewTreeMoved && !turnFailureReason && orphanedChildren.length === 0 ? "done" : "failed";
   if (gateReceipt) {
     const final = finishGateReceipt(gateReceipt, roundState);
     gateReceipt = final.receipt;
@@ -1301,7 +1320,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
     // launch with mode "spawn" but must never become the resume target.
     if (item.kind === "work" && item.sessionId) item.workSessionId = item.sessionId;
     let roundNote: string | undefined;
-    if (reviewModifiedPath) roundNote = `review modified the tree: ${reviewModifiedPath}`;
+    if (reviewTreeMoved) roundNote = `review tree changed despite the read-only sandbox: ${reviewTreeStart} -> ${reviewTreeEnd}`;
     else if (orphanedChildren.length > 0 && !receivedSignal && !maxRuntimeHit) roundNote = `supervisor ended with running children: ${orphanedChildren.join(", ")} (stopped)`;
     else if (gateFailed && gateExit === 0) roundNote = gateReceipt?.reason ?? "gate receipt unavailable";
     else if (gateFailed) {
@@ -1382,9 +1401,9 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
     item.updatedAt = new Date().toISOString();
     return item;
   });
-  const roundStart = workTreeStartSnapshot ?? reviewSnapshot;
   if (jsonMode) appendFileSync(logPath, `${JSON.stringify({ type: "cdx_round_end", timestamp: entry.updatedAt,
-    roundStart: roundStart ? { kind: roundStart.kind, fingerprint: roundStart.fingerprint } : null,
+    roundStart: workTreeStartSnapshot ? { kind: workTreeStartSnapshot.kind, fingerprint: workTreeStartSnapshot.fingerprint } : null,
+    ...(reviewTreeStart ? { reviewTree: { before: reviewTreeStart, after: reviewTreeEnd ?? null } } : {}),
     gateReceiptId: gateReceipt ? `${lane}:r${round}` : null, ...(gateReceipt ? { gateReceipt } : {}) })}\n`);
   // Structured verdict: reviewers end reports with a fenced json findings
   // block. Persist the last parsable one for machine consumers; a malformed
