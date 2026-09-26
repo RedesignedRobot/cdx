@@ -87,7 +87,7 @@ export function digestQuestion(commit: string): string {
     "## Commands: install, build, typecheck, single test file, full suite, with exact invocations.",
     "## Gate: the command a lane gate should run, and what it covers.",
     "## Rules: one line per rule doc section as `path#heading-anchor`: what it governs, so a reader opens only the sections a task needs. Cover AGENTS.md, CLAUDE.md, .cdx-rules.md and docs/.",
-    "Sources: AGENTS.md, CLAUDE.md, .cdx-rules.md, README, package manifests and docs/. Skim headings; read bodies only to confirm commands. Never quote docs at length.",
+    "Sources: AGENTS.md, CLAUDE.md, .cdx-rules.md, README, package manifests and docs/ in this repository only; your own lane instructions are not part of it. Write every path relative to the repository root, since lanes read it from other worktrees. Skim headings; read bodies only to confirm commands. Never quote docs at length.",
   ].join("\n");
 }
 
