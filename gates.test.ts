@@ -166,6 +166,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 import { attestReview, reviewRefusal } from "./gates.ts";
 import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
+import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
 import { briefContractRefusal } from "./brief-contract.ts";
 
@@ -246,6 +247,14 @@ test("a spawn under a closed lane's name drops the old landing and review proof;
   const done = { ...closed, work: { state: "done" } } as Lane;
   expect(reusedLaneProof("work", true, done).reviewAttestations).toEqual([attestation]);
   expect(reusedLaneProof("review", false, done)).toEqual({ reviewAttestations: [attestation], reviewClosed: undefined, landedCommit: "c" });
+});
+
+test("a closed review allows a fresh review of a changed tree and refuses the same tree", () => {
+  const [old, next] = [{ head: "h", tree: "old" }, { head: "h2", tree: "new" }];
+  expect(reviewFollowUp("P2 overflow", false, old, next)).toContain("git diff old new");
+  expect(reviewFollowUp("no findings", true, old, next)).toBe("");
+  expect(() => reviewFollowUp("no findings", true, old, { head: "h2", tree: "old" })).toThrow("reuse its report");
+  expect(reviewFollowUp("", true, old, next)).toBe("");
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {
