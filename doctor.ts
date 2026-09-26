@@ -10,7 +10,7 @@ import {
 import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
 import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
 import { formatGeminiStanding, geminiQuotaState, readGeminiUsageSnapshot, refreshGeminiUsage } from "./gemini-usage.ts";
-import { type AccountChoice, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
+import { type AccountChoice, archivedWorktreeRepos, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
 import { legacyStatePending } from "./migrate.ts";
 import { DB_PATH } from "./store.ts";
 import { readJsonLines } from "./reports.ts";
@@ -23,8 +23,7 @@ import { readUsageHistory } from "./usage-store.ts";
 import { removeReviewSnapshot, staleReviewSnapshots } from "./snapshots.ts";
 import { removeStaleWorktree, staleWorktrees } from "./worktrees.ts";
 import {
-  existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync, unlinkSync,
-  writeFileSync, renameSync,
+  existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, writeFileSync, renameSync,
 } from "node:fs";
 import { join } from "node:path";
 
@@ -703,7 +702,7 @@ export async function doctorCommand(argv: string[]) {
   }
   if (staleSnapshots.length && !parsed.bools.has("fix")) warn("run `cdx doctor --fix` to remove stale review snapshots");
   const worktreeDays = Number(parsed.flags.days ?? 7);
-  const staleTrees = staleWorktrees(readLedger(), worktreeDays);
+  const staleTrees = staleWorktrees(readLedger(), worktreeDays, archivedWorktreeRepos());
   for (const item of staleTrees) {
     warn(`worktree: ${item.action === "remove" ? "merged" : "abandoned"} ${item.branch} at ${displayPath(item.path)}, idle ${Math.floor(item.ageDays)}d`);
     if (!parsed.bools.has("fix")) continue;

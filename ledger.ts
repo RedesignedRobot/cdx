@@ -556,6 +556,12 @@ export function lanesUpdatedSince(iso: string): Ledger {
 }
 
 // The newest archived lanes, for statistics that need finished history.
+// Worktree repositories of closed lanes, without loading their records.
+export function archivedWorktreeRepos(): string[] {
+  return db().query<{ repo: string }, []>("SELECT DISTINCT json_extract(data, '$.worktreeRepo') AS repo FROM archive WHERE repo IS NOT NULL")
+    .all().map((row) => row.repo);
+}
+
 export function recentArchivedLanes(limit: number): Ledger {
   const lanes: Ledger = {};
   for (const row of db().query<LaneRow, [number]>("SELECT name, data FROM archive ORDER BY updated_at DESC LIMIT ?").all(limit)) lanes[row.name] = JSON.parse(row.data);

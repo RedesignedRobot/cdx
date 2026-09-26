@@ -368,12 +368,15 @@ export function staleWorktreeAction(item: { running: boolean; closed: boolean; m
   if (item.closed) return "remove-worktree";
 }
 
-export function staleWorktrees(ledger: Ledger, days: number, now = Date.now()): StaleWorktree[] {
+// Closed lanes leave the ledger, so the caller passes their repositories too;
+// a worktree whose lane is gone counts as closed.
+export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: string[] = [], now = Date.now()): StaleWorktree[] {
   const repos = new Map<string, string>();
-  for (const entry of Object.values(ledger)) {
-    if (!entry.worktreeRepo || !existsSync(entry.worktreeRepo)) continue;
-    const common = Bun.spawnSync({ cmd: ["git", "-C", entry.worktreeRepo, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
-    if (common.success) repos.set(common.stdout.toString().trim(), entry.worktreeRepo);
+  const candidates = new Set([...Object.values(ledger).map((entry) => entry.worktreeRepo), ...archivedRepos]);
+  for (const path of candidates) {
+    if (!path || !existsSync(path)) continue;
+    const common = Bun.spawnSync({ cmd: ["git", "-C", path, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+    if (common.success) repos.set(common.stdout.toString().trim(), path);
   }
   const stale: StaleWorktree[] = [];
   for (const repo of repos.values()) {
