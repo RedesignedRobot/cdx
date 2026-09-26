@@ -1,16 +1,25 @@
-// `cdx shots grade`: one consult judges a screenshot directory against a rubric, so
-// the head reads a verdict file and opens only the failed shots.
+// `cdx shots grade`: consults judge a screenshot directory against a rubric in
+// batches, so the head reads one verdict file and opens only the failed shots.
 
 import { laneName, runConsult } from "./context.ts";
-import { fail, parseArgs } from "./runtime.ts";
+import { CmdError, fail, parseArgs } from "./runtime.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 // Wide enough to read UI text, a third of the tokens of a 1440x900 capture.
 export const DOWNSCALE_PX = 1000;
 const IMAGE = /\.(?:png|jpe?g)$/i;
+// A runshot folder holds 60-70 shots; one consult with all of them overruns the
+// grader's context, so each consult sees at most this many images.
+export const SHOTS_PER_CONSULT = 8;
 
 export interface ScreenVerdict { name: string; verdict: "pass" | "fail"; reason: string }
+
+export function batchShots<T>(shots: T[], size = SHOTS_PER_CONSULT): T[][] {
+  const batches: T[][] = [];
+  for (let start = 0; start < shots.length; start += size) batches.push(shots.slice(start, start + size));
+  return batches;
+}
 
 export function gradeQuestion(rubric: string, shots: string[]): string {
   return [
@@ -48,12 +57,25 @@ export async function shotsCommand(argv: string[]): Promise<void> {
   const shots = readdirSync(dir).filter((name) => IMAGE.test(name)).sort().map((name) => join(dir, name));
   if (!shots.length) fail(`no png or jpg screenshots in ${dir}`);
   const engine = parsed.flags.engine ?? "gpt";
-  const images = engine === "gpt" ? shots : [];
-  const { report, reportPath } = await runConsult(laneName("shots", basename(dir)), dir, gradeQuestion(readFileSync(rubricPath, "utf8"), shots),
-    { engine, model: parsed.flags.model, images });
-  const screens = parseVerdicts(report, shots.map((shot) => basename(shot)));
+  const rubric = readFileSync(rubricPath, "utf8");
+  // One fresh lane per batch: resuming a single thread would carry every earlier batch's images.
+  const lanePrefix = laneName("shots", basename(dir)).slice(0, 55);
+  const screens: ScreenVerdict[] = [];
+  const reports: string[] = [];
+  for (const [index, batch] of batchShots(shots).entries()) {
+    const names = batch.map((shot) => basename(shot));
+    try {
+      const { report, reportPath } = await runConsult(`${lanePrefix}-${index + 1}`, dir, gradeQuestion(rubric, batch),
+        { engine, model: parsed.flags.model, images: engine === "gpt" ? batch : [] });
+      reports.push(reportPath);
+      screens.push(...parseVerdicts(report, names));
+    } catch (error) {
+      if (!(error instanceof CmdError)) throw error;
+      screens.push(...names.map((name) => ({ name, verdict: "fail" as const, reason: `grader consult failed: ${error.message}` })));
+    }
+  }
   const verdictPath = join(dir, "verdict.json");
-  writeFileSync(verdictPath, `${JSON.stringify({ gradedAt: new Date().toISOString(), rubric: realpathSync(rubricPath), engine, report: reportPath, screens }, null, 2)}\n`);
+  writeFileSync(verdictPath, `${JSON.stringify({ gradedAt: new Date().toISOString(), rubric: realpathSync(rubricPath), engine, reports, screens }, null, 2)}\n`);
   const failed = screens.filter((screen) => screen.verdict === "fail").map((screen) => screen.name);
   console.log(`failed: ${failed.length ? failed.join(", ") : "none"}`);
   console.log(`verdict: ${verdictPath}`);

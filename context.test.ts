@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { contextDigest, digestLine, RECENT_ANCESTORS } from "./context.ts";
 import { houseRules, laneInstructions } from "./prompts.ts";
-import { parseVerdicts } from "./shots.ts";
+import { batchShots, parseVerdicts, SHOTS_PER_CONSULT } from "./shots.ts";
 
 const commits = Array.from({ length: RECENT_ANCESTORS + 1 }, (_, index) => index.toString(16).padStart(40, "0"));
 const git = (_cwd: string, ...args: string[]) => args[0] === "rev-parse" ? "/repo/.git" : commits.join("\n");
@@ -43,4 +43,13 @@ test("every screen gets a verdict, and a skipped or mangled one fails", () => {
     { name: "c.png", verdict: "fail", reason: "grader returned no verdict for this screen" },
   ]);
   expect(parseVerdicts("no json", ["a.png"])[0]!.verdict).toBe("fail");
+});
+
+test("shots split into ordered consult batches of at most eight", () => {
+  const shots = Array.from({ length: 68 }, (_, index) => `${String(index).padStart(2, "0")}.png`);
+  const batches = batchShots(shots);
+  expect(batches.map((batch) => batch.length)).toEqual([8, 8, 8, 8, 8, 8, 8, 8, 4]);
+  expect(batches.flat()).toEqual(shots);
+  expect(batchShots(shots.slice(0, SHOTS_PER_CONSULT))).toHaveLength(1);
+  expect(batchShots([])).toEqual([]);
 });
