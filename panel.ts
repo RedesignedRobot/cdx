@@ -6,17 +6,19 @@ import { accountSpec, accountStandings, chooseAccount } from "./accounts.ts";
 import { CLAUDE_MODEL } from "./claude.ts";
 import { config, EXECUTOR_MODEL, resolveEffort, THINKER_MODEL } from "./config.ts";
 import {
-  activeStateOf, callerOwnership, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
-  readLedger, roundNoteOf, type Spec, supervisorLane, type Tokens, validLane, withLane, withLedger,
+  activeStateOf, callerOwnership, type Effort, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
+  type Lane, readLedger, roundNoteOf, type Spec, supervisorLane, type Tokens, validLane, withLane, withLedger,
 } from "./ledger.ts";
+import { laneInstructions } from "./prompts.ts";
 import { controlPathOf, reportPathOf, specPathOf } from "./reports.ts";
+import { readJobs } from "./jobs.ts";
 import { openRound } from "./rounds.ts";
 import { fail, fmtTokens, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF, settleHint, singleLine } from "./runtime.ts";
 import { safeJSON, safeText } from "./safe-text.ts";
 import { db, write } from "./store.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { spawn as nodeSpawn } from "node:child_process";
-import { appendFileSync, copyFileSync, existsSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
 
 export const PANEL_MEMBERS = [
@@ -49,7 +51,6 @@ export interface PanelRecord {
   caller?: string;
   callerRound?: number;
   owner: LaneOwner;
-  background: boolean;
   state: PanelState;
   pid?: number;
   startedAt: string;
@@ -59,8 +60,12 @@ export interface PanelRecord {
 }
 
 export const memberLane = (panel: string, member: string) => `${panel}-${member}`;
-export const panelReportPath = (panel: string) => `${ROOT}/reports/${panel}.md`;
-export const answerPath = (panel: string, member: string) => `${ROOT}/reports/${panel}-${member}.md`;
+// One directory per panel: a flat reports/<name>.md let a panel named foo-r2
+// overwrite lane foo's round 2 report, and panel foo-astra overwrite panel
+// foo's Astra answer.
+export const panelDir = (panel: string) => `${ROOT}/reports/panels/${panel}`;
+export const panelReportPath = (panel: string) => `${panelDir(panel)}/panel.md`;
+export const answerPath = (panel: string, member: string) => `${panelDir(panel)}/${member}.md`;
 
 export function readPanel(name: string): PanelRecord | undefined {
   const row = db().query<{ data: string }, [string]>("SELECT data FROM panels WHERE name = ?").get(name);
@@ -85,8 +90,9 @@ export interface PanelAdmission {
   inputChars: number;
   // Percent left on the account an Astra consult would run on; 0 when none is eligible.
   astraHeadroom: number;
-  // Percent left in the active Claude account's weekly windows; undefined when cca cannot say.
-  claudeHeadroom?: number;
+  // Percent left in the active Claude account's weekly windows, or why cdx
+  // cannot tell; an unknown quota refuses the panel.
+  claudeHeadroom: number | string;
 }
 
 export function panelRefusal(input: PanelAdmission): string | undefined {
@@ -96,7 +102,8 @@ export function panelRefusal(input: PanelAdmission): string | undefined {
   if (input.openPanel) return `panel ${input.openPanel} is still open; one open panel at a time`;
   if (input.inputChars > PANEL_INPUT_CHARS) return `question plus pack is ${input.inputChars} chars; the cap is ${PANEL_INPUT_CHARS}, trim the pack`;
   if (input.astraHeadroom < MIN_HEADROOM_PERCENT) return `Astra's account has ${Math.floor(input.astraHeadroom)}% left; a panel needs ${MIN_HEADROOM_PERCENT}%`;
-  if (input.claudeHeadroom !== undefined && input.claudeHeadroom < MIN_HEADROOM_PERCENT) {
+  if (typeof input.claudeHeadroom === "string") return input.claudeHeadroom;
+  if (input.claudeHeadroom < MIN_HEADROOM_PERCENT) {
     return `the Claude weekly quota has ${Math.floor(input.claudeHeadroom)}% left; a panel needs ${MIN_HEADROOM_PERCENT}%`;
   }
   return undefined;
@@ -112,13 +119,13 @@ export function claudeHeadroom(status: any): number | undefined {
   return 100 - Math.max(...weekly.map((limit: any) => limit.percent));
 }
 
-function readClaudeHeadroom(): number | undefined {
+function readClaudeHeadroom(): number | string {
   const cca = Bun.which("cca");
-  const result = cca ? Bun.spawnSync({ cmd: [cca, "status", "--json"], stdout: "pipe", stderr: "pipe", timeout: 20_000 }) : undefined;
+  if (!cca) return "cca is not on PATH, so cdx cannot check the Claude weekly quota a panel needs; put ~/code/claude-accounts' cca on PATH";
+  const result = Bun.spawnSync({ cmd: [cca, "status", "--json"], stdout: "pipe", stderr: "pipe", timeout: 20_000 });
   let headroom: number | undefined;
-  try { headroom = result?.success ? claudeHeadroom(JSON.parse(result.stdout.toString())) : undefined; } catch { /* reported below */ }
-  if (headroom === undefined) console.error("cdx: warning: cca status --json gave no Claude weekly quota; the Claude headroom check is skipped");
-  return headroom;
+  try { headroom = result.success ? claudeHeadroom(JSON.parse(result.stdout.toString())) : undefined; } catch { /* refused below */ }
+  return headroom ?? `cca status --json (exit ${result.exitCode}) gave no Claude weekly quota; a panel needs it to start`;
 }
 
 async function astraHeadroom(): Promise<number> {
@@ -127,6 +134,15 @@ async function astraHeadroom(): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// cdx wait <panel> polls this: the finished record, or a failed one once the
+// runner died without finishing.
+export function settledPanel(name: string, alive = pidAlive): PanelRecord | undefined {
+  const record = readPanel(name);
+  if (!record || (record.state === "running" && alive(record.pid))) return undefined;
+  if (record.state !== "running") return record;
+  return { ...record, state: "failed", summary: `[cdx] panel=${name} state=failed runner died without finishing; see ${ROOT}/logs/${name}.panel.log` };
 }
 
 // A running record whose runner died is not open; it failed.
@@ -343,6 +359,26 @@ export function completionLine(record: Pick<PanelRecord, "name">, report: string
 
 // Runner
 
+// A member round is a read-only consult: a Codex member gets the review
+// lane home rules, which the runner refuses to start without.
+export function memberSpec(panel: PanelRecord, entry: Lane, round: {
+  lane: string; round: number; engine: Engine; model: string; effort: Effort; prompt: string; maxRuntimeMins: number;
+}): Spec {
+  const { lane, engine, model, effort, prompt, maxRuntimeMins } = round;
+  return {
+    effort, engine, model, mode: "spawn", lane, round: round.round, cwd: panel.cwd, reviewDir: panel.cwd, prompt, taskPrompt: prompt,
+    // The claude member's file tools see only the checkout and these.
+    ...(engine === "claude" && panel.pack ? { additionalDirectories: [dirname(panel.pack)] } : {}),
+    ...(engine === "gpt" ? { ...accountSpec(entry.roundAccount), laneInstructions: laneInstructions({ review: true }) } : {}),
+    maxRuntimeMins, accountHomes: config.accounts,
+    model_auto_compact_token_limit: config.model_auto_compact_token_limit ?? 150_000,
+    tool_output_token_limit: config.tool_output_token_limit ?? 6_000,
+    visibility: config.visibility ?? VISIBILITY_DEFAULTS,
+    ...ownershipSpec(panel.owner),
+    startedAt: entry.roundStartedAt ?? new Date().toISOString(),
+  };
+}
+
 async function startLane(panel: PanelRecord, lane: string, engine: Engine, model: string, prompt: string, maxRuntimeMins: number): Promise<void> {
   const effort = engine === "claude" ? "medium" : resolveEffort(engine, model);
   const { round } = await openRound(lane, "review", panel.cwd, effort, {
@@ -353,17 +389,7 @@ async function startLane(panel: PanelRecord, lane: string, engine: Engine, model
     lineage: { supervisor: false, ...(panel.caller ? { parent: panel.caller, parentRound: panel.callerRound } : {}) },
   });
   const entry = withLane(lane, (item) => { item!.panel = panel.name; return item!; });
-  const spec: Spec = {
-    effort, engine, model, mode: "spawn", lane, round, cwd: panel.cwd, reviewDir: panel.cwd, prompt, taskPrompt: prompt,
-    // The claude member's file tools see only the checkout and these.
-    ...(engine === "claude" && panel.pack ? { additionalDirectories: [dirname(panel.pack)] } : {}),
-    maxRuntimeMins, accountHomes: config.accounts,
-    model_auto_compact_token_limit: config.model_auto_compact_token_limit ?? 150_000,
-    tool_output_token_limit: config.tool_output_token_limit ?? 6_000,
-    visibility: config.visibility ?? VISIBILITY_DEFAULTS,
-    ...(engine === "gpt" ? accountSpec(entry.roundAccount) : {}), ...ownershipSpec(panel.owner),
-    startedAt: entry.roundStartedAt ?? new Date().toISOString(),
-  };
+  const spec = memberSpec(panel, entry, { lane, round, engine, model, effort, prompt, maxRuntimeMins });
   writeFileSync(specPathOf(lane, round), safeJSON(spec, 2));
   writeFileSync(`${ROOT}/briefs/${lane}-r${round}.md`, safeText(prompt));
   const crashLog = openSync(`${ROOT}/logs/${lane}-r${round}.runner.log`, "a");
@@ -435,7 +461,6 @@ function callerActive(record: PanelRecord): boolean {
 }
 
 function deliver(record: PanelRecord, line: string): void {
-  if (!record.background) return;
   if (record.caller && record.callerRound) {
     if (!callerActive(record)) return;
     write(() => appendFileSync(controlPathOf(record.caller!, record.callerRound!), `${safeJSON({ text: line, sentAt: new Date().toISOString(), from: "cdx" })}\n`));
@@ -448,6 +473,7 @@ export async function runPanel(name: string): Promise<number> {
   const record = readPanel(name);
   if (!record) fail(`internal: no panel ${name}`);
   storePanel({ ...record, pid: process.pid });
+  mkdirSync(panelDir(name), { recursive: true });
   const prompt = panelPrompt(record.question, record.cwd, record.pack);
   const lanes = PANEL_MEMBERS.map(({ member }) => memberLane(name, member));
   for (const { member, engine, model } of PANEL_MEMBERS) {
@@ -490,10 +516,13 @@ export async function runPanel(name: string): Promise<number> {
 
 // Command
 
-const USAGE = 'usage: cdx panel <name> --cd <repo> [--pack <file>] [--bg] ("<question>" | -)';
+const USAGE = 'usage: cdx panel <name> --cd <repo> [--pack <file>] ("<question>" | -)';
 
+// A panel runs past the ten minute ceiling of a tool call or a lane's exec,
+// so it always detaches and its completion line arrives as an event, or on a
+// calling supervisor's control file.
 export async function panelCommand(argv: string[]): Promise<void> {
-  const parsed = parseArgs(argv, ["cd", "pack", "bg"]);
+  const parsed = parseArgs(argv, ["cd", "pack"]);
   const [name, questionArg] = parsed.rest;
   const question = await resolveBrief(questionArg, USAGE);
   if (!name || !question || !parsed.flags.cd) fail(USAGE);
@@ -503,47 +532,46 @@ export async function panelCommand(argv: string[]): Promise<void> {
   if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("panel needs macOS sandbox-exec for the Claude member");
   if (parsed.flags.pack !== undefined && !existsSync(parsed.flags.pack)) fail(`--pack does not exist: ${parsed.flags.pack}`);
   const packText = parsed.flags.pack !== undefined ? readFileSync(parsed.flags.pack, "utf8") : "";
-  const lanes = [...PANEL_MEMBERS.map(({ member }) => member), "verdict"].map((member) => memberLane(name, member));
-  if (readPanel(name) || lanes.some((lane) => findLane(validLane(lane)))) fail(`panel name "${name}" is taken; pick a fresh one`);
+  const lanes = [...PANEL_MEMBERS.map(({ member }) => member), "verdict"].map((member) => validLane(memberLane(name, member)));
   const self = process.env.CDX_LANE ? findLane(process.env.CDX_LANE) : undefined;
   const supervisor = supervisorLane();
   const callerRound = supervisor ? Number(process.env.CDX_ROUND) : undefined;
-  const refusal = panelRefusal({
-    callerIsMember: Boolean(self?.panel),
-    callerIsConsultSupervisor: Boolean(supervisor && findLane(supervisor)?.consult),
-    supervisorAskedThisRound: Boolean(supervisor && readPanels().some((record) => record.caller === supervisor && record.callerRound === callerRound)),
-    openPanel: openPanelName(readPanels()),
-    inputChars: question.length + packText.length,
-    astraHeadroom: await astraHeadroom(),
-    claudeHeadroom: readClaudeHeadroom(),
+  const astra = await astraHeadroom();
+  const claude = readClaudeHeadroom();
+  const pack = parsed.flags.pack !== undefined ? `${ROOT}/briefs/${name}-pack.md` : undefined;
+  // The guards that read panels and lanes run in the transaction that
+  // records the panel, so two launches can never both pass them. The
+  // launcher's pid holds the panel open until the runner's replaces it.
+  const refusal = write(() => {
+    // cdx wait takes a lane, job or panel name, so a panel name is unique across all three.
+    if (readPanel(name) || findLane(name) || readJobs()[name] || lanes.some((lane) => findLane(lane))) return `panel name "${name}" is taken; pick a fresh one`;
+    const panels = readPanels();
+    const refused = panelRefusal({
+      callerIsMember: Boolean(self?.panel),
+      callerIsConsultSupervisor: Boolean(supervisor && findLane(supervisor)?.consult),
+      supervisorAskedThisRound: Boolean(supervisor && panels.some((record) => record.caller === supervisor && record.callerRound === callerRound)),
+      openPanel: openPanelName(panels),
+      inputChars: question.length + packText.length,
+      astraHeadroom: astra,
+      claudeHeadroom: claude,
+    });
+    if (refused) return refused;
+    storePanel({
+      name, cwd, question, ...(pack ? { pack } : {}), ...(supervisor ? { caller: supervisor, callerRound } : {}),
+      owner: callerOwnership(), state: "running", pid: process.pid, startedAt: new Date().toISOString(),
+    });
+    return undefined;
   });
   if (refusal) fail(refusal);
   // The pack is frozen beside the briefs so every member reads the same text.
-  const pack = parsed.flags.pack !== undefined ? `${ROOT}/briefs/${name}-pack.md` : undefined;
   if (pack) writeFileSync(pack, packText);
-  const background = parsed.bools.has("bg");
-  write(() => {
-    const open = openPanelName(readPanels());
-    if (open) fail(`panel ${open} is still open; one open panel at a time`);
-    storePanel({
-      name, cwd, question, ...(pack ? { pack } : {}), ...(supervisor ? { caller: supervisor, callerRound } : {}),
-      owner: callerOwnership(), background, state: "running", startedAt: new Date().toISOString(),
-    });
-  });
   // The runner drops the caller's lane identity: members are panel lanes,
   // not a supervisor's children, so the Astra member is not refused.
   const runnerLog = openSync(`${ROOT}/logs/${name}.panel.log`, "a");
-  const child = nodeSpawn(process.execPath, [SELF, "_panel", name], { detached: background, env: runnerEnv(undefined), stdio: ["ignore", runnerLog, runnerLog] });
+  const child = nodeSpawn(process.execPath, [SELF, "_panel", name], { detached: true, env: runnerEnv(undefined), stdio: ["ignore", runnerLog, runnerLog] });
+  child.unref();
   storePanel({ ...readPanel(name)!, pid: child.pid });
   console.log(`cdx: panel=${name} members=${PANEL_MEMBERS.map(({ member }) => member).join(",")} cwd=${cwd} log=${ROOT}/logs/${name}.panel.log`);
-  if (background) {
-    child.unref();
-    console.log(`cdx: detached pid=${child.pid}; ${settleHint(`panel ${name}`)}`);
-    return;
-  }
-  await new Promise<void>((done) => child.on("exit", () => done()));
-  const finished = readPanel(name);
-  if (finished?.summary) console.log(finished.summary);
-  else fail(`panel ${name} runner exited without a result; see ${ROOT}/logs/${name}.panel.log`);
-  if (finished.state === "failed") process.exitCode = 1;
+  const hint = supervisor ? `run cdx wait ${name} before your report; it blocks until the panel settles and prints its completion line` : settleHint(name);
+  console.log(`cdx: detached pid=${child.pid}; report=${panelReportPath(name)}; ${hint}`);
 }

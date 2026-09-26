@@ -200,7 +200,9 @@ export async function runJob(name: string): Promise<number> {
   if (!job) fail(`internal: job "${name}" is missing from the state store`);
   const env = { ...process.env };
   for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
-  withJobs((jobs) => { jobs[name]!.treeStart = jobTree(cwd); });
+  // The git call runs before the write transaction, never inside its lock.
+  const treeStart = jobTree(cwd);
+  withJobs((jobs) => { jobs[name]!.treeStart = treeStart; });
   const child = nodeSpawn("/bin/sh", ["-lc", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"] });
   const timer = job.expectMinutes ? setTimeout(() => {
     for (const item of markJobOverruns(Date.now(), (entry, candidate) => candidate === name
@@ -226,9 +228,10 @@ export async function runJob(name: string): Promise<number> {
   if (timer) clearTimeout(timer);
   const state: JobState = exitCode === 0 ? "done" : "failed";
   const note = signal ? `terminated by ${signal}` : undefined;
+  const treeEnd = jobTree(cwd);
   const finished = withJobs((jobs) => {
     const entry = jobs[name]!;
-    entry.treeEnd = jobTree(cwd);
+    entry.treeEnd = treeEnd;
     entry.exitCode = exitCode;
     entry.finishedAt = new Date().toISOString();
     entry.state = state;

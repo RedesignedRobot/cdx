@@ -3,9 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  citationProblem, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
-  parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
+  answerPath, citationProblem, memberSpec, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
+import type { Lane } from "./ledger.ts";
+import { laneInstructions } from "./prompts.ts";
+import { reportPathOf } from "./reports.ts";
+import { db } from "./store.ts";
 
 const cwd = "/repo";
 const answer = (member: string, claims: string[], recommendation = `${member} says keep it`) => parseAnswer(member, [
@@ -105,7 +109,7 @@ const admitted = { callerIsMember: false, callerIsConsultSupervisor: false, supe
 
 test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal(admitted)).toBeUndefined();
-  expect(panelRefusal({ ...admitted, claudeHeadroom: undefined })).toBeUndefined();
+  expect(panelRefusal({ ...admitted, claudeHeadroom: "cca is not on PATH" })).toBe("cca is not on PATH");
   expect(panelRefusal({ ...admitted, callerIsMember: true })).toBe("a panel member cannot start a panel");
   expect(panelRefusal({ ...admitted, supervisorAskedThisRound: true })).toContain("once per round");
   expect(panelRefusal({ ...admitted, callerIsConsultSupervisor: true })).toContain("a consult supervisor cannot start a panel");
@@ -114,6 +118,21 @@ test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();
   expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("Astra's account has 9% left; a panel needs 10%");
   expect(panelRefusal({ ...admitted, claudeHeadroom: 4 })).toBe("the Claude weekly quota has 4% left; a panel needs 10%");
+});
+
+test("panel files never share a path with a lane report or another panel's files", () => {
+  expect(panelReportPath("foo-r2")).not.toBe(reportPathOf("foo", 2));
+  expect(panelReportPath("foo-astra")).not.toBe(answerPath("foo", "astra"));
+  expect(answerPath("foo", "astra")).not.toBe(reportPathOf("foo-astra", 1));
+});
+
+test("a supervisor-started panel's Codex members carry review lane instructions; the Claude member needs none", () => {
+  const panel = { name: "p", cwd, question: "q", caller: "sup", callerRound: 2, owner: { ownerCwd: cwd }, state: "running" as const, startedAt: "2026-09-26T12:00:00Z" };
+  const round = { lane: "p-astra", round: 1, engine: "gpt" as const, model: "gpt-6-astra", effort: "medium", prompt: "q", maxRuntimeMins: 15 };
+  const entry = { roundStartedAt: "2026-09-26T12:00:00Z" } as Lane;
+  expect(memberSpec(panel, entry, round).laneInstructions).toBe(laneInstructions({ review: true }));
+  expect(memberSpec({ ...panel, caller: undefined, callerRound: undefined }, entry, round).laneInstructions).toBe(laneInstructions({ review: true }));
+  expect(memberSpec(panel, entry, { ...round, lane: "p-fable", engine: "claude" }).laneInstructions).toBeUndefined();
 });
 
 test("claude headroom reads the active account's tightest weekly window", () => {
@@ -132,4 +151,15 @@ test("every member gets the same frozen prompt with the answer shape", () => {
   expect(prompt).toContain("Context pack: /state/briefs/p-pack.md");
   for (const heading of ["## Recommendation", "## Claims", "## Dissent", "## Confidence"]) expect(prompt).toContain(heading);
   expect(prompt).toContain(`codegraph explore -p ${cwd}`);
+});
+
+test("cdx wait on a panel returns its record once it finishes, or a failure once its runner died", () => {
+  const record = { name: "wait-p", cwd, question: "q", owner: { ownerCwd: cwd }, state: "running", pid: 4242, startedAt: "2026-09-26T12:00:00Z" };
+  const store = (data: object) => db().query("INSERT OR REPLACE INTO panels (name, data) VALUES (?, ?)").run("wait-p", JSON.stringify(data));
+  store(record);
+  expect(settledPanel("wait-p", () => true)).toBeUndefined();
+  expect(settledPanel("wait-p", () => false)?.state).toBe("failed");
+  store({ ...record, state: "done", summary: "[cdx] panel=wait-p coverage=3/3" });
+  expect(settledPanel("wait-p", () => true)?.summary).toBe("[cdx] panel=wait-p coverage=3/3");
+  expect(settledPanel("missing", () => true)).toBeUndefined();
 });

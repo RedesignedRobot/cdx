@@ -1,7 +1,7 @@
 // Per-repo context digests keyed to commit, and the foreground consult that builds them.
 
 import { config } from "./config.ts";
-import { readLedger } from "./ledger.ts";
+import { BATCH_ENV, readLedger } from "./ledger.ts";
 import { reportPathOf } from "./reports.ts";
 import { fail, parseArgs, ROOT, SELF } from "./runtime.ts";
 import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
@@ -57,8 +57,10 @@ export function laneName(prefix: string, label: string): string {
 }
 
 // Runs one consult in the foreground and returns its final report. The lane's
-// progress output goes to a log, never to the caller's context.
-export async function runConsult(lane: string, cwd: string, question: string, opts: { engine?: string; model?: string; images?: string[] } = {}): Promise<{ report: string; reportPath: string }> {
+// progress output goes to a log, never to the caller's context, and its
+// terminal event goes to the batch, not the head: the command that ran it
+// reports once for all its consults.
+export async function runConsult(lane: string, cwd: string, question: string, opts: { engine?: string; model?: string; images?: string[]; batch: string }): Promise<{ report: string; reportPath: string }> {
   const log = `${ROOT}/logs/${lane}.consult.log`;
   mkdirSync(dirname(log), { recursive: true });
   const fd = openSync(log, "a");
@@ -68,7 +70,7 @@ export async function runConsult(lane: string, cwd: string, question: string, op
     const proc = Bun.spawn({
       cmd: [process.execPath, SELF, "consult", lane, "--cd", cwd, "--engine", engine, ...(model ? ["--model", model] : []),
         ...(opts.images ?? []).flatMap((image) => ["--image", image]), question],
-      cwd, stdin: "ignore", stdout: fd, stderr: fd,
+      cwd, env: { ...process.env, [BATCH_ENV]: opts.batch }, stdin: "ignore", stdout: fd, stderr: fd,
     });
     if (await proc.exited !== 0) fail(`consult ${lane} failed; log: ${log}`);
   } finally { closeSync(fd); }
@@ -114,7 +116,7 @@ export async function contextCommand(argv: string[]): Promise<void> {
   const path = join(dir, `${commit}.md`);
   if (existsSync(path)) { console.log(`cdx: context digest current: ${path}`); return; }
   const lane = laneName("context", `${basename(dirname(dirname(dir)))}-${commit.slice(0, 8)}`);
-  const { report, reportPath } = await runConsult(lane, cwd, digestQuestion(commit), { model: parsed.flags.model });
+  const { report, reportPath } = await runConsult(lane, cwd, digestQuestion(commit), { model: parsed.flags.model, batch: lane });
   const digest = `<!-- cdx context digest for ${commit}; built ${new Date().toISOString()} -->\n${report}\n`;
   if (digest.length > CONTEXT_DIGEST_MAX_CHARS) fail(`digest is ${digest.length} chars, over ${CONTEXT_DIGEST_MAX_CHARS}; not written. Report: ${reportPath}`);
   mkdirSync(dir, { recursive: true });

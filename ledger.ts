@@ -176,6 +176,9 @@ export interface Lane {
   consult?: true;
   // Panel this consult answers for; its events go to the panel, not the head.
   panel?: string;
+  // The cdx command (shots grade, context) that ran this consult and reports
+  // for it; its terminal event goes to the batch, not the head.
+  batch?: string;
   account?: string;
   codexHome?: string;
   ownerSession?: string;
@@ -287,6 +290,9 @@ export interface Spec {
 
 export type Ledger = Record<string, Lane>;
 
+// runConsult names its batch to the consult it starts through this variable.
+export const BATCH_ENV = "CDX_BATCH";
+
 type EventKind = "question" | "stalled" | "partial" | "account" | "terminal" | "job-exit" | "message" | "thrash" | "overrun" | "outage" | "gate-finished" | "panel";
 
 export interface FeedEvent {
@@ -381,7 +387,7 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
       message = terminalText(message, report, failed ? read(gateLog !== "-" && gateLog ? gateLog : log) : undefined);
     } else message = singleLine(message);
     const at = new Date().toISOString();
-    const supervisor = lane?.panel ? `panel:${lane.panel}` : terminal ? lane?.parent : undefined;
+    const supervisor = lane?.panel ? `panel:${lane.panel}` : terminal && lane?.batch ? `batch:${lane.batch}` : terminal ? lane?.parent : undefined;
     if (supervisor && lane?.parentRound) {
       const parent = findLane(supervisor);
       if (parent && laneRunning(parent) && parent.rounds === lane.parentRound && parent.steerOpen !== false) {
@@ -398,12 +404,17 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
 // A Claude session is a delivery cursor, not an owner: every lane belongs to
 // the one owner. The head is the active session (polled within
 // ACTIVE_SESSION_MS) that most recently drove cdx: spawned, resumed, sent,
-// reviewed, consulted, replied, landed, or ran cdx brief --head. With no
-// active driver the longest-running active session is the head, so a
-// session that only starts and polls (a teammate, a headless claude -p, a
-// second terminal) never takes the wakes. Owner events have one cursor in
-// meta, advanced only after a head received them, so a change of head never
-// skips an event; each session's own cursor covers messages addressed to it.
+// reviewed, consulted, replied, landed, or ran cdx brief --head. The mod
+// runs brief --head when a session starts with a person at the prompt, so a
+// fresh interactive session beside an older idle one takes the wakes at
+// once. A session that starts without a person (a headless claude -p, the
+// SDK) never drives by starting, and with no active driver there is no head:
+// events wait for one rather than wake a session nobody reads. Agent-tool
+// subagents and in-process teammates share their parent's process and
+// session id and fire no session.start of their own. Owner events have one
+// cursor in meta, advanced only after a head received them, so a change of
+// head never skips an event; each session's own cursor covers messages
+// addressed to it.
 const ACTIVE_SESSION_MS = 30_000;
 
 // An idle poll with nothing new skips the write until its liveness mark is
@@ -450,9 +461,8 @@ export function acknowledgeOwnerEvents(id: number): void {
 }
 
 export function electHead(sessions: readonly SessionRow[], now: number): string | undefined {
-  const active = sessions.filter((row) => Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS);
-  const driver = active.filter((row) => row.drove_at).sort((a, b) => b.drove_at!.localeCompare(a.drove_at!))[0];
-  return (driver ?? active.sort((a, b) => a.started_at.localeCompare(b.started_at))[0])?.session;
+  return sessions.filter((row) => row.drove_at && Date.parse(row.polled_at) >= now - ACTIVE_SESSION_MS)
+    .sort((a, b) => b.drove_at!.localeCompare(a.drove_at!))[0]?.session;
 }
 
 export function deliveryHead(now = Date.now()): string | undefined {

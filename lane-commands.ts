@@ -18,9 +18,9 @@ import {
 import { captureGateTree, composeGate, printGateChange, repositoryGate, runPreCheck } from "./gates.ts";
 import { formatGeminiStanding, readGeminiUsageSnapshot, requireGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
+  activeStateOf, BATCH_ENV, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
   ownershipSpec, readLane, readLedger, requireOwnChild, spawnRoots, type Spec,
-  storedOwnership, supervisorLane, validLane, withLedger, workCwdOf,
+  storedOwnership, supervisorLane, validLane, withLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
   resumeRefusal, CODEGRAPH_RULE, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
@@ -446,6 +446,9 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
   const { round, selection } = await openRound(lane, "review", cwd, effort, { engine, ...roundAccount, owner, preserveGate: true, ...roundModel, ...roundParent,
     ...(opts.consult ? { consult: true as const } : { reviewTree }) });
   if (selection) announceAccountSelection(lane, selection);
+  // A reused name must not keep an earlier batch's quiet routing.
+  const batch = opts.consult ? process.env[BATCH_ENV] : undefined;
+  withLane(lane, (item) => { if (batch) item!.batch = batch; else delete item!.batch; });
   return launch({ effort, engine, model, mode: "spawn", lane, round, cwd, reviewDir: cwd, prompt: fullBrief,
     ...(supervisor ? { supervisor: true as const } : {}), ...(!opts.consult ? { outputSchema: REVIEW_FINDINGS_SCHEMA, reviewTree } : {}),
     ...(images.length ? { images } : {}),

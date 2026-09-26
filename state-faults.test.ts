@@ -108,8 +108,9 @@ try {
     console.log(JSON.stringify(events.map((event) => event.text)));
   });
 } catch { console.log("failed"); }`);
-    evalIn(home, `import { feedEvent, startSession } from ${LEDGER};
+    evalIn(home, `import { feedEvent, markDriver, startSession } from ${LEDGER};
 startSession("s1");
+markDriver("s1");
 feedEvent("question", "[cdx] q1", "terminal", { lane: "a", round: 1 });
 feedEvent("gate-finished", "[cdx] gate", "terminal", { lane: "a", round: 1 });
 feedEvent("stalled", "[cdx] s1", "terminal", { lane: "a", round: 1 });`);

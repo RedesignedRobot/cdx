@@ -18,7 +18,7 @@ import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktr
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
 import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
-import { electHead, validLane } from "./ledger.ts";
+import { electHead, eventsAfter, feedEvent, latestEventId, type Lane, storeLane, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { laneChildEnv, registeredFlag, ROOT, runnerEnv } from "./runtime.ts";
 import { logProgress, progressLogPathOf } from "./reports.ts";
@@ -42,7 +42,21 @@ test("an addressed message reaches its session whether or not it is the head", (
   expect(selectEvents(records, "head", 0, 0)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
 });
 
-test("a session that starts and polls later never steals the wakes from the session that drove cdx", () => {
+test("a batch consult's terminal stays off the head's wakes, a panel member's too; a batch consult's question still wakes it", () => {
+  const since = latestEventId();
+  const at = "2026-09-26T12:00:00.000Z";
+  const consult = (extra: Partial<Lane>) => ({ engine: "gpt", kind: "review", consult: true, effort: "medium", rounds: 1, reports: [], tokenAccounting: 1,
+    work: { state: "closed", cwd: "/repo", updatedAt: at }, review: { state: "running", cwd: "/repo", round: 1, updatedAt: at },
+    createdAt: at, updatedAt: at, ...extra }) as unknown as Lane;
+  storeLane("shots-home-1", consult({ batch: "shots-home" }));
+  storeLane("pq-astra", consult({ panel: "pq" }));
+  feedEvent("terminal", "[cdx] lane=shots-home-1 round=1 state=done report=-", "head", { lane: "shots-home-1", round: 1 });
+  feedEvent("terminal", "[cdx] lane=pq-astra round=1 state=done report=-", "head", { lane: "pq-astra", round: 1 });
+  feedEvent("question", "[cdx] lane=shots-home-1 round=1 question #1", "head", { lane: "shots-home-1", round: 1 });
+  expect(selectEvents(eventsAfter(since), "head", since, since).map((event) => event.kind)).toEqual(["question"]);
+});
+
+test("a headless session never steals the wakes; a fresh interactive start takes them from an idle head", () => {
   const now = Date.parse("2026-09-26T12:00:00Z");
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
   const row = (session: string, started: number, drove?: number) => ({ session, cursor: 0, started_at: at(started), polled_at: at(1),
@@ -50,9 +64,12 @@ test("a session that starts and polls later never steals the wakes from the sess
   const head = row("head", 3600, 600);
   const teammate = row("teammate", 5);
   expect(electHead([head, teammate], now)).toBe("head");
-  expect(electHead([row("head", 3600), teammate], now)).toBe("head");
   expect(electHead([head, row("teammate", 5, 2)], now)).toBe("teammate");
-  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBe("teammate");
+  // An interactive start runs brief --head, which is a drive.
+  expect(electHead([head, row("fresh", 5, 5)], now)).toBe("fresh");
+  // With no active driver nobody is head; the owner cursor holds the events.
+  expect(electHead([row("head", 3600), teammate], now)).toBeUndefined();
+  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBeUndefined();
   // The teammate's cursor moves; the head still gets the question past the owner cursor.
   const question = [feed(7, "question")];
   expect(selectEvents(question, "teammate", 0)).toEqual([]);

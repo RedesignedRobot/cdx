@@ -1,8 +1,12 @@
 // `cdx shots grade`: consults judge a screenshot directory against a rubric in
 // batches, so the head reads one verdict file and opens only the failed shots.
+// The grade runs as a cdx job: a folder of 60-70 shots takes longer than the
+// ten minutes a tool call lives, and the job's exit is the one event that
+// wakes the head. The batch consults stay quiet.
 
 import { laneName, runConsult } from "./context.ts";
-import { CmdError, fail, parseArgs } from "./runtime.ts";
+import { jobCommand } from "./jobs.ts";
+import { CmdError, fail, parseArgs, SELF, shellQuote } from "./runtime.ts";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
@@ -14,6 +18,9 @@ const IMAGE = /\.(?:png|jpe?g)$/i;
 export const SHOTS_PER_CONSULT = 8;
 
 export interface ScreenVerdict { name: string; verdict: "pass" | "fail"; reason: string }
+
+// Job names allow no dots, which a directory slug may carry.
+export const gradeJobName = (lanePrefix: string) => lanePrefix.replace(/[^A-Za-z0-9_-]/g, "-");
 
 export function batchShots<T>(shots: T[], size = SHOTS_PER_CONSULT): T[][] {
   const batches: T[][] = [];
@@ -45,28 +52,35 @@ export function parseVerdicts(report: string, names: string[]): ScreenVerdict[] 
   return names.map((name) => byName.get(name) ?? { name, verdict: "fail", reason: "grader returned no verdict for this screen" });
 }
 
+const USAGE = "usage: cdx shots grade <dir> --rubric <file> [--engine gpt|gemini] [--model M] [--downscale]";
+
 export async function shotsCommand(argv: string[]): Promise<void> {
   const [sub, ...rest] = argv;
-  const usage = "usage: cdx shots grade <dir> --rubric <file> [--engine gpt|gemini] [--model M] [--downscale]";
-  if (sub !== "grade") fail(usage);
+  if (sub !== "grade" && sub !== "_grade") fail(USAGE);
   const parsed = parseArgs(rest, ["rubric", "engine", "model", "downscale"]);
   const dirArg = parsed.rest[0];
   const rubricPath = parsed.flags.rubric;
-  if (!dirArg || !existsSync(dirArg) || !rubricPath || !existsSync(rubricPath)) fail(usage);
+  if (!dirArg || !existsSync(dirArg) || !rubricPath || !existsSync(rubricPath)) fail(USAGE);
   const dir = realpathSync(dirArg);
   const shots = readdirSync(dir).filter((name) => IMAGE.test(name)).sort().map((name) => join(dir, name));
   if (!shots.length) fail(`no png or jpg screenshots in ${dir}`);
-  const engine = parsed.flags.engine ?? "gpt";
-  const rubric = readFileSync(rubricPath, "utf8");
   // One fresh lane per batch: resuming a single thread would carry every earlier batch's images.
   const lanePrefix = laneName("shots", basename(dir)).slice(0, 55);
+  if (sub === "grade") {
+    const args = [dir, "--rubric", realpathSync(rubricPath), ...(parsed.flags.engine ? ["--engine", parsed.flags.engine] : []),
+      ...(parsed.flags.model ? ["--model", parsed.flags.model] : []), ...(parsed.bools.has("downscale") ? ["--downscale"] : [])];
+    await jobCommand([gradeJobName(lanePrefix), "--cd", dir, [process.execPath, SELF, "shots", "_grade", ...args].map(shellQuote).join(" ")]);
+    return;
+  }
+  const engine = parsed.flags.engine ?? "gpt";
+  const rubric = readFileSync(rubricPath, "utf8");
   const screens: ScreenVerdict[] = [];
   const reports: string[] = [];
   for (const [index, batch] of batchShots(shots).entries()) {
     const names = batch.map((shot) => basename(shot));
     try {
       const { report, reportPath } = await runConsult(`${lanePrefix}-${index + 1}`, dir, gradeQuestion(rubric, batch),
-        { engine, model: parsed.flags.model, images: engine === "gpt" ? batch : [] });
+        { engine, model: parsed.flags.model, images: engine === "gpt" ? batch : [], batch: lanePrefix });
       reports.push(reportPath);
       screens.push(...parseVerdicts(report, names));
     } catch (error) {
