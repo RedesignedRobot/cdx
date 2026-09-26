@@ -79,6 +79,7 @@ function storePanel(record: PanelRecord): void {
 
 export interface PanelAdmission {
   callerIsMember: boolean;
+  callerIsConsultSupervisor: boolean;
   supervisorAskedThisRound: boolean;
   openPanel?: string;
   inputChars: number;
@@ -90,6 +91,7 @@ export interface PanelAdmission {
 
 export function panelRefusal(input: PanelAdmission): string | undefined {
   if (input.callerIsMember) return "a panel member cannot start a panel";
+  if (input.callerIsConsultSupervisor) return "a consult supervisor cannot start a panel; only work supervisors and the head can";
   if (input.supervisorAskedThisRound) return "a supervisor may call panel once per round; this round already did";
   if (input.openPanel) return `panel ${input.openPanel} is still open; one open panel at a time`;
   if (input.inputChars > PANEL_INPUT_CHARS) return `question plus pack is ${input.inputChars} chars; the cap is ${PANEL_INPUT_CHARS}, trim the pack`;
@@ -345,7 +347,10 @@ async function startLane(panel: PanelRecord, lane: string, engine: Engine, model
   const effort = engine === "claude" ? "medium" : resolveEffort(engine, model);
   const { round } = await openRound(lane, "review", panel.cwd, effort, {
     engine, consult: true, owner: panel.owner, preserveGate: true, reviewModel: model,
-    ...(engine === "gpt" ? { model } : {}), lineage: { supervisor: false },
+    ...(engine === "gpt" ? { model } : {}), panelMember: true,
+    // A supervisor's panel lanes are its children: killing it stops them and
+    // their tokens show under it.
+    lineage: { supervisor: false, ...(panel.caller ? { parent: panel.caller, parentRound: panel.callerRound } : {}) },
   });
   const entry = withLane(lane, (item) => { item!.panel = panel.name; return item!; });
   const spec: Spec = {
@@ -421,11 +426,18 @@ function verdictPrompt(record: PanelRecord, report: string, answers: MemberAnswe
   ].join("\n\n");
 }
 
+// A supervisor's round ending stops its panel lanes; the panel then skips
+// the verdict and the delivery nobody would read.
+function callerActive(record: PanelRecord): boolean {
+  if (!record.caller) return true;
+  const caller = findLane(record.caller);
+  return Boolean(caller && laneRunning(caller) && caller.rounds === record.callerRound);
+}
+
 function deliver(record: PanelRecord, line: string): void {
   if (!record.background) return;
   if (record.caller && record.callerRound) {
-    const caller = findLane(record.caller);
-    if (!caller || !laneRunning(caller) || caller.rounds !== record.callerRound) return;
+    if (!callerActive(record)) return;
     write(() => appendFileSync(controlPathOf(record.caller!, record.callerRound!), `${safeJSON({ text: line, sentAt: new Date().toISOString(), from: "cdx" })}\n`));
     return;
   }
@@ -456,7 +468,7 @@ export async function runPanel(name: string): Promise<number> {
   const report = panelReportPath(name);
   writeFileSync(report, safeText(renderPanelReport({ name, question: record.question, outcomes, answers, lines: (path) => lineCount(record.cwd, path) })));
   const verdictLane = memberLane(name, "verdict");
-  if (answers.length >= 2) {
+  if (answers.length >= 2 && callerActive(record)) {
     try {
       await startLane(record, verdictLane, "gpt", THINKER_MODEL, verdictPrompt(record, report, answers), VERDICT_RUNTIME_MINS);
       await settle([verdictLane], Date.now() + VERDICT_RUNTIME_MINS * 60_000 + SETTLE_GRACE_MS);
@@ -498,6 +510,7 @@ export async function panelCommand(argv: string[]): Promise<void> {
   const callerRound = supervisor ? Number(process.env.CDX_ROUND) : undefined;
   const refusal = panelRefusal({
     callerIsMember: Boolean(self?.panel),
+    callerIsConsultSupervisor: Boolean(supervisor && findLane(supervisor)?.consult),
     supervisorAskedThisRound: Boolean(supervisor && readPanels().some((record) => record.caller === supervisor && record.callerRound === callerRound)),
     openPanel: openPanelName(readPanels()),
     inputChars: question.length + packText.length,

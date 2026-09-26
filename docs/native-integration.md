@@ -20,7 +20,7 @@ The historical 7.0 design below explains the module boundary between `cdx.ts` an
 | --- | --- | --- |
 | `land` | `lane` or `lanes` | Gates the merge result once unless a green receipt already covers that tree, then commits, fast-forwards the base, pushes, removes worktrees and branches, and closes. `lanes` lands a batch; a red batch names the lane that broke it and lands the green prefix |
 | `ask` | `question`, `cd` | Synchronous read-only Gemini answer, no lane, 90-second limit, macOS sandbox-exec required |
-| `panel` | `name`, `question`, `cd` | Always `--bg`. Astra, Sol and Claude Fable answer as read-only consult lanes; one `panel` event carries the merged report path, the three recommendations and coverage. Member events never reach a session |
+| `panel` | `name`, `question`, `cd` | Always `--bg`. Astra, Sol and Claude Fable answer as read-only consult lanes; one `panel` event carries the merged report path, the three recommendations and coverage. Member events never reach a session. The head and work supervisors may call it, a consult supervisor may not. A supervisor's panel lanes are its children: its kill or round end stops them, and its Astra member is an owner-approved exception (2026-09-26) to the no-Astra-child rule |
 | `resume` | `lane`, `followUp`, `fix` | `fix` is `gate` or `review`; same HEAD and failed evidence required |
 
 The tool set is `land`, `ask`, `spawn`, `resume`, `consult`, `panel`, `review`, `events`, `send`, `reply`, `questions`, `status`, `report`, `tail`, `close`, `kill`, `gate`, `gate-receipt`, `job`, `msg`, `inbox`, `usage` and `doctor`.

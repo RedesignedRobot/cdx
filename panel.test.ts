@@ -101,13 +101,14 @@ test("a missing member leaves the report and the completion line incomplete", ()
   expect(line).toBe("[cdx] panel=p2 coverage=incomplete report=/r/p2.md astra: astra says keep it | sol: no answer | fable: fable says keep it");
 });
 
-const admitted = { callerIsMember: false, supervisorAskedThisRound: false, inputChars: 100, astraHeadroom: 50, claudeHeadroom: 50 };
+const admitted = { callerIsMember: false, callerIsConsultSupervisor: false, supervisorAskedThisRound: false, inputChars: 100, astraHeadroom: 50, claudeHeadroom: 50 };
 
 test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal(admitted)).toBeUndefined();
   expect(panelRefusal({ ...admitted, claudeHeadroom: undefined })).toBeUndefined();
   expect(panelRefusal({ ...admitted, callerIsMember: true })).toBe("a panel member cannot start a panel");
   expect(panelRefusal({ ...admitted, supervisorAskedThisRound: true })).toContain("once per round");
+  expect(panelRefusal({ ...admitted, callerIsConsultSupervisor: true })).toContain("a consult supervisor cannot start a panel");
   expect(panelRefusal({ ...admitted, openPanel: "p0" })).toContain("panel p0 is still open");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS + 1 })).toContain("the cap is 20000");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();

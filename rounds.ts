@@ -25,7 +25,7 @@ function roundModelOf(kind: "work" | "review", opts: { model?: string; reviewMod
   return (kind === "review" ? opts?.reviewModel : undefined) ?? opts?.model ?? existing?.model;
 }
 
-export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; reviewModel?: string; lineage?: Lineage; consult?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
+export async function openRound(lane: string, kind: "work" | "review", cwd: string, effort: Effort, opts?: { reviewTree?: GateTree; engine?: Engine; preserveEngine?: boolean; requireSession?: boolean; sessionOverride?: string; account?: AccountChoice; preserveAccount?: boolean; owner?: LaneOwner; preserveOwner?: boolean; worktree?: WorktreeInfo; gate?: string; preserveGate?: boolean; pre?: string; preservePre?: boolean; model?: string; reviewModel?: string; lineage?: Lineage; consult?: true; panelMember?: true; forcedAccount?: string; excludedHomes?: Set<string> }): Promise<{ round: number; sessionId?: string; selection?: AccountSelection }> {
   const engine = opts?.engine ?? "gpt";
   const existingBefore = readLedger()[lane];
   const isChildPre = Boolean(opts?.lineage?.parent ?? existingBefore?.parent ?? supervisorLane());
@@ -33,7 +33,9 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
     ? laneEngine(existingBefore)
     : opts?.engine ?? (existingBefore ? laneEngine(existingBefore) : engine);
   const resolvedModelCandidate = roundEnginePre === "gpt" ? roundModelOf(kind, opts, existingBefore) : undefined;
-  checkChildAstraRefusal(isChildPre, roundEnginePre, resolvedModelCandidate);
+  // Owner-approved exception (2026-09-26): a work supervisor's panel runs an
+  // Astra member as its child.
+  checkChildAstraRefusal(isChildPre && !opts?.panelMember, roundEnginePre, resolvedModelCandidate);
   const claudeRefusal = claudeLaneRefusal(roundEnginePre, kind, Boolean(opts?.consult ?? existingBefore?.consult));
   if (claudeRefusal) throw new CmdError(claudeRefusal);
 
@@ -84,7 +86,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
       }
       const isChildCommitted = Boolean(opts?.lineage?.parent ?? existing?.parent ?? supervisorLane());
       const roundModelCommitted = roundEngineType === "gpt" ? roundModelOf(kind, opts, existing) : undefined;
-      checkChildAstraRefusal(isChildCommitted, roundEngineType, roundModelCommitted);
+      checkChildAstraRefusal(isChildCommitted && !opts?.panelMember, roundEngineType, roundModelCommitted);
       const queuedUntil = engine === "gemini" ? geminiQuotaState().block?.resetsAt ?? geminiAdmission(readGeminiUsageSnapshot(), ledger, Date.now(), lane).queuedUntil : undefined;
       ledger[lane] = {
         ...(existing ?? {}),
