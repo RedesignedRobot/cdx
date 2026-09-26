@@ -164,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
-import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { changesInstalls, childWorktreeTarget, firstRedPrefix, installSource, landJobName, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
 import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
@@ -280,6 +280,16 @@ test("only a finished, non-consult review round attests", () => {
   expect(reviewAttests({ ...review, review: { state: "failed" } } as Lane)).toBe(false);
   expect(reviewAttests({ ...review, consult: true })).toBe(false);
   expect(reviewAttests({ ...review, kind: "work" })).toBe(false);
+});
+
+test("a batch merge gate borrows installs from the lane that changed a lockfile", () => {
+  expect(changesInstalls(["src/a.ts", "package.json"])).toBe(false);
+  expect(changesInstalls(["apps/web/bun.lock"])).toBe(true);
+  expect(changesInstalls(["Cargo.lock"])).toBe(true);
+  const [first, second] = [{ lane: "a", installs: false }, { lane: "b", installs: true }];
+  expect(installSource([first, second])).toBe(second);
+  expect(installSource([first, { ...second, installs: false }])).toBe(first);
+  expect(landJobName("feat.x")).toBe("land-feat-x");
 });
 
 test("a land lock left by a dead lander is taken over; a live or pid-less one refuses", () => {

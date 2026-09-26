@@ -24,7 +24,7 @@ import { statusCommand, usageCommand, waitCommand } from "./status.ts";
 import { contextCommand } from "./context.ts";
 import { panelCommand, runPanel } from "./panel.ts";
 import { shotsCommand } from "./shots.ts";
-import { landCommand, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
+import { landCommand, runLandJob, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
 import { existsSync, readFileSync } from "node:fs";
 
 const USAGE = `cdx tracks Codex and Gemini execution lanes
@@ -33,7 +33,7 @@ cdx policy: model ${config.model}${modelAliases() ? ` (aliases ${modelAliases()}
 Engines:
 ${ENGINE_PICKER}
 
-  land <lane> | land --batch <lane>...     Gate the merge result once, fast-forward the base, push, remove worktrees and branches, close
+  land <lane> | land --batch <lane>...     Gate the merge result once (as a detached job), fast-forward the base, push, remove worktrees and branches, close
   spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--scope-policy ask|extend|stop] [--max-runtime MIN] "<brief>"
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
@@ -221,6 +221,11 @@ switch (command) {
     break;
   }
   case "land": landCommand(argv); break;
+  case "_land": {
+    const [name, ...lanes] = argv;
+    if (!name || !lanes.length) fail("internal: _land <job> <land args>");
+    process.exit(runLandJob(name, lanes));
+  }
   case "close": {
     const parsed = parseArgs(argv, ["remove-worktree", "keep-worktree"]);
     const keepWorktree = closeKeepsWorktree(parsed.bools);
