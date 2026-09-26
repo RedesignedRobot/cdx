@@ -90,8 +90,8 @@ export interface PanelAdmission {
   supervisorAskedThisRound: boolean;
   openPanel?: string;
   inputChars: number;
-  // Percent left on the account the Codex members will run on; 0 when none is eligible.
-  astraHeadroom: number;
+  // The account the Codex members will run on; absent when none is eligible.
+  codexAccount?: Pick<AccountStanding, "choice" | "remainingPercent" | "heldPercent">;
   // Percent left in the active Claude account's weekly windows, or why cdx
   // cannot tell; an unknown quota refuses the panel.
   claudeHeadroom: number | string;
@@ -103,8 +103,13 @@ export function panelRefusal(input: PanelAdmission): string | undefined {
   if (input.supervisorAskedThisRound) return "a supervisor may call panel once per round; this round already did";
   if (input.openPanel) return `panel ${input.openPanel} is still open; one open panel at a time`;
   if (input.inputChars > PANEL_INPUT_CHARS) return `question plus pack is ${input.inputChars} chars; the cap is ${PANEL_INPUT_CHARS}, trim the pack`;
-  if (input.astraHeadroom < MIN_HEADROOM_PERCENT) {
-    return `no Codex account has ${MIN_HEADROOM_PERCENT}% left for the Astra and Sol members; the fullest has ${Math.floor(input.astraHeadroom)}%`;
+  const codex = input.codexAccount;
+  if (!codex) return `no Codex account is eligible for the Astra and Sol members; a panel needs ${MIN_HEADROOM_PERCENT}% free`;
+  if (codex.remainingPercent < MIN_HEADROOM_PERCENT) {
+    // Free is usage headroom minus what running lanes hold, so it can sit
+    // well under the percent cdx usage shows.
+    const held = codex.heldPercent ? ` after ${codex.heldPercent}% held by running lanes` : "";
+    return `${codex.choice.name}, the fullest Codex account, has ${Math.floor(codex.remainingPercent)}% free${held}; a panel needs ${MIN_HEADROOM_PERCENT}%`;
   }
   if (typeof input.claudeHeadroom === "string") return input.claudeHeadroom;
   if (input.claudeHeadroom < MIN_HEADROOM_PERCENT) {
@@ -597,7 +602,7 @@ export async function panelCommand(argv: string[]): Promise<void> {
       supervisorAskedThisRound: Boolean(supervisor && panels.some((record) => record.caller === supervisor && record.callerRound === callerRound)),
       openPanel: openPanelName(panels),
       inputChars: question.length + packText.length,
-      astraHeadroom: account?.remainingPercent ?? 0,
+      codexAccount: account,
       claudeHeadroom: claude,
     });
     if (refused) return refused;

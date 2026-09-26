@@ -106,7 +106,8 @@ test("a missing member leaves the report and the completion line incomplete", ()
   expect(line).toBe("[cdx] panel=p2 coverage=incomplete report=/r/p2.md astra: astra says keep it | sol: no answer | fable: fable says keep it");
 });
 
-const admitted = { callerIsMember: false, callerIsConsultSupervisor: false, supervisorAskedThisRound: false, inputChars: 100, astraHeadroom: 50, claudeHeadroom: 50 };
+const codexAccount = { choice: { name: "codex-2", home: "/home/codex-2" }, remainingPercent: 50 };
+const admitted = { callerIsMember: false, callerIsConsultSupervisor: false, supervisorAskedThisRound: false, inputChars: 100, codexAccount, claudeHeadroom: 50 };
 
 test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal(admitted)).toBeUndefined();
@@ -117,7 +118,10 @@ test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal({ ...admitted, openPanel: "p0" })).toContain("panel p0 is still open");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS + 1 })).toContain("the cap is 20000");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();
-  expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("no Codex account has 10% left for the Astra and Sol members; the fullest has 9%");
+  expect(panelRefusal({ ...admitted, codexAccount: { ...codexAccount, remainingPercent: 9.5 } })).toBe("codex-2, the fullest Codex account, has 9% free; a panel needs 10%");
+  expect(panelRefusal({ ...admitted, codexAccount: { ...codexAccount, remainingPercent: 2, heldPercent: 15 } }))
+    .toBe("codex-2, the fullest Codex account, has 2% free after 15% held by running lanes; a panel needs 10%");
+  expect(panelRefusal({ ...admitted, codexAccount: undefined })).toBe("no Codex account is eligible for the Astra and Sol members; a panel needs 10% free");
   expect(panelRefusal({ ...admitted, claudeHeadroom: 4 })).toBe("the Claude weekly quota has 4% left; a panel needs 10%");
 });
 
@@ -132,7 +136,7 @@ test("a panel skips a nearly empty account near its reset and pins its Codex mem
   expect(decideAccount(standings, "light", quotaNow)?.choice.name).toBe("codex-1");
   const account = panelAccount(standings, quotaNow)!;
   expect(account.choice.name).toBe("codex-2");
-  expect(panelRefusal({ ...admitted, astraHeadroom: account.remainingPercent })).toBeUndefined();
+  expect(panelRefusal({ ...admitted, codexAccount: account })).toBeUndefined();
   // startLane passes the recorded account to openRound, whose chooser keeps an eligible preferred account.
   const member = chooseAccount(standings, "light", undefined, account.choice, quotaNow).choice!;
   expect(member).toEqual(account.choice);
@@ -145,8 +149,7 @@ test("a panel skips a nearly empty account near its reset and pins its Codex mem
 test("a panel is refused when every Codex account is under the threshold", () => {
   const account = panelAccount([standing("codex-1", 98, 0.5), standing("codex-2", 93, 100)], quotaNow);
   expect(account?.choice.name).toBe("codex-2");
-  expect(panelRefusal({ ...admitted, astraHeadroom: account?.remainingPercent ?? 0 }))
-    .toBe("no Codex account has 10% left for the Astra and Sol members; the fullest has 7%");
+  expect(panelRefusal({ ...admitted, codexAccount: account })).toBe("codex-2, the fullest Codex account, has 7% free; a panel needs 10%");
   expect(panelAccount([], quotaNow)).toBeUndefined();
 });
 
