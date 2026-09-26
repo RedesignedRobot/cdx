@@ -51,7 +51,7 @@ ${ENGINE_PICKER}
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   events [--json] [--peek] # unread feed events; the newest active Claude session is the head
-  status [--all | --json | --brief | --line | --watch [--interval S]]
+  status [--all | --json | --brief | --watch [--interval S]]
   wait <lane|job|panel>... [--timeout S] [--json] [--report]
   usage  [--json] [--totals] # quota windows, observed burn, account picks; --totals adds rounds-to-green per engine and repo
   usage  --line            # weekly windows from stored snapshots, for status lines

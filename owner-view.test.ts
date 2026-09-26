@@ -1,5 +1,5 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { pinnedLine, type LiveRow } from "./hooks/delivery.ts";
+import type { LiveRow } from "./hooks/delivery.ts";
 import { storeJob } from "./jobs.ts";
 import { type Lane, startSession, storeLane } from "./ledger.ts";
 import { briefCommand, eventsCommand } from "./session-commands.ts";
@@ -57,9 +57,6 @@ test("each live session sees only its own lanes and jobs; the head also sees uno
   const rowsB = await snapshot("view-b");
   expect(ours(rowsA.map((row) => row.name))).toEqual(["view-job-a", "view-lane-a"]);
   expect(ours(rowsB.map((row) => row.name))).toEqual(["view-job-b", "view-job-terminal", "view-lane-b", "view-lane-gone", "view-lane-terminal"]);
-  const lineA = pinnedLine(rowsA.filter((row) => row.name.startsWith("view-")), now);
-  expect(lineA).toStartWith("cdx 1 lane, 1 job");
-  expect(lineA).not.toContain("view-lane-b");
 
   const briefA = await printed("view-a", () => briefCommand([]));
   expect(briefA).toContain("lane=view-lane-a");

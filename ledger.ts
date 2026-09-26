@@ -565,7 +565,7 @@ function ownerTarget(owner: string | undefined, sessions: ReadonlyMap<string, Se
 }
 
 // Whether a lane or job with this owner belongs in the session's own view:
-// the band, the status line and the brief. The terminal has no view of its
+// the band and the brief. The terminal has no view of its
 // own and sees everything.
 export function ownerView(session: string, now: number): (owner: string | undefined) => boolean {
   if (session === "terminal") return () => true;

@@ -1,4 +1,4 @@
 {
-  "description": "cdx execution lanes: tools, background polling, completion notifications, status line, and a guard against raw work commands",
+  "description": "cdx execution lanes: tools, background polling, completion notifications, a live band, and a guard against raw work commands",
   "modules": ["./register.ts"]
 }

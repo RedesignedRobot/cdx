@@ -21,7 +21,7 @@ cdx is a [Claude Code](https://claude.com/claude-code) plugin and a standalone C
 
 ## Native in Claude Code
 
-cdx runs inside Claude Code as a [function hooks](#claude-code-integration) module. At session start the mod registers tools under `mcp__cdx__`, the `/lanes` command, a live band, a status line, and a two-second poll of the event table. The head spawns a lane with one tool call and ends its turn. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
+cdx runs inside Claude Code as a [function hooks](#claude-code-integration) module. At session start the mod registers tools under `mcp__cdx__`, the `/lanes` command, a live band above the prompt, and a two-second poll of the event table. The head spawns a lane with one tool call and ends its turn. cdx wakes the head when the lane finishes, asks a question, stalls, or hits an outage.
 
 ```mermaid
 sequenceDiagram
@@ -50,7 +50,7 @@ sequenceDiagram
 | `mcp__cdx__land`, `close`, `kill`, `gate`, `gate-receipt`, `job`, `ask`, `doctor` | Land, finish, stop, gate, run detached jobs, ask a code question, diagnose. |
 | `[cdx]` prompts and toasts | Wake events arrive as a prompt when the head is idle and as context on the next tool result mid-turn. |
 | `/lanes` | Opens a live Pane with lane details and recent transcript lines. Arguments forward to cdx. |
-| Live band and status line | This session's running lanes and jobs, refreshed every two seconds. The band is a table (NAME, KIND, ENGINE, EFFORT, STAGE, AGE, STEPS, FILES, NOW) with the stage coloured. EFFORT is the reasoning effort the lane's current round runs at. A narrow terminal drops EFFORT, then ENGINE, then KIND. The status line is one line. |
+| Live band | This session's running lanes and jobs, refreshed every two seconds. The band is a table (NAME, KIND, ENGINE, EFFORT, STAGE, AGE, STEPS, FILES, NOW) with the stage coloured. EFFORT is the reasoning effort the lane's current round runs at. A narrow terminal drops EFFORT, then ENGINE, then KIND. |
 
 There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and people at a terminal.
 
@@ -207,7 +207,7 @@ cdx questions [lane]
 cdx msg     <lane|full-session-id> ("<text>" | -)
 cdx inbox   [-n N]
 cdx events  [--json] [--peek] [--snapshot]
-cdx status  [--all] [--json | --brief | --line | --watch [--interval S]]
+cdx status  [--all] [--json | --brief | --watch [--interval S]]
 cdx wait    <lane|job|panel>... [--timeout S] [--json] [--report]
 cdx usage   [--json] [--totals] | cdx usage --line
 cdx tail    <lane> [-n N] | cdx tail -f [lane]
@@ -342,7 +342,7 @@ A lane belongs to the Claude session that opened its latest round: its spawn, re
 
 Among the sessions that polled within 30 s, the one that most recently drove cdx (spawn, resume, send, review, consult, reply, land, or `cdx brief --head`) is the head and receives the events no live session owns: those owned by `terminal`, by a session that never polled, or by a session that is gone. With no active driver there is no head, and those events wait for one. The mod runs `cdx brief --head` when a session starts with a person at the prompt, so a fresh interactive session beside an older idle one takes the wakes at once. `--head` claims only in the first 30 s of a session's live stretch: a new session, `/clear`, `/resume`, or one that had stopped polling for 30 s. A plugin reload, enable or worker respawn in a running session leaves the head where it was. A headless `claude -p` or an SDK host never claims by starting. Agent-tool subagents and in-process teammates share their parent's process and session id and fire no session start of their own; a teammate in its own terminal pane is its own interactive session and claims the head when it starts. The head's events have one cursor that moves only after a head received them and stops before an event still due to another live session, so neither a change of head nor an owner that dies before its next poll skips one. Messages addressed to a full session id reach only that session, and any session can read everything with `cdx feed`. `cdx brief` prints running lanes, the five newest finished lanes awaiting attention, open questions, and recent jobs, and prints nothing when the same text ran within 10 minutes.
 
-A session's own view (the band, the Pane, the status line, the brief and the rows of `cdx events --snapshot`) lists a lane or job only when its events would reach that session: its owner is this session and live, or it is the head and the owner is `terminal`, unknown or gone. Another live session's work stays out of it. `cdx status`, `cdx status --all`, `cdx feed` and a brief from the terminal still list everything, and `cdx status` marks a lane whose owner is another live session with `owned by another live session` on its `started by` line.
+A session's own view (the band, the Pane, the brief and the rows of `cdx events --snapshot`) lists a lane or job only when its events would reach that session: its owner is this session and live, or it is the head and the owner is `terminal`, unknown or gone. Another live session's work stays out of it. `cdx status`, `cdx status --all`, `cdx feed` and a brief from the terminal still list everything, and `cdx status` marks a lane whose owner is another live session with `owned by another live session` on its `started by` line.
 
 `cdx events` returns only kinds the head acts on: question, stalled, terminal, job-exit, message, thrash, overrun, outage and panel. All carry `wake: true`. Events for a supervisor's children go to the supervisor, never to the head. Terminal events of the consults that the `cdx shots grade` and `cdx context` jobs start skip the head, since the job reads their reports; their questions still wake it. `--peek` leaves the cursor in place; `--json --snapshot` adds the live rows the mod draws.
 
@@ -352,7 +352,7 @@ Round progress (steers delivered or rejected, auto-continues, agy retries, gate 
 
 ## Status, jobs and wait
 
-`cdx status` reads open lanes only. Each block shows state, round, `started by <session prefix> from <cwd>`, round tool steps, git dirty file count, stage (working, gate with elapsed time, reporting, stalled), last action age, tokens, and review outcome on its own line. Consult lanes show `consult`. `--all` and `--json --all` include the archive. `--brief` prints running lanes and jobs one line each under 100 characters, `--line` renders at most 100 characters for a status slot, and `--watch [--interval S]` re-renders the brief view until Ctrl-C.
+`cdx status` reads open lanes only. Each block shows state, round, `started by <session prefix> from <cwd>`, round tool steps, git dirty file count, stage (working, gate with elapsed time, reporting, stalled), last action age, tokens, and review outcome on its own line. Consult lanes show `consult`. `--all` and `--json --all` include the archive. `--brief` prints running lanes and jobs one line each under 100 characters, and `--watch [--interval S]` re-renders the brief view until Ctrl-C.
 
 `cdx job <name> --cd /abs/repo "<cmd>"` runs a detached shell command with one log and a `job-exit` event. A gating land (`land-<lane>`), `cdx shots grade` (`shots-<dir>`) and `cdx context` (`context-<repo>-<commit>-job`) run as jobs too. `wait`, `kill` and `status` know jobs. The native job tool requires `cd`.
 
@@ -410,11 +410,11 @@ Owner ruling, 2026-09-15: the head never blocks on a lane. The mod denies a Bash
 
 ### Delivery in the session
 
-The mod polls `cdx events --json --snapshot` every 2 seconds. One call returns the session's events and a snapshot of running lanes and jobs for the band, the status line and the `/lanes` Pane. Each new wake event shows an 8-second toast.
+The mod polls `cdx events --json --snapshot` every 2 seconds. One call returns the session's events and a snapshot of running lanes and jobs for the band and the `/lanes` Pane. Each new wake event shows an 8-second toast.
 
 - Idle wake: with no turn running and a wake event pending, the mod holds it 15 seconds so a burst costs one prompt, then submits a prompt that starts with `[cdx]`.
 - Mid-turn: after each non-subagent tool call that was not denied, pending events are added as context under `[cdx] events`. Typed prompts receive them too.
-- Prompt budget: Claude Code refuses a plugin's prompt after 50 in one session. The mod then stops submitting, keeps events for the next tool result or typed prompt, puts each fresh wake in the prompt box as a Tab suggestion, and prefixes the status line with `wakes off`. A new session restores wakes.
+- Prompt budget: Claude Code refuses a plugin's prompt after 50 in one session. The mod then stops submitting, keeps events for the next tool result or typed prompt, and puts each fresh wake in the prompt box as a Tab suggestion. A new session restores wakes.
 - Head rollover: the mod counts compactions of the head's own conversation per session; subagent and precompute compactions do not count. The first Stop after the second compaction blocks once with: update BATCH.md, push the owner "roll session", end the turn. The settings Stop hooks (the owner's push guard among them) still run first; a block of theirs joins the rollover text, and one that stops the session wins.
 
 In headless mode UI status, toasts and logs are skipped; polling and delivery continue.

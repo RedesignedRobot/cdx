@@ -12,7 +12,6 @@ import {
   bandTable,
   bandText,
   orderedRows,
-  pinnedLine,
   stageColor,
   type LiveRow,
 } from "./delivery";
@@ -37,7 +36,6 @@ describe("delivery rules", () => {
     const [, parentLine, childLine] = bandTable(orderedRows([child, parent]), now, 120).map(bandText);
     expect(parentLine).toMatch(/^◆ parent +lane +sol +high +gate +2m3s +12 +3 +running bun test/);
     expect(childLine).toMatch(/^\?   child +lane +sol +high +question +2m3s +12 +3 +question: Which branch\?$/);
-    expect(pinnedLine([parent, child], now)).toContain("2m3s");
   });
 
   const bandNow = Date.parse("2026-09-26T16:00:00Z");

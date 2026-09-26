@@ -47,7 +47,7 @@ export {
   statusText, shellQuote, completionVerdict, parseArgs, fmtTokens, fmtTokensFull, resolveStdinText,
 } from "./runtime.ts";
 export {
-  changedFileCount, laneProgress, porcelainFileCount, statusBrief, statusLine, geminiUsageRows, claudeUsageRows, usageTable,
+  changedFileCount, laneProgress, porcelainFileCount, statusBrief, geminiUsageRows, claudeUsageRows, usageTable,
   outageText, usageLine,
 } from "./status.ts";
 export {

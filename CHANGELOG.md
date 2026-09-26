@@ -1,3 +1,11 @@
+## 10.0.8 (2026-09-27)
+
+### Band
+
+- The pinned status line under the prompt (`cdx 1 lane · npm-oidc working 4m38s · …`) is gone; the band above the prompt already shows every running lane and job with its stage, age and current action. The mod no longer calls `$.ui.status`, and `pinnedLine` is deleted.
+- `cdx status --line` and its `statusLine` formatter are deleted. They were the status line's first feed and nothing called them after the mod switched to the snapshot. `cdx usage --line` stays for the Claude Code status line script.
+- Once the engine's prompt budget is spent, the one-time transcript notice is now the only sign; the `wakes off` prefix lived in the deleted line.
+
 ## 10.0.7 (2026-09-26)
 
 ### Band

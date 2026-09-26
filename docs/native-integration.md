@@ -10,11 +10,11 @@ The historical 7.0 design below explains the module boundary between `cdx.ts` an
 - The head is the session, among those that polled within 30 seconds, that most recently drove cdx: spawn, resume, send, review, consult, panel, reply, land, or `cdx brief --head`. With no active driver there is no head and events wait. A headless session that only started and polled never takes the wakes; Agent-tool subagents and in-process teammates fire no session start of their own.
 - An event owned by a known session (one with a sessions row) goes to that session past its own cursor while it polled within 30 seconds. Once it has not, the head receives the event and rewrites the event's owner to itself, so the old owner never receives it after a `/resume` with the same id. Events owned by `terminal` or by a session that never polled go to the head.
 - The head reads past `owner_cursor` in the meta table, which moves only after a head received its events and stops before the first event still due to another live session. When the head changes, the new head picks up every event no head has received; when an owner dies before its next poll, the head picks up its events. Messages addressed to a full session id go to that session only. `cdx feed` shows every event to any session.
-- A session's view follows the same rule (`ownerView` in ledger.ts): the snapshot rows, the brief, and so the band, Pane and status line, hold a lane or job only when its owner is this live session, or when this session is the head and the owner is `terminal`, unknown or gone. `cdx status` lists all lanes and marks those owned by another live session.
+- A session's view follows the same rule (`ownerView` in ledger.ts): the snapshot rows, the brief, and so the band and Pane, hold a lane or job only when its owner is this live session, or when this session is the head and the owner is `terminal`, unknown or gone. `cdx status` lists all lanes and marks those owned by another live session.
 - Only actionable kinds reach a session: `question`, `stalled`, `terminal`, `job-exit`, `message`, `thrash`, `overrun`, `outage`, `panel`. Lifecycle kinds stay in the table for `cdx feed` and never wake a head. There is no heartbeat event; round progress goes to `logs/<lane>-r<round>.progress.log`.
 - A terminal event carries at most 5 lines of 200 characters plus the report path, never the report body. A child's terminal goes to its supervisor, not the head.
 - The cursor advances after the events print, so a crash replays events and never drops them. `--peek` leaves the cursor alone.
-- The mod polls `cdx events --json --snapshot` every 2 seconds; the snapshot rows feed the status line. An idle head is woken by one `[cdx]` prompt per 15-second burst, and a turn in progress gets the events as context on its next tool result. Claude Code allows 50 mod prompts per session; after that, events wait for the next tool result or typed prompt, and a fresh wake goes into the prompt box as a suggestion.
+- The mod polls `cdx events --json --snapshot` every 2 seconds; the snapshot rows feed the band and the `/lanes` Pane. An idle head is woken by one `[cdx]` prompt per 15-second burst, and a turn in progress gets the events as context on its next tool result. Claude Code allows 50 mod prompts per session; after that, events wait for the next tool result or typed prompt, and a fresh wake goes into the prompt box as a suggestion.
 
 ## Tools
 
@@ -70,31 +70,9 @@ JSON output, one object:
 
 Fields: `id`, `kind`, `wake` (`WAKE_EVENTS.has(kind)`), `text`, and any of `lane`, `round`, `job`, `from`, `recipient` present on the record. Text mode prints `text` lines, nothing when empty. Exit 0 always, including an empty list. A `terminal` session id fails: "cdx events needs a Claude session".
 
-### Add `cdx status --line`
-
-One line for the status slot, at most 100 characters, empty output when the caller owns no running lane, job or open question. Shape:
-
-```
-cdx 2 lanes · search-fix gate 3m · api-docs working 12m · 1 question
-```
-
-Owned running lanes first (name, stage word, age since `lastActionAt ?? lastEventAt`), then owned running jobs as `job <name> <age>`, then `<n> question(s)` when any owned current-round question is open, then a Gemini quota block as `gemini blocked <m>m` when present. Cut the middle items before the counts. Pure function `statusLine(...)` exported and tested beside `statusBrief`.
-
-### Free text from stdin everywhere
-
-Every command taking free text accepts `-` as that argument to read stdin: `spawn` and `job` already do; add `resume`, `consult`, `review` (intent), `send`, `reply`, `msg`. A `-` with empty stdin fails with the command's usage line.
-
-### Doctor
-
-Replace the removed checks with three: the personal plugin path `~/.claude/skills/cdx` resolves to this repo; `hooks/hooks.json` names `modules: ["./register.ts"]` and has no classic entries; and the calling session's `polledAt` is within 15 seconds ("plugin: mod live, last poll <n>s ago"), else warn "plugin: mod not polling; set CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 in ~/.claude/settings.json env and /reload-plugins". Also warn when neither the process environment nor `~/.claude/settings.json` `env` sets the flag.
-
-### Version
-
-`VERSION` in cdx.ts and `package.json` become `7.0.0`. Do not touch `hooks/`, `monitors/`, `.claude-plugin/`, README, SKILL or CHANGELOG.
-
 ### Tests
 
-Update the `state` fixture in cdx.test.ts (no `heads`). Add one test per observable rule: events selection and cursor advance as a pure function over records, `statusLine` shape and cut, and the `-` stdin refusal text. No spawned processes, sleeps or temporary homes.
+Update the `state` fixture in cdx.test.ts (no `heads`). Add one test per observable rule: events selection and cursor advance as a pure function over records, and the `-` stdin refusal text. No spawned processes, sleeps or temporary homes.
 
 ## Contract B: the mod (lane `mod`, files `hooks/**`, `.claude-plugin/plugin.json`, `monitors/`, `tsconfig.json`, `package.json` check script only)
 
@@ -116,11 +94,11 @@ A hot reload runs the module afresh with these variables empty and may not fire 
 
 Every `$.process.run` on cdx passes `env: { CLAUDE_CODE_SESSION_ID: session }` and `cwd: root`.
 
-On `command.run` of `clear` or `resume`, after `next`: re-read the session id, clear the buffer, clear the status line, run `cdx brief` again as at start.
+On `command.run` of `clear` or `resume`, after `next`: re-read the session id, clear the buffer, run `cdx brief` again as at start.
 
 ### Delivery
 
-`poll` (skipped while a previous poll is in flight): `cdx events --json` appends to the buffer. Every fifth poll also runs `cdx status --line` and sets `$.ui.status(line || undefined)`. For each new event with `wake: true`, `$.ui.toast(text, { timeoutMs: 8000 })` when a surface exists. When no turn is running and the buffer holds at least one wake event, drain the whole buffer into one `$.prompt.submit({ text })` whose text starts with `[cdx]` and joins the event texts with newlines.
+`poll` (skipped while a previous poll is in flight): `cdx events --json` appends to the buffer. For each new event with `wake: true`, `$.ui.toast(text, { timeoutMs: 8000 })` when a surface exists. When no turn is running and the buffer holds at least one wake event, drain the whole buffer into one `$.prompt.submit({ text })` whose text starts with `[cdx]` and joins the event texts with newlines.
 
 `turn.start` and `turn.complete` track whether a turn is running.
 
@@ -172,7 +150,7 @@ Owner ruling, 2026-09-15: the head never blocks on a lane. There is no `wait` to
 
 ### Headless
 
-`e.surface === null` at `session.start` means no UI: skip `ui.log`, `ui.toast` and `ui.status`, keep polling, context and `prompt.submit`.
+`e.surface === null` at `session.start` means no UI: skip `ui.log` and `ui.toast`, keep polling, context and `prompt.submit`.
 
 ### Tests
 

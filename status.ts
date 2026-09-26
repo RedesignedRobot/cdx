@@ -17,7 +17,7 @@ import {
   type Ledger, ownedElsewhere, readAllLanes, readLedger, roundEngine, roundExitCodeOf, roundNoteOf,
   roundReportOf, type Tokens, workCwdOf,
 } from "./ledger.ts";
-import { questionOpen, type QuestionRecord, readQuestions } from "./questions.ts";
+import { questionOpen, readQuestions } from "./questions.ts";
 import { availableReportPath, jobPhase, logPathOf, readTailLines, renderEventLine } from "./reports.ts";
 import { legacyStatePending } from "./migrate.ts";
 import { laneOutcomes, outcomeLines } from "./outcomes.ts";
@@ -198,105 +198,15 @@ export function statusBrief(ledger: Ledger, jobs: Jobs, io: {
   return lines.join("\n");
 }
 
-interface StatusLineIO {
-  now?: number;
-}
-
-export function statusLine(
-  ledger: Ledger,
-  jobs: Jobs,
-  questions: number | { record: QuestionRecord }[] = 0,
-  quota: GeminiQuotaState | number | undefined = undefined,
-  io: StatusLineIO = {}
-): string {
-  const now = io.now ?? Date.now();
-  const runningLanes: { name: string; stage: string; age: string }[] = [];
-  for (const [name, entry] of Object.entries(ledger)) {
-    if (!laneRunning(entry)) continue;
-    const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
-    const age = statusAge(entry.lastActionAt ?? entry.lastEventAt, now);
-    runningLanes.push({ name, stage, age });
-  }
-
-  const runningJobs: { name: string; age: string }[] = [];
-  for (const [name, job] of Object.entries(jobs)) {
-    if (!jobRunning(job)) continue;
-    const age = statusAge(job.startedAt, now);
-    runningJobs.push({ name, age });
-  }
-
-  let questionCount = 0;
-  if (typeof questions === "number") {
-    questionCount = questions;
-  } else if (Array.isArray(questions)) {
-    for (const q of questions) {
-      const rec = "record" in q ? q.record : q;
-      const entry = ledger[rec.lane];
-      if (entry && entry.rounds === rec.round && questionOpen(rec)) questionCount += 1;
-    }
-  }
-
-  if (runningLanes.length === 0 && runningJobs.length === 0 && questionCount === 0) {
-    return "";
-  }
-
-  let blockedMinutes: number | undefined;
-  if (typeof quota === "number") {
-    blockedMinutes = quota;
-  } else if (quota && "block" in quota && quota.block) {
-    blockedMinutes = quota.block.minutesRemaining;
-  }
-
-  const head = runningLanes.length > 0
-    ? `cdx ${runningLanes.length} ${runningLanes.length === 1 ? "lane" : "lanes"}`
-    : runningJobs.length > 0
-    ? `cdx ${runningJobs.length} ${runningJobs.length === 1 ? "job" : "jobs"}`
-    : "cdx";
-
-  const laneItems = runningLanes.map((l) => `${l.name} ${l.stage} ${l.age}`);
-  const jobItems = runningJobs.map((j) => `job ${j.name} ${j.age}`);
-  const middle = [...laneItems, ...jobItems];
-
-  const trailing: string[] = [];
-  if (questionCount > 0) {
-    trailing.push(`${questionCount} ${questionCount === 1 ? "question" : "questions"}`);
-  }
-  if (blockedMinutes !== undefined && blockedMinutes > 0) {
-    trailing.push(`gemini blocked ${blockedMinutes}m`);
-  }
-
-  function assemble(mid: string[]): string {
-    return [head, ...mid, ...trailing].join(" · ");
-  }
-
-  let currentMiddle = [...middle];
-  let line = assemble(currentMiddle);
-  while (line.length > 100 && currentMiddle.length > 0) {
-    currentMiddle.pop();
-    line = assemble(currentMiddle);
-  }
-  if (line.length > 100) {
-    line = line.slice(0, 100);
-  }
-  return line;
-}
-
 export async function statusCommand(argv: string[]) {
-  const parsed = parseArgs(argv, ["json", "all", "brief", "line", "watch", "interval"]);
-  if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --line | --watch [--interval S]]");
+  const parsed = parseArgs(argv, ["json", "all", "brief", "watch", "interval"]);
+  if (parsed.rest.length) fail("usage: cdx status [--all | --json | --brief | --watch [--interval S]]");
   const watch = parsed.bools.has("watch");
   const interval = Number(parsed.flags.interval ?? 2);
   if (!Number.isFinite(interval) || interval <= 0 || interval > 2_147_483) fail("--interval must be positive seconds below 2147483");
   if (parsed.flags.interval !== undefined && !watch) fail("--interval requires --watch");
-  if (parsed.bools.has("line") && (watch || parsed.bools.has("brief") || parsed.bools.has("json") || parsed.bools.has("all"))) fail("--line cannot be combined with other display modes");
   if (parsed.bools.has("json") && (watch || parsed.bools.has("brief"))) fail("--json cannot be combined with --brief or --watch");
   if (parsed.bools.has("all") && (watch || parsed.bools.has("brief"))) fail("--all lists finished jobs; --brief and --watch show only running work");
-  if (parsed.bools.has("line")) {
-    const ledger = readLedger();
-    const line = statusLine(ledger, readJobs(), readQuestions().map((record) => ({ record })), geminiQuotaState(), { now: Date.now() });
-    if (line) console.log(line);
-    return;
-  }
   if (watch || parsed.bools.has("brief")) {
     const render = () => statusBrief(readLedger(), readJobs(), { files: changedFileCount, phase: jobPhase, now: Date.now() });
     if (!watch) { const text = render(); if (text) console.log(text); return; }

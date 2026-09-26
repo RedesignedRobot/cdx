@@ -11,7 +11,7 @@ import {
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
   geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText,
-  selectEvents, statusLine, resolveStdinText, spawnRoots,
+  selectEvents, resolveStdinText, spawnRoots,
 } from "./cdx.ts";
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
@@ -626,51 +626,6 @@ test("Rank 5: qualifyGeminiResult treats SUCCESS with transport words as success
   try { unlinkSync(tmpReport); } catch {}
 });
 
-test("statusLine returns empty string when nothing owned runs, formats shape, and cuts middle items before counts", () => {
-  const now = Date.parse("2026-09-15T12:15:00Z");
-
-  // Empty string when caller owns no running lane, job, or open question (not "cdx 0 lanes")
-  expect(statusLine({}, {}, 0, undefined, { now })).toBe("");
-  expect(statusLine({}, {}, 0, 15, { now })).toBe("");
-
-  // Exact shape matching doc specification
-  const ledger = {
-    "search-fix": {
-      kind: "work", work: { state: "running", cwd: "/work" },
-      stage: "gate", stageStartedAt: "2026-09-15T12:12:00Z",
-      lastActionAt: "2026-09-15T12:12:00Z",
-      ownerSession: "head",
-    },
-    "api-docs": {
-      kind: "work", work: { state: "running", cwd: "/docs" },
-      stage: "working",
-      lastActionAt: "2026-09-15T12:03:00Z",
-      ownerSession: "head",
-    },
-  } as any;
-  const shaped = statusLine(ledger, {}, 1, undefined, {
-    now,
-  });
-  expect(shaped).toBe("cdx 2 lanes · search-fix gate 3m · api-docs working 12m · 1 question");
-
-  // Middle cut: lines exceeding 100 characters drop middle items before counts
-  const wideLedger: any = {};
-  for (let i = 1; i <= 6; i++) {
-    wideLedger[`worker-long-lane-name-${i}`] = {
-      kind: "work", work: { state: "running", cwd: `/work/${i}` },
-      stage: "working",
-      lastActionAt: "2026-09-15T12:10:00Z",
-      ownerSession: "head",
-    };
-  }
-  const cut = statusLine(wideLedger, {}, 2, 15, {
-    now,
-  });
-  expect(cut.length).toBeLessThanOrEqual(100);
-  expect(cut.startsWith("cdx 6 lanes")).toBe(true);
-  expect(cut.endsWith("2 questions · gemini blocked 15m")).toBe(true);
-});
-
 test("free text from stdin accepts '-' and empty stdin fails with command usage line", () => {
   const usage = 'usage: cdx send <lane> "<text>"';
 
@@ -689,7 +644,6 @@ test("events and status accept their boolean flags at the command line", () => {
   expect(parseArgs(["--json", "--peek"], ["json", "peek"]).bools).toEqual(new Set(["json", "peek"]));
   // The plugin polls with exactly these flags every two seconds; a refusal blanks /lanes and stops lane wakes.
   expect(parseArgs(["--json", "--snapshot"], ["json", "peek", "watch", "snapshot"]).bools).toEqual(new Set(["json", "snapshot"]));
-  expect(parseArgs(["--line"], ["json", "all", "brief", "line", "watch", "interval"]).bools).toEqual(new Set(["line"]));
 });
 
 test("-- ends the flags so free text may start with dashes", () => {

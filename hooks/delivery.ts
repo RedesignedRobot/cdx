@@ -151,15 +151,6 @@ export function bandText(line: readonly BandCell[]): string {
   return line.map((cell) => cell.text).join("");
 }
 
-export function pinnedLine(rows: readonly LiveRow[], now: number, wakesOff = false): string {
-  if (!rows.length) return wakesOff ? "wakes off" : "";
-  const busiest = [...rows].sort((a, b) => b.steps - a.steps || Date.parse(a.startedAt) - Date.parse(b.startedAt))[0]!;
-  const lanes = rows.filter((row) => row.kind === "lane").length;
-  const jobs = rows.length - lanes;
-  const count = `${lanes} ${lanes === 1 ? "lane" : "lanes"}${jobs ? `, ${jobs} ${jobs === 1 ? "job" : "jobs"}` : ""}`;
-  return cut(`${wakesOff ? "wakes off · " : ""}cdx ${count} · ${busiest.name} ${busiest.stage} ${elapsed(busiest.startedAt, now)} · ${actionWords(busiest.action)}`, 120);
-}
-
 export interface DeliveryState {
   pending: PendingEvent[];
   inTurn: boolean;

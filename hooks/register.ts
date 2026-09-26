@@ -15,7 +15,6 @@ import {
   type BandCell,
   bandTable,
   orderedRows,
-  pinnedLine,
 } from "./delivery";
 import { afterCompaction, stopOutcome } from "./rollover";
 import {
@@ -48,8 +47,8 @@ const INSTANCE = `${Date.now()}-${Math.random()}`;
 const loggedRefusals = new Set<string>();
 
 const BUDGET_SPENT_NOTICE = "cdx: the engine's per-session prompt budget is spent (50 prompts); lane events no longer wake an idle head. "
-  + "They still land on the next tool result or typed prompt, a fresh wake goes into the prompt box as a Tab suggestion, "
-  + "and the status line shows 'wakes off'. A new session restores wakes.";
+  + "They still land on the next tool result or typed prompt, and a fresh wake goes into the prompt box as a Tab suggestion. "
+  + "A new session restores wakes.";
 
 async function poll($: EngineInterface) {
   if (pollInFlight || !session || !root) {
@@ -79,7 +78,6 @@ async function poll($: EngineInterface) {
     }
     if (snapshot) {
       await $.state.set(liveRef, snapshot);
-      if (surface !== null) await $.ui.status(pinnedLine(snapshot.rows, snapshot.now, deliveryState.budgetSpent) || undefined);
     }
 
     // Everything the submit would carry, kept so a refused submit can put it
@@ -285,9 +283,6 @@ export function register(on: On) {
     await ensure($);
     session = await $.session.id();
     deliveryState = clearBuffer(deliveryState);
-    if (surface !== null) {
-      await $.ui.status(undefined);
-    }
     // The user typed /clear or /resume here, so this session keeps the head
     // under its new id.
     const briefResult = await $.process.run(CDX.concat(["brief", "--head"]), {
