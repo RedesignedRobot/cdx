@@ -23,8 +23,6 @@ const SECRETS_RULE = "Never print or inline secrets; use environment lookups.";
 const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
-// Codegraph opens its index read-write, which the Codex read-only sandbox refuses.
-const CODEGRAPH_READ_ONLY = "Codegraph cannot open its index inside this read-only sandbox; use rg and targeted file reads for code questions.";
 // Chromium registers mach ports, which the Codex seatbelt denies; one process needs none.
 const BROWSER_RULE = "Chromium starts in this sandbox only with the --single-process flag (for Playwright, pass it in the launch args); sandboxed shells have CODEX_SANDBOX=seatbelt.";
 export const CODEGRAPH_RULE = `In a repository with .codegraph/, \`${CODEGRAPH_EXPLORE} "<question>"\` is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph is missing, the repository is unindexed, or the call times out (exit 142) or fails, fall back to rg and file reads and note it in the report.`;
@@ -61,7 +59,7 @@ const ownerRules = () => config.rules.filter((rule) => !retiredLaneRule(rule));
 
 // The AGENTS.md cdx writes into each role's Codex lane home.
 export function laneInstructions(role: LaneRole = {}): string {
-  const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_READ_ONLY]
+  const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_RULE]
     : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, BROWSER_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
       VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule()])];
   const owner = ownerRules();
@@ -120,7 +118,7 @@ export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "g
   const projectRules = `${cwd}/.cdx-rules.md`;
   if (existsSync(projectRules) && readFileSync(projectRules, "utf8").trim()) facts.push(`Project rules: read ${projectRules} before starting.`);
   const index = codegraphRoot(cwd);
-  if (index && relative(index, cwd).startsWith("..") && !(engine === "gpt" && reviewOnly)) {
+  if (index && relative(index, cwd).startsWith("..")) {
     facts.push(`Codegraph: this worktree has no index of its own; run \`${CODEGRAPH_EXPLORE} -p ${index} "<question>"\`. It answers from the primary checkout at ${index}, so read files you changed from the worktree.`);
   }
   const digest = digestLine(contextDigest(cwd));

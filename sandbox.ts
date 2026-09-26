@@ -50,14 +50,13 @@ export function codegraphRoot(cwd: string, exists: (path: string) => boolean = e
 
 // Codegraph opens its SQLite index read-write, so a lane that queries it needs
 // the index directory writable. It holds the graph cache, never source.
+// A review snapshot links the source's ignored index, and SQLite writes its
+// -wal and -shm files beside the resolved database file.
 function codegraphDirs(spec: SandboxSpec): string[] {
   const root = codegraphRoot(spec.cwd);
-  return root ? [join(root, ".codegraph")] : [];
-}
-
-// Codex read-only lanes cannot open any index, so nothing steers them to codegraph.
-export function laneCodegraphRoot(spec: SandboxSpec & Pick<Spec, "engine">): (cwd: string) => string | undefined {
-  return spec.engine === "gpt" && spec.reviewDir ? () => undefined : codegraphRoot;
+  if (!root) return [];
+  const dir = join(root, ".codegraph");
+  return [...new Set([resolvedPath(dir), dirname(resolvedPath(join(dir, "codegraph.db")))])];
 }
 
 // Seatbelt matches resolved paths (/tmp is /private/tmp), and some roots do
@@ -77,13 +76,25 @@ export function prepareSandboxDirs(spec: SandboxSpec): void {
   for (const dir of laneStateDirs(spec)) mkdirSync(dir, { recursive: true });
 }
 
-// A lane with reviewDir set is read-only: reviews, consults, and consult supervisors.
+export const REVIEW_PROFILE = "cdx-review";
+
+// Spread into thread/start (thread), turn/start (turn) and the thread config
+// overrides (config). A lane with reviewDir set is read-only: reviews, consults,
+// and consult supervisors. Every sandbox mode writes the cwd, so reviews use a
+// permissions profile that writes only TMPDIR and the codegraph index. Codex
+// 0.156 fails every turn with "failed to load workspace requirements" when the
+// profile is selected through the thread/start or turn/start `permissions`
+// field, so the profile comes from the default_permissions config override.
 export function codexSandbox(spec: SandboxSpec) {
-  if (spec.reviewDir) return { mode: "read-only", policy: { type: "readOnly", networkAccess: true } } as const;
+  if (spec.reviewDir) {
+    const filesystem = { ":root": "read", ":tmpdir": "write", ...Object.fromEntries(codegraphDirs(spec).map((dir) => [dir, "write"])) };
+    return { thread: {}, turn: {}, config: { default_permissions: REVIEW_PROFILE,
+      permissions: { [REVIEW_PROFILE]: { filesystem, network: { enabled: true } } } } };
+  }
   // Codex adds the turn cwd as the first writable root and keeps .git read-only.
   const writableRoots = [...(spec.additionalDirectories ?? []), ...laneStateDirs(spec), ...codegraphDirs(spec)].map(resolvedPath);
-  return { mode: "workspace-write", policy: { type: "workspaceWrite", writableRoots, networkAccess: true,
-    excludeTmpdirEnvVar: false, excludeSlashTmp: false } } as const;
+  return { thread: { sandbox: "workspace-write" }, config: {}, turn: { sandboxPolicy: { type: "workspaceWrite", writableRoots,
+    networkAccess: true, excludeTmpdirEnvVar: false, excludeSlashTmp: false } } };
 }
 
 // agy writes its home, TMPDIR, the codegraph index, and the files named by the
