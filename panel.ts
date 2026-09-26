@@ -11,6 +11,7 @@ import {
 } from "./ledger.ts";
 import { laneInstructions } from "./prompts.ts";
 import { controlPathOf, reportPathOf, specPathOf } from "./reports.ts";
+import { readJobs } from "./jobs.ts";
 import { openRound } from "./rounds.ts";
 import { fail, fmtTokens, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF, settleHint, singleLine } from "./runtime.ts";
 import { safeJSON, safeText } from "./safe-text.ts";
@@ -133,6 +134,15 @@ async function astraHeadroom(): Promise<number> {
   } catch {
     return 0;
   }
+}
+
+// cdx wait <panel> polls this: the finished record, or a failed one once the
+// runner died without finishing.
+export function settledPanel(name: string, alive = pidAlive): PanelRecord | undefined {
+  const record = readPanel(name);
+  if (!record || (record.state === "running" && alive(record.pid))) return undefined;
+  if (record.state !== "running") return record;
+  return { ...record, state: "failed", summary: `[cdx] panel=${name} state=failed runner died without finishing; see ${ROOT}/logs/${name}.panel.log` };
 }
 
 // A running record whose runner died is not open; it failed.
@@ -533,7 +543,8 @@ export async function panelCommand(argv: string[]): Promise<void> {
   // records the panel, so two launches can never both pass them. The
   // launcher's pid holds the panel open until the runner's replaces it.
   const refusal = write(() => {
-    if (readPanel(name) || lanes.some((lane) => findLane(lane))) return `panel name "${name}" is taken; pick a fresh one`;
+    // cdx wait takes a lane, job or panel name, so a panel name is unique across all three.
+    if (readPanel(name) || findLane(name) || readJobs()[name] || lanes.some((lane) => findLane(lane))) return `panel name "${name}" is taken; pick a fresh one`;
     const panels = readPanels();
     const refused = panelRefusal({
       callerIsMember: Boolean(self?.panel),
@@ -561,6 +572,6 @@ export async function panelCommand(argv: string[]): Promise<void> {
   child.unref();
   storePanel({ ...readPanel(name)!, pid: child.pid });
   console.log(`cdx: panel=${name} members=${PANEL_MEMBERS.map(({ member }) => member).join(",")} cwd=${cwd} log=${ROOT}/logs/${name}.panel.log`);
-  const hint = supervisor ? "the completion line arrives as a steer message in this round" : settleHint(`panel ${name}`);
+  const hint = supervisor ? `run cdx wait ${name} before your report; it blocks until the panel settles and prints its completion line` : settleHint(name);
   console.log(`cdx: detached pid=${child.pid}; report=${panelReportPath(name)}; ${hint}`);
 }

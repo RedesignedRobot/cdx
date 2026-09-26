@@ -52,7 +52,7 @@ ${ENGINE_PICKER}
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   events [--json] [--peek] # unread feed events; the newest active Claude session is the head
   status [--all | --json | --brief | --line | --watch [--interval S]]
-  wait <lane>... [--timeout S] [--json] [--report]
+  wait <lane|job|panel>... [--timeout S] [--json] [--report]
   usage  [--json] [--totals] # quota windows, observed burn, account picks; --totals adds rounds-to-green per engine and repo
   usage  --line            # weekly windows from stored snapshots, for status lines
   tail   <lane> [-n N]    tail -f [lane]           # -f: live transcript; no lane = all running lanes

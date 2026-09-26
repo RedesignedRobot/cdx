@@ -344,16 +344,22 @@ export async function waitCommand(argv: string[]) {
   const names = parsed.rest;
   const multiple = new Set(names).size > 1;
   const completedReports: { lane: string; entry: Lane }[] = [];
-  if (names.length === 0) fail("usage: cdx wait <lane|job>... [--timeout <sec>] [--json] [--report]");
+  if (names.length === 0) fail("usage: cdx wait <lane|job|panel>... [--timeout <sec>] [--json] [--report]");
   const knownLanes = readLedger();
   const knownJobs = readJobs();
   const lanes = names.filter((name) => knownLanes[name]);
-  const jobNames = names.filter((name) => !knownLanes[name]);
-  for (const name of jobNames) if (!knownJobs[name]) fail(`"${name}" is neither a lane nor a job (cdx status --all lists both)`);
+  // Loaded on use: panel.ts reaches claude.ts, which imports the runner,
+  // which imports this module, so a static import would read claude.ts's
+  // exports before they exist.
+  const { readPanel, settledPanel } = await import("./panel.ts");
+  const panelNames = names.filter((name) => !knownLanes[name] && !knownJobs[name] && readPanel(name));
+  const jobNames = names.filter((name) => !knownLanes[name] && !panelNames.includes(name));
+  for (const name of jobNames) if (!knownJobs[name]) fail(`"${name}" is not a lane, job or panel (cdx status --all lists lanes and jobs)`);
   const timeoutMs = Number(parsed.flags.timeout ?? 7200) * 1000;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
   const pendingJobs = new Set(jobNames);
+  const pendingPanels = new Set(panelNames);
   const reportTextOf = (entry: Lane): string | undefined => {
     const path = roundReportOf(entry);
     try {
@@ -418,8 +424,16 @@ export async function waitCommand(argv: string[]) {
         pendingJobs.delete(name);
       }
     }
-    if (pending.size === 0 && pendingJobs.size === 0) break;
-    if (Date.now() > deadline) fail(`timeout waiting for: ${[...pending, ...pendingJobs].join(", ")}`);
+    for (const name of [...pendingPanels]) {
+      const panel = settledPanel(name);
+      if (!panel) continue;
+      if (json) console.log(JSON.stringify({ panel: name, state: panel.state, report: panel.report ?? null, summary: panel.summary ?? null }));
+      else console.log(panel.summary ?? `cdx: panel=${name} state=${panel.state}`);
+      if (panel.state === "failed") failed = true;
+      pendingPanels.delete(name);
+    }
+    if (pending.size === 0 && pendingJobs.size === 0 && pendingPanels.size === 0) break;
+    if (Date.now() > deadline) fail(`timeout waiting for: ${[...pending, ...pendingJobs, ...pendingPanels].join(", ")}`);
     await Bun.sleep(5000);
   }
   if (!json && multiple) {

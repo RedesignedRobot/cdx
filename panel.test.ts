@@ -3,12 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  answerPath, citationProblem, memberSpec, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  answerPath, citationProblem, memberSpec, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
   panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
 import type { Lane } from "./ledger.ts";
 import { laneInstructions } from "./prompts.ts";
 import { reportPathOf } from "./reports.ts";
+import { db } from "./store.ts";
 
 const cwd = "/repo";
 const answer = (member: string, claims: string[], recommendation = `${member} says keep it`) => parseAnswer(member, [
@@ -150,4 +151,15 @@ test("every member gets the same frozen prompt with the answer shape", () => {
   expect(prompt).toContain("Context pack: /state/briefs/p-pack.md");
   for (const heading of ["## Recommendation", "## Claims", "## Dissent", "## Confidence"]) expect(prompt).toContain(heading);
   expect(prompt).toContain(`codegraph explore -p ${cwd}`);
+});
+
+test("cdx wait on a panel returns its record once it finishes, or a failure once its runner died", () => {
+  const record = { name: "wait-p", cwd, question: "q", owner: { ownerCwd: cwd }, state: "running", pid: 4242, startedAt: "2026-09-26T12:00:00Z" };
+  const store = (data: object) => db().query("INSERT OR REPLACE INTO panels (name, data) VALUES (?, ?)").run("wait-p", JSON.stringify(data));
+  store(record);
+  expect(settledPanel("wait-p", () => true)).toBeUndefined();
+  expect(settledPanel("wait-p", () => false)?.state).toBe("failed");
+  store({ ...record, state: "done", summary: "[cdx] panel=wait-p coverage=3/3" });
+  expect(settledPanel("wait-p", () => true)?.summary).toBe("[cdx] panel=wait-p coverage=3/3");
+  expect(settledPanel("missing", () => true)).toBeUndefined();
 });
