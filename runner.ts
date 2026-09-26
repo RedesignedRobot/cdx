@@ -5,6 +5,7 @@ import { installLaneHome, laneCodexHome } from "./account-sync.ts";
 import { defaultCodexHome } from "./accounts.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
+import { drainGeminiControls } from "./gemini-controls.ts";
 // Round execution, engine event handling, account failover, and finalization.
 
 import { config, geminiConfig } from "./config.ts";
@@ -853,40 +854,19 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     const stderrPump = pumpRaw(proc.stderr, errLog);
     let controlChain = Promise.resolve();
     const drainControls = async () => {
-      if (readLedger()[lane]?.callLimitHit) return;
-      const turnActive = geminiTurnsCompleted < geminiTurnsSent;
-      const toDeliver: ControlRecord[] = [];
-      withLedger((ledger) => {
-        if (turnActive && hooksInstalled) return;
-        const path = controlPathOf(lane, round);
-        if (!existsSync(path)) return;
-        const lines = readFileSync(path, "utf8").split("\n").filter((line) => line.trim());
-        const delivered = readDeliveredCount(lane, round);
-        if (delivered >= lines.length) return;
-
-        let newlyDelivered = 0;
-        for (let i = delivered; i < lines.length; i++) {
-          const line = lines[i]!;
-          let record: ControlRecord;
-          try { record = JSON.parse(line) as ControlRecord; } catch { continue; }
-          if (typeof record.text !== "string" || !record.text.trim()) continue;
-          toDeliver.push(record);
-          newlyDelivered += 1;
-        }
-        writeDeliveredCount(lane, round, lines.length);
-        if (newlyDelivered > 0) {
-          const item = ledger[lane];
-          if (item) {
-            item.steers = (item.steers ?? 0) + newlyDelivered;
-            item.updatedAt = new Date().toISOString();
-          }
-        }
+      drainGeminiControls(controlPathOf(lane, round), geminiTurnsCompleted < geminiTurnsSent, hooksInstalled, {
+        exists: existsSync,
+        lines: (path) => readFileSync(path, "utf8").split("\n").filter((line) => line.trim()),
+        deliveredCount: () => readDeliveredCount(lane, round),
+        markDelivered: (count) => writeDeliveredCount(lane, round, count),
+        withLane: (action) => withLedger((ledger) => action(ledger[lane])),
+        deliver: (record) => {
+          writeUserTurn(controlText(record));
+          const flat = singleLine(record.text);
+          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession, { lane, round });
+        },
+        now: () => new Date().toISOString(),
       });
-      for (const record of toDeliver) {
-        writeUserTurn(controlText(record));
-        const flat = singleLine(record.text);
-        feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession, { lane, round });
-      }
     };
     const queueControlDrain = () => {
       controlChain = controlChain.then(drainControls, drainControls);
