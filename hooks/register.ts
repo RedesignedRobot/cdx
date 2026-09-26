@@ -13,7 +13,6 @@ import {
   type PendingEvent,
   type LiveSnapshot,
   bandRow,
-  headEvents,
   orderedRows,
   pinnedLine,
 } from "./delivery";
@@ -79,7 +78,7 @@ async function poll($: EngineInterface) {
     // back. The submit is issued before any await so no turn can start in
     // between; it is not awaited because the prompt runs when the session is
     // idle and the poll must not wait for that.
-    const drained = [...deliveryState.pending, ...headEvents(incomingEvents)];
+    const drained = [...deliveryState.pending, ...incomingEvents];
     const outcome = afterPoll(deliveryState, incomingEvents);
     deliveryState = outcome.state;
 
@@ -114,7 +113,7 @@ async function poll($: EngineInterface) {
 // answers with the buffer first, then whatever the feed still held, and
 // empties the buffer so the after-hook does not deliver it a second time.
 function eventsToolResult(exitCode: number, stdout: string, stderr: string): string {
-  const buffered = [...deliveryState.pending, ...deliveryState.progress].map((e) => e.text);
+  const buffered = deliveryState.pending.map((e) => e.text);
   deliveryState = clearBuffer(deliveryState);
   let fresh: string[] = [];
   if (exitCode === 0 && stdout.trim()) {

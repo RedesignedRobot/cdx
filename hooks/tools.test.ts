@@ -76,7 +76,6 @@ describe("tool rules", () => {
       msg: { target: "test-lane", text: "hello" },
       inbox: { lines: 5 },
       usage: {},
-      takeover: { target: "test-lane" },
       doctor: { fix: true, probe: true },
     };
 

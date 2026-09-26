@@ -32,8 +32,7 @@ export {
   jobCwd, summaryJobs,
 } from "./jobs.ts";
 export {
-  WAKE_EVENTS, parseFeedEvent, recipientOf, owned, eventOwned, callerLineage, selectEvents, delivery,
-  spawnRoots,
+  WAKE_EVENTS, callerLineage, selectEvents, spawnRoots,
 } from "./ledger.ts";
 export {
   resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES,
@@ -70,7 +69,7 @@ if (import.meta.main) {
   }
   const isHookInvocation = process.argv[2] === "hook";
   if (!isHookInvocation && process.argv[2] !== "view" && process.argv[2] !== "status") {
-    for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
+    for (const dir of ["logs", "reports", "briefs", "specs", "control"]) {
       try {
         mkdirSync(`${ROOT}/${dir}`, { recursive: true });
       } catch { /* ignore if read-only or raced */ }

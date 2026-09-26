@@ -2,14 +2,14 @@ import { safeJSON } from "./safe-text.ts";
 // Questions, steering delivery, peer messages, and the Gemini invocation hook.
 
 import {
-  callerSession, feedEvent, laneRunning, owned, readLedger, recipientOf, requireOwnChild, scopedEvents,
-  withLedger,
+  callerSession, feedEvent, findLane, inboxEvents, laneRunning, readLedger, renderEvent, requireOwnChild, withLedger,
 } from "./ledger.ts";
 import { createHash } from "node:crypto";
 import { readGeminiUsageSnapshot } from "./gemini-usage.ts";
-import { captureRecoveryPartial, logPathOf, controlPathOf } from "./reports.ts";
+import { captureRecoveryPartial, logPathOf, controlPathOf, logProgress } from "./reports.ts";
 import { CmdError, fail, fmtAge, parseArgs, pidAlive, resolveBrief, ROOT, singleLine } from "./runtime.ts";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { db, write } from "./store.ts";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 const deliveredPathOf = (lane: string, round: number) => `${ROOT}/control/${lane}-r${round}.delivered`;
@@ -51,7 +51,7 @@ export function notifyParent(lane: string, text: string): void {
   const parentEntry = ledger[parent];
   if (!parentEntry || !laneRunning(parentEntry) || parentEntry.rounds !== parentRound || parentEntry.steerOpen === false) return;
   const record: ControlRecord = { text: singleLine(text), sentAt: new Date().toISOString(), from: "cdx" };
-  withLedger(() => { writeFileSync(controlPathOf(parent, parentRound), `${safeJSON(record)}\n`, { flag: "a" }); });
+  write(() => { writeFileSync(controlPathOf(parent, parentRound), `${safeJSON(record)}\n`, { flag: "a" }); });
 }
 
 export interface ControlRecord {
@@ -77,32 +77,21 @@ export interface QuestionRecord {
   status?: "expired: round ended";
 }
 
-function readQuestion(path: string): QuestionRecord | undefined {
-  try {
-    const value = JSON.parse(readFileSync(path, "utf8")) as QuestionRecord;
-    return typeof value.question === "string" && typeof value.seq === "number" ? value : undefined;
-  } catch {
-    return undefined;
-  }
+function readQuestion(lane: string, seq: number): QuestionRecord | undefined {
+  const row = db().query<{ data: string }, [string, number]>("SELECT data FROM questions WHERE lane = ? AND seq = ?").get(lane, seq);
+  return row ? JSON.parse(row.data) : undefined;
 }
 
-export function questionFiles(lane?: string): Array<{ path: string; record: QuestionRecord }> {
-  const results: Array<{ path: string; record: QuestionRecord }> = [];
-  if (!existsSync(`${ROOT}/questions`)) return results;
-  for (const file of readdirSync(`${ROOT}/questions`)) {
-    if (!file.endsWith(".json")) continue;
-    const path = `${ROOT}/questions/${file}`;
-    const record = readQuestion(path);
-    if (!record || (lane && record.lane !== lane)) continue;
-    results.push({ path, record });
-  }
-  return results.sort((left, right) => Date.parse(left.record.askedAt) - Date.parse(right.record.askedAt));
+// Questions oldest first, for one lane or all.
+export function readQuestions(lane?: string): QuestionRecord[] {
+  const rows = lane
+    ? db().query<{ data: string }, [string]>("SELECT data FROM questions WHERE lane = ?").all(lane)
+    : db().query<{ data: string }, []>("SELECT data FROM questions").all();
+  return rows.map((row) => JSON.parse(row.data) as QuestionRecord).sort((left, right) => Date.parse(left.askedAt) - Date.parse(right.askedAt));
 }
 
-function writeQuestion(path: string, record: QuestionRecord): void {
-  const tmp = `${path}.tmp.${process.pid}`;
-  writeFileSync(tmp, `${safeJSON(record, 2)}\n`);
-  renameSync(tmp, path);
+export function storeQuestion(record: QuestionRecord): void {
+  db().query("INSERT OR REPLACE INTO questions (lane, seq, round, data) VALUES (?, ?, ?, ?)").run(record.lane, record.seq, record.round, JSON.stringify(record));
 }
 
 export function questionOpen(record: QuestionRecord): boolean {
@@ -111,12 +100,14 @@ export function questionOpen(record: QuestionRecord): boolean {
 
 export function expireRoundQuestions(lane: string, round: number): void {
   const expiredAt = new Date().toISOString();
-  for (const { path, record } of questionFiles(lane)) {
-    if (record.round !== round || !questionOpen(record)) continue;
-    record.expiredAt = expiredAt;
-    record.status = "expired: round ended";
-    writeQuestion(path, record);
-  }
+  write(() => {
+    for (const record of readQuestions(lane)) {
+      if (record.round !== round || !questionOpen(record)) continue;
+      record.expiredAt = expiredAt;
+      record.status = "expired: round ended";
+      storeQuestion(record);
+    }
+  });
 }
 
 export async function sendCommand(argv: string[]): Promise<void> {
@@ -158,8 +149,8 @@ export async function askCommand(argv: string[]): Promise<void> {
   if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) fail("--timeout must be a positive number of minutes");
   const timeoutMinutes = Math.min(requestedTimeout, 30);
   if (requestedTimeout > 30) console.error(`cdx: --timeout ${requestedTimeout}m exceeds the 30m limit; using 30m`);
-  const created = withLedger(() => {
-    const seq = questionFiles(lane).reduce((highest, item) => Math.max(highest, item.record.seq), 0) + 1;
+  const created = write(() => {
+    const seq = readQuestions(lane).reduce((highest, item) => Math.max(highest, item.seq), 0) + 1;
     const record: QuestionRecord = {
       lane,
       round,
@@ -169,14 +160,13 @@ export async function askCommand(argv: string[]): Promise<void> {
       answered: false,
       ...(owner ? { owner } : {}),
     };
-    const path = `${ROOT}/questions/${lane}-r${round}-${seq}.json`;
-    writeQuestion(path, record);
-    return { path, record };
+    storeQuestion(record);
+    return record;
   });
-  feedEvent("question", `[cdx] lane=${lane} round=${round} QUESTION #${created.record.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner, { lane, round });
+  feedEvent("question", `[cdx] lane=${lane} round=${round} QUESTION #${created.seq}: ${question} (answer with: cdx reply ${lane} "<answer>")`, owner, { lane, round });
   const deadline = Date.now() + timeoutMinutes * 60_000;
   while (Date.now() < deadline) {
-    const current = readQuestion(created.path);
+    const current = readQuestion(lane, created.seq);
     if (current?.answered) {
       console.log(current.answer ?? "");
       return;
@@ -187,11 +177,11 @@ export async function askCommand(argv: string[]): Promise<void> {
     }
     await Bun.sleep(Math.min(1000, Math.max(10, deadline - Date.now())));
   }
-  const outcome = withLedger(() => {
-    const current = readQuestion(created.path) ?? created.record;
+  const outcome = write(() => {
+    const current = readQuestion(lane, created.seq) ?? created;
     if (current.answered) return current;
     current.timedOutAt = new Date().toISOString();
-    writeQuestion(created.path, current);
+    storeQuestion(current);
     return current;
   });
   if (outcome.answered) {
@@ -216,20 +206,18 @@ export async function replyCommand(argv: string[]): Promise<void> {
     requireOwnChild(lane, ledger[lane]);
     const currentRound = ledger[lane]?.rounds;
     if (!currentRound) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
-    const open = questionFiles(lane).filter(({ record }) => record.round === currentRound && questionOpen(record));
-    const target = requestedId === undefined ? open[0] : open.find(({ record }) => record.seq === requestedId);
-    if (!target) throw new CmdError(requestedId === undefined
+    const open = readQuestions(lane).filter((record) => record.round === currentRound && questionOpen(record));
+    const current = requestedId === undefined ? open[0] : open.find((record) => record.seq === requestedId);
+    if (!current) throw new CmdError(requestedId === undefined
       ? `lane "${lane}" has no open questions`
       : `lane "${lane}" has no open question #${requestedId}`);
-    const current = readQuestion(target.path) ?? target.record;
-    if (!questionOpen(current)) throw new CmdError(`question #${current.seq} is no longer open`);
     current.answered = true;
     current.answer = answer;
     current.answeredAt = new Date().toISOString();
-    writeQuestion(target.path, current);
+    storeQuestion(current);
     return current;
   });
-  feedEvent("progress", `[cdx] answered question=${lane}:r${answered.round}:q${answered.seq} answer=${answer}`, answered.owner, { lane, round: answered.round });
+  logProgress(lane, answered.round, `answered question=${lane}:r${answered.round}:q${answered.seq} answer=${answer}`);
   console.log(`cdx: answered lane=${lane} question #${answered.seq}`);
 }
 
@@ -238,12 +226,12 @@ export function questionsCommand(argv: string[]): void {
   if (extra) fail("usage: cdx questions [lane]");
   const ledger = readLedger();
   if (lane && !ledger[lane]) fail(`unknown lane "${lane}" (cdx status lists lanes)`);
-  const open = questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[record.lane]?.rounds === record.round && owned(ledger[record.lane]?.ownerSession, record.lane));
+  const open = readQuestions(lane).filter((record) => questionOpen(record) && ledger[record.lane]?.rounds === record.round);
   if (open.length === 0) {
     console.log(lane ? `cdx: lane=${lane} has no open questions` : "cdx: no open questions");
     return;
   }
-  for (const { record } of open) {
+  for (const record of open) {
     console.log(`${record.lane} r${record.round} QUESTION #${record.seq} asked ${fmtAge(record.askedAt)} ago: ${record.question}`);
   }
 }
@@ -255,13 +243,13 @@ export async function msgCommand(argv: string[]): Promise<void> {
   const messageArg = await resolveBrief(rawMessage, usage);
   const message = messageArg ? singleLine(messageArg) : "";
   if (!target || !message) fail(usage);
-  const caller = callerSession();
-  if (caller === "terminal") fail("cdx msg needs a Claude session owner");
-  const lane = readLedger()[target];
-  const recipient = lane ? recipientOf(lane.ownerSession, target) : target;
-  if (recipient === "terminal" || recipient.length <= 8) fail("message target must be a lane name or full session id");
-  feedEvent("message", message, caller, { recipient, from: caller });
-  console.log(`cdx: message sent to=${recipient} from=${caller}`);
+  const caller = process.env.CDX_LANE?.trim() || callerSession();
+  if (caller === "terminal") fail("cdx msg needs a Claude session or a lane");
+  // A lane name addresses the head, the one owner of every lane.
+  const recipient = findLane(target) ? undefined : target;
+  if (recipient !== undefined && recipient.length <= 8) fail("message target must be a lane name or full session id");
+  feedEvent("message", message, caller, { ...(recipient ? { recipient } : {}), from: caller });
+  console.log(`cdx: message sent to=${recipient ?? "head"} from=${caller}`);
 }
 
 export function inboxCommand(argv: string[]): void {
@@ -269,7 +257,7 @@ export function inboxCommand(argv: string[]): void {
   if (parsed.rest.length) fail("usage: cdx inbox [-n <lines>]");
   const limit = Number(parsed.flags.n ?? 20);
   if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
-  const messages = scopedEvents(limit, callerSession(), true);
+  const messages = inboxEvents(callerSession(), limit).map(renderEvent);
   console.log(messages.length ? messages.join("\n") : "cdx: inbox empty");
 }
 
@@ -375,7 +363,7 @@ export async function hookCommand(argv: string[]): Promise<void> {
           });
           newlyDelivered += 1;
           const flat = singleLine(record.text);
-          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=in-turn: ${flat.slice(0, 120)}`, item.ownerSession, { lane, round });
+          logProgress(lane, round, `steer delivered mode=in-turn: ${flat.slice(0, 120)}`);
         }
         writeDeliveredCount(lane, round, lines.length);
         if (newlyDelivered > 0) {

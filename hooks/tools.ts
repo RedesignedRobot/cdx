@@ -404,18 +404,6 @@ export const TOOLS: ToolDefinition[] = [
     run: (input) => ({ argv: ["usage", ...(input.json === true ? ["--json"] : []), ...(input.totals === true ? ["--totals"] : [])] }),
   },
   {
-    name: "takeover",
-    description: "Claim ownership of a lane spawned by another session.",
-    inputSchema: {
-      type: "object",
-      properties: {
-        target: { type: "string", description: "Lane name or session to adopt" },
-      },
-      required: ["target"],
-    },
-    run: (input) => ({ argv: ["takeover", String(input.target)] }),
-  },
-  {
     name: "doctor",
     description: "Diagnose plugin installation, engine accounts, and background workers.",
     inputSchema: {

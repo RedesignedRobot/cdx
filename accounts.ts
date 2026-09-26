@@ -2,7 +2,7 @@
 
 import { config } from "./config.ts";
 import {
-  type AccountChoice, type Demand, feedEvent, type Lane, laneRunning, type Ledger, readLedger, roundEngine,
+  type AccountChoice, type Demand, feedEvent, type Lane, laneRunning, type Ledger, readLedger, recentArchivedLanes, roundEngine,
   type Spec,
 } from "./ledger.ts";
 import { readJsonLines } from "./reports.ts";
@@ -577,14 +577,19 @@ function requiredPercent(standing: AccountStanding, demand: Demand, window?: Win
   return standing.sizing?.[demand].minimumPercent ?? HEADROOM_PERCENT[demand];
 }
 
+// Round costs come from the newest finished lanes; closed lanes live in the
+// archive, not in the active ledger the holds read.
+const SIZING_SAMPLE_LANES = 200;
+
 export function withAccountHolds(standings: AccountStanding[], ledger: Ledger, alive = pidAlive): AccountStanding[] {
+  const history = { ...recentArchivedLanes(SIZING_SAMPLE_LANES), ...ledger };
   return standings.map((standing) => {
     const held = Object.values(ledger).filter((lane) => laneRunning(lane)
       && (alive(lane.pid) || alive(lane.codexPid))
       && (lane.roundAccount?.home === standing.choice.home || (standing.choice.name === "default" && roundEngine(lane) === "gpt"
         && !lane.roundAccount && !lane.account && !lane.codexHome)))
       .reduce((total, lane) => total + HEADROOM_PERCENT[lane.roundAccount?.demand ?? "work"], 0);
-    return { ...standing, sizing: demandSizing(standing, ledger), heldPercent: held, projections: standing.projections?.map((w) => ({ ...w, heldPercent: held })), remainingPercent: Math.max(0, standing.remainingPercent - held),
+    return { ...standing, sizing: demandSizing(standing, history), heldPercent: held, projections: standing.projections?.map((w) => ({ ...w, heldPercent: held })), remainingPercent: Math.max(0, standing.remainingPercent - held),
       reason: held ? `${standing.reason}; ${held}% held by active rounds` : standing.reason };
   });
 }

@@ -10,23 +10,6 @@ export interface PendingEvent {
   kind?: string;
 }
 
-function routineProgress(event: PendingEvent): boolean {
-  return event.kind === "progress" && (event.text === "[cdx] progress" || event.text.startsWith("[cdx] progress\n"));
-}
-
-// Lifecycle notices the band and /lanes already show. The head only needs
-// what it must act on: terminals, questions, stalls, rejections, messages.
-const LIFECYCLE_KINDS: ReadonlySet<string> = new Set(["started", "partial", "report-written", "gate-started", "active"]);
-
-function lifecycleNotice(event: PendingEvent): boolean {
-  if (event.kind && LIFECYCLE_KINDS.has(event.kind)) return true;
-  return event.kind === "progress" && / steer delivered mode=/.test(event.text);
-}
-
-export function headEvents(events: readonly PendingEvent[]): PendingEvent[] {
-  return events.filter((event) => !routineProgress(event) && !lifecycleNotice(event));
-}
-
 function elapsed(startedAt: string, now: number): string {
   const seconds = Math.max(0, Math.floor((now - Date.parse(startedAt)) / 1000) || 0);
   return seconds < 60 ? `${seconds}s` : seconds < 3600 ? `${Math.floor(seconds / 60)}m${seconds % 60}s`
@@ -82,7 +65,6 @@ export function pinnedLine(rows: readonly LiveRow[], now: number, wakesOff = fal
 
 export interface DeliveryState {
   pending: PendingEvent[];
-  progress: PendingEvent[];
   inTurn: boolean;
   // When the first undelivered wake event arrived while idle; the submit
   // waits WAKE_COALESCE_MS from then so one burst costs one prompt.
@@ -99,7 +81,7 @@ export interface DeliveryState {
 export const WAKE_COALESCE_MS = 15_000;
 
 export function initialDeliveryState(): DeliveryState {
-  return { pending: [], progress: [], inTurn: false, submits: 0, budgetSpent: false };
+  return { pending: [], inTurn: false, submits: 0, budgetSpent: false };
 }
 
 export function formatSubmitText(events: readonly PendingEvent[]): string {
@@ -116,10 +98,9 @@ export function afterPoll(
   events: readonly PendingEvent[],
   now = Date.now(),
 ): { state: DeliveryState; toasts: string[]; submit?: { text: string }; suggest?: { text: string } } {
-  const delivered = headEvents(events);
-  const toasts = delivered.filter((e) => Boolean(e.wake)).map((e) => e.text);
-  const pending = [...state.pending, ...delivered];
-  state = { ...state, progress: [...state.progress, ...events.filter(routineProgress)].slice(-20) };
+  // cdx events already filters to the kinds the head acts on.
+  const toasts = events.filter((e) => Boolean(e.wake)).map((e) => e.text);
+  const pending = [...state.pending, ...events];
   const wakePending = pending.some((e) => Boolean(e.wake));
 
   if (state.inTurn || !wakePending) {
@@ -129,7 +110,7 @@ export function afterPoll(
   // No prompt left: the events wait for the next tool result or typed
   // prompt, and a fresh wake goes into the prompt box as a suggestion.
   if (state.budgetSpent) {
-    const fresh = delivered.some((e) => Boolean(e.wake));
+    const fresh = events.some((e) => Boolean(e.wake));
     return {
       state: { ...state, pending },
       toasts,
@@ -204,5 +185,5 @@ export function onTurnComplete(state: DeliveryState): DeliveryState {
 }
 
 export function clearBuffer(state: DeliveryState): DeliveryState {
-  return { ...state, pending: [], progress: [] };
+  return { ...state, pending: [] };
 }

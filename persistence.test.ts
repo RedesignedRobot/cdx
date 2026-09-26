@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,14 +26,16 @@ test("synthetic assignment is redacted in protocol, gate, report, feed, and term
     const ledger = new URL("./ledger.ts", import.meta.url).pathname;
     const child = Bun.spawnSync({ cmd: [process.execPath, "--eval",
       `import { feedEvent } from ${JSON.stringify(ledger)}; feedEvent("message", ${JSON.stringify(line)}, "terminal");`],
-      env: { ...process.env, CDX_HOME: home }, cwd: home });
+      env: { ...process.env, CDX_STATE_HOME: home }, cwd: home });
     expect(child.exitCode).toBe(0);
     // CLI error output also crosses the terminal boundary.
-    const terminal = Bun.spawnSync({ cmd: [process.execPath, cli, line], env: { ...process.env, CDX_HOME: home } });
+    const terminal = Bun.spawnSync({ cmd: [process.execPath, cli, line], env: { ...process.env, CDX_STATE_HOME: home } });
     const shown = terminal.stdout.toString() + terminal.stderr.toString();
     expect(shown).not.toContain(fake);
-    for (const path of [jsonl, gatePath, report, join(home, "feed.log")]) {
-      const text = readFileSync(path, "utf8");
+    const store = new Database(join(home, "state", "cdx.db"), { readonly: true });
+    const feed = store.query<{ message: string }, []>("SELECT message FROM events").all().map((row) => row.message).join("\n");
+    store.close();
+    for (const text of [...[jsonl, gatePath, report].map((path) => readFileSync(path, "utf8")), feed]) {
       expect(text).not.toContain(fake);
       expect(text).toContain("[redacted]");
     }

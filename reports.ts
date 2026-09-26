@@ -7,7 +7,7 @@ import {
 } from "./ledger.ts";
 import { color, coloredState, fail, pidAlive, ROOT, singleLine, statusText } from "./runtime.ts";
 import { toolObservation } from "./visibility.ts";
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 
 export function readTailLines(path: string, limit: number, accept: (line: string) => boolean = () => true): string[] {
   if (!existsSync(path) || limit < 1) return [];
@@ -119,6 +119,15 @@ export function writeProtocolEvent(sink: { write(text: string): unknown; flush()
 }
 
 export const logPathOf = (lane: string, round: number, json: boolean) => `${ROOT}/logs/${lane}-r${round}.${json ? "jsonl" : "log"}`;
+
+// Round progress (steers delivered, retries, auto-continues) goes here, not
+// to the feed. A file of its own: other processes append notes while the
+// runner's buffered writer owns the round log, and that writer would
+// overwrite their bytes.
+export function logProgress(lane: string, round: number, text: string): void {
+  mkdirSync(`${ROOT}/logs`, { recursive: true });
+  appendFileSync(`${ROOT}/logs/${lane}-r${round}.progress.log`, `${new Date().toISOString()} ${singleLine(text)}\n`);
+}
 
 export const specPathOf = (lane: string, round: number) => `${ROOT}/specs/${lane}-r${round}.json`;
 

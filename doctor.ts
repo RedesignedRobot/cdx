@@ -10,11 +10,13 @@ import {
 import { config, geminiConfig, resolveCodexModel, resolveEffort, THINKER_MODEL } from "./config.ts";
 import { type AppTurn, geminiCapacityNotice, inputText } from "./engines.ts";
 import { formatGeminiStanding, geminiQuotaState, readGeminiUsageSnapshot, refreshGeminiUsage } from "./gemini-usage.ts";
-import { type AccountChoice, callerSession, laneRunning, readLedger, readSessions, withLedger } from "./ledger.ts";
+import { type AccountChoice, callerSession, laneRunning, readLedger, readSession, withLedger } from "./ledger.ts";
+import { legacyStatePending } from "./migrate.ts";
+import { DB_PATH } from "./store.ts";
 import { readJsonLines } from "./reports.ts";
 import { failActiveRound } from "./round-state.ts";
 import {
-  color, CONFIG_PATH, displayPath, HOME, LEDGER, parseArgs, pidAlive, REPO_ROOT, ROOT, SELF, singleLine,
+  color, CONFIG_PATH, displayPath, HOME, parseArgs, pidAlive, REPO_ROOT, SELF, singleLine,
   uncoloredChildEnv, VERSION,
 } from "./runtime.ts";
 import { readUsageHistory } from "./usage-store.ts";
@@ -660,9 +662,9 @@ export async function doctorCommand(argv: string[]) {
   }
 
   const currentSession = callerSession();
-  const sessionRecord = currentSession && currentSession !== "terminal" ? readSessions().sessions[currentSession] : undefined;
-  if (sessionRecord?.polledAt) {
-    const pollAgeSec = Math.max(0, Math.round((Date.now() - Date.parse(sessionRecord.polledAt)) / 1000));
+  const sessionRecord = currentSession !== "terminal" ? readSession(currentSession) : undefined;
+  if (sessionRecord) {
+    const pollAgeSec = Math.max(0, Math.round((Date.now() - Date.parse(sessionRecord.polled_at)) / 1000));
     if (pollAgeSec <= 15) {
       good(`plugin: mod live, last poll ${pollAgeSec}s ago`);
     } else {
@@ -688,8 +690,8 @@ export async function doctorCommand(argv: string[]) {
     warn("plugin: CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 is not set in environment or ~/.claude/settings.json env");
   }
 
-  if (parsed.bools.has("fix")) withLedger(() => {});
-  good(`ledger: ${LEDGER} (${Object.keys(readLedger()).length} lanes)`);
+  good(`state: ${DB_PATH} (${Object.keys(readLedger()).length} active lanes)`);
+  if (legacyStatePending()) warn("state: an unmigrated ledger.json is present; run cdx migrate");
   const staleSnapshots = staleReviewSnapshots(pidAlive);
   for (const path of staleSnapshots) {
     warn(`snapshot: stale ${displayPath(path)}`);
@@ -699,7 +701,6 @@ export async function doctorCommand(argv: string[]) {
     }
   }
   if (staleSnapshots.length && !parsed.bools.has("fix")) warn("run `cdx doctor --fix` to remove stale review snapshots");
-  if (existsSync(`${ROOT}/.lock`)) warn("warning: ledger lock present (breaks automatically after 30s if stale)");
   const stale = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !pidAlive(entry.pid));
   for (const [lane, entry] of stale) {
     const orphan = pidAlive(entry.codexPid) ? ` and its codex child (pid ${entry.codexPid}) is STILL RUNNING` : "";

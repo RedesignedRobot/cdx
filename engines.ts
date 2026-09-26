@@ -5,7 +5,7 @@ import { safeText, safeJSON } from "./safe-text.ts";
 import { config } from "./config.ts";
 import { type GeminiUsageSnapshot, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import { feedEvent, type Lane, readLedger, type Spec, type Tokens, withLedger } from "./ledger.ts";
-import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
+import { logPathOf, logProgress, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { HOME, ROOT, singleLine } from "./runtime.ts";
 import { isFiniteCount, parseQuotaResetDelayMs } from "./usage-store.ts";
 import { roundProgress, toolObservation, type VisibilityConfig } from "./visibility.ts";
@@ -444,7 +444,7 @@ export async function qualifyGeminiResult({ lane, round, ownerSession, result, f
       }, true);
     }
     if (treatedAsReplay) {
-      feedEvent("progress", `[cdx] lane=${lane} round=${round} ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`, ownerSession, { lane, round });
+      logProgress(lane, round, `ignored replayed agy error: ${singleLine(effectiveError).slice(0, 80)}`);
     }
     const qualified = qualifyGeminiReport(result, finalAgentResponse, isReview);
     if (qualified.report !== undefined) writeFileSync(reportPath, safeText(qualified.report));

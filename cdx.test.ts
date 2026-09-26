@@ -4,14 +4,14 @@ import { expect, test } from "bun:test";
 import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import {
   verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
-  checkRoundCap, eventOwned, summaryJobs, owned, parseArgs, parseConfig, parseFeedEvent, recipientOf, roundCapRefusal,
+  checkRoundCap, summaryJobs, parseArgs, parseConfig, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, claudeUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
   checkChildAstraRefusal, resolveCodexModel, CODEX_DISABLE_NATIVE_SUBAGENTS,
   classifyGeminiError, shouldRetryGeminiTransport, qualifyGeminiResult, gateEnv, classifyGateFailure,
   fmtTokens, fmtTokensFull, cappedEffort, controlText, outageMinutes, GEMINI_OUTAGE_RETRIES,
   geminiCapacityNotice, parseAgyRetryLine, goDurationMs, outageText,
-  selectEvents, statusLine, resolveStdinText, delivery, spawnRoots,
+  selectEvents, statusLine, resolveStdinText, spawnRoots,
 } from "./cdx.ts";
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
@@ -22,63 +22,23 @@ import { validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
 import { registeredFlag } from "./runtime.ts";
 
-// Keep tests pure. Pass state explicitly so these tests
-// never read user files, spawn engines, or wait on timers.
-const state = {
-  sequence: 0,
-  bindings: { "former-head": "current-head" },
-  lanes: { claimed: "lane-head", unclaimed: "former-head", detached: "terminal" },
-  sessions: {},
-};
+// Keep tests pure: selection is a filter over rows passed in, so these
+// tests never read user files, spawn engines, or wait on timers.
+const feed = (id: number, kind: string, extra: object = {}) => ({ id, timestamp: "2026-09-15T12:00:00Z", kind, owner: "head", message: `${kind} ${id}`, ...extra });
 
-test("feed parsing requires a valid envelope before accepting a record", () => {
-  const event = { id: 1, timestamp: "2026-09-07T00:00:00Z", kind: "question", owner: "head", message: "Which file?" };
-  expect(parseFeedEvent(JSON.stringify(event))).toEqual(event);
-  for (const line of ["", "[cdx] old free-text record", "{", "null", "[]", "42"]) {
-    expect(parseFeedEvent(line)).toBeUndefined();
-  }
-  for (const patch of [
-    { id: 0 }, { id: -1 }, { id: 1.5 }, { id: Number.MAX_SAFE_INTEGER + 1 }, { id: "1" },
-    { timestamp: null }, { owner: null }, { message: null }, { kind: "unknown" },
-  ]) {
-    expect(parseFeedEvent(JSON.stringify({ ...event, ...patch }))).toBeUndefined();
-  }
+test("the head receives actionable kinds only, and never a child's terminal", () => {
+  const records = [feed(1, "question"), feed(2, "gate-finished"), feed(3, "terminal"), feed(4, "partial"),
+    feed(5, "terminal", { lane: "child", supervisor: "parent" }), feed(6, "job-exit")];
+  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([1, 3, 6]);
+  expect(selectEvents(records, "head", true).every((event) => event.wake)).toBe(true);
+  expect(selectEvents(records, "older", false)).toEqual([]);
 });
 
-test("a lane claim overrides its recorded owner and that owner's takeover", () => {
-  expect(recipientOf("former-head", "claimed", state)).toBe("lane-head");
-  expect(owned("former-head", "claimed", "lane-head", state)).toBe(true);
-  expect(owned("former-head", "claimed", "current-head", state)).toBe(false);
-});
-
-test("a session takeover redirects both lane owners and owner-only records", () => {
-  expect(recipientOf("former-head", undefined, state)).toBe("current-head");
-  expect(owned("former-head", "unclaimed", "current-head", state)).toBe(true);
-  expect(owned("former-head", "unclaimed", "former-head", state)).toBe(false);
-});
-
-test("terminal ownership survives an absent owner or an explicit lane claim", () => {
-  expect(recipientOf(undefined, undefined, state)).toBe("terminal");
-  expect(owned("former-head", "detached", "terminal", state)).toBe(true);
-  expect(owned("former-head", "detached", "current-head", state)).toBe(false);
-});
-
-test("ownership compares full session ids even when prefixes collide", () => {
-  const owner = "12345678-1111-4111-8111-111111111111";
-  const other = "12345678-2222-4222-8222-222222222222";
-  expect(owned(owner, undefined, owner, state)).toBe(true);
-  expect(owned(owner, undefined, other, state)).toBe(false);
-  expect(owned(owner, undefined, "12345678", state)).toBe(false);
-});
-
-test("a peer message reaches its recipient rather than its sender or message text", () => {
-  const event = parseFeedEvent(JSON.stringify({
-    id: 2, timestamp: "2026-09-07T00:00:00Z", kind: "message",
-    owner: "sender", recipient: "former-head", from: "sender", message: "owner=sender recipient=someone-else",
-  }))!;
-  expect(eventOwned(event, "current-head", state)).toBe(true);
-  expect(eventOwned(event, "sender", state)).toBe(false);
-  expect(eventOwned(event, "someone-else", state)).toBe(false);
+test("an addressed message reaches its session whether or not it is the head", () => {
+  const records = [feed(1, "message", { recipient: "older", from: "lane-a" }), feed(2, "message", { from: "lane-b" })];
+  expect(selectEvents(records, "older", false).map((event) => event.id)).toEqual([1]);
+  expect(selectEvents(records, "head", true).map((event) => event.id)).toEqual([2]);
+  expect(selectEvents(records, "head", true)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
 });
 
 test("config parsing reads gemini.maxRounds and defaults to 2", () => {
@@ -588,47 +548,6 @@ test("Rank 5: qualifyGeminiResult treats SUCCESS with transport words as success
   try { unlinkSync(tmpReport); } catch {}
 });
 
-test("events selection advances cursor to last record read, marks wake events, and peek leaves cursor", () => {
-  const session = "current-head";
-  const records = [
-    { id: 1, timestamp: "2026-09-15T12:00:00Z", kind: "question", owner: session, message: "q1" },
-    { id: 2, timestamp: "2026-09-15T12:01:00Z", kind: "message", owner: session, message: "m1" },
-    { id: 3, timestamp: "2026-09-15T12:02:00Z", kind: "started", owner: "other", message: "s1" },
-    { id: 4, timestamp: "2026-09-15T12:03:00Z", kind: "terminal", owner: session, message: "t1" },
-    { id: 5, timestamp: "2026-09-15T12:04:00Z", kind: "started", owner: "other", message: "s2" },
-  ];
-  // Three owned events (1, 2, 4). Cursor is at the second owned event (cursor: 2).
-  const testState = {
-    sequence: 5,
-    bindings: {},
-    lanes: {},
-    sessions: { [session]: { cursor: 2 } },
-  };
-
-  // Peek returns event 4, marks wake from WAKE_EVENTS, but leaves cursor at 2
-  const peekResult = selectEvents(records, session, testState, { peek: true });
-  expect(peekResult.events).toHaveLength(1);
-  expect(peekResult.events[0].id).toBe(4);
-  expect(peekResult.events[0].wake).toBe(true);
-  expect(peekResult.cursor).toBe(2);
-  expect(testState.sessions[session].cursor).toBe(2);
-
-  // First call returns exactly one event (id 4), marks wake, advances cursor to last record id read (5, not 4)
-  const firstResult = selectEvents(records, session, testState);
-  expect(firstResult.events).toHaveLength(1);
-  expect(firstResult.events[0].id).toBe(4);
-  expect(firstResult.events[0].kind).toBe("terminal");
-  expect(firstResult.events[0].wake).toBe(true);
-  expect(firstResult.cursor).toBe(5);
-  expect(testState.sessions[session].cursor).toBe(5);
-
-  // A second call returns an empty list
-  const secondResult = selectEvents(records, session, testState);
-  expect(secondResult.events).toEqual([]);
-  expect(secondResult.cursor).toBe(5);
-  expect(testState.sessions[session].cursor).toBe(5);
-});
-
 test("statusLine returns empty string when nothing owned runs, formats shape, and cuts middle items before counts", () => {
   const now = Date.parse("2026-09-15T12:15:00Z");
 
@@ -653,8 +572,6 @@ test("statusLine returns empty string when nothing owned runs, formats shape, an
   } as any;
   const shaped = statusLine(ledger, {}, 1, undefined, {
     now,
-    ownsLane: () => true,
-    ownsJob: () => true,
   });
   expect(shaped).toBe("cdx 2 lanes · search-fix gate 3m · api-docs working 12m · 1 question");
 
@@ -670,8 +587,6 @@ test("statusLine returns empty string when nothing owned runs, formats shape, an
   }
   const cut = statusLine(wideLedger, {}, 2, 15, {
     now,
-    ownsLane: () => true,
-    ownsJob: () => true,
   });
   expect(cut.length).toBeLessThanOrEqual(100);
   expect(cut.startsWith("cdx 6 lanes")).toBe(true);
@@ -703,12 +618,6 @@ test("-- ends the flags so free text may start with dashes", () => {
   const parsed = parseArgs(["--engine", "gpt", "lane", "--", "--model is refused; why?"], ["engine"]);
   expect(parsed.flags.engine).toBe("gpt");
   expect(parsed.rest).toEqual(["lane", "--model is refused; why?"]);
-});
-
-test("a 6.x session record migrates to one cursor without replaying history", () => {
-  const legacy: any = { sequence: 9, bindings: {}, lanes: {}, sessions: { head: { wake: 7, quiet: 4, lease: { pid: 1, claudePid: 2 }, plugin: { root: "/x" } } } };
-  expect(delivery(legacy, "head")).toEqual({ cursor: 7 });
-  expect(delivery(legacy, "fresh")).toEqual({ cursor: 0 });
 });
 
 // Reset credits: the app-server lists each banked credit with its expiry.
@@ -1382,12 +1291,14 @@ test("land refuses dirty bases, red receipts, and edits after an interrupted com
   expect(landRefusal({ ...entry, landingCommit: "committed" }, false, { head: "committed", tree: "unverified" })).toBeDefined();
 });
 
-test("terminal events carry small reports and child terminals never wake the head", () => {
+test("terminal events carry a five-line digest and child terminals never wake the head", () => {
   expect(terminalText("done report=/tmp/a", "Outcome\nfile.ts", undefined)).toContain("Outcome\nfile.ts");
-  expect(terminalText("done", "界".repeat(4000), undefined)).toBe("done");
+  expect(terminalText("done", "界".repeat(4000), undefined)).toBe(`done\n${"界".repeat(200)}`);
+  const long = terminalText("done report=/tmp/a", "# Report\n" + Array.from({ length: 50 }, (_, index) => `line ${index}`).join("\n"), undefined);
+  expect(long.split("\n")).toEqual(["done report=/tmp/a", "line 0", "line 1", "line 2", "line 3"]);
   const event = { id: 1, timestamp: "now", kind: "terminal", owner: "head", lane: "claimed", supervisor: "parent", message: "done" };
-  expect(eventOwned(event, "lane-head", state)).toBe(false);
-  expect(eventOwned({ ...event, supervisor: undefined }, "lane-head", state)).toBe(true);
+  expect(selectEvents([event], "head", true)).toEqual([]);
+  expect(selectEvents([{ ...event, supervisor: undefined }], "head", true)).toHaveLength(1);
 });
 
 

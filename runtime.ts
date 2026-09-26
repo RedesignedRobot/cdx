@@ -2,14 +2,27 @@ import { safeText } from "./safe-text.ts";
 // Process paths, child environments, argument parsing, and terminal text helpers.
 
 import { type Engine, type Tokens } from "./ledger.ts";
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
 import { isatty } from "node:tty";
 
 export const HOME = process.env.HOME ?? "";
 
-export const ROOT = (process.argv[2] === "_run" || process.argv[2] === "_job" ? process.env.CDX_STATE_HOME : undefined)
-  || process.env.CDX_HOME || `${HOME}/.cdx`;
+export const ROOT = resolve(process.env.CDX_STATE_HOME || process.env.CDX_HOME || `${HOME}/.cdx`);
 
-export const LEDGER = `${ROOT}/ledger.json`;
+// bun test sets NODE_ENV=test and its spawned children inherit it; gates and
+// fault runs set CDX_TEST. Neither may ever open the owner's live state.
+if ((process.env.NODE_ENV === "test" || process.env.CDX_TEST) && sameDirectory(ROOT, `${HOME}/.cdx`)) {
+  throw new Error(`cdx: refusing the live state home ${ROOT} under test; set CDX_STATE_HOME to a temp directory`);
+}
+
+function sameDirectory(left: string, right: string): boolean {
+  const real = (path: string) => { try { return realpathSync(path); } catch { return resolve(path); } };
+  return real(left) === real(right);
+}
+
+// The 9.x JSON ledger. Only cdx migrate reads it.
+export const LEGACY_LEDGER = `${ROOT}/ledger.json`;
 
 export const CONFIG_PATH = `${ROOT}/config.json`;
 

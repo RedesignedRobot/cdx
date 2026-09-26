@@ -29,7 +29,7 @@ test("job phase uses the last nonempty line and removes terminal control charact
   expect(jobPhaseText("x".repeat(200))).toHaveLength(80);
 });
 
-test("brief includes all running lanes but only owned running jobs, with bounded single lines", () => {
+test("brief includes every running lane and job, with bounded single lines", () => {
   const job = { state: "running", log: "/job.log", startedAt: "2026-09-11T12:00:00Z", ownerSession: "head" };
   const filesRead: string[] = [];
   const phasesRead: string[] = [];
@@ -39,15 +39,16 @@ test("brief includes all running lanes but only owned running jobs, with bounded
   } as Parameters<typeof statusBrief>[1], {
     files: (cwd) => { filesRead.push(cwd); return 2; },
     phase: (log) => { phasesRead.push(log); return "wall\n" + "x".repeat(150); },
-    ownsJob: (entry) => entry.ownerSession === "head", now,
+    now,
   });
-  expect(output.split("\n")).toHaveLength(3);
+  expect(output.split("\n")).toHaveLength(4);
   expect(output.split("\n").every((line) => line.length < 100 && !line.includes("\u001b"))).toBe(true);
   expect(output).toContain("live 12 steps 2 files working last 5s read src/main.ts");
   expect(output).toContain("job own 10m wall");
+  expect(output).toContain("job foreign 10m wall");
   expect(filesRead).toEqual(["/work", "/review"]);
-  expect(phasesRead).toEqual(["/job.log"]);
-  expect(statusBrief({}, {}, { files: () => 0, phase: () => "", ownsJob: () => true, now })).toBe("");
+  expect(phasesRead).toEqual(["/job.log", "/job.log"]);
+  expect(statusBrief({}, {}, { files: () => 0, phase: () => "", now })).toBe("");
 });
 
 test("usage line shows each Codex account's weekly window, then a Gemini weekly row, from stored snapshots", () => {

@@ -23,7 +23,8 @@ import {
 import { killCommand } from "./round-state.ts";
 import { runRound } from "./runner.ts";
 import { CONFIG_PATH, fail, parseArgs, pidAlive, resolveBrief, singleLine } from "./runtime.ts";
-import { briefCommand, eventsCommand, feedCommand, takeoverCommand } from "./session-commands.ts";
+import { briefCommand, eventsCommand, feedCommand } from "./session-commands.ts";
+import { migrateCommand } from "./migrate.ts";
 import { statusCommand, tailView, targetView, usageCommand, waitCommand } from "./status.ts";
 import { renderView, tuiEnabled } from "./tui.ts";
 import { viewCommand } from "./view.ts";
@@ -51,8 +52,7 @@ ${ENGINE_PICKER}
   ask    --cd /repo "<question>"       # head: synchronous Gemini
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
-  takeover <lane|full-session-id> # explicitly connect ownership to this head
-  events [--json] [--peek] # unread feed events for the Claude session
+  events [--json] [--peek] # unread feed events; the newest active Claude session is the head
   lanes [status options]   Live lane table with CDX_TUI=1 on a terminal
   status [--all | --json | --brief | --line | --watch [--interval S]]
   wait <lane>... [--timeout S] [--json] [--report]
@@ -69,7 +69,8 @@ ${ENGINE_PICKER}
   job    <name> --cd D "<cmd>"  # background shell job: one log, a feed line on exit; wait/kill/status know it
   job                     # list jobs
   doctor [--fix] [--probe]
-  brief                   # owned lanes, completed work awaiting attention, and open questions
+  migrate                 # one-shot import of the 9.x JSON state into state/cdx.db
+  brief                   # makes this session the head; lanes, completed work awaiting attention, and open questions
 
 --bg detaches the lane (survives the parent shell); combine with "cdx wait" for
 one blocking call over many lanes. Foreground lanes print the report on exit.
@@ -82,7 +83,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 
 const REFUSED_INSIDE_LANE = new Set([
   "spawn", "resume", "review", "consult", "adopt", "land",
-  "kill", "close", "clean", "gate", "reply", "job", "takeover",
+  "kill", "close", "clean", "gate", "reply", "job", "migrate",
 ]);
 
 // A supervisor drives its children with these; each mutation checks ownership.
@@ -98,7 +99,7 @@ export async function dispatch(command: string | undefined, argv: string[]) {
   }
 switch (command) {
   case "events": await eventsCommand(argv); break;
-  case "takeover": takeoverCommand(argv); break;
+  case "migrate": migrateCommand(argv); break;
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;

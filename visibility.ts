@@ -169,24 +169,3 @@ export function roundProgress(cwd: string, limits = VISIBILITY_DEFAULTS, gate?: 
     return { steps, thrash: reason, testRuns, testSuites, testStatus, testThrash, codegraphCalls, codeSearchesBeforeGraph, codegraphThrash };
   };
 }
-
-export interface ProgressSample { key: string; round?: number; steps?: number; files?: number; stage: string; action: string }
-// A job appears in the digest once, when it is first seen running; its end
-// arrives as its own job-exit event. Repeating a dev server's hmr line every
-// heartbeat told the head nothing and cost context each turn.
-export function digestLines(samples: ProgressSample[], previous: ProgressSample[]): string[] {
-  const old = new Map(previous.map((sample) => [sample.key, sample]));
-  const delta = (value: number) => `${value >= 0 ? "+" : ""}${value}`;
-  return samples.filter((sample) => !(sample.key.startsWith("job=") && old.has(sample.key))).map((sample) => {
-    const prior = old.get(sample.key);
-    const sameRound = prior?.round === sample.round;
-    const steps = sample.steps === undefined ? "" : ` steps=${sample.steps}(${delta(sample.steps - (sameRound ? prior?.steps ?? 0 : 0))})`;
-    const files = sample.files === undefined ? "" : ` files=${sample.files}${sameRound && prior?.files !== undefined ? `(${delta(sample.files - prior.files)})` : ""}`;
-    const stage = prior && prior.stage !== sample.stage ? `${prior.stage}>${sample.stage}` : sample.stage;
-    return `${sample.key}${steps}${files} ${stage} ${sample.action}`.replace(/[\r\n\x00-\x1f]/g, " ").slice(0, 180);
-  });
-}
-
-export function heartbeatDue(now: number, last: number, minutes: number): boolean {
-  return now - last >= minutes * 60_000;
-}

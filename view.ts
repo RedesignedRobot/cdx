@@ -2,12 +2,12 @@
 
 import { jobDuration, readJobs } from "./jobs.ts";
 import {
-  activeStateOf, type Lane, laneEngine, type Ledger, parseFeedEvent, readEvents, readLedger, renderEvent,
-  roundEngine, withEvents,
+  activeStateOf, eventsAfter, type Lane, laneEngine, latestEventId, type Ledger, readLedger, recentEvents, renderEvent,
+  roundEngine,
 } from "./ledger.ts";
-import { questionFiles } from "./questions.ts";
+import { readQuestions } from "./questions.ts";
 import { type Cursor, drainCursor, logPathOf, readTailLines } from "./reports.ts";
-import { CmdError, parseArgs, ROOT } from "./runtime.ts";
+import { CmdError, parseArgs } from "./runtime.ts";
 import { existsSync, readFileSync, statSync } from "node:fs";
 
 import { safeText } from "./safe-text.ts";
@@ -48,7 +48,7 @@ function viewState() {
         duration: jobDuration(job), lastLines: readTailLines(job.log, 20),
       };
     }).sort(viewActivityOrder),
-    feed: withEvents(() => readEvents().slice(-200).map(renderEvent), false),
+    feed: recentEvents(200).map(renderEvent),
   };
 }
 
@@ -60,7 +60,7 @@ function viewLane(name: string, ledger = readLedger()) {
     reports: entry.reports.map((path) => ({ path, text: existsSync(path) ? readFileSync(path, "utf8") : null })),
     parent: entry.parent ? { name: entry.parent, entry: ledger[entry.parent] ?? null } : null,
     children: Object.entries(ledger).filter(([, lane]) => lane.parent === name).map(([name, lane]) => ({ ...lane, name })),
-    questions: existsSync(`${ROOT}/questions`) ? questionFiles(name).map(({ record }) => record) : [],
+    questions: readQuestions(name),
   };
 }
 
@@ -93,15 +93,7 @@ export function viewCommand(argv: string[]) {
   type Client = { send: (event: string, value: unknown) => void; close: () => void; lane?: string; round?: number; cursor: string; detail: string };
   const clients = new Set<Client>();
   let previous = "";
-  const feedPath = `${ROOT}/feed.log`;
-  let feedIdentity = "";
-  const feedCursor: Cursor = { round: 0, path: feedPath, offset: 0, buffer: "", json: false, decoder: new TextDecoder() };
-  withEvents(() => {
-    if (!existsSync(feedPath)) return;
-    const stat = statSync(feedPath);
-    feedCursor.offset = stat.size;
-    feedIdentity = `${stat.dev}:${stat.ino}`;
-  }, false);
+  let feedCursor = latestEventId();
   const server = Bun.serve({
     hostname: "127.0.0.1", port,
     fetch(request, server) {
@@ -170,19 +162,10 @@ export function viewCommand(argv: string[]) {
       const state = viewState();
       const serialized = viewJSON(state);
       if (serialized !== previous) { for (const client of clients) client.send("state", state); previous = serialized; }
-      withEvents(() => {
-        if (!existsSync(feedPath)) return;
-        const stat = statSync(feedPath);
-        const identity = `${stat.dev}:${stat.ino}`;
-        if (identity !== feedIdentity || stat.size < feedCursor.offset) {
-          feedCursor.offset = 0; feedCursor.buffer = ""; feedCursor.decoder = new TextDecoder();
-        }
-        feedIdentity = identity;
-        drainCursor(feedCursor, "", (line) => {
-          const event = parseFeedEvent(line);
-          if (event) for (const client of clients) client.send("feed", renderEvent(event));
-        });
-      }, false);
+      for (const event of eventsAfter(feedCursor)) {
+        for (const client of clients) client.send("feed", renderEvent(event));
+        feedCursor = event.id;
+      }
       const ledger = readLedger();
       for (const client of clients) {
         try { updateLane(client, ledger); }

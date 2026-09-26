@@ -10,47 +10,18 @@ import {
   onTurnStart,
   WAKE_COALESCE_MS,
   bandRow,
-  headEvents,
   orderedRows,
   pinnedLine,
 } from "./delivery";
 
 describe("delivery rules", () => {
-  test("progress stays available on demand but cannot wake or enter head context", () => {
-    const events = [
-      { kind: "progress", text: "[cdx] progress", wake: true },
-      ...["question", "terminal", "stalled", "thrash", "outage", "message", "job-exit"].map((kind) =>
-        ({ kind, text: `[cdx] ${kind}`, wake: true })),
-    ];
-    expect(headEvents(events).map((event) => event.kind)).toEqual(events.slice(1).map((event) => event.kind));
+  test("every polled event reaches head context and wake events toast", () => {
+    const events = ["question", "terminal", "stalled", "thrash", "outage", "message", "job-exit"].map((kind) =>
+      ({ kind, text: `[cdx] ${kind}`, wake: true }));
     const outcome = afterPoll(initialDeliveryState(), events, 1000);
-    expect(outcome.state.pending).toEqual(events.slice(1));
-    expect(outcome.state.progress).toEqual(events.slice(0, 1));
+    expect(outcome.state.pending).toEqual(events);
     expect(outcome.toasts).toHaveLength(7);
-    expect(afterToolCall(outcome.state).context).not.toContain("progress");
-  });
-
-  test("an answered question notice reaches the head", () => {
-    const event = { kind: "progress", text: "[cdx] answered question=alpha:r1:q2 answer=yes", wake: false };
-    expect(headEvents([event])).toEqual([event]);
-    const outcome = afterPoll(initialDeliveryState(), [event]);
-    expect(afterToolCall(outcome.state).context).toContain(event.text);
-  });
-
-  test("lifecycle notices stay in the band and out of head context", () => {
-    const quiet = [
-      ...["started", "partial", "report-written", "gate-started", "active"].map((kind) => ({ kind, text: `[cdx] lane=alpha round=1 ${kind}`, wake: false })),
-      { kind: "progress", text: "[cdx] lane=alpha round=1 steer delivered mode=steered: fix it", wake: false },
-    ];
-    expect(headEvents(quiet)).toEqual([]);
-    expect(afterToolCall(afterPoll(initialDeliveryState(), quiet).state).context).toBeUndefined();
-  });
-
-  test("a rejected steer notice reaches the head", () => {
-    const event = { kind: "progress", text: "[cdx] lane=alpha round=1 steer rejected and retained: turn closed", wake: false };
-    expect(headEvents([event])).toEqual([event]);
-    const outcome = afterPoll(initialDeliveryState(), [event]);
-    expect(afterToolCall(outcome.state).context).toContain(event.text);
+    expect(afterToolCall(outcome.state).context).toContain("[cdx] job-exit");
   });
 
   test("band rows show hierarchy, elapsed round time, and questions within width", () => {

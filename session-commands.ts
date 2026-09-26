@@ -1,21 +1,19 @@
-// Session events, progress digests, takeover, and brief commands.
+// Session events and brief commands.
 
-import { config } from "./config.ts";
 import { geminiQuotaState } from "./gemini-usage.ts";
-import { jobRunning, markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts";
+import { markJobOverruns, readJobs, renderJobLine, summaryJobs } from "./jobs.ts";
 import { markOverrun, overrunNotice } from "./duration.ts";
 import {
-  activeStateOf, callerSession, delivery, feedEvent, type FeedEvent, laneRunning, owned, readEvents, readLedger,
-  readSessions, recipientOf, roundReportOf, scopedEvents, selectEvents, withEvents, withLedger,
+  acknowledgeEvents, activeStateOf, callerSession, deliverEvents, deliveryHead, eventsAfter, feedEvent, laneRunning,
+  latestEventId, markBrief, readLedger, readSession, recentEvents, renderEvent, roundReportOf, selectEvents, startSession,
+  withLedger,
 } from "./ledger.ts";
-import { questionFiles, questionOpen } from "./questions.ts";
-import { jobPhase } from "./reports.ts";
-import { fail, parseArgs, ROOT, singleLine, statusAge, statusText } from "./runtime.ts";
-import { changedFileCount, liveRows } from "./status.ts";
+import { questionOpen, readQuestions } from "./questions.ts";
+import { fail, parseArgs, ROOT } from "./runtime.ts";
+import { liveRows } from "./status.ts";
 import { liveView, renderView, tuiEnabled } from "./tui.ts";
-import { digestLines, heartbeatDue, type ProgressSample, VISIBILITY_DEFAULTS } from "./visibility.ts";
+import { write } from "./store.ts";
 import { createHash } from "node:crypto";
-import { appendFileSync } from "node:fs";
 
 export async function eventsCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["json", "peek", "watch", "snapshot"]);
@@ -27,65 +25,26 @@ export async function eventsCommand(argv: string[]): Promise<void> {
 
   if (parsed.bools.has("watch")) {
     if (!tuiEnabled() || json) fail("events --watch requires CDX_TUI=1 on a terminal without --json");
-    let seen = 0;
+    let seen = readSession(session)?.cursor ?? latestEventId();
     const lines: string[] = [];
     await liveView(() => {
-      const state = readSessions();
-      const records = readEvents();
-      const selected = selectEvents(records, session, state, { peek: true }).events.filter((event) => event.id > seen);
-      for (const event of selected) {
-        const record = records.find((record) => record.id === event.id)!;
-        lines.push(`${record.timestamp}  ${event.kind}  ${event.text}`);
-        seen = Math.max(seen, event.id);
+      const records = eventsAfter(seen);
+      for (const event of selectEvents(records, session, deliveryHead() === session)) {
+        lines.push(`${records.find((record) => record.id === event.id)!.timestamp}  ${event.kind}  ${event.text}`);
       }
+      seen = records.at(-1)?.id ?? seen;
       lines.splice(0, Math.max(0, lines.length - 100));
-      const cursor = records.at(-1)?.id ?? 0;
+      const cursor = seen;
       return { title: "events", lines, progress: `${lines.length} recent events`, written: () => {
-        if (!peek) withEvents((current) => {
-          const target = delivery(current, session);
-          target.cursor = Math.max(target.cursor, cursor);
-          target.polledAt = new Date().toISOString();
-        });
+        if (!peek) acknowledgeEvents(session, cursor);
       } };
     });
     return;
   }
 
   const now = Date.now();
-  const visibilityCfg = config.visibility ?? VISIBILITY_DEFAULTS;
-  if (!peek) monitorOverruns(now, session);
-
-  withEvents((state) => {
-    const current = delivery(state, session);
-    current.polledAt = new Date(now).toISOString();
-
-    if (!peek) {
-      if (!current.digestAt) {
-        current.digestAt = new Date(now).toISOString();
-        current.progress = [];
-      } else if (heartbeatDue(now, Date.parse(current.digestAt), visibilityCfg.heartbeatMinutes)) {
-        current.digestAt = new Date(now).toISOString();
-        let samples: ProgressSample[] = [];
-        try { samples = sessionProgress(session, now); } catch { /* Digest detail cannot block events. */ }
-        if (samples.length) {
-          const records = readEvents();
-          state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
-          const message = `[cdx] progress\n${digestLines(samples, current.progress ?? []).join("\n")}`;
-          const progressEvent: FeedEvent = {
-            id: ++state.sequence,
-            timestamp: new Date().toISOString(),
-            kind: "progress",
-            owner: session,
-            message: message.split("\n").map(singleLine).join("\n"),
-          };
-          appendFileSync(`${ROOT}/feed.log`, `${JSON.stringify(progressEvent)}\n`);
-          current.progress = samples;
-        }
-      }
-    }
-
-    const records = readEvents();
-    const { events } = selectEvents(records, session, state, { peek: true });
+  if (!peek) monitorOverruns(now);
+  deliverEvents(session, now, peek, (events) => {
     if (json) {
       let rows: ReturnType<typeof liveRows> | undefined;
       if (parsed.bools.has("snapshot")) {
@@ -95,25 +54,19 @@ export async function eventsCommand(argv: string[]): Promise<void> {
     } else if (events.length > 0) {
       console.log(tuiEnabled() ? renderView({ title: "events", lines: events.map((e) => e.text), progress: `${events.length} events` }, undefined, 0, Number.MAX_SAFE_INTEGER) : events.map((e) => e.text).join("\n"));
     }
-    // Persist only after stdout succeeds. A crash may replay, never acknowledge early.
-    if (!peek) current.cursor = Math.max(current.cursor, records.at(-1)?.id ?? 0);
   });
 }
 
 // The head calls events throughout a lane's life. This path still runs while
 // a synchronous gate blocks the runner's own watchdog.
-export function monitorOverruns(now: number, session: string): void {
-  const state = readSessions();
-  const ledger = readLedger();
-  const due = Object.entries(ledger).filter(([name, entry]) => laneRunning(entry) && !entry.overrunSent
-    && owned(entry.ownerSession, name, session, state) && entry.expectMinutes
-    && overrunNotice(entry.roundStartedAt ?? entry.createdAt, entry.expectMinutes, now));
+export function monitorOverruns(now: number): void {
+  const due = Object.entries(readLedger()).filter(([, entry]) => laneRunning(entry) && !entry.overrunSent
+    && entry.expectMinutes && overrunNotice(entry.roundStartedAt ?? entry.createdAt, entry.expectMinutes, now));
   if (due.length) {
     const notices = withLedger((current) => due.flatMap(([name, original]) => {
       const entry = current[name];
       if (!entry || !laneRunning(entry) || !entry.expectMinutes || entry.rounds !== original.rounds
-        || (entry.roundStartedAt ?? entry.createdAt) !== (original.roundStartedAt ?? original.createdAt)
-        || !owned(entry.ownerSession, name, session, readSessions())) return [];
+        || (entry.roundStartedAt ?? entry.createdAt) !== (original.roundStartedAt ?? original.createdAt)) return [];
       const notice = markOverrun(entry, entry.roundStartedAt ?? entry.createdAt, entry.expectMinutes, now, entry.lastAction,
         entry.stage === "gate" ? `${ROOT}/logs/${name}-r${entry.rounds}.gate.log` : `${ROOT}/logs/${name}-r${entry.rounds}.jsonl`,
         entry.lastActionAt ?? entry.roundStartedAt ?? entry.createdAt);
@@ -124,34 +77,9 @@ export function monitorOverruns(now: number, session: string): void {
     }));
     for (const item of notices) feedEvent("overrun", `[cdx] lane=${item.name} round=${item.round} overrun ${item.notice}`, item.owner, { lane: item.name, round: item.round });
   }
-  for (const item of markJobOverruns(now, (job) => owned(job.ownerSession, undefined, session, readSessions()))) {
+  for (const item of markJobOverruns(now, () => true)) {
     feedEvent("overrun", `[cdx] job=${item.name} overrun ${item.notice}`, item.owner, { job: item.name });
   }
-}
-
-function sessionProgress(session: string, now: number): ProgressSample[] {
-  const detailDeadline = Date.now() + 100;
-  const state = readSessions();
-  const samples: ProgressSample[] = [];
-  const files = new Map<string, number | undefined>();
-  for (const [name, entry] of Object.entries(readLedger())) {
-    if (!laneRunning(entry) || !owned(entry.ownerSession, name, session, state)) continue;
-    const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
-    if (!files.has(cwd)) {
-      const remaining = detailDeadline - Date.now();
-      files.set(cwd, remaining > 0 ? changedFileCount(cwd, Math.min(remaining, 50)) : undefined);
-    }
-    const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
-    const gateAge = stage === "gate" ? `gate running ${statusAge(entry.stageStartedAt, now)} ` : "";
-    samples.push({ key: `lane=${name}`, round: entry.rounds, steps: entry.roundSteps ?? 0, files: files.get(cwd), stage,
-      action: `codegraph=${entry.roundCodegraphCalls ?? 0} code-before-graph=${entry.roundCodeSearchesBeforeGraph ?? 0} ${entry.roundTestRuns ? `tests=${entry.roundTestRuns} suites=${entry.roundTestSuites ?? 0} ${entry.roundTestStatus ?? "running"} ` : ""}${gateAge}last ${statusAge(entry.lastActionAt ?? entry.lastEventAt, now)} ${statusText(entry.lastAction ?? "-", 80)}` });
-  }
-  for (const [name, job] of Object.entries(readJobs())) {
-    if (jobRunning(job) && owned(job.ownerSession, undefined, session, state)) {
-      samples.push({ key: `job=${name}`, stage: "running", action: jobPhase(job.log) || "-" });
-    }
-  }
-  return samples;
 }
 
 // Finished jobs older than this stay out of the brief: a release job that
@@ -165,53 +93,22 @@ const BRIEF_FINISHED_JOB_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // all forty each time.
 const BRIEF_FINISHED_SHOWN = 5;
 
-function sessionSummary(session: string): string {
-  const state = readSessions();
+function sessionSummary(): string {
   const ledger = readLedger();
-  const open = Object.entries(ledger).filter(([lane, entry]) => owned(entry.ownerSession, lane, session, state)
-    && entry.work.state !== "closed").sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
+  const open = Object.entries(ledger).sort((a, b) => b[1].updatedAt.localeCompare(a[1].updatedAt));
   const finished = open.filter(([, entry]) => !laneRunning(entry));
   const hidden = Math.max(0, finished.length - BRIEF_FINISHED_SHOWN);
   const lines = [...open.filter(([, entry]) => laneRunning(entry)), ...finished.slice(0, BRIEF_FINISHED_SHOWN)]
     .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${activeStateOf(entry)} report=${roundReportOf(entry) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
   if (hidden > 0) lines.push(`${hidden} older finished lanes not closed; cdx status --all lists them`);
-  for (const { record } of questionFiles()) {
+  for (const record of readQuestions()) {
     const entry = ledger[record.lane];
-    if (entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state)) {
+    if (entry && entry.rounds === record.round && questionOpen(record)) {
       lines.push(`lane=${record.lane} r${record.round} QUESTION #${record.seq}: ${record.question}; cdx reply ${record.lane} --id ${record.seq} "<answer>"`);
     }
   }
-  const jobs = Object.fromEntries(Object.entries(readJobs()).filter(([, job]) => owned(job.ownerSession, undefined, session, state)));
-  for (const [name, job] of summaryJobs(jobs, BRIEF_FINISHED_SHOWN, BRIEF_FINISHED_JOB_MAX_AGE_MS)) lines.push(renderJobLine(name, job));
+  for (const [name, job] of summaryJobs(readJobs(), BRIEF_FINISHED_SHOWN, BRIEF_FINISHED_JOB_MAX_AGE_MS)) lines.push(renderJobLine(name, job));
   return lines.join("\n");
-}
-
-export function takeoverCommand(argv: string[]): void {
-  const [target, extra] = argv;
-  const session = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-  if (!target || extra || !session || session === "terminal") fail("usage: cdx takeover <lane|full-session-id> from a Claude session");
-  withLedger((ledger) => withEvents((state) => {
-    const entry = ledger[target];
-    if (entry) {
-      // A lane claim moves that lane and its children only; the previous
-      // head keeps everything else it owns.
-      const tree = new Set([target]);
-      for (const [name, lane] of Object.entries(ledger)) if (lane.parent === target) tree.add(name);
-      for (const name of tree) state.lanes[name] = session;
-    } else {
-      if (target.length <= 8 || target === "terminal") fail("takeover needs a lane name or full session id; terminal work must be claimed by lane");
-      const previous = recipientOf(target, undefined, state);
-      for (const [owner, recipient] of Object.entries(state.bindings)) if (recipient === previous) state.bindings[owner] = session;
-      state.bindings[previous] = session;
-    }
-    // Nothing is replayed: the summary below carries what needs attention.
-    const latest = readEvents().at(-1)?.id ?? 0;
-    const cursor = delivery(state, session);
-    cursor.cursor = Math.max(cursor.cursor, latest);
-  }));
-  console.log(`cdx: ownership connected to session=${session}; target=${target}`);
-  const summary = sessionSummary(session);
-  if (summary) console.log(summary);
 }
 
 // A plugin reload registers a fresh hook instance beside the live ones, and
@@ -222,19 +119,22 @@ const BRIEF_REPEAT_WINDOW_MS = 10 * 60 * 1000;
 
 function briefRepeated(session: string, text: string, now = Date.now()): boolean {
   const hash = createHash("sha256").update(text).digest("hex");
-  return withEvents((state) => {
-    const record = state.sessions[session] ?? { cursor: 0 };
-    const repeated = record.briefHash === hash && record.briefAt !== undefined && now - Date.parse(record.briefAt) < BRIEF_REPEAT_WINDOW_MS;
-    if (!repeated) state.sessions[session] = { ...record, briefHash: hash, briefAt: new Date(now).toISOString() };
+  return write(() => {
+    const record = readSession(session);
+    const repeated = record?.brief_hash === hash && record.brief_at !== null && now - Date.parse(record.brief_at) < BRIEF_REPEAT_WINDOW_MS;
+    if (!repeated) markBrief(session, hash, now);
     return repeated;
   });
 }
 
+// Session start, resume and compaction run the brief, so the calling session
+// becomes the head that receives events from here on.
 export function briefCommand() {
   const quotaState = geminiQuotaState();
   if (quotaState.block) console.log(`gemini quota: exhausted until ${quotaState.block.resetsAt} (in ${quotaState.block.minutesRemaining}m)`);
   const session = callerSession();
-  const summary = sessionSummary(session);
+  if (session !== "terminal") startSession(session);
+  const summary = sessionSummary();
   if (summary && !briefRepeated(session, summary)) console.log(summary);
 }
 
@@ -242,5 +142,5 @@ export function feedCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["n"]);
   const limit = Number(parsed.flags.n ?? 20);
   if (!Number.isInteger(limit) || limit < 1) fail("-n must be a positive integer");
-  console.log(scopedEvents(limit).join("\n"));
+  console.log(recentEvents(limit).map(renderEvent).join("\n"));
 }

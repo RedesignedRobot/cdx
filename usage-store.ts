@@ -1,8 +1,9 @@
 // Usage snapshots, exhaustion markers, history, and burn projections.
 
 import { config } from "./config.ts";
-import { type AccountChoice, readLedger, roundEngine, type Spec, withLedger, withLockedJson } from "./ledger.ts";
+import { type AccountChoice, lanesUpdatedSince, roundEngine, type Spec, withLedger } from "./ledger.ts";
 import { rateLimitWindowName, ROOT, USAGE_PATH } from "./runtime.ts";
+import { withLockedJson } from "./store.ts";
 import { readFileSync, renameSync, writeFileSync } from "node:fs";
 
 export function parseQuotaResetDelayMs(text: string): number | undefined {
@@ -114,7 +115,7 @@ export function mergeUsageHistory(history: UsageReading[], fresh: UsageReading[]
 export function recordUsageHistory(account: string, windows: RateLimitWindow[], checkedAt: string): void {
   const rounds: Record<string, number> = {};
   let complete = true;
-  for (const [name, lane] of Object.entries(readLedger())) {
+  for (const [name, lane] of Object.entries(lanesUpdatedSince(new Date(Date.parse(checkedAt) - BURN_HORIZON_MS).toISOString()))) {
     if ((roundEngine(lane) === "gemini" ? "gemini" : lane.roundAccount?.name ?? lane.account ?? "default") !== account) continue;
     if (!lane.roundStartedAt || Date.parse(lane.updatedAt) < Date.parse(checkedAt) - BURN_HORIZON_MS) continue;
     const tokens = lane.roundTokens;
@@ -257,13 +258,13 @@ export function storeUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, a
   Object.assign(state, account ? { accounts: { ...accounts, [account.name]: snapshot } } : snapshot);
 }
 
-// Every usage mutation reads and merges under this lock, including warning
-// deduplication and failed probes. No nested or separate writer lock.
+// Every usage mutation reads and merges under the store's write lock,
+// including warning deduplication and failed probes.
 export function withUsageState<T>(mutate: (state: UsageState) => T): T {
-  return withLockedJson(USAGE_PATH, `${ROOT}/.usage.lock`, readUsageState, mutate);
+  return withLockedJson(USAGE_PATH, readUsageState, mutate);
 }
 
-// Called under .usage.lock. A failed history write cannot publish the snapshot.
+// Called under the store's write lock. A failed history write cannot publish the snapshot.
 export function publishUsageSnapshot(state: UsageState, snapshot: UsageSnapshot, account: AccountChoice | undefined, publishHistory: () => void): UsageSnapshot {
   publishHistory();
   storeUsageSnapshot(state, snapshot, account);

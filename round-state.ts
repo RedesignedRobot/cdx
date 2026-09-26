@@ -6,7 +6,7 @@ import {
   roundNoteOf, roundReportOf, supervisorLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import { expireRoundQuestions } from "./questions.ts";
-import { availableReportPath, captureRecoveryPartial, logPathOf } from "./reports.ts";
+import { availableReportPath, captureRecoveryPartial, logPathOf, logProgress } from "./reports.ts";
 import { CmdError, color, coloredState, completionVerdict, fail, pidAlive, singleLine } from "./runtime.ts";
 import { invalidateAccountUsage } from "./usage-store.ts";
 
@@ -79,7 +79,7 @@ export async function killChildren(supervisor: string, note: string): Promise<st
 
 async function killLane(lane: string, entry: Lane, note?: string) {
   captureRecoveryPartial(lane, entry.rounds, entry.kind === "review" ? entry.review!.cwd : workCwdOf(entry), true);
-  feedEvent("progress", `[cdx] kill requested reason=${note ?? "caller requested stop"} partial=${availableReportPath(lane, entry.rounds) ?? "unavailable"}`, entry.ownerSession, { lane, round: entry.rounds });
+  logProgress(lane, entry.rounds, `kill requested reason=${note ?? "caller requested stop"} partial=${availableReportPath(lane, entry.rounds) ?? "unavailable"}`);
   const runnerAlive = pidAlive(entry.pid);
   if (!runnerAlive && !pidAlive(entry.codexPid)) {
     throw new CmdError(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);

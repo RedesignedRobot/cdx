@@ -10,19 +10,20 @@ import {
   refreshGeminiUsage,
 } from "./gemini-usage.ts";
 import {
-  type Job, jobRunning, type Jobs, JOBS, printRunningJobs, readJobs, renderJobLine, settledJob,
+  jobRunning, type Jobs, printRunningJobs, readJobs, renderJobLine, settledJob,
 } from "./jobs.ts";
 import {
-  type AccountChoice, activeStateOf, callerSession, type Lane, laneEngine, type LaneOutage, laneRunning,
-  type Ledger, owned, readLedger, readSessions, recipientOf, roundEngine, roundExitCodeOf, roundNoteOf,
+  type AccountChoice, activeStateOf, type Lane, laneEngine, type LaneOutage, laneRunning,
+  type Ledger, readAllLanes, readLedger, roundEngine, roundExitCodeOf, roundNoteOf,
   roundReportOf, type Tokens, workCwdOf,
 } from "./ledger.ts";
-import { questionFiles, questionOpen, type QuestionRecord } from "./questions.ts";
+import { questionOpen, type QuestionRecord, readQuestions } from "./questions.ts";
 import { availableReportPath, jobPhase, logPathOf, openCursor, readTailLines, renderEventLine } from "./reports.ts";
+import { legacyStatePending } from "./migrate.ts";
 import { safeText } from "./safe-text.ts";
 import {
   color, coloredState, displayPath, fail, FINISHED_SHOWN, fmtAge, fmtCreated, fmtTokens, fmtTokensFull,
-  fmtUntil, HOME, LEDGER, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText, uncoloredChildEnv,
+  fmtUntil, HOME, parseArgs, pidAlive, rateLimitResetDate, statusAge, statusText, uncoloredChildEnv,
 } from "./runtime.ts";
 import {
   firstExhaustion, liveView, renderNote, renderStatus, renderTable, renderUsageTable, tuiEnabled, type View,
@@ -82,7 +83,7 @@ export function liveRows(now = Date.now()): LiveRow[] {
   const files = new Map<string, number | undefined>();
   const rows: LiveRow[] = [];
   const ledger = readLedger();
-  const questions = questionFiles();
+  const questions = readQuestions();
   for (const [name, entry] of Object.entries(ledger)) {
     if (!laneRunning(entry)) continue;
     const cwd = entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd;
@@ -90,13 +91,13 @@ export function liveRows(now = Date.now()): LiveRow[] {
       const remaining = detailDeadline - Date.now();
       files.set(cwd, remaining > 0 ? changedFileCount(cwd, Math.min(remaining, 75)) : undefined);
     }
-    const question = questions.find(({ record }) => record.lane === name && record.round === entry.rounds && questionOpen(record));
+    const question = questions.find((record) => record.lane === name && record.round === entry.rounds && questionOpen(record));
     rows.push({ name, parent: entry.parent, kind: "lane", engine: roundEngine(entry),
       model: entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.fallbackModel ?? entry.model,
       stage: question ? "question" : entry.outage ? "outage" : entry.queuedUntil && Date.parse(entry.queuedUntil) > now ? "queued"
         : now - Date.parse(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt) >= 300_000 ? "stalled" : entry.stage ?? "working",
       startedAt: entry.roundStartedAt ?? entry.createdAt, steps: entry.roundSteps ?? 0,
-      files: files.get(cwd), action: entry.lastAction ?? "", question: question?.record.question,
+      files: files.get(cwd), action: entry.lastAction ?? "", question: question?.question,
       transcript: Date.now() < detailDeadline ? recentTranscript(name, entry.rounds) : [] });
   }
   for (const [name, job] of Object.entries(readJobs())) {
@@ -144,15 +145,9 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const roleDetail = entry.supervisor ? "  supervisor" : entry.parent ? `  parent=${entry.parent}` : "";
   const first = `${color.magenta(lane)}  ${coloredState(state)}  ${entry.consult ? "consult" : "work"}${workRound ? ` r${workRound}` : ""}  engine=${engine}${modelDetail}${roleDetail}  ${entry.effort}${entry.account ? `  account=${entry.account}` : ""}${steerMode}${steerDetail}${continueDetail}`;
   const line = (label: string, value: string) => `${color.dim(`  ${label.padEnd(12)}`)}${value}`;
-  let owner = "-";
-  if (entry.ownerCwd || entry.ownerSession || readSessions().lanes[lane]) {
-    const currentSession = process.env.CLAUDE_CODE_SESSION_ID?.trim();
-    const resolvedOwner = recipientOf(entry.ownerSession, lane);
-    const ownerId = resolvedOwner === "terminal" ? "terminal" : resolvedOwner.slice(0, 8);
-    const relation = resolvedOwner === "terminal" || !currentSession ? "(terminal)"
-      : resolvedOwner === currentSession ? "(this session)" : "(other session)";
-    owner = `${ownerId} ${relation}  from ${entry.ownerCwd ? displayPath(entry.ownerCwd) : "-"}`;
-  }
+  // Provenance only: every lane belongs to the one owner.
+  const owner = entry.ownerCwd || entry.ownerSession
+    ? `${entry.ownerSession?.slice(0, 8) ?? "terminal"}  from ${entry.ownerCwd ? displayPath(entry.ownerCwd) : "-"}` : "-";
   const timing = workState === "running"
     ? `running ${fmtAge(entry.roundStartedAt ?? entry.createdAt)} · idle ${fmtAge(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt)}`
     : `finished ${fmtAge(record.updatedAt ?? entry.updatedAt)} ago`;
@@ -165,11 +160,11 @@ function renderLaneBlock(lane: string, entry: Lane): string {
   const lastParts = [entry.diffEmpty ? "no tree change" : undefined, record.note, report ? `report ${displayPath(report)}` : undefined].filter(Boolean);
   const last = (entry.consult || entry.kind === "work") && active ? entry.lastAction ?? "-"
     : lastParts.join(" · ") || "-";
-  const lines = [first, line("owner", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
+  const lines = [first, line("started by", owner), line("lane", laneDetail), line("tokens", tokenDetail), line("last", last)];
   if (active) lines.push(line("progress", laneProgress(entry, changedFileCount(entry.kind === "review" ? entry.review?.cwd ?? entry.work.cwd : entry.work.cwd))));
   if (active && entry.outage) lines.push(line("outage", color.yellow(outageText(entry.outage, entry.agyRetries))));
-  const waiting = questionFiles(lane).find(({ record }) => record.round === entry.rounds && questionOpen(record));
-  if (active && waiting) lines.push(line("question", `waiting on question #${waiting.record.seq}: ${waiting.record.question}`));
+  const waiting = readQuestions(lane).find((record) => record.round === entry.rounds && questionOpen(record));
+  if (active && waiting) lines.push(line("question", `waiting on question #${waiting.seq}: ${waiting.question}`));
   if (entry.review?.state && !entry.consult) {
     const reviewState = entry.kind === "review" && stale ? "running(dead?)" : entry.review?.state;
     const reviewTiming = entry.review?.state === "running"
@@ -187,7 +182,6 @@ function renderLaneBlock(lane: string, entry: Lane): string {
 export function statusBrief(ledger: Ledger, jobs: Jobs, io: {
   files: (cwd: string) => number | undefined;
   phase: (log: string) => string;
-  ownsJob: (job: Job) => boolean;
   now: number;
 }): string {
   const lines: string[] = [];
@@ -197,15 +191,13 @@ export function statusBrief(ledger: Ledger, jobs: Jobs, io: {
     lines.push(statusText(`${statusText(name, 24)} ${laneProgress(entry, io.files(cwd), io.now)}`, 99));
   }
   for (const [name, job] of Object.entries(jobs)) {
-    if (!jobRunning(job) || !io.ownsJob(job)) continue;
+    if (!jobRunning(job)) continue;
     lines.push(statusText(`job ${statusText(name, 24)} ${statusAge(job.startedAt, io.now)}${job.expectMinutes ? ` expect ${job.expectMinutes}m` : ""} ${io.phase(job.log) || "-"}`, 99));
   }
   return lines.join("\n");
 }
 
 interface StatusLineIO {
-  ownsLane?: (name: string, entry: Lane) => boolean;
-  ownsJob?: (name: string, job: Job) => boolean;
   now?: number;
 }
 
@@ -220,7 +212,6 @@ export function statusLine(
   const runningLanes: { name: string; stage: string; age: string }[] = [];
   for (const [name, entry] of Object.entries(ledger)) {
     if (!laneRunning(entry)) continue;
-    if (io.ownsLane && !io.ownsLane(name, entry)) continue;
     const stage = entry.stage === "gate" ? "gate" : entry.stage ?? "working";
     const age = statusAge(entry.lastActionAt ?? entry.lastEventAt, now);
     runningLanes.push({ name, stage, age });
@@ -229,7 +220,6 @@ export function statusLine(
   const runningJobs: { name: string; age: string }[] = [];
   for (const [name, job] of Object.entries(jobs)) {
     if (!jobRunning(job)) continue;
-    if (io.ownsJob && !io.ownsJob(name, job)) continue;
     const age = statusAge(job.startedAt, now);
     runningJobs.push({ name, age });
   }
@@ -241,9 +231,7 @@ export function statusLine(
     for (const q of questions) {
       const rec = "record" in q ? q.record : q;
       const entry = ledger[rec.lane];
-      if (entry && entry.rounds === rec.round && questionOpen(rec)) {
-        if (!io.ownsLane || io.ownsLane(rec.lane, entry)) questionCount += 1;
-      }
+      if (entry && entry.rounds === rec.round && questionOpen(rec)) questionCount += 1;
     }
   }
 
@@ -304,7 +292,7 @@ function laneView(): View {
       : entry.work.state === "gate-invalid" ? "invalid" : entry.gate ? "pending" : "-";
     return [name, String(entry.rounds), activeStateOf(entry), entry.lastAction ?? "-", String(files.get(cwd) ?? "?"), gate];
   });
-  const jobs = Object.entries(readJobs()).filter(([, job]) => jobRunning(job) && owned(job.ownerSession));
+  const jobs = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
   return { title: "lanes", header: ["lane", "round", "state", "last step", "files", "gate"], rows,
     reports: entries.map(([, entry]) => roundReportOf(entry)),
     progress: `${entries.filter(([, entry]) => laneRunning(entry)).length} running lanes; ${jobs.length} running jobs`,
@@ -366,20 +354,8 @@ export async function statusCommand(argv: string[]) {
   if (parsed.bools.has("json") && (watch || parsed.bools.has("brief"))) fail("--json cannot be combined with --brief or --watch");
   if (parsed.bools.has("all") && (watch || parsed.bools.has("brief"))) fail("--all lists finished jobs; --brief and --watch show only running work");
   if (parsed.bools.has("line")) {
-    const session = callerSession();
-    const state = readSessions();
     const ledger = readLedger();
-    const jobs = readJobs();
-    const questions = questionFiles().filter(({ record }) => {
-      const entry = ledger[record.lane];
-      return entry && entry.rounds === record.round && questionOpen(record) && owned(entry.ownerSession, record.lane, session, state);
-    }).length;
-    const quota = geminiQuotaState();
-    const line = statusLine(ledger, jobs, questions, quota, {
-      ownsLane: (name, entry) => owned(entry.ownerSession, name, session, state),
-      ownsJob: (_name, job) => owned(job.ownerSession, undefined, session, state),
-      now: Date.now(),
-    });
+    const line = statusLine(ledger, readJobs(), readQuestions().map((record) => ({ record })), geminiQuotaState(), { now: Date.now() });
     if (line) console.log(line);
     return;
   }
@@ -388,7 +364,7 @@ export async function statusCommand(argv: string[]) {
     return;
   }
   if (watch || parsed.bools.has("brief")) {
-    const render = () => statusBrief(readLedger(), readJobs(), { files: changedFileCount, phase: jobPhase, ownsJob: (job) => owned(job.ownerSession), now: Date.now() });
+    const render = () => statusBrief(readLedger(), readJobs(), { files: changedFileCount, phase: jobPhase, now: Date.now() });
     if (!watch) { const text = render(); if (text) console.log(text); return; }
     process.stdout.write(`\x1b[H\x1b[2J${render()}\n`);
     await new Promise<void>((resolve, reject) => {
@@ -403,8 +379,9 @@ export async function statusCommand(argv: string[]) {
     });
     return;
   }
-  const ledger = readLedger();
-  const all = Object.entries(ledger);
+  const showAll = parsed.bools.has("all");
+  const all = Object.entries(showAll ? readAllLanes() : readLedger());
+  if (legacyStatePending()) console.error(color.yellow("cdx: an unmigrated ledger.json is present; run cdx migrate"));
   if (parsed.bools.has("json")) {
     const enriched = Object.fromEntries(all.map(([lane, entry]) => [lane, { ...entry, engine: laneEngine(entry), alive: laneRunning(entry) ? pidAlive(entry.pid) : undefined }]));
     console.log(JSON.stringify(enriched, null, 2));
@@ -421,7 +398,6 @@ export async function statusCommand(argv: string[]) {
   // newest first, capped unless --all.
   const byRecency = (a: [string, Lane], b: [string, Lane]) =>
     Date.parse(b[1].updatedAt) - Date.parse(a[1].updatedAt);
-  const showAll = parsed.bools.has("all");
   const running = all.filter(([, entry]) => laneRunning(entry)).sort(byRecency);
   // Closed lanes are handled history; only --all lists them.
   const finished = all.filter(([, entry]) => !laneRunning(entry) && (showAll || entry.work.state !== "closed")).sort(byRecency);
@@ -449,7 +425,7 @@ export async function waitCommand(argv: string[]) {
   const knownJobs = readJobs();
   const lanes = names.filter((name) => knownLanes[name]);
   const jobNames = names.filter((name) => !knownLanes[name]);
-  for (const name of jobNames) if (!knownJobs[name]) fail(`"${name}" is neither a lane in ${LEDGER} nor a job in ${JOBS}`);
+  for (const name of jobNames) if (!knownJobs[name]) fail(`"${name}" is neither a lane nor a job (cdx status --all lists both)`);
   const timeoutMs = Number(parsed.flags.timeout ?? 7200) * 1000;
   const deadline = Date.now() + timeoutMs;
   const pending = new Set(lanes);
@@ -465,7 +441,7 @@ export async function waitCommand(argv: string[]) {
   if (tuiEnabled() && !json) {
     const result = await liveView(() => {
       const ledger = readLedger(), jobs = readJobs();
-      const questions = lanes.some((lane) => questionFiles(lane).some(({ record }) => questionOpen(record) && ledger[lane]?.rounds === record.round));
+      const questions = lanes.some((lane) => readQuestions(lane).some((record) => questionOpen(record) && ledger[lane]?.rounds === record.round));
       const running = lanes.some((lane) => ledger[lane] && laneRunning(ledger[lane]) && pidAlive(ledger[lane].pid))
         || jobNames.some((name) => jobs[name] && jobRunning(jobs[name]) && pidAlive(jobs[name].pid));
       if (running && !questions && Date.now() > deadline) fail(`timeout waiting for: ${names.join(", ")}`);
@@ -487,7 +463,7 @@ export async function waitCommand(argv: string[]) {
     const ledger = readLedger();
     // A waited lane that asks a question is blocked, not busy: return at
     // once (exit 2) so the caller answers instead of both sides idling.
-    const questions = [...pending].flatMap((lane) => questionFiles(lane).filter(({ record }) => questionOpen(record) && ledger[lane]?.rounds === record.round).map(({ record }) => record));
+    const questions = [...pending].flatMap((lane) => readQuestions(lane).filter((record) => questionOpen(record) && ledger[lane]?.rounds === record.round));
     if (questions.length > 0) {
       for (const record of questions) {
         if (json) console.log(JSON.stringify({ lane: record.lane, round: record.round, question: record.seq, text: record.question }));
@@ -685,7 +661,7 @@ export async function usageCommand(argv: string[]): Promise<void> {
   // (resume, native review) report none.
   const totals = new Map<string, { lanes: number; tokens: Tokens; incomplete: boolean }>();
   const geminiTotals = { lanes: 0, tokens: { input: 0, cached: 0, output: 0 } as Tokens, incomplete: false };
-  for (const entry of Object.values(readLedger())) {
+  for (const entry of Object.values(readAllLanes())) {
     if (laneEngine(entry) === "gemini") {
       geminiTotals.lanes += 1;
       if (entry.tokensIncomplete) geminiTotals.incomplete = true;

@@ -5,15 +5,16 @@ import { safeText } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 // Detached shell jobs and their lifecycle.
 
-import { feedEvent, owned, readLedger, withLockedJson } from "./ledger.ts";
+import { feedEvent, findLane } from "./ledger.ts";
 import { jobPhase } from "./reports.ts";
 import {
   CmdError, color, coloredState, completionVerdict, fail, FINISHED_SHOWN, parseArgs, pidAlive, ROOT, SELF,
   settleHint, uncoloredChildEnv,
 } from "./runtime.ts";
+import { db, write } from "./store.ts";
 import { renderNote } from "./tui.ts";
 import { spawn as nodeSpawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 export function jobCwd(explicit: string | undefined): string {
@@ -54,19 +55,29 @@ export interface Job {
 
 export type Jobs = Record<string, Job>;
 
-export const JOBS = `${ROOT}/jobs.json`;
-
 const JOB_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 
 const SIGNAL_EXIT_CODES: Record<string, number> = { SIGINT: 130, SIGKILL: 137, SIGTERM: 143 };
 
 export function readJobs(): Jobs {
-  if (!existsSync(JOBS)) return {};
-  return JSON.parse(readFileSync(JOBS, "utf8")) as Jobs;
+  const jobs: Jobs = {};
+  for (const row of db().query<{ name: string; data: string }, []>("SELECT name, data FROM jobs").all()) jobs[row.name] = JSON.parse(row.data);
+  return jobs;
 }
 
+export function storeJob(name: string, job: Job): void {
+  db().query("INSERT OR REPLACE INTO jobs (name, data) VALUES (?, ?)").run(name, JSON.stringify(job));
+}
+
+// One write transaction over the jobs; only changed rows are written back.
 function withJobs<T>(mutate: (jobs: Jobs) => T): T {
-  return withLockedJson(JOBS, `${ROOT}/.jobs.lock`, readJobs, mutate);
+  return write(() => {
+    const jobs = readJobs();
+    const loaded = new Map(Object.entries(jobs).map(([name, job]) => [name, JSON.stringify(job)]));
+    const result = mutate(jobs);
+    for (const [name, job] of Object.entries(jobs)) if (loaded.get(name) !== JSON.stringify(job)) storeJob(name, job);
+    return result;
+  });
 }
 
 export function jobRunning(job: Job): boolean {
@@ -120,7 +131,7 @@ export function settledJob(name: string): Job | undefined {
 }
 
 export function printRunningJobs(tui = false): void {
-  const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job) && owned(job.ownerSession));
+  const running = Object.entries(readJobs()).filter(([, job]) => jobRunning(job));
   if (running.length === 0) return;
   const text = `jobs running:\n${running.map(([name, job]) => `  ${renderJobLine(name, job)}`).join("\n")}`;
   console.log(`\n${tui ? text.split("\n").map((line) => renderNote(line)).join("\n") : text}`);
@@ -140,7 +151,7 @@ export async function jobCommand(argv: string[]) {
   const [name, ...rest] = parsed.rest;
   if (!name) { listJobs(); return; }
   if (!JOB_NAME.test(name)) fail(`job name "${name}" must match ${JOB_NAME.source}`);
-  if (readLedger()[name]) fail(`"${name}" is a lane; pick another job name`);
+  if (findLane(name)) fail(`"${name}" is a lane; pick another job name`);
   let cmd = rest.join(" ");
   if (cmd === "-") cmd = await Bun.stdin.text();
   cmd = cmd.trim();
@@ -159,7 +170,6 @@ export async function jobCommand(argv: string[]) {
   // check, and a concurrent wait never sees a running job without a pid.
   withJobs((jobs) => {
     const existing = jobs[name];
-    if (existing && !owned(existing.ownerSession)) fail(`job "${name}" belongs to another session; explicit takeover required`);
     if (existing && jobRunning(existing) && pidAlive(existing.pid)) {
       throw new CmdError(`job "${name}" is still running (pid ${existing.pid}); cdx kill ${name} first or pick another name`);
     }
@@ -188,7 +198,7 @@ export async function runJob(name: string): Promise<number> {
   const cwd = process.env.CDX_JOB_CWD;
   if (!cmd || !cwd) fail("internal: _job needs CDX_JOB_CMD and CDX_JOB_CWD");
   const job = readJobs()[name];
-  if (!job) fail(`internal: job "${name}" is missing from ${JOBS}`);
+  if (!job) fail(`internal: job "${name}" is missing from the state store`);
   const env = { ...process.env };
   for (const key of ["CDX_JOB_CMD", "CDX_JOB_CWD", "CDX_JOB_OWNER", "CDX_STATE_HOME"]) delete env[key];
   withJobs((jobs) => { jobs[name]!.treeStart = jobTree(cwd); });
@@ -231,7 +241,6 @@ export async function runJob(name: string): Promise<number> {
 }
 
 export async function killJob(name: string, job: Job, note?: string): Promise<void> {
-  if (!owned(job.ownerSession)) fail(`job "${name}" belongs to another session; use cdx takeover ${job.ownerSession} first`);
   if (!jobRunning(job)) fail(`job "${name}" is not running (state ${job.state})`);
   const finalize = (exitCode: number, why: string): Job => withJobs((jobs) => {
     const entry = jobs[name]!;

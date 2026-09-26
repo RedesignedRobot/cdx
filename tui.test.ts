@@ -101,20 +101,21 @@ test("non-TTY command output stays byte-identical with TUI enabled", () => {
     const report = join(root, "portal-r1.md");
     const timestamp = "2026-09-22T00:00:00Z";
     writeFileSync(report, "Completed renderer.\n");
-    writeFileSync(join(root, "ledger.json"), JSON.stringify({ version: 5, lanes: { portal: {
-      engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [report],
+    writeFileSync(join(root, "ledger.json"), JSON.stringify({ version: 5, tokenAccounting: 1, lanes: { portal: {
+      engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [report], tokenAccounting: 1,
       work: { state: "done", cwd: root, round: 1, report, exitCode: 0, updatedAt: timestamp },
       createdAt: timestamp, updatedAt: timestamp, ownerSession: "tui-test",
     } } }));
     writeFileSync(join(root, "logs", "portal-r1.log"), "first\nlast\n");
     writeFileSync(join(root, "feed.log"), JSON.stringify({ id: 1, kind: "terminal", owner: "tui-test", timestamp, message: "portal done" }) + "\n");
-    const env = { ...process.env, CDX_HOME: root, CDX_LANE: "", CDX_OWNER: "", CLAUDE_CODE_SESSION_ID: "tui-test", NO_COLOR: "1" };
+    const env = { ...process.env, CDX_STATE_HOME: root, CDX_LANE: "", CDX_OWNER: "", CLAUDE_CODE_SESSION_ID: "tui-test", NO_COLOR: "1" };
     const run = (args: string[], enabled: string) => {
       const result = Bun.spawnSync([process.execPath, new URL("./cdx.ts", import.meta.url).pathname, ...args],
         { env: { ...env, CDX_TUI: enabled }, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
       expect(result.exitCode).toBe(0);
       return { stdout: result.stdout.toString(), stderr: result.stderr.toString() };
     };
+    expect(run(["migrate"], "0").stdout).toContain("migrated 1 lanes (1 active, 0 archived), 1 events");
     for (const args of [["status"], ["status", "--json"], ["status", "--brief"], ["lanes"], ["events", "--peek"], ["tail", "portal"], ["wait", "portal", "--report"]]) {
       expect(run(args, "1")).toEqual(run(args, "0"));
     }

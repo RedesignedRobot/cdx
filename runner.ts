@@ -24,8 +24,8 @@ import {
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import {
-  activeStateOf, callerSession, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
-  type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLedger,
+  activeStateOf, feedEvent, type GateReceipt, type Lane, type LaneOutage, readLane, readLedger,
+  type ReviewState, roundNoteOf, roundReportOf, type Spec, type Tokens, withLane, withLedger,
 } from "./ledger.ts";
 import { sharedTreeLanes, reviewLoopClosed } from "./prompts.ts";
 import {
@@ -34,7 +34,7 @@ import {
 } from "./questions.ts";
 import {
   availableReportPath, captureRecoveryPartial, controlPathOf, excerpt, logPathOf, partialReportPathOf,
-  readJsonLines, renderTail, reportPathOf, specPathOf, writeCapturedReport, writeProtocolEvent,
+  readJsonLines, renderTail, reportPathOf, logProgress, specPathOf, writeCapturedReport, writeProtocolEvent,
 } from "./reports.ts";
 import { failActiveRound, killChildren } from "./round-state.ts";
 import { openRound } from "./rounds.ts";
@@ -273,8 +273,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     const patches = pendingPatches;
     pendingPatches = [];
     lastFlush = Date.now();
-    withLedger((ledger) => {
-      const item = ledger[lane];
+    withLane(lane, (item) => {
       if (!item) return;
       for (const patch of patches) patch(item);
       item.updatedAt = new Date().toISOString();
@@ -296,7 +295,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   let lastEventMs = Date.now();
   let lastStallWarn = 0;
   const noteActivity = () => {
-    if (lastStallWarn) feedEvent("active", `[cdx] lane=${lane} round=${round} active again after quiet stretch`, spec.ownerSession, { lane, round });
+    if (lastStallWarn) logProgress(lane, round, "active again after quiet stretch");
     lastStallWarn = 0;
     lastEventMs = Date.now();
   };
@@ -320,7 +319,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     : undefined;
   const watchdog = setInterval(() => {
     flushLedger();
-    monitorOverruns(Date.now(), callerSession());
+    monitorOverruns(Date.now());
     if (gemini && Date.now() - Date.parse(readGeminiUsageSnapshot()?.checkedAt ?? "1970-01-01") > 60_000) void refreshGeminiUsage().catch(() => undefined);
     const quiet = Date.now() - lastEventMs;
     if (quiet >= 300_000 && !lastStallWarn) {
@@ -375,7 +374,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     touchLedger((item) => { item.outage = undefined; }, true);
     if (!outageAnnounced) return;
     outageAnnounced = false;
-    feedEvent("active", `[cdx] lane=${lane} round=${round} gemini answering again after ${detail}; no action needed`, spec.ownerSession, { lane, round });
+    logProgress(lane, round, `gemini answering again after ${detail}`);
   };
   const announceOutage = (notice: string) => {
     if (outageAnnounced) return;
@@ -411,7 +410,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     if (attempt >= AGY_RETRY_WAKE_ATTEMPT) {
       announceOutage(`[cdx] lane=${lane} round=${round} gemini ${short}: agy is retrying in-process (attempt ${attempt}, next in ${delay}) and cdx ladders up to ${GEMINI_OUTAGE_RETRIES} more times (~${outageMinutes(GEMINI_OUTAGE_RETRIES)} min) if agy gives up; the process is alive, do not resume or respawn it`);
     } else {
-      feedEvent("progress", `[cdx] lane=${lane} round=${round} agy retry ${attempt} ${short} next=${delay}`, spec.ownerSession, { lane, round });
+      logProgress(lane, round, `agy retry ${attempt} ${short} next=${delay}`);
     }
   };
   let agyLogOffset = 0;
@@ -536,7 +535,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       persistProgress(trackTools({ method: "item/started", params: { item: gateItem } }, new Date().toISOString())!, new Date().toISOString());
       flushLedger();
       withLedger((ledger) => { ledger[lane]!.stage = "gate"; });
-      feedEvent("gate-started", `[cdx] lane=${lane} round=${round} gate started`, spec.ownerSession, { lane, round });
+      logProgress(lane, round, "gate started");
       const verified = runFrozenGate(round, spec.cwd, spec.gate!, `${ROOT}/logs/${lane}-r${round}.gate.log`, lane);
       persistProgress(trackTools({ method: "item/completed", params: { item: { ...gateItem, exitCode: verified.gate.exitCode } } }, new Date().toISOString())!, new Date().toISOString());
       flushLedger();
@@ -712,7 +711,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
             }, true);
             const reason = singleLine(errorText).slice(0, 80);
             const waitNotice = retryDecision.backoffMs > 0 ? ` wait=${retryDecision.backoffMs / 1000}s` : "";
-            feedEvent("progress", `[cdx] lane=${lane} round=${round} auto-continue ${geminiContinuations}/${retryDecision.limit}${waitNotice} reason=${reason}`, spec.ownerSession, { lane, round });
+            logProgress(lane, round, `auto-continue ${geminiContinuations}/${retryDecision.limit}${waitNotice} reason=${reason}`);
             outageSince ??= now;
             outageAttempts += 1;
             const short = shortGeminiReason(errorText);
@@ -859,11 +858,11 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         lines: (path) => readFileSync(path, "utf8").split("\n").filter((line) => line.trim()),
         deliveredCount: () => readDeliveredCount(lane, round),
         markDelivered: (count) => writeDeliveredCount(lane, round, count),
-        withLane: (action) => withLedger((ledger) => action(ledger[lane])),
+        withLane: (action) => withLane(lane, action),
         deliver: (record) => {
           writeUserTurn(controlText(record));
           const flat = singleLine(record.text);
-          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`, spec.ownerSession, { lane, round });
+          logProgress(lane, round, `steer delivered mode=follow-up-turn: ${flat.slice(0, 120)}`);
         },
         now: () => new Date().toISOString(),
       });
@@ -1006,7 +1005,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         const item = ledger[lane];
         if (item) { item.steers = (item.steers ?? 0) + 1; item.updatedAt = new Date().toISOString(); }
       });
-      feedEvent("progress", `[cdx] lane=${lane} round=${round} steer delivered mode=${mode}: ${short}`, spec.ownerSession, { lane, round });
+      logProgress(lane, round, `steer delivered mode=${mode}: ${short}`);
     };
     const deliverControl = async (record: ControlRecord): Promise<"steered" | "follow-up-turn" | undefined> => {
       const expectedTurnId = activeTurnId;
@@ -1031,7 +1030,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         const reason = steerError instanceof Error ? steerError.message : String(steerError);
         if (!reportedControlFailures.has(controlIndex)) {
           reportedControlFailures.add(controlIndex);
-          feedEvent("progress", `[cdx] lane=${lane} round=${round} steer rejected and retained: ${reason.slice(0, 160)}`, spec.ownerSession, { lane, round });
+          logProgress(lane, round, `steer rejected and retained: ${reason.slice(0, 160)}`);
         }
         return undefined;
       }
@@ -1143,7 +1142,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       }
       await Promise.allSettled([stdoutPump, stderrPump]);
       if (roundCleanupWarning) {
-        feedEvent("progress", `[cdx] lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`, spec.ownerSession, { lane, round });
+        logProgress(lane, round, `cleanup warning: ${roundCleanupWarning}`);
         console.error(`cdx: lane=${lane} round=${round} cleanup warning: ${roundCleanupWarning}`);
       }
     } catch (error) {
@@ -1261,7 +1260,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
     if (shared.length) {
       const notice = `[cdx] lane=${lane} round=${round} gate starts while lanes share this working tree: ${shared.join(", ")}`;
       console.error(notice);
-      feedEvent("progress", notice, spec.ownerSession, { lane, round });
+      logProgress(lane, round, notice);
     }
     const verified = preparedGate;
     if (!verified) throw new CmdError("work report has no gate execution evidence");
@@ -1291,7 +1290,6 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
     gateReceipt = final.receipt;
     appendFileSync(reportPath, final.report);
   }
-  if (reportOk) feedEvent("report-written", `[cdx] lane=${lane} round=${round} report written`, spec.ownerSession, { lane, round });
   expireRoundQuestions(lane, round);
   const capturedReport = availableReportPath(lane, round);
   const entry = withLedger((ledger) => {

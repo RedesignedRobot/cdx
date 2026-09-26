@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
-import { digestLines, heartbeatDue, roundProgress, testCommands, toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
-import { parseArgs, parseConfig, parseFeedEvent, summaryJobs, WAKE_EVENTS } from "./cdx.ts";
+import { roundProgress, testCommands, toolObservation, VISIBILITY_DEFAULTS } from "./visibility.ts";
+import { parseArgs, parseConfig, summaryJobs, WAKE_EVENTS } from "./cdx.ts";
 import { expectMinutes, historyMinutes, markOverrun, overrunNotice } from "./duration.ts";
 import { composeGate } from "./gates.ts";
 
@@ -77,20 +77,6 @@ test("test runs count at start, completion-only runs count once, and the fourth 
   expect(testCommands('echo "bun test && vitest run"')).toHaveLength(0);
 });
 
-test("digests combine rows and reset step deltas across rounds", () => {
-  const previous = [{ key: "lane=a", round: 1, steps: 50, files: 4, stage: "working", action: "old" }];
-  const current = [{ key: "lane=a", round: 1, steps: 55, files: 3, stage: "gate", action: "last 2s check" }, { key: "job=train", stage: "running", action: "land 10/15" }];
-  const lines = digestLines(current, previous);
-  expect(lines).toHaveLength(2);
-  expect(lines[0]).toContain("steps=55(+5) files=3(-1) working>gate");
-  expect(lines[1]).toBe("job=train running land 10/15");
-  expect(digestLines([{ ...current[0]!, round: 2, steps: 2 }], previous)[0]).toContain("steps=2(+2)");
-  expect(digestLines([], previous)).toEqual([]);
-  expect(digestLines(current, [...previous, { key: "job=train", stage: "running", action: "land 9/15" }])).toHaveLength(1);
-  expect(heartbeatDue(599_999, 0, 10)).toBe(false);
-  expect(heartbeatDue(600_000, 0, 10)).toBe(true);
-});
-
 test("visibility settings reject invalid cadence and thresholds and status flags parse", () => {
   expect(parseConfig("{}").visibility).toEqual(VISIBILITY_DEFAULTS);
   expect(parseConfig('{"visibility":{"heartbeatMinutes":0.5,"failureRepeats":2,"fileEdits":3}}').visibility)
@@ -104,10 +90,9 @@ test("visibility settings reject invalid cadence and thresholds and status flags
   expect(flags.flags.interval).toBe("3");
 });
 
-test("new stages stay quiet while thrash wakes and older events still parse", () => {
-  for (const kind of ["gate-started", "gate-finished", "report-written", "progress", "thrash", "started"]) {
-    expect(parseFeedEvent(JSON.stringify({ id: 1, timestamp: "now", kind, owner: "head", message: "event" }))?.kind).toBe(kind);
-    expect(WAKE_EVENTS.has(kind as any)).toBe(kind === "thrash");
+test("only actionable kinds wake the head", () => {
+  for (const kind of ["gate-finished", "partial", "account", "thrash", "terminal", "question"]) {
+    expect(WAKE_EVENTS.has(kind)).toBe(!["gate-finished", "partial", "account"].includes(kind));
   }
 });
 

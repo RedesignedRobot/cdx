@@ -1,14 +1,12 @@
-import { migrateTokenAccounting, type TokenRoundEvidence } from "./tokens.ts";
 import { failureDigest } from "./gates.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
-// Lane records, ledger migration and locks, ownership, and the event journal.
+// Lane records, ownership, and the event journal, stored in the SQLite state store.
 
-import { CmdError, fail, LEDGER, ROOT, singleLine } from "./runtime.ts";
-import { type ProgressSample, type VisibilityConfig } from "./visibility.ts";
-import {
-  appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmdirSync, statSync, writeFileSync,
-} from "node:fs";
-import { relative, resolve } from "node:path";
+import { fail, ROOT, singleLine } from "./runtime.ts";
+import { db, write } from "./store.ts";
+import { type VisibilityConfig } from "./visibility.ts";
+import { appendFileSync, mkdirSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 // Inside a supervisor lane both variables name the same lane. Anything else
 // (a child, a plain worker, the head's shell) is not a supervisor. The claim
@@ -31,13 +29,11 @@ export function supervisorLane(): string | undefined {
   return supervisor;
 }
 
-// One ownership policy for every mutation a supervisor may issue: it may
-// touch only lanes it spawned. Heads must hold the resolved ownership.
+// A supervisor may drive only lanes it spawned. The head is the one owner
+// and may drive any lane.
 export function requireOwnChild(lane: string, entry: Lane | undefined): void {
   const supervisor = supervisorLane();
-  if (!entry) return;
-  if (!owned(entry.ownerSession, lane)) fail(`lane "${lane}" belongs to another session; use cdx takeover ${lane} first`);
-  if (supervisor && entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
+  if (entry && supervisor && entry.parent !== supervisor) fail(`supervisor ${supervisor} may only drive its own children; lane "${lane}" is not one`);
 }
 
 export interface Lineage { supervisor: boolean; parent?: string; parentRound?: number }
@@ -288,7 +284,7 @@ export interface Spec {
 
 export type Ledger = Record<string, Lane>;
 
-type EventKind = "started" | "question" | "stalled" | "active" | "partial" | "account" | "progress" | "terminal" | "job-exit" | "message" | "thrash" | "overrun" | "outage" | "gate-started" | "gate-finished" | "report-written";
+type EventKind = "question" | "stalled" | "partial" | "account" | "terminal" | "job-exit" | "message" | "thrash" | "overrun" | "outage" | "gate-finished";
 
 export interface FeedEvent {
   id: number;
@@ -304,93 +300,73 @@ export interface FeedEvent {
   supervisor?: string;
 }
 
-interface SessionDelivery {
-  cursor: number;
-  polledAt?: string;
-  digestAt?: string;
-  progress?: ProgressSample[];
-  briefHash?: string;
-  briefAt?: string;
-}
-
-interface SessionState {
-  sequence: number;
-  bindings: Record<string, string>;
-  lanes: Record<string, string>;
-  sessions: Record<string, SessionDelivery>;
-}
-
-const SESSION_STATE = `${ROOT}/sessions.json`;
-
+// The kinds a head acts on. The other kinds stay in the table for cdx feed
+// and never reach a session.
 export const WAKE_EVENTS = new Set<string>(["question", "stalled", "terminal", "job-exit", "message", "thrash", "overrun", "outage"]);
 
-export function readSessions(): SessionState {
-  return { sequence: 0, bindings: {}, lanes: {}, sessions: {}, ...(existsSync(SESSION_STATE) ? JSON.parse(readFileSync(SESSION_STATE, "utf8")) : {}) };
-}
-
-export function withEvents<T>(action: (state: SessionState) => T, persist = true): T {
-  if (!persist && !existsSync(ROOT)) return action(readSessions());
-  mkdirSync(ROOT, { recursive: true });
-  return withLockedJson(SESSION_STATE, `${ROOT}/.events.lock`, readSessions, action, persist);
-}
-
-export function recipientOf(owner: string | undefined, lane?: string, state = readSessions()): string {
-  const token = state.lanes[lane ?? ""] ?? owner ?? "terminal";
-  return state.bindings[token] ?? token;
-}
-
 export function callerSession(): string {
-  // A worker's inherited owner wins even when it is explicitly terminal.
-  const owner = (process.env.CDX_LANE ? process.env.CDX_OWNER?.trim() : undefined)
-    || process.env.CLAUDE_CODE_SESSION_ID?.trim() || "terminal";
-  return process.env.CDX_LANE ? recipientOf(owner, process.env.CDX_LANE) : owner;
+  return process.env.CLAUDE_CODE_SESSION_ID?.trim() || "terminal";
 }
 
-export function owned(owner?: string, lane?: string, session = callerSession(), state = readSessions()): boolean {
-  return recipientOf(owner, lane, state) === session;
+interface EventRow {
+  id: number; at: string; kind: string; owner: string; recipient: string | null; sender: string | null;
+  lane: string | null; round: number | null; job: string | null; supervisor: string | null; message: string;
 }
 
-export function parseFeedEvent(line: string): FeedEvent | undefined {
-  try {
-    const event = JSON.parse(line);
-    if (Number.isSafeInteger(event.id) && event.id > 0 && typeof event.timestamp === "string"
-      && typeof event.owner === "string" && typeof event.message === "string"
-      && ["started", "question", "stalled", "active", "partial", "account", "progress", "terminal", "job-exit", "message", "thrash", "overrun", "outage", "gate-started", "gate-finished", "report-written"].includes(event.kind)) return event;
-  } catch { /* Version 5 free-text records are deliberately ignored. */ }
+function feedEventOf(row: EventRow): FeedEvent {
+  const event: FeedEvent = { id: row.id, timestamp: row.at, kind: row.kind, owner: row.owner, message: row.message };
+  if (row.recipient !== null) event.recipient = row.recipient;
+  if (row.sender !== null) event.from = row.sender;
+  if (row.lane !== null) event.lane = row.lane;
+  if (row.round !== null) event.round = row.round;
+  if (row.job !== null) event.job = row.job;
+  if (row.supervisor !== null) event.supervisor = row.supervisor;
+  return event;
 }
 
-export function readEvents(): FeedEvent[] {
-  if (!existsSync(`${ROOT}/feed.log`)) return [];
-  return readFileSync(`${ROOT}/feed.log`, "utf8").split("\n").flatMap((line) => {
-    const event = parseFeedEvent(line);
-    return event ? [event] : [];
-  });
+export function eventsAfter(cursor: number): FeedEvent[] {
+  return db().query<EventRow, [number]>("SELECT * FROM events WHERE id > ? ORDER BY id").all(cursor).map(feedEventOf);
+}
+
+// The newest events, oldest first.
+export function recentEvents(limit: number): FeedEvent[] {
+  return db().query<EventRow, [number]>("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit).reverse().map(feedEventOf);
+}
+
+// Messages addressed to the session or to the head, oldest first.
+export function inboxEvents(session: string, limit: number): FeedEvent[] {
+  return db().query<EventRow, [string, number]>("SELECT * FROM events WHERE kind = 'message' AND (recipient IS NULL OR recipient = ?) ORDER BY id DESC LIMIT ?")
+    .all(session, limit).reverse().map(feedEventOf);
+}
+
+export function latestEventId(): number {
+  return db().query<{ id: number | null }, []>("SELECT MAX(id) AS id FROM events").get()?.id ?? 0;
 }
 
 export function renderEvent(event: FeedEvent): string {
-  if (event.kind === "message") return safeText(`[cdx] msg to=${event.recipient} from=${event.from}: ${event.message}`);
+  if (event.kind === "message") return safeText(`[cdx] msg to=${event.recipient ?? "head"} from=${event.from}: ${event.message}`);
   return safeText(event.message);
 }
 
-export function eventOwned(event: FeedEvent, session: string, state: SessionState): boolean {
-  if (event.supervisor) return false;
-  return recipientOf(event.recipient ?? event.owner, event.lane, state) === session;
-}
+// A terminal event is at most TERMINAL_LINES lines: the verdict line, which
+// names the report path, then the head of the failure evidence or of the
+// report. The body stays on disk for the head or supervisor to open.
+const TERMINAL_LINES = 5;
+
+const DIGEST_LINE_CHARS = 200;
 
 export function terminalText(message: string, report: string | undefined, failure: string | undefined): string {
-  const body = report && Buffer.byteLength(report) < 10_000 ? `\n\n${report.trim()}` : "";
-  const digest = failure ? `\n\nFailure evidence:\n${failureDigest(failure)}` : "";
-  return safeText(message + body + digest);
+  const source = failure ? failureDigest(failure).split("\n") : (report ?? "").split("\n").filter((line) => !/^\s*#/.test(line));
+  const digest = source.map(singleLine).filter(Boolean).slice(0, TERMINAL_LINES - 1)
+    .map((line) => Array.from(line).slice(0, DIGEST_LINE_CHARS).join(""));
+  return safeText([singleLine(message), ...digest].join("\n"));
 }
 
 export function feedEvent(kind: EventKind, message: string, owner?: string, identity: { lane?: string; round?: number; job?: string; recipient?: string; from?: string } = {}): void {
-  return withEvents((state) => {
-    // Recover sequence after a crash between append and state rename.
-    const records = readEvents();
-    state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
-    if (kind === "terminal" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
-    if (kind === "partial" && records.some((event) => event.kind === kind && event.lane === identity.lane && event.round === identity.round)) return;
-    const lane = identity.lane ? readLedger()[identity.lane] : undefined;
+  write(() => {
+    if ((kind === "terminal" || kind === "partial") && db().query("SELECT 1 FROM events WHERE lane IS ? AND round IS ? AND kind = ?")
+      .get(identity.lane ?? null, identity.round ?? null, kind)) return;
+    const lane = identity.lane ? findLane(identity.lane) : undefined;
     const terminal = kind === "terminal" || kind === "job-exit";
     if (kind === "terminal" && lane) message += ` tests=${lane.roundTestRuns ?? 0} suites=${lane.roundTestSuites ?? 0}${lane.roundTestStatus ? ` testStatus=${lane.roundTestStatus}` : ""} codegraph=${lane.roundCodegraphCalls ?? 0} code-before-graph=${lane.roundCodeSearchesBeforeGraph ?? 0}`;
     const read = (path?: string) => { try { return path && path !== "-" ? readFileSync(path, "utf8") : undefined; } catch { return undefined; } };
@@ -400,38 +376,64 @@ export function feedEvent(kind: EventKind, message: string, owner?: string, iden
       const gateLog = /(?:^|\s)gateLog=(\S+)/.exec(message)?.[1];
       const log = /(?:^|\s)log=(\S+)/.exec(message)?.[1];
       message = terminalText(message, report, failed ? read(gateLog !== "-" && gateLog ? gateLog : log) : undefined);
-    }
+    } else message = singleLine(message);
+    const at = new Date().toISOString();
     const supervisor = terminal ? lane?.parent : undefined;
-    const event: FeedEvent = { id: ++state.sequence, timestamp: new Date().toISOString(), kind, owner: owner || "terminal", ...identity,
-      ...(supervisor ? { supervisor } : {}), message: terminal || kind === "progress" ? safeText(message) : singleLine(message) };
     if (supervisor && lane?.parentRound) {
-      const parent = readLedger()[supervisor];
+      const parent = findLane(supervisor);
       if (parent && laneRunning(parent) && parent.rounds === lane.parentRound && parent.steerOpen !== false) {
         mkdirSync(`${ROOT}/control`, { recursive: true });
-        appendFileSync(`${ROOT}/control/${supervisor}-r${lane.parentRound}.jsonl`, `${safeJSON({ text: event.message, sentAt: event.timestamp, from: "cdx" })}\n`);
+        appendFileSync(`${ROOT}/control/${supervisor}-r${lane.parentRound}.jsonl`, `${safeJSON({ text: message, sentAt: at, from: "cdx" })}\n`);
       }
     }
-    appendFileSync(`${ROOT}/feed.log`, `${safeJSON(event)}\n`);
+    db().query("INSERT INTO events (at, kind, owner, recipient, sender, lane, round, job, supervisor, message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(at, kind, owner || "terminal", identity.recipient ?? null, identity.from ?? null, identity.lane ?? null,
+        identity.round ?? null, identity.job ?? null, supervisor ?? null, message);
   });
 }
 
-export function scopedEvents(limit: number, session = callerSession(), messagesOnly = false): string[] {
-  return withEvents((state) => readEvents().filter((event) => eventOwned(event, session, state)
-    && (!messagesOnly || event.kind === "message")).slice(-limit).map(renderEvent), false);
+// A Claude session is a delivery cursor, not an owner: every lane belongs to
+// the one owner. The newest session that polled within ACTIVE_SESSION_MS is
+// the head and receives the events. Older sessions still open advance their
+// cursor and hear only messages addressed to them, so when the newest one
+// closes, delivery moves to the next without replaying history.
+const ACTIVE_SESSION_MS = 30_000;
+
+// An idle poll with nothing new skips the write until its liveness mark is
+// this old; the mod polls every two seconds.
+const POLL_MARK_MS = 10_000;
+
+export interface SessionRow { session: string; cursor: number; started_at: string; polled_at: string; brief_hash: string | null; brief_at: string | null }
+
+export function readSession(session: string): SessionRow | undefined {
+  return db().query<SessionRow, [string]>("SELECT * FROM sessions WHERE session = ?").get(session) ?? undefined;
 }
 
-// A 6.x record carried two cursors (wake, quiet) and a hook receipt. The
-// higher cursor becomes the single cursor so an upgraded session never
-// replays its history; the receipt fields are dropped.
-export function delivery(state: SessionState, session: string): SessionDelivery {
-  const entry = state.sessions[session] ??= { cursor: 0 };
-  const legacy = entry as SessionDelivery & { wake?: number; quiet?: number; lease?: unknown; plugin?: unknown };
-  if (typeof entry.cursor !== "number") entry.cursor = Math.max(legacy.wake ?? 0, legacy.quiet ?? 0);
-  delete legacy.wake; delete legacy.quiet; delete legacy.lease; delete legacy.plugin;
-  return entry;
+// Session start, resume and compaction call this through cdx brief, making
+// the session the head. A new session starts at the newest event: what
+// happened before it is the brief's job, not a replay.
+export function startSession(session: string, now = Date.now()): void {
+  const at = new Date(now).toISOString();
+  write(() => db().query(`INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT (session) DO UPDATE SET started_at = excluded.started_at, polled_at = excluded.polled_at`).run(session, latestEventId(), at, at));
 }
 
-interface EventsRecord {
+// Only a session that already has a row records its brief; the terminal
+// never becomes a delivery target.
+export function markBrief(session: string, hash: string, now: number): void {
+  write(() => db().query("UPDATE sessions SET brief_hash = ?, brief_at = ? WHERE session = ?").run(hash, new Date(now).toISOString(), session));
+}
+
+export function acknowledgeEvents(session: string, id: number): void {
+  write(() => db().query("UPDATE sessions SET cursor = MAX(cursor, ?) WHERE session = ?").run(id, session));
+}
+
+export function deliveryHead(now = Date.now()): string | undefined {
+  return db().query<{ session: string }, [string]>("SELECT session FROM sessions WHERE polled_at >= ? ORDER BY started_at DESC LIMIT 1")
+    .get(new Date(now - ACTIVE_SESSION_MS).toISOString())?.session;
+}
+
+export interface EventsRecord {
   id: number;
   kind: string;
   wake: boolean;
@@ -443,190 +445,156 @@ interface EventsRecord {
   recipient?: string;
 }
 
-interface SelectEventsOptions {
-  peek?: boolean;
-}
-
-export function selectEvents(
-  records: FeedEvent[],
-  session: string,
-  state: SessionState,
-  options: SelectEventsOptions = {}
-): {
-  events: EventsRecord[];
-  cursor: number;
-} {
-  const current = delivery(state, session);
-  const currentCursor = current.cursor ?? 0;
-  const matching = records.filter((event) => event.id > currentCursor && eventOwned(event, session, state));
-  const lastRecordId = records.length > 0 ? records[records.length - 1]!.id : currentCursor;
-  const newCursor = options.peek ? currentCursor : Math.max(currentCursor, lastRecordId);
-  if (!options.peek) {
-    current.cursor = newCursor;
-  }
-  const events: EventsRecord[] = matching.map((event) => {
-    const e: EventsRecord = {
-      id: event.id,
-      kind: event.kind,
-      wake: WAKE_EVENTS.has(event.kind),
-      text: renderEvent(event),
-    };
-    if (event.lane !== undefined) e.lane = event.lane;
-    if (event.round !== undefined) e.round = event.round;
-    if (event.job !== undefined) e.job = event.job;
-    if (event.from !== undefined) e.from = event.from;
-    if (event.recipient !== undefined) e.recipient = event.recipient;
-    return e;
+// Which events after a cursor reach a session: actionable kinds only, never
+// a child's terminal routed to its supervisor, addressed messages to their
+// session and everything else to the head.
+export function selectEvents(records: readonly FeedEvent[], session: string, head: boolean): EventsRecord[] {
+  return records.filter((event) => WAKE_EVENTS.has(event.kind) && !event.supervisor
+    && (event.recipient ? event.recipient === session : head)).map((event) => {
+    const record: EventsRecord = { id: event.id, kind: event.kind, wake: true, text: renderEvent(event) };
+    if (event.lane !== undefined) record.lane = event.lane;
+    if (event.round !== undefined) record.round = event.round;
+    if (event.job !== undefined) record.job = event.job;
+    if (event.from !== undefined) record.from = event.from;
+    if (event.recipient !== undefined) record.recipient = event.recipient;
+    return record;
   });
-  return { events, cursor: current.cursor };
 }
 
-function normalizeLane(entry: any): void {
-  entry.engine ??= "gpt";
-  entry.work ??= {
-    state: entry.workState ?? (entry.kind === "review" ? entry.workSessionId ? "done" : "adopted" : entry.state),
-    round: entry.workRound ?? (entry.kind === "work" ? entry.rounds : undefined),
-    cwd: entry.workCwd ?? entry.worktreePath ?? entry.cwd,
-    exitCode: entry.kind === "review" && !entry.workState ? undefined : entry.exitCode,
-    note: entry.kind === "review" && !entry.workState ? undefined : entry.note,
-    report: entry.workReport,
-    updatedAt: entry.workUpdatedAt,
-  };
-  if (!entry.review && (entry.reviewState || entry.kind === "review")) {
-    entry.review = {
-      state: entry.reviewState ?? entry.state,
-      round: entry.reviewRound ?? (entry.kind === "review" ? entry.rounds : undefined),
-      cwd: entry.reviewCwd ?? entry.work.cwd,
-      exitCode: entry.reviewExitCode ?? (entry.kind === "review" && !entry.workState ? entry.exitCode : undefined),
-      note: entry.reviewNote ?? (entry.kind === "review" && !entry.workState ? entry.note : undefined),
-      report: entry.reviewReport,
-      updatedAt: entry.reviewUpdatedAt,
-    };
-  }
-  const active = entry.kind === "review" ? entry.review : entry.work;
-  const lastReport = entry.reports?.at(-1);
-  if (active && !active.report && lastReport?.endsWith(`-r${entry.rounds}.md`)) active.report = lastReport;
-  if (entry.account && entry.codexHome && (entry.kind === "review" ? entry.reviewEngine ?? entry.engine ?? "gpt" : entry.engine ?? "gpt") === "gpt") {
-    entry.roundAccount ??= { name: entry.account, home: entry.codexHome, demand: entry.kind === "review" ? "light" : entry.supervisor ? "supervisor" : "work" };
-  }
-  for (const key of ["workState", "workRound", "workCwd", "workReport", "workUpdatedAt", "exitCode", "note", "reviewState", "reviewRound", "reviewCwd", "reviewExitCode", "reviewNote", "reviewReport", "reviewUpdatedAt"]) delete entry[key];
-  delete entry.state;
-  delete entry.cwd;
-}
-
-const LEDGER_VERSION_PATH = `${ROOT}/.ledger-version`;
-
-const LEGACY_LANE_KEYS = ["state", "cwd", "workState", "workRound", "workCwd", "workReport", "workUpdatedAt", "exitCode", "note", "reviewState", "reviewRound", "reviewCwd", "reviewExitCode", "reviewNote", "reviewReport", "reviewUpdatedAt"];
-
-function readLedgerDocument(document: any = existsSync(LEDGER) ? JSON.parse(readFileSync(LEDGER, "utf8")) : {}) {
-  if (document && typeof document === "object" && Object.keys(document).length === 0) return { version: 5, tokenAccounting: 1, lanes: {} as Ledger };
-  const current = document?.version === 5;
-  if (!current && (existsSync(LEDGER_VERSION_PATH) || typeof document?.version === "number")) {
-    throw new CmdError("unsupported ledger shape; stop older cdx writers and restore a version 5 ledger");
-  }
-  const ledger = current ? document.lanes : document;
-  if (!ledger || typeof ledger !== "object" || Array.isArray(ledger)) throw new CmdError("invalid ledger: expected lane records");
-  for (const [name, entry] of Object.entries(ledger) as [string, any][]) {
-    if (!entry || typeof entry !== "object" || Array.isArray(entry)) throw new CmdError(`invalid ledger lane "${name}"`);
-    if (!current) normalizeLane(entry);
-    if (LEGACY_LANE_KEYS.some((key) => Object.hasOwn(entry, key))
-      || !["gpt", "gemini"].includes(entry.engine)
-      || !entry.work || typeof entry.work.cwd !== "string"
-      || !["running", "done", "failed", "gate-invalid", "adopted", "closed"].includes(entry.work.state)
-      || !["work", "review"].includes(entry.kind)
-      || (entry.kind === "review" && (!entry.review || typeof entry.review.cwd !== "string" || !["running", "done", "failed"].includes(entry.review.state)))) {
-      throw new CmdError(`invalid ledger lane "${name}": version 5 requires an engine and work/review records, without flat aliases`);
-    }
-  }
-  const result = { version: 5, tokenAccounting: document.tokenAccounting as number | undefined, lanes: ledger as Ledger };
-  migrateTokenAccounting(result, (name, entry) => {
-      const evidence: (TokenRoundEvidence & { round: number })[] = [];
-      for (let round = 1; round <= entry.rounds; round++) {
-        try {
-          const spec = JSON.parse(readFileSync(`${ROOT}/specs/${name}-r${round}.json`, "utf8"));
-          if (["gpt", "gemini"].includes(spec.engine)) evidence.push({ engine: spec.engine, round });
-        } catch { /* cleaned specs leave engine attribution incomplete */ }
-      }
-      const mixed = new Set([entry.engine, entry.reviewEngine ?? entry.engine, ...evidence.map((round) => round.engine)]).size > 1;
-      if (mixed) {
-        for (const record of evidence) {
-          if (record.engine !== "gemini") continue;
-          try {
-            const round = record.round;
-            const lines = readFileSync(`${ROOT}/logs/${name}-r${round}.jsonl`, "utf8").split("\n");
-            let cached = 0;
-            for (const line of lines) {
-              let event: any;
-              try { event = JSON.parse(line); } catch { continue; }
-              const usage = event.event === "step_update" ? event.step_update?.usage : undefined;
-              if (usage && [usage.input_tokens, usage.cache_read_tokens, usage.output_tokens]
-                .every((n) => typeof n === "number" && Number.isFinite(n) && n >= 0)) cached += usage.cache_read_tokens;
-            }
-            record.cached = cached;
-          } catch { /* preserve the incomplete evidence */ }
-        }
-      }
-      return evidence;
+// Hands the session its events and advances the cursor only after emit
+// returns: a crash in between replays events, never drops them.
+export function deliverEvents(session: string, now: number, peek: boolean, emit: (events: EventsRecord[]) => void): void {
+  const current = readSession(session);
+  if (current && latestEventId() <= current.cursor && now - Date.parse(current.polled_at) < POLL_MARK_MS) { emit([]); return; }
+  write(() => {
+    const at = new Date(now).toISOString();
+    const row = readSession(session);
+    const cursor = row?.cursor ?? latestEventId();
+    if (row) db().query("UPDATE sessions SET polled_at = ? WHERE session = ?").run(at, session);
+    else db().query("INSERT INTO sessions (session, cursor, started_at, polled_at) VALUES (?, ?, ?, ?)").run(session, cursor, at, at);
+    const records = eventsAfter(cursor);
+    emit(selectEvents(records, session, deliveryHead(now) === session));
+    if (!peek && records.length) acknowledgeEvents(session, records.at(-1)!.id);
   });
-  return result;
+}
+
+interface LaneRow { name: string; data: string }
+
+const LANE_NAME = /^[a-z0-9][a-z0-9._-]*$/i;
+
+// A closed lane with no round running lives in the archive table.
+function archivable(entry: Lane): boolean {
+  return entry.work.state === "closed" && !laneRunning(entry);
+}
+
+function archivedRow(name: string): LaneRow | undefined {
+  return db().query<LaneRow, [string]>("SELECT name, data FROM archive WHERE name = ?").get(name) ?? undefined;
+}
+
+function laneRows(table: "lanes" | "archive"): Ledger {
+  const lanes: Ledger = {};
+  for (const row of db().query<LaneRow, []>(`SELECT name, data FROM ${table}`).all()) lanes[row.name] = JSON.parse(row.data);
+  return lanes;
+}
+
+// Active lanes by name. Iteration sees only active lanes. Looking up a name
+// that is not active falls through to the archive by primary key, so
+// resume, review, report, wait and close still reach a closed lane; the
+// lane found that way joins the object and withLedger writes it back if it
+// changed.
+function laneTable(lanes: Ledger, loaded?: Map<string, string>): Ledger {
+  return new Proxy(lanes, {
+    get(target, key, receiver) {
+      if (typeof key !== "string" || key in target || !LANE_NAME.test(key)) return Reflect.get(target, key, receiver);
+      const row = archivedRow(key);
+      if (!row) return undefined;
+      target[key] = JSON.parse(row.data);
+      loaded?.set(key, row.data);
+      return target[key];
+    },
+  });
+}
+
+export function storeLane(name: string, entry: Lane, data = safeJSON(entry)): void {
+  if (archivable(entry)) {
+    db().query("DELETE FROM lanes WHERE name = ?").run(name);
+    db().query("INSERT OR REPLACE INTO archive (name, data, updated_at) VALUES (?, ?, ?)").run(name, data, entry.updatedAt);
+  } else {
+    db().query("DELETE FROM archive WHERE name = ?").run(name);
+    db().query("INSERT OR REPLACE INTO lanes (name, data) VALUES (?, ?)").run(name, data);
+  }
+}
+
+export function dropLane(name: string): void {
+  db().query("DELETE FROM lanes WHERE name = ?").run(name);
+  db().query("DELETE FROM archive WHERE name = ?").run(name);
 }
 
 export function readLedger(): Ledger {
-  if (!existsSync(LEDGER)) return {};
-  const document = JSON.parse(readFileSync(LEDGER, "utf8"));
-  if (document.version === 5 && document.tokenAccounting === 1 && Object.values(document.lanes ?? {}).every((lane: any) => lane.tokenAccounting === 1)) return readLedgerDocument(document).lanes;
-  // Persist the migration under the normal writer lock, including read-only
-  // usage requests. A second reader rechecks the marker after taking the lock.
-  return withLockedJson(LEDGER, `${ROOT}/.lock`, readLedgerDocument, (document) => document.lanes);
+  return laneTable(laneRows("lanes"));
 }
 
+export function findLane(name: string): Lane | undefined {
+  const row = db().query<LaneRow, [string]>("SELECT name, data FROM lanes WHERE name = ?").get(name) ?? archivedRow(name);
+  return row ? JSON.parse(row.data) : undefined;
+}
+
+// Active and archived lanes. Only history views and totals read this.
+export function readAllLanes(): Ledger {
+  return { ...laneRows("archive"), ...laneRows("lanes") };
+}
+
+// Active lanes plus archived lanes updated at or after the instant.
+export function lanesUpdatedSince(iso: string): Ledger {
+  const archived: Ledger = {};
+  for (const row of db().query<LaneRow, [string]>("SELECT name, data FROM archive WHERE updated_at >= ?").all(iso)) archived[row.name] = JSON.parse(row.data);
+  return { ...archived, ...laneRows("lanes") };
+}
+
+// The newest archived lanes, for statistics that need finished history.
+export function recentArchivedLanes(limit: number): Ledger {
+  const lanes: Ledger = {};
+  for (const row of db().query<LaneRow, [number]>("SELECT name, data FROM archive ORDER BY updated_at DESC LIMIT ?").all(limit)) lanes[row.name] = JSON.parse(row.data);
+  return lanes;
+}
+
+// One write transaction over the active lanes. Only rows whose JSON changed
+// are written back; a lane that turned closed moves to the archive.
 export function withLedger<T>(mutate: (ledger: Ledger) => T): T {
-  // Finish any legacy migration before callbacks can read under this lock.
-  readLedger();
-  return withLockedJson(LEDGER, `${ROOT}/.lock`,
-    readLedgerDocument,
-    (document) => {
-      if (!existsSync(LEDGER_VERSION_PATH) || readFileSync(LEDGER_VERSION_PATH, "utf8").trim() !== "5") writeFileSync(LEDGER_VERSION_PATH, "5\n");
-      return mutate(document.lanes);
-    });
+  return write(() => {
+    const lanes: Ledger = {};
+    const loaded = new Map<string, string>();
+    for (const row of db().query<LaneRow, []>("SELECT name, data FROM lanes").all()) {
+      lanes[row.name] = JSON.parse(row.data);
+      loaded.set(row.name, row.data);
+    }
+    const result = mutate(laneTable(lanes, loaded));
+    for (const [name, entry] of Object.entries(lanes)) {
+      const data = safeJSON(entry);
+      if (loaded.get(name) !== data) storeLane(name, entry, data);
+    }
+    for (const name of loaded.keys()) if (!Object.hasOwn(lanes, name)) dropLane(name);
+    return result;
+  });
 }
 
-// Read-mutate-write one JSON state file under a mkdir lock, written through a
-// temp file so a reader never sees a torn document.
-export function withLockedJson<S, T>(path: string, lock: string, read: () => S, mutate: (state: S) => T, persist = true): T {
-  const deadline = Date.now() + 10_000;
-  for (;;) {
-    try {
-      mkdirSync(lock);
-      break;
-    } catch {
-      // A lock older than 30s belongs to a dead process; break it.
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 30_000) { rmdirSync(lock); continue; }
-      } catch { /* raced */ }
-      if (Date.now() > deadline) throw new CmdError(`${relative(ROOT, path)} lock timeout`);
-      Bun.sleepSync(50);
-    }
-  }
-  try {
-    const state = read();
-    const result = mutate(state);
-    if (persist) {
-      const serialized = safeJSON(state, 2);
-      if (!existsSync(path) || readFileSync(path, "utf8") !== serialized) {
-        const tmp = `${path}.tmp.${process.pid}`;
-        writeFileSync(tmp, serialized);
-        renameSync(tmp, path);
-      }
+// One lane's row in one write transaction, for patches that touch nothing
+// else: the runner's step counter must not rewrite its siblings.
+export function withLane<T>(name: string, mutate: (entry: Lane | undefined) => T): T {
+  return write(() => {
+    const row = db().query<LaneRow, [string]>("SELECT name, data FROM lanes WHERE name = ?").get(name);
+    const entry: Lane | undefined = row ? JSON.parse(row.data) : undefined;
+    const result = mutate(entry);
+    if (entry) {
+      const data = safeJSON(entry);
+      if (data !== row!.data) storeLane(name, entry, data);
     }
     return result;
-  } finally {
-    try { rmdirSync(lock); } catch { /* broken by a peer */ }
-  }
+  });
 }
 
 export function readLane(lane: string): Lane {
-  const entry = readLedger()[lane];
+  const entry = findLane(lane);
   if (!entry) fail(`unknown lane "${lane}" (cdx status lists lanes)`);
   return entry;
 }
@@ -691,7 +659,7 @@ export function validLane(lane: string): string {
 }
 
 export function laneEngine(lane: Pick<Lane, "engine"> | undefined): Engine {
-  if (!lane || !["gpt", "gemini"].includes(lane.engine)) throw new CmdError("lane has no valid engine; restore its engine in the ledger");
+  if (!lane || !["gpt", "gemini"].includes(lane.engine)) fail("lane has no valid engine; restore its engine in the ledger");
   return lane.engine;
 }
 
@@ -711,10 +679,10 @@ export interface AccountChoice { name: string; home: string }
 
 export interface LaneOwner { ownerSession?: string; ownerCwd: string }
 
+// The session that started a lane, kept as provenance. It routes nothing.
 export function callerOwnership(): LaneOwner {
   const parent = supervisorLane();
-  const inherited = parent ? readSessions().lanes[parent] ?? readLedger()[parent]?.ownerSession ?? "terminal" : undefined;
-  const ownerSession = inherited === "terminal" ? undefined : inherited ?? process.env.CLAUDE_CODE_SESSION_ID?.trim();
+  const ownerSession = parent ? findLane(parent)?.ownerSession : process.env.CLAUDE_CODE_SESSION_ID?.trim();
   return { ...(ownerSession ? { ownerSession } : {}), ownerCwd: process.cwd() };
 }
 

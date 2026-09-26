@@ -20,9 +20,9 @@ import {
 } from "./gates.ts";
 import { formatGeminiStanding, readGeminiUsageSnapshot, requireGeminiQuota } from "./gemini-usage.ts";
 import {
-  type AccountChoice, activeStateOf, callerLineage, callerOwnership, feedEvent, laneEngine, laneRunning,
-  ownershipSpec, readEvents, readLane, readLedger, recipientOf, requireOwnChild, spawnRoots, type Spec,
-  storedOwnership, supervisorLane, validLane, withEvents, withLedger, workCwdOf,
+  type AccountChoice, activeStateOf, callerLineage, callerOwnership, dropLane, laneEngine, laneRunning,
+  ownershipSpec, readLane, readLedger, requireOwnChild, spawnRoots, type Spec,
+  storedOwnership, supervisorLane, validLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
   resumeRefusal, CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
@@ -30,6 +30,7 @@ import {
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { failActiveRound } from "./round-state.ts";
+import { db, write } from "./store.ts";
 import { expectMinutes, historyMinutes } from "./duration.ts";
 import { openRound } from "./rounds.ts";
 import { chooseSpawnModel } from "./repo-routing.ts";
@@ -42,7 +43,7 @@ import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { createWorktree, mergeDirectories, storedDirectories, type WorktreeInfo } from "./worktrees.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
-  existsSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync,
+  existsSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 
 function gitCommonDir(cwd: string): string | undefined {
@@ -105,7 +106,6 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
   spec.startedAt ??= entry.roundStartedAt ?? new Date().toISOString();
   writeFileSync(specPathOf(spec.lane, spec.round), safeJSON(spec, 2));
   writeFileSync(`${ROOT}/briefs/${spec.lane}-r${spec.round}.md`, safeText(brief));
-  feedEvent("started", `[cdx] lane=${spec.lane} round=${spec.round} started report=${reportPathOf(spec.lane, spec.round)}`, spec.ownerSession, { lane: spec.lane, round: spec.round });
   const jsonMode = spec.engine === "gemini" || spec.reviewDir === undefined || spec.mode === "spawn";
   if (spec.reviewDir) console.log(`cdx: REVIEW DIRECTORY ${spec.reviewDir}`);
   console.log(`cdx: lane=${color.magenta(spec.lane)} engine=${spec.engine}${spec.model ? ` model=${spec.model}` : ""}${spec.supervisor ? " supervisor" : ""} mode=${spec.mode} round=${spec.round} cwd=${spec.cwd}${background ? " (background)" : ""}`);
@@ -464,38 +464,33 @@ export async function reviewCommand(argv: string[], opts: { consult?: boolean; s
 export function cleanCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["days"]);
   const days = Number(parsed.flags.days ?? 14);
-  const cutoff = Date.now() - days * 86_400_000;
-  const removed: string[] = [];
-  withLedger((ledger) => {
-    for (const [lane, entry] of Object.entries(ledger)) {
-      if (entry.work.state !== "closed" || Date.parse(entry.updatedAt) > cutoff) continue;
-      // Anchor on "-r<digits>" plus a separator so lane "foo" never matches
-      // "foo-review-r1".
-      const escaped = lane.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`^${escaped}-r\\d+(?:\\.|-)`);
-      for (const dir of ["logs", "reports", "briefs", "specs", "control", "questions"]) {
-        for (const file of readdirSync(`${ROOT}/${dir}`)) {
-          if (pattern.test(file)) rmSync(`${ROOT}/${dir}/${file}`, { force: true, recursive: true });
-        }
-      }
-      delete ledger[lane];
-      removed.push(lane);
+  const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+  // Only archived lanes qualify, so a lane closed while its round still ran
+  // stays. Events and sessions older than the cutoff go too: every cursor
+  // that could still want them belongs to a session that stopped polling.
+  const removed = write(() => {
+    const lanes = db().query<{ name: string }, [string]>("SELECT name FROM archive WHERE updated_at <= ?").all(cutoff).map((row) => row.name);
+    for (const lane of lanes) {
+      dropLane(lane);
+      db().query("DELETE FROM events WHERE lane = ?").run(lane);
+      db().query("DELETE FROM questions WHERE lane = ?").run(lane);
     }
-    withEvents((state) => {
-      for (const lane of removed) delete state.lanes[lane];
-      const records = readEvents();
-      state.sequence = Math.max(state.sequence, records.at(-1)?.id ?? 0);
-      const keep = records.filter((record, index) => {
-        if (record.lane && removed.includes(record.lane)) return false;
-        if (index >= records.length - 2000) return true;
-        const session = state.sessions[recipientOf(record.recipient ?? record.owner, record.lane, state)];
-        return session && record.id > session.cursor;
-      });
-      const temporary = `${ROOT}/feed.log.tmp.${process.pid}`;
-      writeFileSync(temporary, keep.map((record) => JSON.stringify(record) + "\n").join(""));
-      renameSync(temporary, `${ROOT}/feed.log`);
-    });
+    db().query("DELETE FROM events WHERE at <= ?").run(cutoff);
+    db().query("DELETE FROM sessions WHERE polled_at <= ?").run(cutoff);
+    return lanes;
   });
+  for (const lane of removed) {
+    // Anchor on "-r<digits>" plus a separator so lane "foo" never matches
+    // "foo-review-r1".
+    const escaped = lane.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`^${escaped}-r\\d+(?:\\.|-)`);
+    for (const dir of ["logs", "reports", "briefs", "specs", "control"]) {
+      if (!existsSync(`${ROOT}/${dir}`)) continue;
+      for (const file of readdirSync(`${ROOT}/${dir}`)) {
+        if (pattern.test(file)) rmSync(`${ROOT}/${dir}/${file}`, { force: true, recursive: true });
+      }
+    }
+  }
   console.log(removed.length > 0 ? `cdx: pruned closed lanes older than ${days}d: ${removed.join(", ")}` : `cdx: nothing to prune (closed lanes older than ${days}d)`);
 }
 
