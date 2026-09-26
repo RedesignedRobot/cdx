@@ -254,7 +254,7 @@ export function appThreadParams(spec: Spec): Record<string, unknown> {
     model_auto_compact_token_limit: spec.model_auto_compact_token_limit ?? 150_000,
     tool_output_token_limit: spec.tool_output_token_limit ?? 6_000,
   };
-  const sandbox = codexSandbox(spec);
+  const sandbox = codexSandbox(spec, config.fullAccess === true);
   return {
     ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
     cwd: spec.cwd,

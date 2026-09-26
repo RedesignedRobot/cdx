@@ -21,6 +21,12 @@ test("codex reviews write only TMPDIR and the index; work lanes write only their
   expect(roots.some((root) => root === resolvedPath(ROOT) || root.endsWith("config.json"))).toBe(false);
 });
 
+test("fullAccess drops the work lane sandbox and keeps reviews read-only", () => {
+  expect(codexSandbox({ cwd: "/repo", lane: "w", round: 1 }, true)).toEqual({ thread: { sandbox: "danger-full-access" }, config: {},
+    turn: { sandboxPolicy: { type: "dangerFullAccess" } } });
+  expect(codexSandbox({ cwd: "/repo", reviewDir: "/repo" }, true).config).toMatchObject({ default_permissions: REVIEW_PROFILE });
+});
+
 test("a review snapshot may write the linked index and the directory SQLite resolves it to", () => {
   const base = mkdtempSync(join(tmpdir(), "cdx-index-"));
   try {

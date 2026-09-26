@@ -37,7 +37,7 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "thinkerModel", "models", "repoRouting", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
+  const allowed = new Set(["model", "thinkerModel", "models", "repoRouting", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "fullAccess", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -143,6 +143,8 @@ export function parseConfig(text: string): Config {
     }
   }
 
+  if (Object.hasOwn(input, "fullAccess") && typeof input.fullAccess !== "boolean") configError("fullAccess must be true or false");
+  const fullAccess = input.fullAccess === true;
   let worktreeSetup: string | undefined;
   if (Object.hasOwn(input, "worktreeSetup")) {
     if (typeof input.worktreeSetup !== "string" || input.worktreeSetup.trim().length === 0) {
@@ -216,7 +218,7 @@ export function parseConfig(text: string): Config {
   return {
     ...limits, visibility, expectMinutes,
     model, thinkerModel, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
-    ...(accounts ? { accounts } : {}), effortCaps, repoRouting, ...(worktreeSetup ? { worktreeSetup } : {}), gemini: gemini ?? defaults.gemini,
+    ...(accounts ? { accounts } : {}), effortCaps, repoRouting, ...(worktreeSetup ? { worktreeSetup } : {}), ...(fullAccess ? { fullAccess } : {}), gemini: gemini ?? defaults.gemini,
   };
 }
 

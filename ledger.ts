@@ -87,6 +87,9 @@ export interface Config {
   // Highest effort a Codex model may run at, by model id.
   effortCaps: Record<string, string>;
   worktreeSetup?: string;
+  // Owner ruling 2026-09-26: Codex work lanes and supervisors run with no
+  // sandbox. Reviews and consults stay read-only, since review proof needs it.
+  fullAccess?: boolean;
   gemini?: GeminiConfig;
 }
 

@@ -241,6 +241,8 @@ Every lane runs sandboxed. cdx builds the writable roots once and hands them to 
 | Gemini review | state, control and spill dirs, the round's partial report and progress log, TMPDIR and the reviewed tree's `.codegraph/` except its `.gitignore` | Gemini hooks run inside agy and write them |
 | Claude panel member | `~/.claude`, `~/.claude.json`, TMPDIR, `/tmp/claude-<uid>` | `sandbox-exec`; tools Read, Grep, Glob, Bash |
 
+`"fullAccess": true` in `config.json` runs Codex work lanes and supervisors with `danger-full-access`: no seatbelt, so they reach the GPU, Metal compilers, `ps` and `.git`. Reviews and consults keep the read-only profile, because review proof depends on it. Lane rules still forbid commits; cdx land commits.
+
 Nothing else under `~/.cdx` is writable from a lane: not `config.json`, not hooks, not the cdx source. Head-side `cdx ask` uses the read-only Gemini profile. Gates run outside the sandbox in their snapshot.
 
 Supervisors run from their own Codex home, `<account>/cdx-supervisor`, which holds `rules/cdx.rules` with one exec-policy rule, `prefix_rule(pattern = ["cdx"], decision = "allow")`. Codex runs a matching `cdx ...` call outside the sandbox, because Seatbelt does not nest and each child lane needs its own sandbox. Everything that call writes (specs, briefs, logs, reports, `usage.json`, git state for land) comes from that unsandboxed process. Codex skips the rule for commands with a redirect, `$(...)`, an env assignment or a wildcard, so supervisors call `cdx` plainly and leave git writes to cdx. A double-quoted brief with backticks, or a `'\''` splice, also misses the rule and runs sandboxed, so the supervisor rules tell it to single-quote every brief, gate and question and keep apostrophes out of them.

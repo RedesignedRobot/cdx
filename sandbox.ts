@@ -128,13 +128,14 @@ export function reviewSandboxRefusal(thread: { activePermissionProfile?: { id?: 
 // workspace requirements" when the profile is selected through the
 // thread/start or turn/start `permissions` field, so the profile comes from
 // the default_permissions config override.
-export function codexSandbox(spec: SandboxSpec) {
+export function codexSandbox(spec: SandboxSpec, fullAccess = false) {
   if (spec.reviewDir) {
     const filesystem = { ":root": "read", ":tmpdir": "write", ...Object.fromEntries(codegraphDirs(spec).map((dir) => [dir, "write"])),
       ...Object.fromEntries(indexIgnores(spec).map((path) => [path, "read"])) };
     return { thread: {}, turn: {}, config: { default_permissions: REVIEW_PROFILE,
       permissions: { [REVIEW_PROFILE]: { filesystem, network: { enabled: true } } } } };
   }
+  if (fullAccess) return { thread: { sandbox: "danger-full-access" }, config: {}, turn: { sandboxPolicy: { type: "dangerFullAccess" } } };
   // Codex adds the turn cwd as the first writable root and keeps .git read-only.
   const writableRoots = [...(spec.additionalDirectories ?? []), ...laneStateDirs(spec), ...codegraphDirs(spec)].map(resolvedPath);
   return { thread: { sandbox: "workspace-write" }, config: {}, turn: { sandboxPolicy: { type: "workspaceWrite", writableRoots,
