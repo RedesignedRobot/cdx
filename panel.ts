@@ -232,21 +232,39 @@ export function groupClaims(answers: MemberAnswer[]): PathGroup[] {
   return [...groups.values()].sort((left, right) => right.agreement - left.agreement || left.path.localeCompare(right.path));
 }
 
-export function lineCount(cwd: string, path: string): number | undefined {
+// Larger than any source file a claim should cite; bigger files are not read.
+const CITED_FILE_BYTES = 2_000_000;
+
+// A line count, or why the file was not counted.
+export type FileLines = number | "no such file" | "outside repo" | "too large";
+
+const insideRoot = (root: string, path: string) => {
+  const rel = relative(root, path);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+};
+
+// Members choose the cited paths, so cdx reads only regular files that
+// resolve, symlinks included, inside the checkout.
+export function lineCount(cwd: string, path: string): FileLines {
   const full = resolve(cwd, path);
+  if (!insideRoot(cwd, full)) return "outside repo";
   try {
-    if (!statSync(full).isFile()) return undefined;
-    const text = readFileSync(full, "utf8");
+    const real = realpathSync(full);
+    if (!insideRoot(realpathSync(cwd), real)) return "outside repo";
+    const stat = statSync(real);
+    if (!stat.isFile()) return "no such file";
+    if (stat.size > CITED_FILE_BYTES) return "too large";
+    const text = readFileSync(real, "utf8");
     return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
   } catch {
-    return undefined;
+    return "no such file";
   }
 }
 
-export function citationProblem(claim: Claim, lines: (path: string) => number | undefined): string | undefined {
+export function citationProblem(claim: Claim, lines: (path: string) => FileLines): string | undefined {
   if (!claim.path || claim.line === undefined) return undefined;
   const count = lines(claim.path);
-  if (count === undefined) return `${claim.member} ${claim.evidence} (no such file)`;
+  if (typeof count === "string") return `${claim.member} ${claim.evidence} (${count})`;
   const last = claim.endLine ?? claim.line;
   if (claim.line < 1 || last > count || last < claim.line) return `${claim.member} ${claim.evidence} (file has ${count} lines)`;
   return undefined;
@@ -265,7 +283,7 @@ const clip = (text: string, chars: number) => {
 };
 
 export function renderPanelReport(input: {
-  name: string; question: string; outcomes: MemberOutcome[]; answers: MemberAnswer[]; lines: (path: string) => number | undefined;
+  name: string; question: string; outcomes: MemberOutcome[]; answers: MemberAnswer[]; lines: (path: string) => FileLines;
 }): string {
   const members = PANEL_MEMBERS.map(({ member }) => member);
   const answered = new Map(input.answers.map((answer) => [answer.member, answer]));

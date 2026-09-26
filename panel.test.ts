@@ -1,6 +1,9 @@
 import { expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
-  citationProblem, claudeHeadroom, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  citationProblem, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
   parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
 
@@ -37,7 +40,7 @@ test("claims group by cited path into three, two and one member agreement", () =
 });
 
 test("citation checks catch missing files and lines past the end", () => {
-  const lines = (path: string) => path === "a.ts" ? 10 : undefined;
+  const lines = (path: string) => path === "a.ts" ? 10 : "no such file" as const;
   const [inside, past, missing, range, number] = answer("fable", [
     "- verified | a.ts:10 | ok", "- verified | a.ts:11 | past", "- verified | nope.ts:1 | missing", "- verified | a.ts:9-12 | range", "- verified | 42 | n",
   ]).claims;
@@ -46,6 +49,24 @@ test("citation checks catch missing files and lines past the end", () => {
   expect(citationProblem(missing!, lines)).toBe("fable nope.ts:1 (no such file)");
   expect(citationProblem(range!, lines)).toBe("fable a.ts:9-12 (file has 10 lines)");
   expect(citationProblem(number!, lines)).toBeUndefined();
+});
+
+test("line counts read only regular files inside the checkout", () => {
+  const base = mkdtempSync(join(tmpdir(), "panel-lines-"));
+  const repo = join(base, "repo");
+  mkdirSync(join(repo, "src"), { recursive: true });
+  writeFileSync(join(repo, "src", "a.ts"), "one\ntwo\n");
+  writeFileSync(join(base, "secret.txt"), "outside\n");
+  symlinkSync(join(base, "secret.txt"), join(repo, "link.txt"));
+  writeFileSync(join(repo, "big.bin"), Buffer.alloc(2_000_001));
+  expect(lineCount(repo, "src/a.ts")).toBe(2);
+  expect(lineCount(repo, "../secret.txt")).toBe("outside repo");
+  expect(lineCount(repo, join(base, "secret.txt"))).toBe("outside repo");
+  expect(lineCount(repo, "link.txt")).toBe("outside repo");
+  expect(lineCount(repo, "big.bin")).toBe("too large");
+  expect(lineCount(repo, "src")).toBe("no such file");
+  expect(lineCount(repo, "gone.ts")).toBe("no such file");
+  rmSync(base, { recursive: true, force: true });
 });
 
 test("the merged report stays under 60 lines with many paths and flags bad citations", () => {
@@ -70,7 +91,7 @@ test("the merged report stays under 60 lines with many paths and flags bad citat
 test("a missing member leaves the report and the completion line incomplete", () => {
   const answers = [answer("astra", []), answer("fable", [])];
   const report = renderPanelReport({
-    name: "p2", question: "q", answers, lines: () => undefined,
+    name: "p2", question: "q", answers, lines: () => "no such file",
     outcomes: [{ member: "astra", state: "done" }, { member: "sol", state: "failed", note: "max runtime" }, { member: "fable", state: "done" }],
   });
   expect(report).toContain("Coverage: 2/3");
