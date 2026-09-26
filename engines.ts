@@ -7,14 +7,14 @@ import { type GeminiUsageSnapshot, refreshGeminiUsage, writeGeminiQuota } from "
 import { feedEvent, type Lane, readLedger, type Spec, type Tokens, withLedger } from "./ledger.ts";
 import { logPathOf, logProgress, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
 import { HOME, ROOT, singleLine } from "./runtime.ts";
-import { codexSandbox } from "./sandbox.ts";
+import { codegraphRoot, codexSandbox } from "./sandbox.ts";
 import { isFiniteCount, parseQuotaResetDelayMs } from "./usage-store.ts";
 import { roundProgress, toolObservation, type VisibilityConfig } from "./visibility.ts";
 import { createHash } from "node:crypto";
 import {
   closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync,
 } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 
 const GEMINI_TRANSPORT_RETRIES = 1;
 
@@ -530,16 +530,6 @@ function canonicalHash(value: unknown): string {
 
 // Engine events remain the source for arguments and output. Only derived measurements
 // go into cdx_tool, once per completed identity, beside those original events.
-export function codegraphRoot(cwd: string, exists: (path: string) => boolean = existsSync): string | undefined {
-  let path = resolve(cwd);
-  for (;;) {
-    if (exists(`${path}/.codegraph`)) return path;
-    // A nested checkout must not borrow its parent's index.
-    if (exists(`${path}/.git`) || dirname(path) === path) return;
-    path = dirname(path);
-  }
-}
-
 export function roundTools(cwd: string, limits: VisibilityConfig, fileHash: (path: string) => string | null, gate?: string, indexedRoot = codegraphRoot) {
   const progress = roundProgress(cwd, limits, gate, indexedRoot);
   const reads = new Map<string, number>();

@@ -1,7 +1,11 @@
 import { expect, test } from "bun:test";
 import { capNotice, CAP_BYTES, cappedCommand, codexPreTool, geminiOverwrite, invokesCdx, utf8Boundary } from "./cap.ts";
-import { codexSandbox, geminiProfile, resolvedPath, spillDirOf } from "./sandbox.ts";
+import { codexSandbox, geminiProfile, laneCodegraphRoot, resolvedPath, spillDirOf } from "./sandbox.ts";
+import { houseRules, laneInstructions } from "./prompts.ts";
 import { ROOT } from "./runtime.ts";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const env = { CDX_LANE: "w", CDX_ROUND: "2", CDX_HOME: "/state" };
 
@@ -27,6 +31,29 @@ test("the agy profile denies writes except the engine, lane state, and a work ch
   expect(work).toContain('(subpath "/private/tmp")');
   const ask = geminiProfile({ cwd: "/repo", reviewDir: "/repo" });
   expect(ask).not.toContain(resolvedPath(`${ROOT}/state`));
+});
+
+test("a worktree lane queries its primary checkout's index, which it may write", () => {
+  const base = mkdtempSync(join(tmpdir(), "cdx-index-"));
+  try {
+    const primary = join(base, "repo"), lane = join(base, "wt", "lane");
+    mkdirSync(join(primary, ".git"), { recursive: true });
+    mkdirSync(join(primary, ".codegraph"));
+    writeFileSync(join(primary, ".codegraph", "codegraph.db"), "");
+    mkdirSync(lane, { recursive: true });
+    writeFileSync(join(lane, ".git"), `gitdir: ${primary}/.git/worktrees/lane\n`);
+    const index = resolvedPath(join(primary, ".codegraph"));
+    expect((codexSandbox({ cwd: lane, lane: "w", round: 1 }).policy as { writableRoots: string[] }).writableRoots).toContain(index);
+    expect(geminiProfile({ cwd: lane, reviewDir: lane })).toContain(`(subpath ${JSON.stringify(index)})`);
+    expect(houseRules(lane, false, "gpt")).toContain(`codegraph explore -p ${primary} "<question>"`);
+    expect(houseRules(lane, true, "gpt")).not.toContain("codegraph");
+    expect(laneCodegraphRoot({ cwd: lane, reviewDir: lane, engine: "gpt" })(lane)).toBeUndefined();
+    expect(laneCodegraphRoot({ cwd: lane, reviewDir: lane, engine: "gemini" })(lane)).toBe(primary);
+  } finally { rmSync(base, { recursive: true, force: true }); }
+});
+
+test("supervisor cdx calls are single-quoted so the exec-policy rule matches", () => {
+  expect(laneInstructions({ supervisor: true })).toContain("cdx spawn <child> --bg --gate '<cmd>' '<brief with the four headings>'");
 });
 
 test("the cap wraps lane shell commands except cdx calls", () => {

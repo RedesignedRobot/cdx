@@ -1,14 +1,20 @@
 import { expect, test } from "bun:test";
-import { codegraphRoot, roundTools } from "./engines.ts";
+import { roundTools } from "./engines.ts";
+import { codegraphRoot } from "./sandbox.ts";
 import { laneProgress } from "./status.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import type { Lane } from "./ledger.ts";
 
-test("index lookup ascends subdirectories but never crosses a nested checkout", () => {
-  const paths = new Set(["/repo/.codegraph", "/repo/nested/.git"]);
-  expect(codegraphRoot("/repo/src/ui", (path) => paths.has(path))).toBe("/repo");
-  expect(codegraphRoot("/repo/nested/src", (path) => paths.has(path))).toBeUndefined();
-  expect(codegraphRoot("/outside", (path) => paths.has(path))).toBeUndefined();
+test("index lookup stops at the checkout, and a linked worktree borrows its primary's index", () => {
+  const paths = new Set(["/repo/.codegraph/codegraph.db", "/repo/.git", "/repo/nested/.git", "/code/.codegraph/codegraph.db",
+    "/code/wt/lane/.git", "/code/wt/lane/.codegraph", "/code/wt/own/.git", "/code/wt/own/.codegraph/codegraph.db"]);
+  const exists = (path: string) => paths.has(path);
+  const gitFile = (path: string) => path.startsWith("/code/wt/") ? `gitdir: /repo/.git/worktrees/${path.split("/")[3]}\n` : undefined;
+  expect(codegraphRoot("/repo/src/ui", exists, gitFile)).toBe("/repo");
+  expect(codegraphRoot("/repo/nested/src", exists, gitFile)).toBeUndefined();
+  expect(codegraphRoot("/code/wt/lane/src", exists, gitFile)).toBe("/repo");
+  expect(codegraphRoot("/code/wt/own/src", exists, gitFile)).toBe("/code/wt/own");
+  expect(codegraphRoot("/outside", exists, gitFile)).toBeUndefined();
 });
 
 test("structured round accounting reaches the status counters", () => {
