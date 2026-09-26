@@ -67,6 +67,7 @@ A verification brief also names the candidate, the item IDs under test, a succes
 
 - A supervisor spawns Sol children, or Gemini for read-only helpers. Each writer child gets its own worktree off the supervisor's branch, and the supervisor merges green children into its own branch with `cdx land <child>`. You land the supervisor lane.
 - Supervisors call `cdx` plainly: no pipe, redirect, env prefix, `$(...)` or wildcard, and every brief, gate and question in single quotes with no apostrophes, because only a plain `cdx` call runs outside their sandbox. They never run git writes; cdx does. Do not brief a supervisor to do otherwise.
+- A supervisor reviews child trees with git and file reads, because its sandbox cannot open a child's codegraph index.
 - Child events go to the supervisor, never to you. `mcp__cdx__kill` on a supervisor stops its tree.
 
 ## Panel
