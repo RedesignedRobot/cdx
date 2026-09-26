@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Gate
+
+- A worktree lane whose checkout equals its base no longer runs its gate. The base is the merge base of the lane's HEAD with its base branch, the same point `cdx land` diffs against, and the checkout is compared with untracked files included. On 2026-09-26 and 27 two lanes ended DEAD (prototype written, measured, reverted) and each ran the 20 to 45 minute `.cdx-gate` GPU suite on a tree identical to base, holding the shared GPU lease while other lanes queued. The round now finishes with the note `no diff against base, gate skipped`, a `## Gate` section saying so in the report, and `gateExit=not-run` on the terminal line. Land still merges nothing. It refuses a lane whose HEAD moved, since there is no receipt, and closes a lane whose HEAD is still in the base as already merged. A lane with committed or uncommitted work against the base still gates, and so does a supervisor whose children merged into its branch. Lanes without a managed worktree record no base and gate as before.
+
 ### Codegraph hook
 
 - `hooks/codegraph-nudge.sh` no longer denies the first semantic source search of each turn in an indexed repo. That denial forced one `codegraph explore` per turn, about 6.6k tokens each in the `~/code` index. The hook now lets the search run and adds a note of under 50 words, once per session, keyed by the session id. The classifier is unchanged, so literal sweeps, log and non-code searches and file listings stay silent. The transcript turn parsing that served the per-turn denial is deleted.

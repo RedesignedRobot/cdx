@@ -23,7 +23,7 @@ import {
 } from "./engines.ts";
 import {
   captureGateTree, captureReviewTree, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
-  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot,
+  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot, laneMatchesBase, NO_BASE_DIFF_NOTE,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import { runWorktreeSetup } from "./worktrees.ts";
@@ -564,8 +564,17 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   };
   let gateAttempt = 0;
   let preparedGate: ReturnType<typeof verifyGate> | undefined;
+  let gateSkipped = false;
   const runAcceptedGate = async (repair: (prompt: string) => Promise<boolean>) => {
     if (!spec.gate || startingLane?.kind !== "work" || turnFailureReason || receivedSignal || maxRuntimeHit || !existsSync(reportPath)) return;
+    // A lane that ends where it forked (a DEAD verdict reverts its prototype)
+    // has nothing to land; its gate held a shared GPU lease for 20-45 minutes
+    // to prove the base again.
+    if (laneMatchesBase(spec.cwd, startingLane)) {
+      gateSkipped = true;
+      logProgress(lane, round, NO_BASE_DIFF_NOTE);
+      return;
+    }
     const run = () => {
       gatePaths();
       const gateItem = { id: `cdx-gate-${++gateAttempt}`, type: "commandExecution", command: spec.gate };
@@ -1225,12 +1234,13 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   process.off("SIGINT", onInt);
 
   flushLedger();
-  return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
+  return finalizeRound({ treeCwd, preparedGate, gateSkipped, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
-export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+export async function finalizeRound({ treeCwd, preparedGate, gateSkipped = false, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, indexIgnoreStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
   treeCwd: string;
   preparedGate?: ReturnType<typeof verifyGate>;
+  gateSkipped?: boolean;
   spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
   logPath: string; reportPath: string;
   reviewTreeStart?: string; indexIgnoreStart?: string;
@@ -1272,7 +1282,8 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
   // An unchanged tree is evidence for the report, never a verdict: a
   // verification-only round or a supervisor whose children worked in their
   // own worktrees changes nothing here and can still be correct. The gate
-  // decides; the head reads diff=empty on the feed line.
+  // decides; the head reads diff=empty on the feed line. Only a checkout
+  // equal to the lane's base skips the gate (gateSkipped).
   const unchangedWork = Boolean(workTreeUnchanged && beforeFinalize?.kind === "work" && exitCode === 0 && reportOk && !turnFailureReason);
 
   const capturedSessionId = beforeFinalize?.sessionId;
@@ -1313,6 +1324,9 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
     setStage("reporting");
     feedEvent("gate-finished", `[cdx] lane=${lane} round=${round} gate finished exit=${gateExit} receipt=${gateReceipt.valid ? "valid" : "invalid"} log=${ROOT}/logs/${lane}-r${round}.gate.log`, spec.ownerSession, { lane, round });
     writeFileSync(reportPath, safeText(`${readFileSync(reportPath, "utf8").trimEnd()}\n\n## Gate\n\n\`${spec.gate}\` exited ${gateExit}\n\n\`\`\`\n${gateOutputForReport(gate.output, gateExit)}\n\`\`\`\n`));
+  }
+  if (gateSkipped && existsSync(reportPath)) {
+    appendFileSync(reportPath, `\n\n## Gate\n\nSkipped: ${NO_BASE_DIFF_NOTE}. The checkout equals the lane's base, so \`${spec.gate}\` did not run and there is nothing to land.\n`);
   }
   if (unchangedWork && existsSync(reportPath)) {
     appendFileSync(reportPath, "\n\n## Harness note\n\nThis round changed no files.\n");
@@ -1373,6 +1387,7 @@ export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, 
       }
     }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
+    else if (exitCode === 0 && gateSkipped) roundNote = NO_BASE_DIFF_NOTE;
     else if (roundCleanupWarning) roundNote = `cleanup warning: ${roundCleanupWarning.slice(0, 200)}`;
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.

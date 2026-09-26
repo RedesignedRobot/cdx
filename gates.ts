@@ -145,6 +145,25 @@ export function captureGateTree(cwd: string, _paths?: string[]): GateTree | unde
   }
 }
 
+export const NO_BASE_DIFF_NOTE = "no diff against base, gate skipped";
+
+// True when a worktree lane's whole checkout, untracked files included, has
+// the tree of its merge base with the base branch: the base land diffs
+// against, so there is nothing to land and a gate would only retest the
+// base. Lanes without a managed worktree record no base and always gate.
+export function laneMatchesBase(cwd: string, entry: Pick<Lane, "worktreePath" | "branch" | "baseBranch"> | undefined): boolean {
+  if (!entry?.worktreePath || !entry.branch) return false;
+  const git = (...args: string[]) => {
+    const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
+    return result.success ? result.stdout.toString().trim() : undefined;
+  };
+  const base = git("merge-base", "HEAD", `refs/heads/${entry.baseBranch ?? "main"}`);
+  const baseTree = base && git("rev-parse", `${base}^{tree}`);
+  if (!baseTree) return false;
+  try { return captureGateTree(cwd)?.tree === baseTree; }
+  catch { return false; }
+}
+
 export function gateReceiptCommand(argv: string[]): void {
   const parsed = parseArgs(argv, ["json"]);
   const [lane, extra] = parsed.rest;

@@ -409,3 +409,115 @@ test("worktree setup runs the configured command, then an executable repo script
     expect(failed.tail).toBe("$ echo first\nfirst\n$ echo broken >&2; exit 3\nbroken");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+import { laneMatchesBase, NO_BASE_DIFF_NOTE } from "./gates.ts";
+import { finalizeRound } from "./runner.ts";
+import { reportPathOf } from "./reports.ts";
+import { readFileSync, unlinkSync } from "node:fs";
+import type { Spec } from "./ledger.ts";
+
+// A repository with main and a lane worktree cut from it, as cdx spawn --worktree makes.
+const laneRepo = () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-base-"));
+  const repo = join(dir, "repo");
+  const git = (cwd: string, ...args: string[]) => {
+    const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, "-c", "user.name=cdx", "-c", "user.email=cdx@test", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", ...args] });
+    if (!result.success) throw new Error(`git ${args.join(" ")}: ${result.stderr.toString()}`);
+    return result.stdout.toString().trim();
+  };
+  mkdirSync(repo);
+  git(repo, "init", "--quiet", "--initial-branch=main");
+  writeFileSync(join(repo, "kernel.ts"), "base\n");
+  writeFileSync(join(repo, ".gitignore"), "build/\n");
+  git(repo, "add", "--all");
+  git(repo, "commit", "--quiet", "-m", "base");
+  const worktree = (name: string, from = "main") => {
+    const path = join(dir, name);
+    git(repo, "worktree", "add", "--quiet", path, "-b", `lane/${name}`, from);
+    return { path, entry: { worktreePath: path, branch: `lane/${name}`, baseBranch: "main" } };
+  };
+  return { dir, repo, git, worktree };
+};
+
+test("a lane whose checkout equals its base skips the gate, even after edit-then-revert", () => {
+  const { dir, repo, git, worktree } = laneRepo();
+  try {
+    const { path, entry } = worktree("dead");
+    expect(laneMatchesBase(path, entry)).toBe(true);
+    writeFileSync(join(path, "kernel.ts"), "prototype\n");
+    expect(laneMatchesBase(path, entry)).toBe(false);
+    git(path, "checkout", "--", "kernel.ts");
+    writeFileSync(join(path, "probe.ts"), "measure\n");
+    expect(laneMatchesBase(path, entry)).toBe(false);
+    unlinkSync(join(path, "probe.ts"));
+    mkdirSync(join(path, "build"));
+    writeFileSync(join(path, "build", "out.bin"), "ignored\n");
+    expect(laneMatchesBase(path, entry)).toBe(true);
+    writeFileSync(join(repo, "other.ts"), "base moved on\n");
+    git(repo, "add", "--all");
+    git(repo, "commit", "--quiet", "-m", "base moves");
+    expect(laneMatchesBase(path, entry)).toBe(true);
+    writeFileSync(join(path, "kernel.ts"), "prototype\n");
+    git(path, "commit", "--quiet", "-am", "prototype");
+    expect(laneMatchesBase(path, entry)).toBe(false);
+    git(path, "revert", "--quiet", "--no-edit", "HEAD");
+    expect(laneMatchesBase(path, entry)).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a lane with work against its base, a supervisor with merged children, and a lane with no worktree still gate", () => {
+  const { dir, repo, git, worktree } = laneRepo();
+  try {
+    const { path, entry } = worktree("verify");
+    writeFileSync(join(path, "kernel.ts"), "fast\n");
+    git(path, "commit", "--quiet", "-am", "fast kernel");
+    expect(laneMatchesBase(path, entry)).toBe(false);
+    const supervisor = worktree("sup");
+    const child = worktree("child", "lane/sup");
+    writeFileSync(join(child.path, "child.ts"), "child work\n");
+    git(child.path, "add", "--all");
+    git(child.path, "commit", "--quiet", "-m", "child work");
+    expect(laneMatchesBase(supervisor.path, supervisor.entry)).toBe(true);
+    git(supervisor.path, "merge", "--quiet", "--no-ff", "--no-edit", "lane/child");
+    expect(laneMatchesBase(supervisor.path, supervisor.entry)).toBe(false);
+    expect(laneMatchesBase(repo, {})).toBe(false);
+    expect(laneMatchesBase(repo, undefined)).toBe(false);
+    const clean = worktree("clean");
+    expect(laneMatchesBase(clean.path, { ...clean.entry, baseBranch: "missing" })).toBe(false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a skipped gate finalizes with a no-diff verdict in state, report and feed, and land refuses the lane", async () => {
+  const { dir, git, worktree } = laneRepo();
+  const lane = "dead-verdict";
+  const { path, entry } = worktree(lane);
+  const gate = "bun run check";
+  try {
+    writeFileSync(join(path, "kernel.ts"), "prototype\n");
+    git(path, "commit", "--quiet", "-am", "prototype");
+    git(path, "revert", "--quiet", "--no-edit", "HEAD");
+    const at = new Date().toISOString();
+    storeLane(lane, { engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [], gate, ...entry, worktreeRepo: join(dir, "repo"),
+      work: { state: "running", cwd: path, round: 1, updatedAt: at }, createdAt: at, updatedAt: at } as unknown as Lane);
+    const reportPath = reportPathOf(lane, 1);
+    mkdirSync(join(reportPath, ".."), { recursive: true });
+    writeFileSync(reportPath, "DEAD: the prototype measured slower; reverted.\n");
+    const log = console.log;
+    console.log = () => {};
+    let code: number;
+    try {
+      code = await finalizeRound({ treeCwd: path, gateSkipped: true, lane, round: 1, jsonMode: true, gemini: false,
+        spec: { engine: "gpt", cwd: path, gate, effort: "medium" } as Spec, logPath: join(dir, "round.log"), reportPath,
+        exitCode: 0, maxRuntimeHit: false, geminiContinuations: 0 });
+    } finally { console.log = log; }
+    expect(code).toBe(0);
+    const finished = readLane(lane);
+    expect(finished.work).toMatchObject({ state: "done", note: NO_BASE_DIFF_NOTE });
+    expect(finished.gateReceipt).toBeUndefined();
+    expect(readFileSync(reportPath, "utf8")).toContain(`## Gate\n\nSkipped: ${NO_BASE_DIFF_NOTE}.`);
+    const terminal = recentEvents(5).find((event) => event.kind === "terminal" && event.lane === lane)!;
+    expect(terminal.message).toContain(`note=${NO_BASE_DIFF_NOTE}`);
+    expect(terminal.message).toContain("gateExit=not-run");
+    expect(landRefusal(finished)).toBe("no content-bound gate receipt; run a new work round");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
