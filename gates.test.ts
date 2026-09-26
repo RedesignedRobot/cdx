@@ -164,7 +164,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
 });
 
 import { attestReview, reviewAttests, reviewRefusal } from "./gates.ts";
-import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
+import { childWorktreeTarget, firstRedPrefix, landLockHolder, landRefusal, overlappingPaths, primaryHasCopy, receiptProves, staleWorktreeAction, statusPaths, takeLandLock } from "./worktrees.ts";
 import { reusedLaneProof } from "./rounds.ts";
 import { reviewFollowUp } from "./lane-commands.ts";
 import { laneInstructions, resumeRefusal } from "./prompts.ts";
@@ -229,6 +229,23 @@ test("doctor removes merged worktrees and keeps unmerged branches of abandoned l
   expect(staleWorktreeAction({ ...old, merged: false, closed: false }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, running: true }, 7)).toBeUndefined();
   expect(staleWorktreeAction({ ...old, ageDays: 2 }, 7)).toBeUndefined();
+});
+
+test("doctor keeps a stale worktree whose ignored files have no copy in the primary checkout", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-stale-"));
+  const [lane, primary] = [join(dir, "lane"), join(dir, "primary")];
+  try {
+    for (const root of [lane, primary]) mkdirSync(join(root, "node_modules"), { recursive: true });
+    mkdirSync(join(lane, "dist"));
+    writeFileSync(join(lane, ".env"), "TOKEN=lane\n");
+    writeFileSync(join(primary, ".env"), "TOKEN=primary\n");
+    writeFileSync(join(lane, "same.env"), "A=1\n");
+    writeFileSync(join(primary, "same.env"), "A=1\n");
+    expect(primaryHasCopy(lane, primary, "node_modules/")).toBe(true);
+    expect(primaryHasCopy(lane, primary, "dist/")).toBe(false);
+    expect(primaryHasCopy(lane, primary, ".env")).toBe(false);
+    expect(primaryHasCopy(lane, primary, "same.env")).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a migrated 9.x lane with an open review cannot land until a review attests its tree", () => {

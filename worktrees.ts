@@ -388,18 +388,19 @@ export function takeLandLock(lock: string, alive: (pid: number) => boolean = pid
   });
 }
 
-export interface StaleWorktree { repo: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }
+export interface StaleWorktree { repo: string; primary: string; path: string; branch: string; action: "remove" | "remove-worktree"; ageDays: number }
 
-// Merged worktrees go with their branch. A closed or unrecorded lane keeps an
-// unmerged branch so committed work survives; git itself refuses dirty trees.
+// Merged worktrees go with their branch. A closed lane keeps an unmerged
+// branch so committed work survives. A lane cdx has no record of, active or
+// archived, is not cdx's to judge unless its branch is merged.
 export function staleWorktreeAction(item: { running: boolean; closed: boolean; merged: boolean; ageDays: number }, days: number): StaleWorktree["action"] | undefined {
   if (item.running || item.ageDays < days) return;
   if (item.merged) return "remove";
   if (item.closed) return "remove-worktree";
 }
 
-// Closed lanes leave the ledger, so the caller passes their repositories too;
-// a worktree whose lane is gone counts as closed.
+// Closed lanes leave the active table, so the caller passes their
+// repositories too; the ledger proxy finds their records in the archive.
 export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: string[] = [], now = Date.now()): StaleWorktree[] {
   const repos = new Map<string, string>();
   const candidates = new Set([...Object.values(ledger).map((entry) => entry.worktreeRepo), ...archivedRepos]);
@@ -411,6 +412,7 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
   const stale: StaleWorktree[] = [];
   for (const repo of repos.values()) {
     const blocks = git(repo, "worktree", "list", "--porcelain").split("\n\n");
+    const primary = blocks[0]!.match(/^worktree (.+)$/m)![1]!;
     const primaryRef = blocks[0]?.match(/^branch (.+)$/m)?.[1];
     for (const block of blocks.slice(1)) {
       const path = block.match(/^worktree (.+)$/m)?.[1];
@@ -422,16 +424,31 @@ export function staleWorktrees(ledger: Ledger, days: number, archivedRepos: stri
       const committed = Number(Bun.spawnSync({ cmd: ["git", "-C", repo, "log", "-1", "--format=%ct", ref] }).stdout.toString().trim()) * 1000;
       const ageDays = (now - Math.max(committed || 0, entry ? Date.parse(entry.updatedAt) : 0)) / 86_400_000;
       const action = staleWorktreeAction({
-        running: Boolean(entry && laneRunning(entry)), closed: !entry || entry.work.state === "closed",
+        running: Boolean(entry && laneRunning(entry)), closed: entry?.work.state === "closed",
         merged: bases.some((base) => gitOk(repo, "merge-base", "--is-ancestor", ref, base)), ageDays,
       }, days);
-      if (action) stale.push({ repo, path, branch, action, ageDays });
+      if (action) stale.push({ repo, primary, path, branch, action, ageDays });
     }
   }
   return stale;
 }
 
+// git worktree remove refuses untracked and modified files but deletes
+// ignored ones. An ignored directory the primary checkout also has is an
+// install or build output; an ignored file survives only as an identical copy
+// there. Anything else (a .env written in the lane) keeps the worktree.
+export function primaryHasCopy(worktree: string, primary: string, entry: string): boolean {
+  const mine = join(worktree, entry), theirs = join(primary, entry);
+  try {
+    if (entry.endsWith("/")) return statSync(theirs).isDirectory();
+    return readFileSync(mine).equals(readFileSync(theirs));
+  } catch { return false; }
+}
+
 export function removeStaleWorktree(item: StaleWorktree): string {
+  const ignored = gitRaw(item.path, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").split("\0").filter(Boolean);
+  const lost = ignored.filter((entry) => !primaryHasCopy(item.path, item.primary, entry));
+  if (lost.length) throw new CmdError(`kept ${displayPath(item.path)}: removal would delete ignored files with no copy in ${displayPath(item.primary)}: ${lost.slice(0, 5).join(", ")}${lost.length > 5 ? ", ..." : ""}`);
   const remove = Bun.spawnSync({ cmd: ["git", "-C", item.repo, "worktree", "remove", item.path] });
   if (!remove.success) throw new CmdError(`kept ${displayPath(item.path)}: ${remove.stderr.toString().trim().split("\n").at(-1)}`);
   if (item.action === "remove-worktree") return `removed ${displayPath(item.path)}; kept unmerged branch ${item.branch}`;
