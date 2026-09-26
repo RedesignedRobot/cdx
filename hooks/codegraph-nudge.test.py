@@ -23,18 +23,6 @@ def load(path):
 hook = load(SOURCE)
 
 
-def user(text, uuid="turn"):
-    return {"uuid": uuid, "message": {"role": "user", "content": [{"type": "text", "text": text}]}}
-
-
-def call(name, args, cwd=None):
-    return {"cwd": cwd, "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "call", "name": name, "input": args}]}}
-
-
-def result(error=False):
-    return {"message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call", "is_error": error}]}}
-
-
 class HookRules(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -113,64 +101,40 @@ class HookRules(unittest.TestCase):
         for command in commands:
             with self.subTest(command=command):
                 self.assertFalse(hook.command_search(command, repo))
-                self.assertEqual(hook.decision({"cwd": repo, "tool_input": {"command": command}},
-                                               [user("Find handler")]), (False, None))
-
-    def test_completed_explore_matches_exact_tool_and_root(self):
-        valid = [("mcp__codegraph__codegraph_explore", {"query": "handler"}), ("mcp__codegraph__codegraph_explore", {"projectPath": str(self.repo)}), ("Bash", {"command": f"cd {self.repo} && codegraph explore handler"}),
-                 ("Bash", {"command": f"cd {self.repo} && {hook.EXPLORE} 'where is handler'"})]
-        invalid = [("mcp__other__codegraph_explore", {"projectPath": str(self.repo)}), ("mcp__codegraph__codegraph_explore", {"projectPath": str(self.other)}), ("Bash", {"command": f"cd {self.other} && codegraph explore handler"}), ("Bash", {"command": "echo codegraph explore"})]
-        for name, args in valid + invalid:
-            records = [user("Find handler"), call(name, args, str(self.repo)), result()]
-            with self.subTest(name=name, args=args):
-                self.assertEqual(hook.completed_explore(records, str(self.repo), self.repo.resolve()), ("turn", (name, args) in valid))
-                self.assertEqual(hook.completed_explore(records[:-1], str(self.repo), self.repo.resolve()), ("turn", False))
-                # A failed or timed-out explore counts: the text search is the fallback.
-                self.assertEqual(hook.completed_explore(records[:-1] + [result(True)], str(self.repo), self.repo.resolve()), ("turn", (name, args) in valid))
-        self.assertEqual(hook.completed_explore([user("Find"), call(*valid[0], cwd=str(self.repo)), result(), user("Next", "next")], str(self.repo), self.repo.resolve()), ("next", False))
-        self.assertEqual(hook.completed_explore([user("Find"), call("mcp__codegraph__codegraph_explore", {"query": "handler"}, str(self.other)), result()], str(self.repo), self.repo.resolve()), ("turn", False))
+                self.assertFalse(hook.should_nudge({"cwd": repo, "tool_input": {"command": command}}))
 
     def test_deadline_wrapper_and_missing_binary(self):
         repo = str(self.repo)
         self.assertFalse(hook.command_search(f"{hook.EXPLORE} handler && rg handleRequest src", repo))
         self.assertTrue(hook.command_search(f"rg handleRequest src && {hook.EXPLORE} handler", repo))
         payload = {"cwd": repo, "tool_input": {"command": "rg handleRequest src"}}
-        self.assertEqual(hook.decision(payload, [user("Find handler")]), (True, "turn"))
+        self.assertTrue(hook.should_nudge(payload))
         with patch.object(hook.shutil, "which", return_value=None):
-            self.assertEqual(hook.decision(payload, [user("Find handler")]), (False, None))
+            self.assertFalse(hook.should_nudge(payload))
 
-    def test_bounded_transcript_fails_open_without_turn(self):
-        path = self.base / "history.jsonl"
-        path.write_text(json.dumps(user("old")) + "\n" + (json.dumps(result()) + "\n") * 10000)
-        records = hook.read_transcript(path)
-        self.assertLess(len(records), 10000)
-        payload = {"cwd": str(self.repo), "tool_input": {"command": "rg handleRequest src"}}
-        self.assertEqual(hook.decision(payload, records), (False, None))
+    def test_missing_directories_stay_silent(self):
         for cwd, command in ((str(self.base / "missing"), "rg handleRequest src"),
                              (str(self.repo), "cd missing && rg handleRequest src")):
             with self.subTest(cwd=cwd, command=command):
                 self.assertIsNone(hook.search_root_for(command, cwd))
-                self.assertEqual(hook.decision({"cwd": cwd, "tool_input": {"command": command}}, [user("Find handler")]), (False, None))
-        missing_uuid = user("Find handler")
-        del missing_uuid["uuid"]
-        self.assertEqual(hook.decision(payload, [missing_uuid]), (False, None))
-        self.assertEqual(hook.decision(payload, [result(), missing_uuid]), (False, None))
-        mixed_result = {"message": {"role": "user", "content": result()["message"]["content"] + [{"type": "text", "text": "tool output"}]}}
-        self.assertEqual(hook.decision(payload, [user("Find handler"), mixed_result]), (True, "turn"))
+                self.assertFalse(hook.should_nudge({"cwd": cwd, "tool_input": {"command": command}}))
 
-    def test_main_denies_once_per_turn_with_mocked_io(self):
-        path = self.base / "history.jsonl"
-        path.write_text(json.dumps(user("Find handler")) + "\n")
-        payload = {"cwd": str(self.repo), "tool_input": {"command": "rg handleRequest src"}, "transcript_path": str(path), "session_id": "session"}
-        def run():
+    def test_main_nudges_once_per_session_without_blocking(self):
+        def run(command, session="session"):
+            payload = {"cwd": str(self.repo), "tool_input": {"command": command}, "session_id": session}
             output = io.StringIO()
             with patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), patch.object(sys, "stdout", output), patch.object(hook.tempfile, "gettempdir", return_value=str(self.base)):
                 hook.main()
             return output.getvalue()
-        self.assertEqual(json.loads(run())["hookSpecificOutput"]["permissionDecision"], "deny")
-        self.assertEqual(run(), "")
-        path.write_text(path.read_text() + json.dumps(user("Next", "next")) + "\n")
-        self.assertEqual(json.loads(run())["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertEqual(run("rg -F handleRequest src"), "")
+        nudge = json.loads(run("rg handleRequest src"))["hookSpecificOutput"]
+        self.assertEqual(nudge, {"hookEventName": "PreToolUse", "additionalContext": hook.NUDGE})
+        self.assertIn(hook.EXPLORE, hook.NUDGE)
+        self.assertLess(len(hook.NUDGE.split()), 50)
+        self.assertEqual(run("rg handleRequest src"), "")
+        self.assertEqual(run("rg parseConfig src"), "")
+        self.assertIn("additionalContext", run("rg handleRequest src", "other"))
+        self.assertEqual(run("rg handleRequest src", ""), "")
 
 if __name__ == "__main__":
     unittest.main()

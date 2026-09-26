@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Conservative Codegraph-first PreToolUse hook for Bash searches.
+"""Codegraph-first PreToolUse hook for Bash searches.
 
-Blocks one semantic source search per turn in an indexed repo. Never blocks when
-codegraph is not installed, the repo is unindexed, or an explore already ran this
-turn, including one that failed or hit its 60 s deadline."""
+Adds one short nudge per session to the first semantic source search in an
+indexed repo. It never blocks. It stays silent when codegraph is not installed,
+the repo is unindexed, or the same command explores before it searches."""
 
 import hashlib
 import json
@@ -26,6 +26,9 @@ FILTER_OPTIONS = {"-g", "--glob", "-t", "--type", "--include"}
 # cdx runs codegraph as `perl -e 'alarm 60; exec @ARGV' codegraph explore ...`.
 DEADLINE = re.compile(r"""\bperl -e (['"])alarm \d+; ?exec @ARGV\1 """)
 EXPLORE = "perl -e 'alarm 60; exec @ARGV' codegraph explore"
+NUDGE = (f"This repo has a Codegraph index. For code questions, `{EXPLORE} '<question>'` "
+         "returns the source and call paths in one call. This search may proceed, as may "
+         "literal sweeps, log or non-code searches and file listings.")
 
 
 def obscured_shell_syntax(command):
@@ -192,102 +195,9 @@ def semantic_search(args, directory=None, root=None):
     return False
 
 
-def actual_user(content):
-    if isinstance(content, str):
-        return bool(content.strip())
-    return (isinstance(content, list)
-            and not any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
-            and any(isinstance(block, dict) and block.get("type") == "text" and str(block.get("text", "")).strip() for block in content))
-
-
-def completed_explore(records, cwd, search_root):
-    """Return (last real turn marker, explore finished in that turn, failed or not)."""
-    turn = None
-    after = []
-    for record in records:
-        message = record.get("message", {})
-        if not isinstance(message, dict):
-            continue
-        role = message.get("role", record.get("type"))
-        if role == "user" and actual_user(message.get("content")):
-            uuid = record.get("uuid")
-            if not isinstance(uuid, str) or not uuid.strip():
-                return None, False
-            turn = uuid
-            after = []
-        elif turn is not None:
-            after.append((role, message.get("content"), record.get("cwd")))
-    if turn is None:
-        return None, False
-    calls = {}
-    for role, content, record_cwd in after:
-        if not isinstance(content, list):
-            continue
-        for block in content:
-            if not isinstance(block, dict):
-                continue
-            if role == "assistant" and block.get("type") == "tool_use":
-                name = block.get("name", "")
-                tool_input = block.get("input", {})
-                if not isinstance(tool_input, dict):
-                    continue
-                base = tool_input.get("cwd", record_cwd)
-                if not isinstance(base, str):
-                    base = None
-                if name == "mcp__codegraph__codegraph_explore":
-                    project = tool_input.get("projectPath", base)
-                    if not isinstance(project, str) or (not isinstance(base, str) and not Path(project).is_absolute()):
-                        continue
-                    same_root = indexed_root(Path(base or "/") / project) == search_root
-                elif name == "Bash":
-                    command = tool_input.get("command")
-                    same_root = isinstance(command, str) and explore_in_command(command, base or "/", search_root)
-                else:
-                    same_root = False
-                if same_root:
-                    calls[block.get("id")] = True
-            elif role == "user" and block.get("type") == "tool_result":
-                if block.get("tool_use_id") in calls:
-                    return turn, True
-    return turn, False
-
-
-def explore_in_command(command, cwd, search_root):
-    try:
-        directory = Path(cwd).resolve(strict=True)
-    except (OSError, ValueError):
-        return False
-    for segment in shell_segments(command):
-        if os.path.basename(segment[0]) == "cd" and len(segment) == 2:
-            try:
-                directory = (directory / os.path.expanduser(segment[1])).resolve(strict=True)
-            except (OSError, ValueError):
-                return False
-        elif os.path.basename(segment[0]) == "codegraph" and len(segment) > 1 and segment[1] == "explore" and indexed_root(directory) == search_root:
-            return True
-    return False
-
-
-def read_transcript(path):
-    try:
-        with open(path, "rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            offset = max(0, stream.tell() - 262144)
-            stream.seek(offset)
-            data = stream.read(262144)
-        if offset:
-            data = data.partition(b"\n")[2]
-        records = [json.loads(line) for line in data.splitlines() if line.strip()]
-        if not all(isinstance(record, dict) for record in records):
-            return None
-        return records
-    except (OSError, UnicodeError, ValueError):
-        return None
-
-
-def first_denial(session, transcript, turn):
-    """Atomic per-turn marker. If it cannot be stored, allow the tool."""
-    key = hashlib.sha256(json.dumps([session, transcript, turn]).encode()).hexdigest()
+def first_nudge(session):
+    """Atomic per-session marker. If it cannot be stored, stay silent."""
+    key = hashlib.sha256(session.encode()).hexdigest()
     directory = Path(tempfile.gettempdir()) / f"codegraph-nudge-{os.getuid()}"
     try:
         directory.mkdir(mode=0o700, exist_ok=True)
@@ -300,20 +210,13 @@ def first_denial(session, transcript, turn):
         return False
 
 
-def decision(payload, records):
-    if not isinstance(payload, dict) or records is None:
-        return False, None
-    command = payload.get("tool_input", {}).get("command") if isinstance(payload.get("tool_input"), dict) else None
+def should_nudge(payload):
+    tool_input = payload.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
     cwd = payload.get("cwd")
     if not isinstance(command, str) or not isinstance(cwd, str) or shutil.which("codegraph") is None:
-        return False, None
-    search_root = search_root_for(command, cwd)
-    if search_root is None:
-        return False, None
-    turn, explored = completed_explore(records, cwd, search_root)
-    if turn is None or explored:
-        return False, turn
-    return True, turn
+        return False
+    return command_search(command, cwd)
 
 
 def main():
@@ -323,13 +226,11 @@ def main():
         return
     if not isinstance(payload, dict):
         return
-    transcript = payload.get("transcript_path")
     session = payload.get("session_id")
-    if not isinstance(transcript, str) or not transcript or not isinstance(session, str) or not session:
+    if not isinstance(session, str) or not session:
         return
-    should_block, turn = decision(payload, read_transcript(transcript))
-    if should_block and first_denial(session, transcript, turn):
-        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": f"Owner Codegraph-first rule: run `{EXPLORE} '<question>'` before a semantic source search in this indexed repo. If it times out or fails, this search is allowed on retry; so is a literal sweep, a log or non-code search, or a file listing."}}))
+    if should_nudge(payload) and first_nudge(session):
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": NUDGE}}))
 
 
 if __name__ == "__main__":

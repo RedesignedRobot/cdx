@@ -1,3 +1,9 @@
+## Unreleased
+
+### Codegraph hook
+
+- `hooks/codegraph-nudge.sh` no longer denies the first semantic source search of each turn in an indexed repo. That denial forced one `codegraph explore` per turn, about 6.6k tokens each in the `~/code` index. The hook now lets the search run and adds a note of under 50 words, once per session, keyed by the session id. The classifier is unchanged, so literal sweeps, log and non-code searches and file listings stay silent. The transcript turn parsing that served the per-turn denial is deleted.
+
 ## 10.0.8 (2026-09-27)
 
 ### Band

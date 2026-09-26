@@ -421,7 +421,7 @@ In headless mode UI status, toasts and logs are skipped; polling and delivery co
 
 ### Codegraph hook
 
-`hooks/codegraph-nudge.sh` is the head's codegraph PreToolUse hook; the installed copy lives at `~/.claude/hooks/codegraph-nudge.sh`. In a repository with `.codegraph/` it denies clear source exploration once per turn when no explore ran for that repository. It never blocks when the codegraph binary is missing, the repo is unindexed, or an explore already ran that turn, including a failed or timed-out one. Both engines record `codegraphCalls` and `codeSearchesBeforeGraph` per round, shown in status and terminal events.
+`hooks/codegraph-nudge.sh` is the head's codegraph PreToolUse hook; the installed copy lives at `~/.claude/hooks/codegraph-nudge.sh`. It never blocks. The first clear source search (`rg` or `grep` with a symbol or code pattern over source) in a repository with `.codegraph/` gets one short note with the `codegraph explore` shell form, once per session; a marker file keyed by the session id keeps it to one. Literal sweeps, log and non-code searches, file listings, a command that explores before it searches, and a machine without the codegraph binary get nothing. Both engines record `codegraphCalls` and `codeSearchesBeforeGraph` per round, shown in status and terminal events.
 
 ### Doctor checks for the mod
 
