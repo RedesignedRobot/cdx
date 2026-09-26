@@ -27,7 +27,7 @@ Breaking. Stop every lane and job, install 10.0, then run `cdx migrate` once. Re
 - `cdx land` commits the lane, builds the merge with `git merge-tree --write-tree`, and gates that merge commit once in a frozen snapshot. When the merge tree equals the green receipt tree, no gate runs. Head edits after the gate no longer refuse.
 - `cdx land --batch <lane>...` (MCP `lanes: [...]`) merges lanes in order under one gate and one push. A red batch bisects with at most log2 N extra gates, lands the green prefix, and names the lane whose merge turned it red.
 - A dirty base checkout blocks only when its dirty files overlap the merge. The base need not be checked out; land updates the ref directly. Push goes to the base branch's upstream and is skipped without one.
-- Supervisor children get their own worktree by default, branched from the supervisor's branch. A supervisor lands children only into its own branch.
+- A work supervisor spawned without `--worktree` gets one named after the lane. Supervisor children get their own worktree by default, branched from the supervisor's branch. A supervisor lands children only into its own branch.
 - `cdx close` removes a clean worktree even when its branch is unmerged, and keeps the branch. `cdx doctor --days N` (default 7) lists idle cdx worktrees; `--fix` removes them.
 
 ### Contract

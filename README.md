@@ -288,7 +288,7 @@ A supervisor merges green children into its own branch with `cdx land <child>` o
 
 ### Worktrees and close
 
-`spawn --worktree <path>` creates a git worktree on branch `lane/<lane>` from the repo at `--cd`; a bare name resolves to `~/code/wt/<name>`. It runs the config `worktreeSetup` command, then the repository's executable `.cdx-worktree-setup` when present; a nonzero exit fails the spawn. A clean existing worktree on the expected branch is reused without setup. Supervisor children get their own worktree by default, branched from the supervisor's branch.
+`spawn --worktree <path>` creates a git worktree on branch `lane/<lane>` from the repo at `--cd`; a bare name resolves to `~/code/wt/<name>`. It runs the config `worktreeSetup` command, then the repository's executable `.cdx-worktree-setup` when present; a nonzero exit fails the spawn. A clean existing worktree on the expected branch is reused without setup. A work supervisor spawned without `--worktree` gets one named after the lane, and its children get their own worktree by default, branched from the supervisor's branch.
 
 `cdx close <lane>` removes a clean worktree even when its branch is unmerged, and keeps the branch; it refuses a dirty worktree. `--keep-worktree` (native `keepWorktree: true`) closes without touching the worktree and prints guarded manual cleanup commands. `cdx doctor` lists cdx worktrees idle past `--days N` (default 7): merged ones lose worktree and branch, those of closed or unrecorded lanes lose the worktree and keep an unmerged branch. `--fix` removes them; git refuses dirty trees.
 

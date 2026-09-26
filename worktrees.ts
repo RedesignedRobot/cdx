@@ -94,8 +94,10 @@ export function createWorktree(repo: string, target: string, lane: string): Work
 
 // A supervisor's writers never share a tree: each child gets a worktree cut
 // from the checkout the supervisor runs in, which is its own lane branch.
-export function childWorktreeTarget(lane: string, requested: string | undefined, parent: string | undefined, respawn: boolean): string | undefined {
-  return requested ?? (parent && !respawn ? lane : undefined);
+// So a supervisor gets a worktree too: land refuses to merge children into
+// a checkout that is not the supervisor's lane branch.
+export function childWorktreeTarget(lane: string, requested: string | undefined, parent: string | undefined, respawn: boolean, supervisor = false): string | undefined {
+  return requested ?? ((parent || supervisor) && !respawn ? lane : undefined);
 }
 
 type WorktreeRecord = Pick<Lane, "worktreeRepo" | "worktreePath" | "branch" | "baseBranch">;

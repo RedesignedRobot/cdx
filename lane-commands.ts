@@ -233,7 +233,7 @@ export async function spawnCommand(argv: string[]) {
     engine, forcedAccount: parsed.flags.account, ...(existingLane && engine === "gpt" ? { preserveAccount: true as const } : engine === "gpt" ? { account } : {}), owner, worktree, gate, pre,
     ...(model ? { model } : {}), lineage: callerLineage(supervisor),
   });
-  const worktreeTarget = childWorktreeTarget(lane, parsed.flags.worktree, parent, Boolean(existingLane));
+  const worktreeTarget = childWorktreeTarget(lane, parsed.flags.worktree, parent, Boolean(existingLane), supervisor);
   if (worktreeTarget) {
     try {
       worktree = createWorktree(roots.worktreeRepo, worktreeTarget, lane);

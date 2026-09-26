@@ -203,11 +203,13 @@ test("a red batch names the first breaking lane within log2 extra gates", () => 
   }
 });
 
-test("supervisor children get their own worktree and land into the parent branch", () => {
+test("supervisors and their children get their own worktree, and children land into the supervisor branch", () => {
   expect(childWorktreeTarget("child", undefined, "parent", false)).toBe("child");
   expect(childWorktreeTarget("child", "custom", "parent", false)).toBe("custom");
   expect(childWorktreeTarget("child", undefined, "parent", true)).toBeUndefined();
   expect(childWorktreeTarget("lane", undefined, undefined, false)).toBeUndefined();
+  expect(childWorktreeTarget("sup", undefined, undefined, false, true)).toBe("sup");
+  expect(childWorktreeTarget("sup", undefined, undefined, true, true)).toBeUndefined();
   const rules = laneInstructions({ supervisor: true });
   expect(rules).toContain("cdx land <child>");
   expect(rules).toContain("plain call");
