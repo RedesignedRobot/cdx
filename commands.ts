@@ -38,7 +38,7 @@ ${ENGINE_PICKER}
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... "<question>"  # read-only advisor
-  panel  <name> --cd D [--pack F] [--bg] ("<question>" | -)  # Astra, Sol and Claude Fable answer; one merged report
+  panel  <name> --cd D [--pack F] ("<question>" | -)  # Astra, Sol and Claude Fable answer; one merged report
   context <repo> [--model M]             # build the repo's context digest for HEAD with one read-only consult
   shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]  # verdict.json; prints failed screens only
 

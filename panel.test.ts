@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  answerPath, citationProblem, memberSpec, readPanel, reapPanels, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
+  answerPath, citationProblem, memberSpec, panelAccount, readPanel, reapPanels, settledPanel, claudeHeadroom, lineCount, completionLine, groupClaims, type MemberAnswer, panelPrompt, panelRefusal,
   panelReportPath, parseAnswer, PANEL_INPUT_CHARS, renderPanelReport, REPORT_LINES, VERDICT_LINES,
 } from "./panel.ts";
+import { chooseAccount, decideAccount, standingOf } from "./accounts.ts";
 import { eventsAfter, latestEventId, type Lane } from "./ledger.ts";
 import { laneInstructions } from "./prompts.ts";
 import { reportPathOf } from "./reports.ts";
@@ -116,8 +117,37 @@ test("panel guards refuse recursion, repeats, size and low quota", () => {
   expect(panelRefusal({ ...admitted, openPanel: "p0" })).toContain("panel p0 is still open");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS + 1 })).toContain("the cap is 20000");
   expect(panelRefusal({ ...admitted, inputChars: PANEL_INPUT_CHARS })).toBeUndefined();
-  expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("Astra's account has 9% left; a panel needs 10%");
+  expect(panelRefusal({ ...admitted, astraHeadroom: 9.5 })).toBe("no Codex account has 10% left for the Astra and Sol members; the fullest has 9%");
   expect(panelRefusal({ ...admitted, claudeHeadroom: 4 })).toBe("the Claude weekly quota has 4% left; a panel needs 10%");
+});
+
+const quotaNow = Date.parse("2026-09-26T12:00:00Z");
+const standing = (name: string, usedPercent: number, resetHours: number) => {
+  const window = { usedPercent, windowDurationMins: 10080, resetsAt: quotaNow / 1000 + resetHours * 3600 };
+  return standingOf({ name, home: `/home/${name}` }, { ...window, checkedAt: new Date(quotaNow).toISOString(), planType: "pro", resetCreditsAvailable: 1, reached: false, windows: [window] }, [], quotaNow);
+};
+
+test("a panel skips a nearly empty account near its reset and pins its Codex members to the fullest one", () => {
+  const standings = [standing("codex-1", 98, 0.5), standing("codex-2", 37, 100)];
+  expect(decideAccount(standings, "light", quotaNow)?.choice.name).toBe("codex-1");
+  const account = panelAccount(standings, quotaNow)!;
+  expect(account.choice.name).toBe("codex-2");
+  expect(panelRefusal({ ...admitted, astraHeadroom: account.remainingPercent })).toBeUndefined();
+  // startLane passes the recorded account to openRound, whose chooser keeps an eligible preferred account.
+  const member = chooseAccount(standings, "light", undefined, account.choice, quotaNow).choice!;
+  expect(member).toEqual(account.choice);
+  const panel = { name: "p", cwd, question: "q", owner: { ownerCwd: cwd }, account: member, state: "running" as const, startedAt: "2026-09-26T12:00:00Z" };
+  const round = { lane: "p-astra", round: 1, engine: "gpt" as const, model: "gpt-6-astra", effort: "medium", prompt: "q", maxRuntimeMins: 15 };
+  expect(memberSpec(panel, { roundAccount: { ...member, demand: "light" } } as Lane, round)).toMatchObject({ account: "codex-2", codexHome: "/home/codex-2" });
+  expect(panelAccount([standing("codex-1", 20, 0.5), standing("codex-2", 37, 100)], quotaNow)?.choice.name).toBe("codex-1");
+});
+
+test("a panel is refused when every Codex account is under the threshold", () => {
+  const account = panelAccount([standing("codex-1", 98, 0.5), standing("codex-2", 93, 100)], quotaNow);
+  expect(account?.choice.name).toBe("codex-2");
+  expect(panelRefusal({ ...admitted, astraHeadroom: account?.remainingPercent ?? 0 }))
+    .toBe("no Codex account has 10% left for the Astra and Sol members; the fullest has 7%");
+  expect(panelAccount([], quotaNow)).toBeUndefined();
 });
 
 test("panel files never share a path with a lane report or another panel's files", () => {

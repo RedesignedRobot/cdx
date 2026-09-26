@@ -2,11 +2,11 @@
 // lanes. cdx merges the three answers by cited path, checks every file:line,
 // and one Astra consult rules only on the contradictions. The caller sees one
 // completion line; the answers stay on disk.
-import { accountSpec, accountStandings, chooseAccount } from "./accounts.ts";
+import { accountSpec, type AccountStanding, accountStandings, decideAccount } from "./accounts.ts";
 import { CLAUDE_MODEL } from "./claude.ts";
 import { config, EXECUTOR_MODEL, resolveEffort, THINKER_MODEL } from "./config.ts";
 import {
-  activeStateOf, callerOwnership, type Effort, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
+  type AccountChoice, activeStateOf, callerOwnership, type Effort, type Engine, feedEvent, findLane, type LaneOwner, laneRunning, ownershipSpec,
   type Lane, readLedger, roundNoteOf, type Spec, supervisorLane, type Tokens, validLane, withLane, withLedger,
 } from "./ledger.ts";
 import { laneInstructions } from "./prompts.ts";
@@ -51,6 +51,8 @@ export interface PanelRecord {
   caller?: string;
   callerRound?: number;
   owner: LaneOwner;
+  // The Codex account the guard checked; the Astra and Sol members run on it.
+  account?: AccountChoice;
   state: PanelState;
   pid?: number;
   startedAt: string;
@@ -88,7 +90,7 @@ export interface PanelAdmission {
   supervisorAskedThisRound: boolean;
   openPanel?: string;
   inputChars: number;
-  // Percent left on the account an Astra consult would run on; 0 when none is eligible.
+  // Percent left on the account the Codex members will run on; 0 when none is eligible.
   astraHeadroom: number;
   // Percent left in the active Claude account's weekly windows, or why cdx
   // cannot tell; an unknown quota refuses the panel.
@@ -101,7 +103,9 @@ export function panelRefusal(input: PanelAdmission): string | undefined {
   if (input.supervisorAskedThisRound) return "a supervisor may call panel once per round; this round already did";
   if (input.openPanel) return `panel ${input.openPanel} is still open; one open panel at a time`;
   if (input.inputChars > PANEL_INPUT_CHARS) return `question plus pack is ${input.inputChars} chars; the cap is ${PANEL_INPUT_CHARS}, trim the pack`;
-  if (input.astraHeadroom < MIN_HEADROOM_PERCENT) return `Astra's account has ${Math.floor(input.astraHeadroom)}% left; a panel needs ${MIN_HEADROOM_PERCENT}%`;
+  if (input.astraHeadroom < MIN_HEADROOM_PERCENT) {
+    return `no Codex account has ${MIN_HEADROOM_PERCENT}% left for the Astra and Sol members; the fullest has ${Math.floor(input.astraHeadroom)}%`;
+  }
   if (typeof input.claudeHeadroom === "string") return input.claudeHeadroom;
   if (input.claudeHeadroom < MIN_HEADROOM_PERCENT) {
     return `the Claude weekly quota has ${Math.floor(input.claudeHeadroom)}% left; a panel needs ${MIN_HEADROOM_PERCENT}%`;
@@ -128,11 +132,21 @@ function readClaudeHeadroom(): number | string {
   return headroom ?? `cca status --json (exit ${result.exitCode}) gave no Claude weekly quota; a panel needs it to start`;
 }
 
-async function astraHeadroom(): Promise<number> {
+// Light demand spends the account nearest its reset first, which near a
+// reset is nearly empty. A panel then takes the fullest eligible account
+// instead, so one account near reset cannot refuse every panel.
+export function panelAccount(standings: AccountStanding[], now = Date.now()): AccountStanding | undefined {
+  const pick = decideAccount(standings, "light", now);
+  if (!pick || pick.remainingPercent >= MIN_HEADROOM_PERCENT) return pick;
+  return standings.filter((standing) => !standing.reached)
+    .reduce((best, standing) => standing.remainingPercent > best.remainingPercent ? standing : best, pick);
+}
+
+async function codexAccount(): Promise<AccountStanding | undefined> {
   try {
-    return chooseAccount(await accountStandings(), "light").pick?.remainingPercent ?? 0;
+    return panelAccount(await accountStandings());
   } catch {
-    return 0;
+    return undefined;
   }
 }
 
@@ -405,7 +419,7 @@ async function startLane(panel: PanelRecord, lane: string, engine: Engine, model
   const effort = engine === "claude" ? "medium" : resolveEffort(engine, model);
   const { round } = await openRound(lane, "review", panel.cwd, effort, {
     engine, consult: true, owner: panel.owner, preserveGate: true, reviewModel: model,
-    ...(engine === "gpt" ? { model } : {}), panelMember: true,
+    ...(engine === "gpt" ? { model, ...(panel.account ? { account: panel.account } : {}) } : {}), panelMember: true,
     // A supervisor's panel lanes are its children: killing it stops them and
     // their tokens show under it.
     lineage: { supervisor: false, ...(panel.caller ? { parent: panel.caller, parentRound: panel.callerRound } : {}) },
@@ -567,7 +581,7 @@ export async function panelCommand(argv: string[]): Promise<void> {
   const self = process.env.CDX_LANE ? findLane(process.env.CDX_LANE) : undefined;
   const supervisor = supervisorLane();
   const callerRound = supervisor ? Number(process.env.CDX_ROUND) : undefined;
-  const astra = await astraHeadroom();
+  const account = await codexAccount();
   const claude = readClaudeHeadroom();
   const pack = parsed.flags.pack !== undefined ? `${ROOT}/briefs/${name}-pack.md` : undefined;
   // The guards that read panels and lanes run in the transaction that
@@ -583,12 +597,12 @@ export async function panelCommand(argv: string[]): Promise<void> {
       supervisorAskedThisRound: Boolean(supervisor && panels.some((record) => record.caller === supervisor && record.callerRound === callerRound)),
       openPanel: openPanelName(panels),
       inputChars: question.length + packText.length,
-      astraHeadroom: astra,
+      astraHeadroom: account?.remainingPercent ?? 0,
       claudeHeadroom: claude,
     });
     if (refused) return refused;
     storePanel({
-      name, cwd, question, ...(pack ? { pack } : {}), ...(supervisor ? { caller: supervisor, callerRound } : {}),
+      name, cwd, question, ...(pack ? { pack } : {}), ...(account ? { account: account.choice } : {}), ...(supervisor ? { caller: supervisor, callerRound } : {}),
       owner: callerOwnership(), state: "running", pid: process.pid, startedAt: new Date().toISOString(),
     });
     return undefined;
