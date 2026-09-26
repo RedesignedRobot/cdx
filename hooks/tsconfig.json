@@ -10,6 +10,6 @@
     "noEmit": true,
     "skipLibCheck": true
   },
-  "include": ["*.ts", "types"],
+  "include": ["*.ts", "kit/*.ts", "types"],
   "exclude": ["*.test.ts"]
 }

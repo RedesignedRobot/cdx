@@ -223,12 +223,15 @@ export function register(on: On) {
     return result;
   });
 
+  // The settings Stop hooks (the owner's push guard among them) sit beneath
+  // this one and still run; a block of theirs travels with the rollover's.
   on("classic.Stop", async ($, e, next) => {
+    const result = await next(e);
     const { value } = await $.state.get(rolloverRef);
     const outcome = stopOutcome(value, await $.session.id());
-    if (!outcome) return next(e);
+    if (!outcome || result.preventContinuation) return result;
     await $.state.set(rolloverRef, outcome.state);
-    return { block: outcome.block };
+    return { ...result, block: [result.block, outcome.block].filter(Boolean).join("\n\n") };
   });
 
   on("command.run", { command: "lanes" }, async ($, e) => {
