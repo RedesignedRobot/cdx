@@ -54,3 +54,13 @@ export function geminiProfile(spec: SandboxSpec, files: string[] = []): string {
     ...files.map((path) => `(literal ${JSON.stringify(resolvedPath(path))})`)];
   return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
 }
+
+// claude runs only read-only consults. It writes its own state under
+// ~/.claude and ~/.claude.json (plus backups), and its Bash tool needs a
+// scratch directory at /tmp/claude-<uid>; the checkout stays read-only.
+export function claudeProfile(uid = process.getuid?.() ?? 0): string {
+  const subpaths = [join(HOME, ".claude"), tmpdir(), `/tmp/claude-${uid}`, "/dev"].map(resolvedPath);
+  const config = `^${resolvedPath(HOME).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}/\\.claude\\.json`;
+  const rules = [...subpaths.map((path) => `(subpath ${JSON.stringify(path)})`), `(regex #"${config}")`];
+  return `(version 1)(allow default)(deny file-write*)(allow file-write* ${rules.join(" ")})`;
+}

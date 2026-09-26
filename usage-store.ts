@@ -116,6 +116,7 @@ export function recordUsageHistory(account: string, windows: RateLimitWindow[], 
   const rounds: Record<string, number> = {};
   let complete = true;
   for (const [name, lane] of Object.entries(lanesUpdatedSince(new Date(Date.parse(checkedAt) - BURN_HORIZON_MS).toISOString()))) {
+    if (roundEngine(lane) === "claude") continue;
     if ((roundEngine(lane) === "gemini" ? "gemini" : lane.roundAccount?.name ?? lane.account ?? "default") !== account) continue;
     if (!lane.roundStartedAt || Date.parse(lane.updatedAt) < Date.parse(checkedAt) - BURN_HORIZON_MS) continue;
     const tokens = lane.roundTokens;

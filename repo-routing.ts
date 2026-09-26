@@ -1,3 +1,4 @@
+import type { Engine } from "./ledger.ts";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
 
 type Routing = Record<string, { model: string }>;
@@ -13,7 +14,7 @@ export interface SpawnModelChoice {
 export function chooseSpawnModel(
   baseModel: string | undefined,
   options: {
-    engine: "gpt" | "gemini";
+    engine: Engine;
     cwd: string;
     routing: Routing | undefined;
     commonDir: () => string | undefined;

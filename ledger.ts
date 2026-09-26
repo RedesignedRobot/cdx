@@ -51,7 +51,8 @@ export function callerLineage(supervisor: boolean): Lineage {
 
 export type Effort = string;
 
-export type Engine = "gpt" | "gemini";
+// claude runs read-only consult lanes only (panel members); openRound refuses the rest.
+export type Engine = "gpt" | "gemini" | "claude";
 
 type Mode = "spawn" | "resume";
 
@@ -663,7 +664,7 @@ export function validLane(lane: string): string {
 }
 
 export function laneEngine(lane: Pick<Lane, "engine"> | undefined): Engine {
-  if (!lane || !["gpt", "gemini"].includes(lane.engine)) fail("lane has no valid engine; restore its engine in the ledger");
+  if (!lane || !["gpt", "gemini", "claude"].includes(lane.engine)) fail("lane has no valid engine; restore its engine in the ledger");
   return lane.engine;
 }
 

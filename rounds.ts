@@ -1,4 +1,5 @@
 import { reviewerForTree } from "./prompts.ts";
+import { claudeLaneRefusal } from "./claude.ts";
 // Round admission and ledger reservation.
 
 import {
@@ -33,6 +34,8 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
     : opts?.engine ?? (existingBefore ? laneEngine(existingBefore) : engine);
   const resolvedModelCandidate = roundEnginePre === "gpt" ? roundModelOf(kind, opts, existingBefore) : undefined;
   checkChildAstraRefusal(isChildPre, roundEnginePre, resolvedModelCandidate);
+  const claudeRefusal = claudeLaneRefusal(roundEnginePre, kind, Boolean(opts?.consult ?? existingBefore?.consult));
+  if (claudeRefusal) throw new CmdError(claudeRefusal);
 
   for (;;) {
     if (engine === "gpt") {

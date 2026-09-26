@@ -7,6 +7,7 @@ import { defaultCodexHome } from "./accounts.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 import { safeLines } from "./safe-lines.ts";
 import { drainGeminiControls } from "./gemini-controls.ts";
+import { runClaudeRound } from "./claude.ts";
 // Round execution, engine event handling, account failover, and finalization.
 
 import { config, geminiConfig } from "./config.ts";
@@ -174,6 +175,7 @@ async function trustCapHook(request: (method: string, params: Record<string, unk
 async function runRoundInner(lane: string, round: number): Promise<number> {
   const spec = JSON.parse(readFileSync(specPathOf(lane, round), "utf8")) as Spec;
   const entry = readLedger()[lane];
+  if (spec.engine === "claude") return runClaudeRound(lane, round, spec);
   if (entry?.kind !== "review" || entry.consult) return executeRound(lane, round, spec);
   const snapshot = createReviewSnapshot(spec.cwd, lane, round, spec.reviewTree);
   try {
@@ -1209,7 +1211,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
   return finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning });
 }
 
-async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
+export async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMode, gemini, logPath, reportPath, reviewTreeStart, workTreeStartSnapshot, exitCode, turnFailureReason, receivedSignal, maxRuntimeHit, geminiContinuations, roundCleanupWarning }: {
   treeCwd: string;
   preparedGate?: ReturnType<typeof verifyGate>;
   spec: Spec; lane: string; round: number; jsonMode: boolean; gemini: boolean;
@@ -1234,9 +1236,10 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   const stderrText = (() => {
     try { return readFileSync(`${ROOT}/logs/${lane}-r${round}.stderr.log`, "utf8"); } catch { return ""; }
   })();
-  if (!gemini && !receivedSignal && !maxRuntimeHit && exitCode !== 0 && isCodexQuotaFailure(stderrText)) recordCodexExhaustion(spec, stderrText);
+  const codex = spec.engine === "gpt";
+  if (codex && !receivedSignal && !maxRuntimeHit && exitCode !== 0 && isCodexQuotaFailure(stderrText)) recordCodexExhaustion(spec, stderrText);
   const beforeFinalize = readLedger()[lane];
-  const retryQuota = !gemini && !receivedSignal && !maxRuntimeHit && (exitCode !== 0 || Boolean(turnFailureReason)) && Boolean(beforeFinalize?.quotaFailure);
+  const retryQuota = codex && !receivedSignal && !maxRuntimeHit && (exitCode !== 0 || Boolean(turnFailureReason)) && Boolean(beforeFinalize?.quotaFailure);
   // The 503 ladder ran out on the policy model: one more round continues the
   // same conversation on the fallback tier (same 3.8 family, own capacity
   // pool). The runner opens it; the lane stays "running" meanwhile.
@@ -1256,7 +1259,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
 
   const capturedSessionId = beforeFinalize?.sessionId;
   const resolvedSessionId = capturedSessionId
-    || (!gemini ? resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt) : undefined);
+    || (codex ? resolveSessionIdFromRollouts(spec, beforeFinalize?.roundStartedAt) : undefined);
   if (resolvedSessionId && spec.sessionId !== resolvedSessionId) {
     spec.sessionId = resolvedSessionId;
     writeFileSync(specPathOf(lane, round), safeJSON(spec, 2));
@@ -1313,7 +1316,7 @@ async function finalizeRound({ treeCwd, preparedGate, spec, lane, round, jsonMod
   const capturedReport = availableReportPath(lane, round);
   const entry = withLedger((ledger) => {
     const item = ledger[lane]!;
-    if (!gemini) invalidateAccountUsage(item.roundAccount);
+    if (codex) invalidateAccountUsage(item.roundAccount);
     if (!retryQuota) item.quotaFailure = undefined;
     if (!item.sessionId && resolvedSessionId) item.sessionId = resolvedSessionId;
     // Ledger kind, not spec.mode, decides work vs review: intent reviews
