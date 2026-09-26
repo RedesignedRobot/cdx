@@ -42,7 +42,7 @@ test("an addressed message reaches its session whether or not it is the head", (
   expect(selectEvents(records, "head", 0, 0)[0]!.text).toBe("[cdx] msg to=head from=lane-b: message 2");
 });
 
-test("a session that starts and polls later never steals the wakes from the session that drove cdx", () => {
+test("a headless session never steals the wakes; a fresh interactive start takes them from an idle head", () => {
   const now = Date.parse("2026-09-26T12:00:00Z");
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
   const row = (session: string, started: number, drove?: number) => ({ session, cursor: 0, started_at: at(started), polled_at: at(1),
@@ -50,9 +50,12 @@ test("a session that starts and polls later never steals the wakes from the sess
   const head = row("head", 3600, 600);
   const teammate = row("teammate", 5);
   expect(electHead([head, teammate], now)).toBe("head");
-  expect(electHead([row("head", 3600), teammate], now)).toBe("head");
   expect(electHead([head, row("teammate", 5, 2)], now)).toBe("teammate");
-  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBe("teammate");
+  // An interactive start runs brief --head, which is a drive.
+  expect(electHead([head, row("fresh", 5, 5)], now)).toBe("fresh");
+  // With no active driver nobody is head; the owner cursor holds the events.
+  expect(electHead([row("head", 3600), teammate], now)).toBeUndefined();
+  expect(electHead([{ ...head, polled_at: at(60) }, teammate], now)).toBeUndefined();
   // The teammate's cursor moves; the head still gets the question past the owner cursor.
   const question = [feed(7, "question")];
   expect(selectEvents(question, "teammate", 0)).toEqual([]);

@@ -107,9 +107,10 @@ function briefRepeated(session: string, text: string, now = Date.now()): boolean
   });
 }
 
-// Session start, resume and compaction run the brief, which registers the
-// session for delivery. Only --head, a user's explicit claim, makes it the
-// head; a session that merely started never takes the wakes.
+// Session start and /clear or /resume run the brief, which registers the
+// session for delivery. --head claims the wakes: the mod passes it when a
+// person is at the prompt, so a headless session that merely started never
+// takes them.
 export function briefCommand(argv: string[]) {
   const parsed = parseArgs(argv, ["head"]);
   if (parsed.rest.length) fail("usage: cdx brief [--head]");
