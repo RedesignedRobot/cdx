@@ -25,6 +25,8 @@ const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; a
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
 // Codegraph opens its index read-write, which the Codex read-only sandbox refuses.
 const CODEGRAPH_READ_ONLY = "Codegraph cannot open its index inside this read-only sandbox; use rg and targeted file reads for code questions.";
+// Chromium registers mach ports, which the Codex seatbelt denies; one process needs none.
+const BROWSER_RULE = "Chromium starts in this sandbox only with the --single-process flag (for Playwright, pass it in the launch args); sandboxed shells have CODEX_SANDBOX=seatbelt.";
 export const CODEGRAPH_RULE = `In a repository with .codegraph/, \`${CODEGRAPH_EXPLORE} "<question>"\` is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph is missing, the repository is unindexed, or the call times out (exit 142) or fails, fall back to rg and file reads and note it in the report.`;
 const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
@@ -59,7 +61,7 @@ const ownerRules = () => config.rules.filter((rule) => !retiredLaneRule(rule));
 // The AGENTS.md cdx writes into each role's Codex lane home.
 export function laneInstructions(role: LaneRole = {}): string {
   const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_READ_ONLY]
-    : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
+    : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, BROWSER_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
       VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule()])];
   const owner = ownerRules();
   return [`# cdx ${roleTitle(role)}`, "", "These are your standing rules as a cdx lane. The brief carries the task and the facts for this lane.", "",
