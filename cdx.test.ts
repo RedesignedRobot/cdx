@@ -3,7 +3,7 @@ import "./status-progress.test.ts";
 import { expect, test } from "bun:test";
 import { readdirSync, readFileSync, unlinkSync } from "node:fs";
 import {
-  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, GEMINI_WORKER_RULES, toolLogRecords,
+  verifyGate, requireAccountModel, recoveryPartial, roundTools, resumePrompt, promptRules, pendingTestsRefusal, sharedTreeLanes, VERIFICATION_RULE, toolLogRecords,
   checkRoundCap, summaryJobs, parseArgs, parseConfig, roundCapRefusal,
   recordCodexTokenDelta, reconcileExhaustionWithSnapshot, isExhaustionObsolete, standingOf,
   parseAccountUsage, formatAccountUsage, describeResetCredits, resetCreditAlerts, rankAccounts, accountAdvice, chooseAccount, decideAccount, demandSizing, shouldRedeemCredit, publishUsageSnapshot, geminiQuotaState, geminiUsageRows, claudeUsageRows, withAccountHolds, projectWindow, mergeUsageHistory, usageTable, geminiWindows, adviceLines, RESET_CREDIT_ALERT_DAYS,
@@ -1169,14 +1169,15 @@ test("tool measurements retain bytes and tokens without inventing tool tree hash
 });
 
 test("Gemini resumes are shorter than spawn prompts and carry only changed rules and recovery", () => {
-  const rules = [...GEMINI_WORKER_RULES, VERIFICATION_RULE].map((rule) => `- ${rule}`).join("\n");
+  const standing = "Deliver within your files; the parent owns design and scope.";
+  const rules = [standing, VERIFICATION_RULE].map((rule) => `- ${rule}`).join("\n");
   const spawn = `Ground rules:\n${rules}\n\nTask:\nFix the parser.`;
   const resumed = resumePrompt("Continue.", rules, promptRules(spawn), "Last action: parser fixed.");
   expect(resumed.length).toBeLessThan(spawn.length);
   expect(promptRules(`Ground rules:\n${rules}\n\nYour previous round ended with this partial report: pending\n\nTask:\nContinue.`)).toBe(rules);
   expect(resumed).toContain("Last action: parser fixed.");
   expect(resumed).not.toContain("Ground rules");
-  expect(resumed).not.toContain(GEMINI_WORKER_RULES[0]!);
+  expect(resumed).not.toContain(standing);
   const previous = `${rules}\nAllowed edits:\n- a.ts\nForbidden edits:\n- b.ts`;
   const current = `${rules}\nAllowed edits:\n- b.ts\nForbidden edits:\n- a.ts`;
   expect(resumePrompt("Continue.", current, previous)).toContain(`superseding the previous block:\n${current}`);

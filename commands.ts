@@ -28,6 +28,7 @@ import { migrateCommand } from "./migrate.ts";
 import { statusCommand, tailView, targetView, usageCommand, waitCommand } from "./status.ts";
 import { renderView, tuiEnabled } from "./tui.ts";
 import { viewCommand } from "./view.ts";
+import { contextCommand } from "./context.ts";
 import { landCommand, closeKeepsWorktree, removeWorktree, worktreeCleanupCommands } from "./worktrees.ts";
 import { existsSync, readFileSync } from "node:fs";
 
@@ -42,6 +43,7 @@ ${ENGINE_PICKER}
   resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] "<question>"  # read-only advisor
+  context <repo> [--model M]             # build the repo's context digest for HEAD with one read-only consult
   adopt  <lane> <sessionId> [--engine gpt|gemini] [--model M] [--account NAME] [--cd D]
 
   --model M picks a Codex model for a gpt lane: an alias from config.models or a raw id.
@@ -82,7 +84,7 @@ Only --gate-baseline-check runs the gate before worker startup, including worktr
 --max-runtime MIN kills the round past the cap and marks it failed.`;
 
 const REFUSED_INSIDE_LANE = new Set([
-  "spawn", "resume", "review", "consult", "adopt", "land",
+  "spawn", "resume", "review", "consult", "context", "adopt", "land",
   "kill", "close", "clean", "gate", "reply", "job", "migrate",
 ]);
 
@@ -103,6 +105,7 @@ switch (command) {
   case "spawn": await spawnCommand(argv); break;
   case "review": await reviewCommand(argv); break;
   case "consult": await consultCommand(argv); break;
+  case "context": await contextCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "send": await sendCommand(argv); break;
   case "ask": await (process.env.CDX_LANE ? askCommand(argv) : codeQuestionCommand(argv)); break;

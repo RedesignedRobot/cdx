@@ -1,5 +1,5 @@
 import { fixReviewPrompt } from "./prompts.ts";
-import { retiredLaneRule, installLaneHome } from "./account-sync.ts";
+import { retiredLaneRule } from "./account-sync.ts";
 import { requireGeminiAgent } from "./doctor.ts";
 import { safeText, safeJSON } from "./safe-text.ts";
 // Lane launch, spawn, resume, review, consult, and cleanup commands.
@@ -25,7 +25,7 @@ import {
   storedOwnership, supervisorLane, validLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
-  resumeRefusal, CONSULT_FRAME, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
+  resumeRefusal, CODEGRAPH_RULE, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
   REVIEW_FINDINGS_SCHEMA, reviewFrame,
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
@@ -36,7 +36,7 @@ import { openRound } from "./rounds.ts";
 import { chooseSpawnModel } from "./repo-routing.ts";
 import { runRound } from "./runner.ts";
 import {
-  color, displayPath, fail, fmtAge, HOME, REPO_ROOT, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
+  color, displayPath, fail, fmtAge, HOME, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
@@ -93,7 +93,7 @@ function launch(spec: Spec, brief: string, background: boolean): Promise<never> 
     spec.codexHome = choice?.home;
     spec.model ??= entry.model ?? config.model;
     Object.assign(spec, accountSpec(choice));
-    installLaneHome(spec.codexHome ?? defaultCodexHome(), readFileSync(`${REPO_ROOT}/agents/codex-lane.md`, "utf8"));
+    spec.laneInstructions = laneInstructions({ review: spec.reviewDir !== undefined, supervisor: Boolean(spec.supervisor) });
     if (changedHome && (spec.sourceThreadId || spec.mode === "resume")) {
       freshAccountSpec(spec, entry, recoveryPrompt(spec, entry));
       brief = spec.prompt;
@@ -506,7 +506,7 @@ export async function codeQuestionCommand(argv: string[]): Promise<void> {
   requireGeminiAgent(policy.reviewAgent, cwd);
   // Keep this request read-only even when its shell tool tries to write.
   if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
-  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. Use shell codegraph when indexed.\n${question}`,
+  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. ${CODEGRAPH_RULE}\n${question}`,
     "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--print-timeout", "90s", "--add-dir", cwd],
     cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
   const timer = setTimeout(() => proc.kill("SIGKILL"), 90_000);

@@ -89,8 +89,10 @@ test("lane home installation is idempotent and preserves the interactive instruc
     expect(installed).toEqual(withCapHook(laneHooks(original)));
     expect(installed.hooks.PreToolUse.map((group: any) => group.hooks[0].command)).toEqual(["unrelated-hook", CAP_HOOK_COMMAND]);
     expect(existsSync(join(lane, "rules"))).toBe(false);
-    const supervisor = installLaneHome(home, "lane instructions", true);
-    expect(supervisor).toBe(laneCodexHome(home, true));
+    const supervisor = installLaneHome(home, "lane instructions", { supervisor: true });
+    expect(supervisor).toBe(laneCodexHome(home, { supervisor: true }));
+    expect(installLaneHome(home, "review instructions", { review: true })).toBe(join(home, "cdx-review"));
+    expect(existsSync(join(home, "cdx-review", "rules"))).toBe(false);
     expect(readFileSync(join(supervisor, "rules", "cdx.rules"), "utf8")).toBe(SUPERVISOR_RULES);
     expect(laneHooks(laneHooks(original))).toEqual(laneHooks(original));
     expect(laneHooks(original).hooks.UserPromptSubmit[0].hooks[0].command).toContain('CDX_LANE');
