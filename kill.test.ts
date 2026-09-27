@@ -7,17 +7,19 @@ import { dispatch } from "./commands.ts";
 import { findLane, type Lane, storeLane } from "./ledger.ts";
 import { pidAlive } from "./runtime.ts";
 
-// A detached stand-in for the lane runner while it gates: the gate runs
-// under spawnSync, so the runner's SIGTERM handler, which finalizes the
-// round, cannot run until the gate exits.
-function gatingRunner(lane: string, gatePidFile: string) {
+// A detached stand-in for the lane runner while it gates: executeGate runs
+// the gate under spawnSync, so the runner's SIGTERM handler, which finalizes
+// the round, cannot run until the gate exits. The gate's background child
+// stands in for locked.py, which sits in the gate's own process group.
+function gatingRunner(lane: string, gatePidFile: string, cwd: string) {
   const script = `
     import { withLedger } from ${JSON.stringify(join(import.meta.dir, "ledger.ts"))};
+    import { executeGate } from ${JSON.stringify(join(import.meta.dir, "gates.ts"))};
     process.on("SIGTERM", () => {
       withLedger((ledger) => { ledger[${JSON.stringify(lane)}].work.state = "failed"; });
       process.exit(143);
     });
-    Bun.spawnSync({ cmd: ["/bin/sh", "-c", ${JSON.stringify(`echo $$ > ${gatePidFile}; exec sleep 300`)}] });
+    executeGate(${JSON.stringify(`sleep 300 & echo $! > ${gatePidFile}; wait`)}, ${JSON.stringify(cwd)}, ${JSON.stringify(join(cwd, "gate.log"))});
     await Bun.sleep(60_000);
   `;
   const child = spawn(process.execPath, ["-e", script], { detached: true, stdio: "ignore" });
@@ -30,7 +32,7 @@ test("kill stops a gating lane's gate process, not only its runner", async () =>
   const cwd = mkdtempSync(join(tmpdir(), "cdx-kill-"));
   const gatePidFile = join(cwd, "gate.pid");
   const at = new Date().toISOString();
-  const pid = gatingRunner(lane, gatePidFile);
+  const pid = gatingRunner(lane, gatePidFile, cwd);
   storeLane(lane, { engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [], tokenAccounting: 1, pid, stage: "gate",
     work: { state: "running", cwd, updatedAt: at }, createdAt: at, updatedAt: at } as unknown as Lane);
   const deadline = Date.now() + 5_000;

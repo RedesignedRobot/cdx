@@ -580,3 +580,30 @@ test("a docs-only lane finalizes done with a tree-bound receipt that land accept
     expect(landRefusal(finished)).toBeUndefined();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+import { executeGate } from "./gates.ts";
+import { pidAlive } from "./runtime.ts";
+
+test("a gate that times out is stopped with everything it started, not only its shell", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-gate-timeout-"));
+  const pidFile = join(dir, "child.pid");
+  try {
+    // The subshell stands in for locked.py: a descendant that outlives a
+    // SIGKILL sent only to the gate's shell.
+    const gate = executeGate(`(sleep 300; echo late) & echo $! > ${pidFile}; wait`, dir, join(dir, "gate.log"), 1_500);
+    const child = Number(readFileSync(pidFile, "utf8").trim());
+    expect(gate.timedOut).toBe(true);
+    expect(gate.exitCode).toBe(124);
+    expect(gate.output).toContain("cdx: gate timed out after 0.025 minutes");
+    expect(pidAlive(child)).toBe(false);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a gate's own exit code and output pass through the process-group wrapper", () => {
+  const dir = mkdtempSync(join(tmpdir(), "cdx-gate-exit-"));
+  try {
+    const gate = executeGate("echo out; echo err >&2; exit 3", dir, join(dir, "gate.log"));
+    expect(gate).toMatchObject({ exitCode: 3, timedOut: false });
+    expect(gate.output).toContain("out\nerr\n");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

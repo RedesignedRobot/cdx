@@ -1,4 +1,5 @@
 import { isNoOpGate } from "./brief-contract.ts";
+import { GATE_TIMEOUT_EXIT } from "./gate-group.ts";
 import { safeText } from "./safe-text.ts";
 // Gate execution, content receipts, review tree snapshots, and gate commands.
 
@@ -261,15 +262,21 @@ export function verifyGate(round: number, cwd: string, command: string,
   return { gate, receipt, proofRequired };
 }
 
-export function executeGate(command: string, cwd: string, logPath: string): GateResult {
+const GATE_GROUP = join(import.meta.dir, "gate-group.ts");
+const GATE_TIMEOUT_MS = 60 * 60 * 1000;
+// gate-group.ts stops the gate's group itself; this only catches a wrapper
+// that hangs past its own deadline.
+const WRAPPER_BACKSTOP_MS = 60_000;
+
+export function executeGate(command: string, cwd: string, logPath: string, timeoutMs = GATE_TIMEOUT_MS): GateResult {
   const started = Date.now();
   const gate = Bun.spawnSync({
-    cmd: ["/bin/sh", "-lc", `exec 2>&1\n${command}`], cwd, env: gateEnv(cwd),
-    timeout: 60 * 60 * 1000, killSignal: "SIGKILL",
+    cmd: [process.execPath, GATE_GROUP, String(timeoutMs), command], cwd, env: gateEnv(cwd),
+    timeout: timeoutMs + WRAPPER_BACKSTOP_MS, killSignal: "SIGKILL",
   });
-  const timedOut = gate.signalCode === "SIGKILL" && Date.now() - started >= 60 * 60 * 1000 - 1000;
+  const timedOut = gate.exitCode === GATE_TIMEOUT_EXIT && Date.now() - started >= timeoutMs;
   const exitCode = gate.exitCode ?? 1;
-  const timeoutNote = timedOut ? "\ncdx: gate timed out after 60 minutes\n" : "";
+  const timeoutNote = timedOut ? `\ncdx: gate timed out after ${timeoutMs / 60_000} minutes\n` : "";
   const output = safeText(`${gate.stdout.toString()}${gate.stderr.toString()}${timeoutNote}`);
   writeFileSync(logPath, output);
   return { exitCode, output, timedOut };

@@ -13,6 +13,7 @@
 
 ### Kill
 
+- A gate that times out is now stopped with everything it started. The gate ran under `spawnSync`, whose timeout SIGKILLs only the direct child, `/bin/sh`; on 2026-09-27 astra-duallist's gate timed out and left `locked.py`, `cdx-gate.sh`, `listcheck` and a lease ticket running under pid 1. `gate-group.ts` now starts the gate shell as its own process group leader and, on timeout or on SIGTERM from `cdx kill`, sends SIGTERM to the group, then SIGKILL after 5 seconds. A timed-out gate exits 124 with the same `cdx: gate timed out` note.
 - `cdx kill` now signals the runner's process group instead of the runner alone. The runner runs the gate under `spawnSync`, so it cannot act on SIGTERM until the gate exits; kill waited 10 seconds, SIGKILLed the runner and its engine, and left the gate shell and its children running with parent pid 1. On 2026-09-27 killing astra-pmebig and astra-pme4 left one gate in its test step holding a GPU lease ticket and another waiting on `ultra-gate.lock` until the head TERMed them by pid. The gate now gets the SIGTERM, exits, and the runner finalizes the round within the first second.
 
 ### Delivery
