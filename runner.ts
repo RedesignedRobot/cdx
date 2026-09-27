@@ -580,7 +580,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       const gateItem = { id: `cdx-gate-${++gateAttempt}`, type: "commandExecution", command: spec.gate };
       persistProgress(trackTools({ method: "item/started", params: { item: gateItem } }, new Date().toISOString())!, new Date().toISOString());
       flushLedger();
-      withLedger((ledger) => { ledger[lane]!.stage = "gate"; });
+      withLedger((ledger) => { ledger[lane]!.stage = "gate"; ledger[lane]!.stageStartedAt = new Date().toISOString(); });
       logProgress(lane, round, "gate started");
       const verified = runFrozenGate(round, spec.cwd, spec.gate!, `${ROOT}/logs/${lane}-r${round}.gate.log`, lane);
       persistProgress(trackTools({ method: "item/completed", params: { item: { ...gateItem, exitCode: verified.gate.exitCode } } }, new Date().toISOString())!, new Date().toISOString());
@@ -589,7 +589,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     };
     preparedGate = await repairGateOnce(() => (preparedGate = run()), async (prompt) => {
       if (readLedger()[lane]?.callLimitHit || receivedSignal || maxRuntimeHit) return false;
-      withLedger((ledger) => { ledger[lane]!.stage = "working"; });
+      withLedger((ledger) => { ledger[lane]!.stage = "working"; ledger[lane]!.stageStartedAt = new Date().toISOString(); });
       log.write(`${safeJSON({ type: "cdx_gate_repair", timestamp: new Date().toISOString(), lane, round, prompt })}\n`);
       log.flush();
       try { return await repair(prompt); }
@@ -939,6 +939,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     clearInterval(controlWatcher);
     await controlChain;
     withLedger((ledger) => { const item = ledger[lane]; if (item) item.steerOpen = false; });
+    expireRoundQuestions(lane, round);
     // A send that landed before steerOpen closed still gets its own turn.
     await queueControlDrain();
     await awaitTurns();
@@ -1153,6 +1154,9 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         const item = ledger[lane];
         if (item) item.steerOpen = false;
       });
+      // An ask the engine left running when its last turn ended prints to an
+      // exec nothing reads again, so a reply to it would be lost.
+      expireRoundQuestions(lane, round);
       await queueControlDrain();
       while (activeTurnId) {
         const finalQueuedTurn = activeTurnId;

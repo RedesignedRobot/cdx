@@ -130,7 +130,9 @@ export async function sendCommand(argv: string[]): Promise<void> {
     requireOwnChild(lane, current);
     if (!current) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
     if (!laneRunning(current) || !pidAlive(current.pid)) throw new CmdError(`lane "${lane}" is not running`);
-    if (current.steerOpen === false) throw new CmdError(`lane "${lane}" is finishing and no longer accepts steering`);
+    if (current.steerOpen === false) {
+      throw new CmdError(`lane "${lane}" is finishing (stage ${current.stage ?? "reporting"}): its engine has no turn left to read steering. Act on its report when it settles, or cdx kill ${lane} to stop it now`);
+    }
     writeFileSync(controlPathOf(lane, current.rounds), `${safeJSON(record)}\n`, { flag: "a" });
     return current;
   });
@@ -220,6 +222,10 @@ export async function replyCommand(argv: string[]): Promise<void> {
     if (!currentRound) throw new CmdError(`unknown lane "${lane}" (cdx status lists lanes)`);
     const open = readQuestions(lane).filter((record) => record.round === currentRound && questionOpen(record));
     const current = requestedId === undefined ? open[0] : open.find((record) => record.seq === requestedId);
+    const expired = readQuestions(lane).filter((record) => record.round === currentRound && record.expiredAt && (requestedId === undefined || record.seq === requestedId)).at(-1);
+    if (!current && expired) {
+      throw new CmdError(`lane "${lane}" question #${expired.seq} expired: its engine finished its turns, so no answer reaches it. Carry the ruling into the next round or a fresh lane`);
+    }
     if (!current) throw new CmdError(requestedId === undefined
       ? `lane "${lane}" has no open questions`
       : `lane "${lane}" has no open question #${requestedId}`);
