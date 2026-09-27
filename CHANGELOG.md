@@ -7,6 +7,10 @@
 - The gate stage records when it started, so `cdx status` shows `gate running` for the gate's age rather than the round's.
 - `cdx brief` shows each running lane's stage, as `stage=gate` for a lane past its last turn. The line said only `state=running`, so a lane waiting on the gate lock read as a lane still working.
 
+### Kill
+
+- `cdx kill` now signals the runner's process group instead of the runner alone. The runner runs the gate under `spawnSync`, so it cannot act on SIGTERM until the gate exits; kill waited 10 seconds, SIGKILLed the runner and its engine, and left the gate shell and its children running with parent pid 1. On 2026-09-27 killing astra-pmebig and astra-pme4 left one gate in its test step holding a GPU lease ticket and another waiting on `ultra-gate.lock` until the head TERMed them by pid. The gate now gets the SIGTERM, exits, and the runner finalizes the round within the first second.
+
 ### Delivery
 
 - A `/clear` or `/resume` no longer stops the poll for the rest of the process. The host keeps `$.state` per session, so the session the process moved to held no `poller` claim, and the running timer read the empty claim as a newer instance and cancelled itself. `ensure` does not start a second timer, so no settle or question event reached the session again and the wakes stopped. On 2026-09-27 a head restarted with `claude --continue` resumed into its old session id and stopped polling at once; its cursor sat at event 3507 while lanes settled and asked questions up to 3552. The `clear` and `resume` hook now cancels the old timer, starts a new one and writes the instance's claim under the new session.

@@ -77,6 +77,15 @@ export async function killChildren(supervisor: string, note: string): Promise<st
   return names;
 }
 
+// The detached runner leads its own process group, and the gate shell and
+// everything it starts stay in it. The runner runs the gate synchronously,
+// so it cannot act on its own SIGTERM until the gate exits; signalling the
+// group stops the gate too instead of leaving it orphaned with its lock or
+// lease.
+function signalRunnerGroup(pid: number, signal: NodeJS.Signals): void {
+  try { process.kill(-pid, signal); } catch { try { process.kill(pid, signal); } catch { /* gone */ } }
+}
+
 async function killLane(lane: string, entry: Lane, note?: string) {
   captureRecoveryPartial(lane, entry.rounds, entry.kind === "review" ? entry.review!.cwd : workCwdOf(entry), true);
   logProgress(lane, entry.rounds, `kill requested reason=${note ?? "caller requested stop"} partial=${availableReportPath(lane, entry.rounds) ?? "unavailable"}`);
@@ -85,7 +94,7 @@ async function killLane(lane: string, entry: Lane, note?: string) {
     throw new CmdError(`lane "${lane}" is marked running but its runner and codex child are both dead; run cdx doctor --fix`);
   }
   if (runnerAlive) {
-    try { process.kill(entry.pid!, "SIGTERM"); } catch { /* exited between check and kill */ }
+    signalRunnerGroup(entry.pid!, "SIGTERM");
     const deadline = Date.now() + 10_000;
     while (Date.now() < deadline) {
       const current = readLedger()[lane];
@@ -107,9 +116,8 @@ async function killLane(lane: string, entry: Lane, note?: string) {
     }
   }
   const current = readLedger()[lane] ?? entry;
-  for (const pid of [current.codexPid, current.pid]) {
-    if (pidAlive(pid)) { try { process.kill(pid!, "SIGKILL"); } catch { /* exited between check and kill */ } }
-  }
+  if (pidAlive(current.codexPid)) { try { process.kill(current.codexPid!, "SIGKILL"); } catch { /* exited between check and kill */ } }
+  if (pidAlive(current.pid)) signalRunnerGroup(current.pid!, "SIGKILL");
   const finalized = withLedger((ledger) => {
     const item = ledger[lane]!;
     failActiveRound(lane, item, note ? `killed: ${note}` : "killed");

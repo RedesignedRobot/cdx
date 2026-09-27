@@ -358,7 +358,7 @@ Round progress (steers delivered or rejected, auto-continues, agy retries, gate 
 
 `cdx wait <lane|job|panel>...` blocks until targets finish, prints each completion as the five-second poll sees it, and with `--report` prints report bodies. It exits 1 when a target failed and 2 the moment a waited lane asks a question. `--json` prints one object per finished lane. Supervisors join children with it; the head never does.
 
-`cdx kill` sends SIGTERM to the runner, which reaps its engine child and finalizes the round; a runner silent after 10 seconds gets SIGKILL. `--max-runtime MIN` uses the same sequence. Killing a supervisor stops its tree.
+`cdx kill` sends SIGTERM to the runner's process group, which holds the runner and a running gate with everything it started; the runner reaps its engine child and finalizes the round. A runner silent after 10 seconds gets SIGKILL, again for the whole group. `--max-runtime MIN` uses the same sequence. Killing a supervisor stops its tree.
 
 ## Claude Code integration
 
