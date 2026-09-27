@@ -23,7 +23,7 @@ import {
 } from "./engines.ts";
 import {
   captureGateTree, captureReviewTree, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
-  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot, laneDiffAgainstBase, docsOnly, docsOnlyGate, DOCS_ONLY_NOTE, NO_BASE_DIFF_NOTE,
+  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot, laneDiffAgainstBase, docsOnly, docsOnlyGate, DEFAULT_GATE_TIMEOUT_MINUTES, DOCS_ONLY_NOTE, NO_BASE_DIFF_NOTE,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import { runWorktreeSetup } from "./worktrees.ts";
@@ -588,7 +588,8 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       flushLedger();
       withLedger((ledger) => { ledger[lane]!.stage = "gate"; ledger[lane]!.stageStartedAt = new Date().toISOString(); });
       logProgress(lane, round, "gate started");
-      const verified = runFrozenGate(round, spec.cwd, spec.gate!, `${ROOT}/logs/${lane}-r${round}.gate.log`, lane);
+      const verified = runFrozenGate(round, spec.cwd, spec.gate!, `${ROOT}/logs/${lane}-r${round}.gate.log`, lane,
+        { timeoutMs: (spec.gateTimeoutMinutes ?? DEFAULT_GATE_TIMEOUT_MINUTES) * 60_000 });
       persistProgress(trackTools({ method: "item/completed", params: { item: { ...gateItem, exitCode: verified.gate.exitCode } } }, new Date().toISOString())!, new Date().toISOString());
       flushLedger();
       return verified;

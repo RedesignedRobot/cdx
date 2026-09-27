@@ -37,7 +37,7 @@ export function parseConfig(text: string): Config {
   }
 
   const input = value as Record<string, unknown>;
-  const allowed = new Set(["model", "thinkerModel", "models", "repoRouting", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "worktreeSetup", "fullAccess", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
+  const allowed = new Set(["model", "thinkerModel", "models", "repoRouting", "efforts", "defaultEffort", "rules", "accounts", "effortCaps", "expectMinutes", "gateTimeoutMinutes", "repoGateTimeoutMinutes", "worktreeSetup", "fullAccess", "gemini", "visibility", "model_auto_compact_token_limit", "tool_output_token_limit"]);
   const unknown = Object.keys(input).filter((key) => !allowed.has(key));
   if (unknown.length > 0) configError(`unknown config key${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
 
@@ -209,6 +209,26 @@ export function parseConfig(text: string): Config {
     expectMinutes = value;
   }
 
+  let gateTimeoutMinutes: number | undefined;
+  if (Object.hasOwn(input, "gateTimeoutMinutes")) {
+    const value = input.gateTimeoutMinutes;
+    if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) configError("gateTimeoutMinutes must be a positive number of minutes");
+    gateTimeoutMinutes = value;
+  }
+  let repoGateTimeoutMinutes: Record<string, number> | undefined;
+  if (Object.hasOwn(input, "repoGateTimeoutMinutes")) {
+    const value = input.repoGateTimeoutMinutes;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+      configError("repoGateTimeoutMinutes must be an object mapping canonical repository paths to minutes");
+    }
+    repoGateTimeoutMinutes = {};
+    for (const [path, minutes] of Object.entries(value as Record<string, unknown>)) {
+      if (!isAbsolute(path) || resolve(path) !== path) configError(`repoGateTimeoutMinutes key "${path}" must be an absolute canonical path`);
+      if (typeof minutes !== "number" || !Number.isFinite(minutes) || minutes <= 0) configError(`repoGateTimeoutMinutes.${path} must be a positive number of minutes`);
+      repoGateTimeoutMinutes[path] = minutes;
+    }
+  }
+
   const limits = { model_auto_compact_token_limit: 150_000, tool_output_token_limit: 6_000 };
   for (const key of Object.keys(limits) as Array<keyof typeof limits>) {
     if (!Object.hasOwn(input, key)) continue;
@@ -216,7 +236,7 @@ export function parseConfig(text: string): Config {
     limits[key] = Number(input[key]);
   }
   return {
-    ...limits, visibility, expectMinutes,
+    ...limits, visibility, expectMinutes, ...(gateTimeoutMinutes ? { gateTimeoutMinutes } : {}), ...(repoGateTimeoutMinutes ? { repoGateTimeoutMinutes } : {}),
     model, thinkerModel, ...(models ? { models } : {}), efforts: efforts as string[], defaultEffort, rules: rules as string[],
     ...(accounts ? { accounts } : {}), effortCaps, repoRouting, ...(worktreeSetup ? { worktreeSetup } : {}), ...(fullAccess ? { fullAccess } : {}), gemini: gemini ?? defaults.gemini,
   };

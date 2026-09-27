@@ -4,7 +4,7 @@ import { safeText } from "./safe-text.ts";
 // Gate execution, content receipts, review tree snapshots, and gate commands.
 
 import {
-  activeStateOf, type GateReceipt, type GateTree, type Lane, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
+  activeStateOf, type Config, type GateReceipt, type GateTree, type Lane, laneRunning, type Ledger, readLane, requireOwnChild, type ReviewAttestation,
   type RoundRecord, supervisorLane, withLedger,
 } from "./ledger.ts";
 import { tailOutput } from "./reports.ts";
@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 
 // Receipt format stays at version 1 across ledger migrations. Absence means no content proof.
 export function makeGateReceipt(round: number, cwd: string, command: string, exitCode: number,
@@ -102,6 +102,18 @@ export function composeGate(required: string | undefined, requested: string | un
   }
   // Separate shells prevent exit, cd and shell options in one check skipping the other.
   return `(/bin/sh -lc ${shellQuote(baseline)}) && (/bin/sh -lc ${shellQuote(gate)})`;
+}
+
+export const DEFAULT_GATE_TIMEOUT_MINUTES = 60;
+
+// A repository's own limit beats the global one. The key is the main
+// checkout, as for repoRouting and .cdx-gate, so every worktree matches. A gate
+// that waits on shared locks or runs only by day needs more than the default.
+export function gateTimeoutMinutes(cwd: string, settings: Pick<Config, "gateTimeoutMinutes" | "repoGateTimeoutMinutes">): number {
+  const common = Bun.spawnSync({ cmd: ["git", "-C", cwd, "rev-parse", "--path-format=absolute", "--git-common-dir"] });
+  const commonDir = common.success ? realpathOrUndefined(common.stdout.toString().trim()) : undefined;
+  const repo = commonDir && basename(commonDir) === ".git" ? dirname(commonDir) : undefined;
+  return (repo ? settings.repoGateTimeoutMinutes?.[repo] : undefined) ?? settings.gateTimeoutMinutes ?? DEFAULT_GATE_TIMEOUT_MINUTES;
 }
 
 export function repositoryGate(cwd: string): string | undefined {
@@ -263,12 +275,11 @@ export function verifyGate(round: number, cwd: string, command: string,
 }
 
 const GATE_GROUP = join(import.meta.dir, "gate-group.ts");
-const GATE_TIMEOUT_MS = 60 * 60 * 1000;
 // gate-group.ts stops the gate's group itself; this only catches a wrapper
 // that hangs past its own deadline.
 const WRAPPER_BACKSTOP_MS = 60_000;
 
-export function executeGate(command: string, cwd: string, logPath: string, timeoutMs = GATE_TIMEOUT_MS): GateResult {
+export function executeGate(command: string, cwd: string, logPath: string, timeoutMs = DEFAULT_GATE_TIMEOUT_MINUTES * 60_000): GateResult {
   const started = Date.now();
   const gate = Bun.spawnSync({
     cmd: [process.execPath, GATE_GROUP, String(timeoutMs), command], cwd, env: gateEnv(cwd),

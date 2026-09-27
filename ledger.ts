@@ -98,6 +98,10 @@ export interface Config {
   // Highest effort a Codex model may run at, by model id.
   effortCaps: Record<string, string>;
   worktreeSetup?: string;
+  // Minutes a gate may run, waits on shared locks included, globally and by
+  // repository main checkout.
+  gateTimeoutMinutes?: number;
+  repoGateTimeoutMinutes?: Record<string, number>;
   // Owner ruling 2026-09-26: Codex work lanes and supervisors run with no
   // sandbox. Reviews and consults stay read-only, since review proof needs it.
   fullAccess?: boolean;
@@ -278,6 +282,7 @@ export interface Spec {
   expectMinutes?: number;
   // Copied from config at launch; the runner reads no config file.
   fullAccess?: boolean;
+  gateTimeoutMinutes?: number;
   promptBytes?: Record<string, number>;
   model_auto_compact_token_limit?: number;
   tool_output_token_limit?: number;

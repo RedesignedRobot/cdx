@@ -11,6 +11,10 @@
 
 - A worktree lane whose changes against its base are all docs (`*.md`) or files under a `lanes/` directory no longer runs its gate. On 2026-09-27 astra-pmebig's only commit was `platforms/metal/tests/pmebig-results.md` and astra-pme4's was its DEAD report, yet each queued for the 20 to 45 minute GPU gate. The round now ends `done` with the note `only docs changed against base, gate skipped`, a `## Gate` section saying so, and `gateExit=not-run`. Unlike the no-diff skip, the lane gets a receipt bound to its tree and marked `skipped: "docs only"`, so `cdx land` merges the docs; a merge result that differs from the lane's tree still runs the gate at land.
 
+### Gate timeout
+
+- The gate time limit is configurable: `gateTimeoutMinutes` globally and `repoGateTimeoutMinutes` by repository main checkout, keyed like `repoRouting`. The default stays 60 minutes. The limit counts waits on shared locks and leases, and the openmm-metal gate sleeps from 00:00Z to 07:05Z by design, so a lane finishing at night always timed out; astra-duallist's gate timed out on 2026-09-27 after waiting 38 minutes for `ultra-gate.lock`. Spawn and resume copy the limit into the spec, since the runner reads no config, and land reads it for the merge gate.
+
 ### Kill
 
 - A gate that times out is now stopped with everything it started. The gate ran under `spawnSync`, whose timeout SIGKILLs only the direct child, `/bin/sh`; on 2026-09-27 astra-duallist's gate timed out and left `locked.py`, `cdx-gate.sh`, `listcheck` and a lease ticket running under pid 1. `gate-group.ts` now starts the gate shell as its own process group leader and, on timeout or on SIGTERM from `cdx kill`, sends SIGTERM to the group, then SIGKILL after 5 seconds. A timed-out gate exits 124 with the same `cdx: gate timed out` note.

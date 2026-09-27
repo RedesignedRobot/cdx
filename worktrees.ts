@@ -3,7 +3,7 @@
 import { config } from "./config.ts";
 import { feedEvent, readLane, requireOwnChild, supervisorLane, withLedger, laneRunning, type Lane, type Ledger, type Spec } from "./ledger.ts";
 import { type Job, jobDuration, jobRunning, readJobs, storeJob } from "./jobs.ts";
-import { captureGateTree, gateFailure, receiptRefusal, reviewRefusal } from "./gates.ts";
+import { captureGateTree, gateFailure, gateTimeoutMinutes, receiptRefusal, reviewRefusal } from "./gates.ts";
 import { createReviewSnapshot, runFrozenGate } from "./snapshots.ts";
 import { specPathOf } from "./reports.ts";
 import { CmdError, completionVerdict, displayPath, fail, HOME, pidAlive, ROOT, SELF, settleHint, shellQuote, uncoloredChildEnv } from "./runtime.ts";
@@ -310,7 +310,8 @@ function proveMerge(repo: string, commit: string, targets: LandLane[]): string |
   const log = `${ROOT}/logs/${source.lane}-land-${tree.slice(0, 12)}.gate.log`;
   console.log(`cdx: gating merge result ${commit.slice(0, 12)} of ${targets.map((target) => target.lane).join(", ")}`);
   const { gate, receipt } = runFrozenGate(source.entry.work.round!, source.entry.worktreePath!, mergeGateCommand(targets), log, source.lane,
-    { create: (cwd, lane, round) => createReviewSnapshot(cwd, lane, round, { head: commit, tree }) });
+    { create: (cwd, lane, round) => createReviewSnapshot(cwd, lane, round, { head: commit, tree }),
+      timeoutMs: gateTimeoutMinutes(repo, config) * 60_000 });
   if (receipt.valid) {
     if (source.tree === tree && source.entry.gateReceipt!.tree !== tree) withLedger((ledger) => { ledger[source.lane]!.gateReceipt = receipt; });
     return;

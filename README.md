@@ -441,6 +441,8 @@ State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the 
   "defaultEffort": "medium",
   "effortCaps": { "gpt-6-astra": "medium", "gpt-6-sol": "high" },
   "expectMinutes": 15,
+  "gateTimeoutMinutes": 60,
+  "repoGateTimeoutMinutes": {},
   "rules": [],
   "worktreeSetup": "bun install",
   "gemini": {
@@ -464,6 +466,7 @@ The values shown are the defaults except `worktreeSetup`, which has none. Unknow
 - `effortCaps` maps a model id to its highest effort, checked after alias resolution on spawn, resume, review, consult and the doctor probe. An explicit effort above the cap fails; an inherited one clamps with a note.
 - `repoRouting` maps absolute canonical repository paths to `{ "model": ... }`. Default `{}`.
 - `expectMinutes` is the floor of the expected duration for lanes and jobs.
+- `gateTimeoutMinutes` limits one gate run, time spent waiting on shared locks included; `repoGateTimeoutMinutes` maps absolute canonical repository paths, keyed like `repoRouting`, to a limit that wins for that repository. Spawn and resume copy the limit into the lane's spec, and land reads it for the merge gate. Default 60 minutes.
 - `rules` are rendered into each lane home's AGENTS.md; the lane's `.cdx-rules.md` follows as a pointer.
 - `worktreeSetup` runs inside each new `--worktree` in the lane's runner before the engine starts, logged to `logs/<lane>-r<round>.setup.log`; nonzero fails the round and leaves the worktree for inspection.
 - `gemini.maxRounds` caps Gemini work rounds per lane; resume past it fails with `round cap <n> reached for <lane>: close it and spawn a new lane with the failure attached`. `outageFallbackModel` must stay in the gemini-3.8 family; empty disables the fallback round.

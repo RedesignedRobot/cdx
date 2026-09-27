@@ -607,3 +607,28 @@ test("a gate's own exit code and output pass through the process-group wrapper",
     expect(gate.output).toContain("out\nerr\n");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+import { parseConfig } from "./config.ts";
+import { DEFAULT_GATE_TIMEOUT_MINUTES, gateTimeoutMinutes } from "./gates.ts";
+import { realpathSync } from "node:fs";
+
+test("the gate timeout comes from the repository override, then the global setting, then 60 minutes", () => {
+  const { dir, repo, worktree } = laneRepo();
+  try {
+    const { path } = worktree("night");
+    const key = realpathSync(repo);
+    const settings = parseConfig(JSON.stringify({ gateTimeoutMinutes: 90, repoGateTimeoutMinutes: { [key]: 540 } }));
+    expect(gateTimeoutMinutes(path, settings)).toBe(540);
+    expect(gateTimeoutMinutes(repo, settings)).toBe(540);
+    expect(gateTimeoutMinutes(path, parseConfig(JSON.stringify({ gateTimeoutMinutes: 90, repoGateTimeoutMinutes: { "/other/repo": 540 } })))).toBe(90);
+    expect(gateTimeoutMinutes(path, parseConfig("{}"))).toBe(DEFAULT_GATE_TIMEOUT_MINUTES);
+    expect(gateTimeoutMinutes(dir, settings)).toBe(90);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("gate timeout settings must be positive minutes keyed by canonical paths", () => {
+  expect(() => parseConfig(JSON.stringify({ gateTimeoutMinutes: 0 }))).toThrow("gateTimeoutMinutes must be a positive number of minutes");
+  expect(() => parseConfig(JSON.stringify({ repoGateTimeoutMinutes: [] }))).toThrow("repoGateTimeoutMinutes must be an object");
+  expect(() => parseConfig(JSON.stringify({ repoGateTimeoutMinutes: { "relative/repo": 540 } }))).toThrow("absolute canonical path");
+  expect(() => parseConfig(JSON.stringify({ repoGateTimeoutMinutes: { "/repo": "540" } }))).toThrow("repoGateTimeoutMinutes./repo must be a positive number of minutes");
+});

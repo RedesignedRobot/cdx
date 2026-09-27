@@ -119,6 +119,7 @@ interface FrozenGateOps {
   capture?: typeof captureGateTree;
   execute?: typeof executeGate;
   remove?: typeof removeReviewSnapshot;
+  timeoutMs?: number;
   changedPaths?: (before: GateTree, after: GateTree) => string[];
 }
 
@@ -136,6 +137,6 @@ export function runFrozenGate(round: number, cwd: string, command: string, logPa
     return verifyGate(round, cwd, command, () => {
       if (first) { first = false; return initial; }
       return capture();
-    }, () => (ops.execute ?? executeGate)(command, snapshot.cwd, logPath), changedPaths);
+    }, () => (ops.execute ?? executeGate)(command, snapshot.cwd, logPath, ops.timeoutMs), changedPaths);
   } finally { (ops.remove ?? removeReviewSnapshot)(snapshot.path); }
 }
