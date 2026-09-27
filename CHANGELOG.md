@@ -7,6 +7,10 @@
 - The gate stage records when it started, so `cdx status` shows `gate running` for the gate's age rather than the round's.
 - `cdx brief` shows each running lane's stage, as `stage=gate` for a lane past its last turn. The line said only `state=running`, so a lane waiting on the gate lock read as a lane still working.
 
+### Gate
+
+- A worktree lane whose changes against its base are all docs (`*.md`) or files under a `lanes/` directory no longer runs its gate. On 2026-09-27 astra-pmebig's only commit was `platforms/metal/tests/pmebig-results.md` and astra-pme4's was its DEAD report, yet each queued for the 20 to 45 minute GPU gate. The round now ends `done` with the note `only docs changed against base, gate skipped`, a `## Gate` section saying so, and `gateExit=not-run`. Unlike the no-diff skip, the lane gets a receipt bound to its tree and marked `skipped: "docs only"`, so `cdx land` merges the docs; a merge result that differs from the lane's tree still runs the gate at land.
+
 ### Kill
 
 - `cdx kill` now signals the runner's process group instead of the runner alone. The runner runs the gate under `spawnSync`, so it cannot act on SIGTERM until the gate exits; kill waited 10 seconds, SIGKILLed the runner and its engine, and left the gate shell and its children running with parent pid 1. On 2026-09-27 killing astra-pmebig and astra-pme4 left one gate in its test step holding a GPU lease ticket and another waiting on `ultra-gate.lock` until the head TERMed them by pid. The gate now gets the SIGTERM, exits, and the runner finalizes the round within the first second.

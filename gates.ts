@@ -146,22 +146,41 @@ export function captureGateTree(cwd: string, _paths?: string[]): GateTree | unde
 }
 
 export const NO_BASE_DIFF_NOTE = "no diff against base, gate skipped";
+export const DOCS_ONLY_NOTE = "only docs changed against base, gate skipped";
 
-// True when a worktree lane's whole checkout, untracked files included, has
-// the tree of its merge base with the base branch: the base land diffs
-// against, so there is nothing to land and a gate would only retest the
-// base. Lanes without a managed worktree record no base and always gate.
-export function laneMatchesBase(cwd: string, entry: Pick<Lane, "worktreePath" | "branch" | "baseBranch"> | undefined): boolean {
-  if (!entry?.worktreePath || !entry.branch) return false;
+// What a worktree lane's whole checkout, untracked files included, changes
+// against the tree of its merge base with the base branch: the base land
+// diffs against. Lanes without a managed worktree record no base, and a
+// checkout git cannot read has no answer; both always gate.
+export function laneDiffAgainstBase(cwd: string, entry: Pick<Lane, "worktreePath" | "branch" | "baseBranch"> | undefined): { paths: string[]; tree: GateTree } | undefined {
+  if (!entry?.worktreePath || !entry.branch) return undefined;
   const git = (...args: string[]) => {
     const result = Bun.spawnSync({ cmd: ["git", "-C", cwd, ...args] });
     return result.success ? result.stdout.toString().trim() : undefined;
   };
   const base = git("merge-base", "HEAD", `refs/heads/${entry.baseBranch ?? "main"}`);
   const baseTree = base && git("rev-parse", `${base}^{tree}`);
-  if (!baseTree) return false;
-  try { return captureGateTree(cwd)?.tree === baseTree; }
-  catch { return false; }
+  if (!baseTree) return undefined;
+  let tree: GateTree | undefined;
+  try { tree = captureGateTree(cwd); }
+  catch { return undefined; }
+  if (!tree) return undefined;
+  if (tree.tree === baseTree) return { paths: [], tree };
+  const diff = git("diff", "--name-only", baseTree, tree.tree);
+  return diff === undefined ? undefined : { paths: diff.split("\n").filter(Boolean), tree };
+}
+
+// A DEAD lane still commits its report or results note; no gate tests those,
+// so a 20-45 minute GPU gate on them only holds the shared lease.
+export function docsOnly(paths: string[]): boolean {
+  return paths.length > 0 && paths.every((path) => /\.md$/i.test(path) || path.split("/").slice(0, -1).includes("lanes"));
+}
+
+// The receipt binds the tree without a gate run, so land can merge the docs;
+// a merge result that differs from this tree still gates at land.
+export function docsOnlyGate(round: number, cwd: string, command: string, tree: GateTree): ReturnType<typeof verifyGate> {
+  const receipt: GateReceipt = { ...makeGateReceipt(round, cwd, command, 0, new Date().toISOString(), tree, tree), skipped: "docs only" };
+  return { gate: { exitCode: 0, output: "", timedOut: false }, receipt, proofRequired: true };
 }
 
 export function gateReceiptCommand(argv: string[]): void {

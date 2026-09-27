@@ -410,7 +410,9 @@ test("worktree setup runs the configured command, then an executable repo script
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-import { laneMatchesBase, NO_BASE_DIFF_NOTE } from "./gates.ts";
+import { DOCS_ONLY_NOTE, docsOnly, docsOnlyGate, laneDiffAgainstBase, NO_BASE_DIFF_NOTE } from "./gates.ts";
+
+const laneMatchesBase = (cwd: string, entry: Parameters<typeof laneDiffAgainstBase>[1]) => laneDiffAgainstBase(cwd, entry)?.paths.length === 0;
 import { finalizeRound } from "./runner.ts";
 import { reportPathOf } from "./reports.ts";
 import { readFileSync, unlinkSync } from "node:fs";
@@ -519,5 +521,62 @@ test("a skipped gate finalizes with a no-diff verdict in state, report and feed,
     expect(terminal.message).toContain(`note=${NO_BASE_DIFF_NOTE}`);
     expect(terminal.message).toContain("gateExit=not-run");
     expect(landRefusal(finished)).toBe("no content-bound gate receipt; run a new work round");
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a lane that changed only docs or files under a lanes/ directory skips the gate; any other path gates", () => {
+  const { dir, git, worktree } = laneRepo();
+  try {
+    const { path, entry } = worktree("results");
+    mkdirSync(join(path, "platforms", "metal", "tests"), { recursive: true });
+    writeFileSync(join(path, "platforms", "metal", "tests", "pmebig-results.md"), "DEAD\n");
+    git(path, "add", "--all");
+    git(path, "commit", "--quiet", "-m", "results");
+    expect(laneDiffAgainstBase(path, entry)?.paths).toEqual(["platforms/metal/tests/pmebig-results.md"]);
+    expect(docsOnly(laneDiffAgainstBase(path, entry)!.paths)).toBe(true);
+    mkdirSync(join(path, "lanes", "r3"), { recursive: true });
+    writeFileSync(join(path, "lanes", "r3", "cost.py"), "print(1)\n");
+    expect(docsOnly(laneDiffAgainstBase(path, entry)!.paths)).toBe(true);
+    writeFileSync(join(path, "kernel.ts"), "fast\n");
+    expect(docsOnly(laneDiffAgainstBase(path, entry)!.paths)).toBe(false);
+    expect(docsOnly([])).toBe(false);
+    expect(docsOnly(["lanes"])).toBe(false);
+    expect(docsOnly(["README.MD", "exp/lanes/report.txt"])).toBe(true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a docs-only lane finalizes done with a tree-bound receipt that land accepts, and no gate exit", async () => {
+  const { dir, git, worktree } = laneRepo();
+  const lane = "docs-verdict";
+  const { path, entry } = worktree(lane);
+  const gate = "bun run check";
+  try {
+    writeFileSync(join(path, "results.md"), "DEAD: slower\n");
+    git(path, "add", "--all");
+    git(path, "commit", "--quiet", "-m", "results");
+    const at = new Date().toISOString();
+    storeLane(lane, { engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [], gate, ...entry, worktreeRepo: join(dir, "repo"),
+      work: { state: "running", cwd: path, round: 1, updatedAt: at }, createdAt: at, updatedAt: at } as unknown as Lane);
+    const reportPath = reportPathOf(lane, 1);
+    mkdirSync(join(reportPath, ".."), { recursive: true });
+    writeFileSync(reportPath, "DEAD: the prototype measured slower; results committed.\n");
+    const log = console.log;
+    console.log = () => {};
+    let code: number;
+    try {
+      code = await finalizeRound({ treeCwd: path, preparedGate: docsOnlyGate(1, path, gate, laneDiffAgainstBase(path, entry)!.tree), lane, round: 1, jsonMode: true, gemini: false,
+        spec: { engine: "gpt", cwd: path, gate, effort: "medium" } as Spec, logPath: join(dir, "round.log"), reportPath,
+        exitCode: 0, maxRuntimeHit: false, geminiContinuations: 0 });
+    } finally { console.log = log; }
+    expect(code).toBe(0);
+    const finished = readLane(lane);
+    expect(finished.work).toMatchObject({ state: "done", note: DOCS_ONLY_NOTE });
+    expect(finished.gateReceipt).toMatchObject({ valid: true, exitCode: 0, skipped: "docs only", tree: git(path, "rev-parse", "HEAD^{tree}") });
+    expect(readFileSync(reportPath, "utf8")).toContain(`## Gate\n\nSkipped: ${DOCS_ONLY_NOTE}.`);
+    const terminal = recentEvents(5).find((event) => event.kind === "terminal" && event.lane === lane)!;
+    expect(terminal.message).toContain(`note=${DOCS_ONLY_NOTE}`);
+    expect(terminal.message).toContain("gateExit=not-run");
+    expect(recentEvents(5).some((event) => event.kind === "gate-finished" && event.lane === lane)).toBe(false);
+    expect(landRefusal(finished)).toBeUndefined();
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

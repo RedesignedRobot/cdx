@@ -136,6 +136,8 @@ export interface GateReceipt {
   tree?: string;
   valid: boolean;
   reason?: string;
+  // The gate command never ran: only docs changed against the base.
+  skipped?: "docs only";
 }
 
 export interface RoundRecord<S extends WorkState = WorkState> {

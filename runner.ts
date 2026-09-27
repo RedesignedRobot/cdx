@@ -23,7 +23,7 @@ import {
 } from "./engines.ts";
 import {
   captureGateTree, captureReviewTree, changedPaths, repairGateOnce, gateFailure, executeGate, finishGateReceipt,
-  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot, laneMatchesBase, NO_BASE_DIFF_NOTE,
+  gateAcceptanceFailed, gateOutputForReport, verifyGate, attestReview, reviewAttests, reviewRoot, laneDiffAgainstBase, docsOnly, docsOnlyGate, DOCS_ONLY_NOTE, NO_BASE_DIFF_NOTE,
 } from "./gates.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, parseQuotaResetIso, refreshGeminiUsage, writeGeminiQuota } from "./gemini-usage.ts";
 import { runWorktreeSetup } from "./worktrees.ts";
@@ -570,9 +570,15 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
     // A lane that ends where it forked (a DEAD verdict reverts its prototype)
     // has nothing to land; its gate held a shared GPU lease for 20-45 minutes
     // to prove the base again.
-    if (laneMatchesBase(spec.cwd, startingLane)) {
+    const diff = laneDiffAgainstBase(spec.cwd, startingLane);
+    if (diff?.paths.length === 0) {
       gateSkipped = true;
       logProgress(lane, round, NO_BASE_DIFF_NOTE);
+      return;
+    }
+    if (diff && docsOnly(diff.paths)) {
+      logProgress(lane, round, `${DOCS_ONLY_NOTE}: ${diff.paths.join(", ")}`);
+      preparedGate = docsOnlyGate(round, spec.cwd, spec.gate, diff.tree);
       return;
     }
     const run = () => {
@@ -1304,7 +1310,10 @@ export async function finalizeRound({ treeCwd, preparedGate, gateSkipped = false
   let gateTimedOut = false;
   let gateReceipt: GateReceipt | undefined;
   let proofRequired = false;
-  if (preparedGate && spec.gate && beforeFinalize?.kind === "work") {
+  if (preparedGate?.receipt.skipped && spec.gate && beforeFinalize?.kind === "work") {
+    gateReceipt = preparedGate.receipt;
+    appendFileSync(reportPath, `\n\n## Gate\n\nSkipped: ${DOCS_ONLY_NOTE}. \`${spec.gate}\` did not run. The receipt binds this tree so land can merge it, and land gates any merge result that differs.\n`);
+  } else if (preparedGate && spec.gate && beforeFinalize?.kind === "work") {
     setStage("gate");
     const shared = sharedTreeLanes(lane, spec.cwd, readLedger(), (cwd) => {
       try {
@@ -1392,6 +1401,7 @@ export async function finalizeRound({ treeCwd, preparedGate, gateSkipped = false
     }
     else if (exitCode === 0 && !reportOk) roundNote = "no final report";
     else if (exitCode === 0 && gateSkipped) roundNote = NO_BASE_DIFF_NOTE;
+    else if (exitCode === 0 && gateReceipt?.skipped) roundNote = DOCS_ONLY_NOTE;
     else if (roundCleanupWarning) roundNote = `cleanup warning: ${roundCleanupWarning.slice(0, 200)}`;
     // Signal exits outrank the auth regex: a SIGTERM'd codex can leave auth
     // words in stderr and a kill must never read as a login failure.
