@@ -94,7 +94,7 @@ A hot reload runs the module afresh with these variables empty and may not fire 
 
 Every `$.process.run` on cdx passes `env: { CLAUDE_CODE_SESSION_ID: session }` and `cwd: root`.
 
-On `command.run` of `clear` or `resume`, after `next`: re-read the session id, clear the buffer, run `cdx brief` again as at start.
+On `command.run` of `clear` or `resume`, after `next`: re-read the session id, clear the buffer, restart the poll timer, run `cdx brief` again as at start. The host keeps `$.state` per session, so the session the process moved to holds no `poller` claim until the restart writes one; without it the old timer reads the empty claim as a newer instance and stops for good.
 
 ### Delivery
 

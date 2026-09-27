@@ -1,3 +1,9 @@
+## Unreleased
+
+### Delivery
+
+- A `/clear` or `/resume` no longer stops the poll for the rest of the process. The host keeps `$.state` per session, so the session the process moved to held no `poller` claim, and the running timer read the empty claim as a newer instance and cancelled itself. `ensure` does not start a second timer, so no settle or question event reached the session again and the wakes stopped. On 2026-09-27 a head restarted with `claude --continue` resumed into its old session id and stopped polling at once; its cursor sat at event 3507 while lanes settled and asked questions up to 3552. The `clear` and `resume` hook now cancels the old timer, starts a new one and writes the instance's claim under the new session.
+
 ## 10.0.9 (2026-09-27)
 
 ### Gate

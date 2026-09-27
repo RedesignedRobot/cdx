@@ -6,9 +6,9 @@ import type { On, ProcessRunInit } from "claude-code";
 
 type Run = { argv: readonly string[]; init?: ProcessRunInit };
 
-function engine(on: On, runs: Run[], sessionId = "head") {
+function engine(on: On, runs: Run[], sessionId: string | (() => string) = "head") {
   const clock = mock.clock(on);
-  on("session.id", () => ({ value: sessionId }));
+  on("session.id", () => ({ value: typeof sessionId === "string" ? sessionId : sessionId() }));
   on("session.cwd", () => ({ value: "/tmp" }));
   on("session.surfaces", () => ({ value: ["terminal"] }) as never);
   on("session.start", (_$, e) => ({ cwd: e.cwd }));
@@ -55,6 +55,32 @@ test("a newer instance's claim stops this instance's poller", async ($, on) => {
   newer = "reloaded";
   await clock.advance(6000);
   expect(polls(runs)).toEqual(["head"]);
+});
+
+// The host holds $.state per session, so the session a /clear or /resume
+// moves the process to starts with no poller claim.
+function stateBySession(on: On, current: () => string) {
+  const claims = new Map<string, string>();
+  on("state.set", { plugin: "cdx", key: "poller" }, (_$, e) => {
+    claims.set(current(), e.value);
+    return { value: { isSet: true, version: 1 } } as never;
+  });
+  on("state.get", { plugin: "cdx", key: "poller" }, () =>
+    ({ value: { value: claims.get(current()), version: claims.has(current()) ? 1 : 0 } }) as never);
+}
+
+test("a /resume into a session with no poller claim keeps the poll running under the new id", async ($, on) => {
+  const runs: Run[] = [];
+  let id = "fresh";
+  const clock = engine(on, runs, () => id);
+  stateBySession(on, () => id);
+  on("command.run", { command: ["clear", "resume"] }, () => ({ text: "" }) as never);
+  await $.session.start({ cwd: "/tmp", surface: "terminal", isInteractive: true });
+  await clock.advance(2000);
+  id = "head";
+  await $.command.run({ command: "resume", args: "" } as never);
+  await clock.advance(6000);
+  expect(polls(runs)).toEqual(["fresh", "head", "head", "head"]);
 });
 
 test("a lane or job tool with no session id is refused, a read runs", async ($, on) => {

@@ -1,4 +1,4 @@
-import type { BoxProps, ElementConstructor, EngineInterface, On, RenderElement, RenderSurface, TextProps } from "claude-code";
+import type { BoxProps, ElementConstructor, EngineInterface, On, RenderElement, RenderSurface, TextProps, Timer } from "claude-code";
 import { blockingCdxCommand, blockingCdxRefusal, invokedRawEngine, nativeCdxCommand, nativeCdxRefusal, rawEngineRefusal } from "../guard";
 import {
   afterPoll,
@@ -36,6 +36,7 @@ let CDX: string[] = [];
 let surface: RenderSurface | null = null;
 let deliveryState: DeliveryState = initialDeliveryState();
 let pollInFlight = false;
+let pollTimer: Timer | undefined;
 let outputSequence = 0;
 const liveRef = { plugin: "cdx", key: "live" } as const;
 const rolloverRef = { plugin: "cdx", key: "rollover" } as const;
@@ -125,12 +126,21 @@ async function ensure($: EngineInterface) {
   root = $.plugin.root;
   CDX = ["bun", `${root}/cdx.ts`];
   if (surface === null) surface = (await $.session.surfaces())[0] ?? null;
-  await $.state.set(pollerRef, INSTANCE);
+  await startPolling($);
+}
+
+// The host holds $.state for the session, so after a /clear or /resume the
+// session the process moved to has no claim and the running timer would
+// read that as a newer instance and stop. That hook starts the timer again.
+async function startPolling($: EngineInterface) {
+  pollTimer?.cancel();
   const timer = $.clock.every(POLL_INTERVAL_MS, async () => {
     if ((await $.state.get(pollerRef)).value !== INSTANCE) return timer.cancel();
     await ensure($);
     await poll($);
   });
+  pollTimer = timer;
+  await $.state.set(pollerRef, INSTANCE);
 }
 
 // The poll drains the feed every two seconds into the buffer, so the CLI
@@ -283,6 +293,7 @@ export function register(on: On) {
     await ensure($);
     session = await $.session.id();
     deliveryState = clearBuffer(deliveryState);
+    await startPolling($);
     // The user typed /clear or /resume here, so this session keeps the head
     // under its new id.
     const briefResult = await $.process.run(CDX.concat(["brief", "--head"]), {
