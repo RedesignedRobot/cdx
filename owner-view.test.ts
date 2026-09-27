@@ -21,11 +21,11 @@ async function printed(session: string | undefined, run: () => unknown): Promise
   return lines.join("\n");
 }
 
-function runningLane(name: string, owner?: string): void {
+function runningLane(name: string, owner?: string, stage?: Lane["stage"]): void {
   const at = new Date().toISOString();
   storeLane(name, { engine: "gpt", kind: "work", effort: "medium", rounds: 1, reports: [], tokenAccounting: 1,
     ...(owner ? { ownerSession: owner } : {}), ownerCwd: "/repo", work: { state: "running", cwd: "/repo", updatedAt: at },
-    createdAt: at, updatedAt: at, roundStartedAt: at } as unknown as Lane);
+    createdAt: at, updatedAt: at, roundStartedAt: at, ...(stage ? { stage } : {}) } as unknown as Lane);
 }
 
 function runningJob(name: string, owner?: string): void {
@@ -76,4 +76,12 @@ test("each live session sees only its own lanes and jobs; the head also sees uno
   expect(block("view-lane-gone")).not.toContain("owned by another live session");
   const terminalBrief = await printed(undefined, () => briefCommand([]));
   for (const name of ["view-lane-a", "view-lane-b", "view-lane-terminal"]) expect(terminalBrief).toContain(name);
+});
+
+test("the brief shows a running lane's stage, so a lane past its last turn reads as gating", async () => {
+  runningLane("stage-lane", undefined, "gate");
+  runningLane("stage-new");
+  const brief = await printed(undefined, () => briefCommand([]));
+  expect(brief).toContain("lane=stage-lane round=1 kind=work state=running report=- stage=gate");
+  expect(brief).toContain("lane=stage-new round=1 kind=work state=running report=- stage=working");
 });

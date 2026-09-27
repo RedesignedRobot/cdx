@@ -5,6 +5,7 @@
 - A question still open when a lane's engine ends its last turn now expires then, instead of at round end. On 2026-09-27 astra-pme4 asked questions 2 to 4 from background execs, committed its report and ended its turn at 20:55, then waited on the shared GPU gate lock. The head answered #3 and #4 at 21:03 and `cdx reply` reported success, but the engine never ran another turn, so the ruling reached nothing. A reply to an expired question is now refused with `question #N expired: its engine finished its turns`.
 - A `cdx send` after the last turn is still refused, since nothing reads it, and the refusal now names the stage and the way out: act on the report when the lane settles, or `cdx kill` it. Queuing the text for a next round would carry a stale ruling into work the head has not yet read the report for.
 - The gate stage records when it started, so `cdx status` shows `gate running` for the gate's age rather than the round's.
+- `cdx brief` shows each running lane's stage, as `stage=gate` for a lane past its last turn. The line said only `state=running`, so a lane waiting on the gate lock read as a lane still working.
 
 ### Delivery
 

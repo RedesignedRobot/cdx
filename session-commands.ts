@@ -85,7 +85,7 @@ function sessionSummary(visible: (owner: string | undefined) => boolean): string
   const finished = open.filter(([, entry]) => !laneRunning(entry));
   const hidden = Math.max(0, finished.length - BRIEF_FINISHED_SHOWN);
   const lines = [...open.filter(([, entry]) => laneRunning(entry)), ...finished.slice(0, BRIEF_FINISHED_SHOWN)]
-    .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${activeStateOf(entry)} report=${roundReportOf(entry) ?? "-"}${laneRunning(entry) ? "" : " awaiting attention; close when handled"}`);
+    .map(([lane, entry]) => `lane=${lane} round=${entry.rounds} kind=${entry.kind} state=${activeStateOf(entry)} report=${roundReportOf(entry) ?? "-"}${laneRunning(entry) ? ` stage=${entry.stage ?? "working"}` : " awaiting attention; close when handled"}`);
   if (hidden > 0) lines.push(`${hidden} older finished lanes not closed; cdx status --all lists them`);
   for (const record of readQuestions()) {
     const entry = ledger[record.lane];
