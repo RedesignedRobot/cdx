@@ -16,7 +16,6 @@ import {
   bandTable,
   orderedRows,
 } from "./delivery";
-import { afterCompaction, stopOutcome } from "./rollover";
 import {
   CDX_TOOL_PREFIX,
   MAX_PROCESS_TIMEOUT_MS,
@@ -39,7 +38,6 @@ let pollInFlight = false;
 let pollTimer: Timer | undefined;
 let outputSequence = 0;
 const liveRef = { plugin: "cdx", key: "live" } as const;
-const rolloverRef = { plugin: "cdx", key: "rollover" } as const;
 const pollerRef = { plugin: "cdx", key: "poller" } as const;
 const POLL_INTERVAL_MS = 2000;
 const INSTANCE = `${Date.now()}-${Math.random()}`;
@@ -248,27 +246,6 @@ export function register(on: On) {
   on("turn.complete", async ($, e, next) => {
     if (!e.agentId) deliveryState = onTurnComplete(deliveryState);
     return next(e);
-  });
-
-  // Counts compactions that stand in the head's own conversation; a subagent's,
-  // a precompute and a skipped one leave the head's context as it was.
-  on("session.compact", async ($, e, next) => {
-    const result = await next(e);
-    if (e.agentId || e.trigger === "precompute" || !result.messages) return result;
-    const { value } = await $.state.get(rolloverRef);
-    await $.state.set(rolloverRef, afterCompaction(value, await $.session.id()));
-    return result;
-  });
-
-  // The settings Stop hooks (the owner's push guard among them) sit beneath
-  // this one and still run; a block of theirs travels with the rollover's.
-  on("classic.Stop", async ($, e, next) => {
-    const result = await next(e);
-    const { value } = await $.state.get(rolloverRef);
-    const outcome = stopOutcome(value, await $.session.id());
-    if (!outcome || result.preventContinuation) return result;
-    await $.state.set(rolloverRef, outcome.state);
-    return { ...result, block: [result.block, outcome.block].filter(Boolean).join("\n\n") };
   });
 
   on("command.run", { command: "lanes" }, async ($, e) => {

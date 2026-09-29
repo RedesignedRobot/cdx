@@ -1,5 +1,9 @@
 ## Unreleased
 
+### Removed
+
+- The head rollover Stop block is gone (owner ruling 2026-09-30). It blocked the first Stop after a third compaction and told the head to hand off to a fresh session. Auto-compaction already carries a long session, so the block only interrupted work.
+
 ### Models
 
 - GPT-6.1 Sol replaces GPT-6 Sol (owner ruling 2026-09-29). OpenAI shipped `gpt-6.1-sol` on 2026-09-29 at Sol's price ($2/$10 per 1M tokens in/out), near Astra on agentic coding. The default `model`, the `sol` alias and the built-in `high` cap now name `gpt-6.1-sol`. `gpt-6-sol` is retired: in config, on `--model` or stored on a lane it resolves to `gpt-6.1-sol`. `thread/resume` and the resume turn now carry the lane's model, so resuming one of the 115 lanes recorded on `gpt-6-sol` moves its thread to 6.1 instead of pinning the old model. Resume only ever reattaches to a work thread, whose model is the lane's `model`; review and consult rounds start new threads, so an Astra reviewer is never switched.

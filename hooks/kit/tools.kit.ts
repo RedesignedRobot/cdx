@@ -1,4 +1,4 @@
-// The native tools through the engine's tool.call chain; see rollover.kit.ts.
+// The native tools through the engine's tool.call chain; run.sh runs these.
 import { expect, mock, test } from "claude-code/testing";
 import type { On, ProcessRunInit } from "claude-code";
 

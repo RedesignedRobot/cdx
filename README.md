@@ -415,7 +415,6 @@ The mod polls `cdx events --json --snapshot` every 2 seconds. One call returns t
 - Idle wake: with no turn running and a wake event pending, the mod holds it 15 seconds so a burst costs one prompt, then submits a prompt that starts with `[cdx]`.
 - Mid-turn: after each non-subagent tool call that was not denied, pending events are added as context under `[cdx] events`. Typed prompts receive them too.
 - Prompt budget: Claude Code refuses a plugin's prompt after 50 in one session. The mod then stops submitting, keeps events for the next tool result or typed prompt, and puts each fresh wake in the prompt box as a Tab suggestion. A new session restores wakes.
-- Head rollover: the mod counts compactions of the head's own conversation per session; subagent and precompute compactions do not count. The first Stop after the second compaction blocks once with: update BATCH.md, push the owner "roll session", end the turn. The settings Stop hooks (the owner's push guard among them) still run first; a block of theirs joins the rollover text, and one that stops the session wins.
 
 In headless mode UI status, toasts and logs are skipped; polling and delivery continue.
 

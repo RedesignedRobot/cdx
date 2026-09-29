@@ -1,6 +1,6 @@
 // A hot reload runs the module afresh with empty variables and may skip
 // session.start. Each test here loads the plugin without calling it, which is
-// that state; see rollover.kit.ts for how run.sh runs these.
+// that state; run.sh runs these.
 import { expect, mock, test } from "claude-code/testing";
 import type { On, ProcessRunInit } from "claude-code";
 
