@@ -256,7 +256,9 @@ export function appThreadParams(spec: Spec): Record<string, unknown> {
   };
   const sandbox = codexSandbox(spec, spec.fullAccess === true);
   return {
-    ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
+    // A resume names the lane's model too: a lane stored on a retired model
+    // (gpt-6-sol) moves its thread to the replacement.
+    ...(spec.mode === "spawn" || spec.model ? { model: spec.model ?? config.model } : {}),
     cwd: spec.cwd,
     approvalPolicy: "never",
     ...sandbox.thread,

@@ -1,5 +1,11 @@
 ## Unreleased
 
+### Models
+
+- GPT-6.1 Sol replaces GPT-6 Sol (owner ruling 2026-09-29). OpenAI shipped `gpt-6.1-sol` on 2026-09-29 at Sol's price ($2/$10 per 1M tokens in/out), near Astra on agentic coding. The default `model`, the `sol` alias and the built-in `high` cap now name `gpt-6.1-sol`. `gpt-6-sol` is retired: in config, on `--model` or stored on a lane it resolves to `gpt-6.1-sol`. `thread/resume` and the resume turn now carry the lane's model, so resuming one of the 115 lanes recorded on `gpt-6-sol` moves its thread to 6.1 instead of pinning the old model. Resume only ever reattaches to a work thread, whose model is the lane's `model`; review and consult rounds start new threads, so an Astra reviewer is never switched.
+- The first-round green table labels `gpt-6-sol` lanes `sol-6`, so first-round green compares 6.1 against 6.
+- Verified against Codex CLI 0.159.0. The server catalog lists `gpt-6.1-sol` once a home is refreshed with `codex debug models` on 0.159.0; its entry needs client 0.153.0 or later.
+
 ### Questions and steering
 
 - A question still open when a lane's engine ends its last turn now expires then, instead of at round end. On 2026-09-27 astra-pme4 asked questions 2 to 4 from background execs, committed its report and ended its turn at 20:55, then waited on the shared GPU gate lock. The head answered #3 and #4 at 21:03 and `cdx reply` reported success, but the engine never ran another turn, so the ruling reached nothing. A reply to an expired question is now refused with `question #N expired: its engine finished its turns`.

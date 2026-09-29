@@ -16,7 +16,7 @@ import {
 
 import { finishGateReceipt, gateTreeFromGit, storedDirectories, closeKeepsWorktree, worktreeCleanupCommands, removeWorktree, makeGateReceipt, gateAcceptanceFailed, receiptRefusal, composeGate, shellQuote, completionVerdict, jobCwd, mergeDirectories, worktreeReuseRefusal, cleanupRefusal } from "./cdx.ts";
 import { blockingCdxCommand, nativeCdxCommand, nativeCdxRefusal } from "./guard.ts";
-import { config, EXECUTOR_MODEL, modelOf, THINKER_MODEL } from "./config.ts";
+import { config, EXECUTOR_MODEL, laneModel, modelOf, THINKER_MODEL } from "./config.ts";
 import { missingCodexModels, usageVerdict } from "./doctor.ts";
 import { deliverEvents, electHead, eventsAfter, feedEvent, latestEventId, type Lane, readSession, startSession, storeLane, validLane } from "./ledger.ts";
 import { TOOLS_BY_NAME } from "./hooks/tools.ts";
@@ -392,8 +392,8 @@ test("Rank 3: child Astra is refused across all resolution routes while head Ast
   );
 
   // An omitted model resolves to the Sol executor, which children may run
-  expect(resolveCodexModel(undefined, { model: EXECUTOR_MODEL })).toBe("gpt-6-sol");
-  expect(resolveCodexModel("sol")).toBe("gpt-6-sol");
+  expect(resolveCodexModel(undefined, { model: EXECUTOR_MODEL })).toBe("gpt-6.1-sol");
+  expect(resolveCodexModel("sol")).toBe("gpt-6.1-sol");
   expect(() => checkChildAstraRefusal(true, "gpt", undefined, { model: EXECUTOR_MODEL })).not.toThrow();
 
   // Child Astra is refused when config.model is an alias ("astra" -> "gpt-6-astra")
@@ -537,7 +537,7 @@ test("9.0.0: the GPT-6 split defaults work to Sol and head-launched thinking to 
   const cfg = parseConfig("{}");
   expect(cfg.model).toBe(EXECUTOR_MODEL);
   expect(cfg.thinkerModel).toBe(THINKER_MODEL);
-  expect(parseConfig('{"thinkerModel":"gpt-6-sol"}').thinkerModel).toBe("gpt-6-sol");
+  expect(parseConfig('{"thinkerModel":"gpt-6.1-sol"}').thinkerModel).toBe("gpt-6.1-sol");
   expect(() => parseConfig('{"thinkerModel":""}')).toThrow();
 
   const flags = (model?: string) => parseArgs(model ? ["--model", model] : [], ["model"]);
@@ -545,16 +545,26 @@ test("9.0.0: the GPT-6 split defaults work to Sol and head-launched thinking to 
   // A child thinking lane never gets Astra by default
   expect(modelOf(flags(), "gpt", "think", true)).toBe(config.model);
   expect(modelOf(flags(), "gpt", "work", false)).toBe(config.model);
-  expect(modelOf(flags("sol"), "gpt", "think", false)).toBe("gpt-6-sol");
+  expect(modelOf(flags("sol"), "gpt", "think", false)).toBe("gpt-6.1-sol");
   expect(modelOf(flags("astra"), "gpt", "work", false)).toBe("gpt-6-astra");
   expect(modelOf(flags(), "gemini", "think", false)).toBeUndefined();
 });
 
+test("GPT-6.1 Sol replaces the retired GPT-6 Sol wherever the old id appears", () => {
+  const flags = (model: string) => parseArgs(["--model", model], ["model"]);
+  expect(EXECUTOR_MODEL).toBe("gpt-6.1-sol");
+  expect(modelOf(flags("gpt-6-sol"), "gpt", "work", false)).toBe("gpt-6.1-sol");
+  expect(resolveCodexModel("gpt-6-sol")).toBe("gpt-6.1-sol");
+  expect(resolveCodexModel(undefined, { model: "gpt-6-sol" })).toBe("gpt-6.1-sol");
+  expect(laneModel({ model: "gpt-6-sol" })).toBe("gpt-6.1-sol");
+  expect(laneModel({ model: "gpt-6-astra" })).toBe("gpt-6-astra");
+});
+
 test("9.0.0: doctor lists catalog gaps for configured Codex models", () => {
-  const cache = JSON.stringify({ models: [{ slug: "gpt-6-astra" }, { slug: "gpt-6-sol" }] });
-  expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-6-astra", "gpt-6-sol"])).toEqual([]);
-  expect(missingCodexModels(cache, ["gpt-6-sol", "gpt-7"])).toEqual(["gpt-7"]);
-  expect(missingCodexModels(JSON.stringify([{ slug: "gpt-6-sol" }]), ["gpt-6-astra"])).toEqual(["gpt-6-astra"]);
+  const cache = JSON.stringify({ models: [{ slug: "gpt-6-astra" }, { slug: "gpt-6.1-sol" }] });
+  expect(missingCodexModels(cache, ["gpt-6.1-sol", "gpt-6-astra", "gpt-6.1-sol"])).toEqual([]);
+  expect(missingCodexModels(cache, ["gpt-6.1-sol", "gpt-7"])).toEqual(["gpt-7"]);
+  expect(missingCodexModels(JSON.stringify([{ slug: "gpt-6.1-sol" }]), ["gpt-6-astra"])).toEqual(["gpt-6-astra"]);
 });
 
 test("9.1.0: projected exhaustion is a doctor caution; only a reached or 95% window blocks", () => {
@@ -1263,6 +1273,9 @@ test("every GPT role receives the caps and a sandbox, and every thread sheds unu
     features: { memories: false, plugins: false, apps: false }, skills: { include_instructions: false } });
   expect(work.mcp_servers.context7.enabled).toBe(false);
   expect(appThreadParams(base).sandbox).toBe("workspace-write");
+  // A resume names the lane's model so a retired model's thread moves on
+  expect(appThreadParams({ ...base, mode: "resume", model: "gpt-6.1-sol" }).model).toBe("gpt-6.1-sol");
+  expect(appThreadParams({ ...base, mode: "resume" }).model).toBeUndefined();
   for (const [patch, sandbox] of [[{ reviewDir: "/repo" }, undefined], [{ supervisor: true }, "workspace-write"]] as const) {
     const params = appThreadParams({ ...base, ...patch });
     expect(params.sandbox).toBe(sandbox);

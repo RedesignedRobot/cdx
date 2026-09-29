@@ -7,17 +7,26 @@ import { existsSync, readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 
 // Codex reasoning efforts from cheapest to most expensive; effortCaps compare
-// against this order. Codex 0.156 also offers "ultra", which delegates to
+// against this order. Codex 0.159 also offers "ultra", which delegates to
 // native sub-agents; cdx lanes disable those, so ultra is not accepted.
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
 // Shipped ceilings. Configured caps may raise or lower either model's ceiling.
-const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6-sol": "high" };
+const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6.1-sol": "high" };
 
 // GPT-6 split (owner ruling 2026-09-23): Sol executes work lanes, Astra thinks.
 // Astra runs head-launched consults, reviews and supervisors; children never.
-export const EXECUTOR_MODEL = "gpt-6-sol";
+export const EXECUTOR_MODEL = "gpt-6.1-sol";
 export const THINKER_MODEL = "gpt-6-astra";
+
+// Owner ruling 2026-09-29: GPT-6.1 Sol replaces GPT-6 Sol. A retired id in
+// config, on --model or stored on a lane runs its replacement, so a resumed
+// lane moves to the new model instead of pinning the old one.
+const RETIRED_MODELS: Record<string, string> = { "gpt-6-sol": EXECUTOR_MODEL };
+
+function current(model: string): string {
+  return RETIRED_MODELS[model] ?? model;
+}
 
 function configError(message: string): never {
   fail(`${CONFIG_PATH}: ${message}`);
@@ -302,7 +311,7 @@ function configuredEffort(effort: string): Effort {
   return effort;
 }
 
-export const ENGINE_PICKER = `gpt is the default engine and runs gpt-6-sol (alias sol) for work in every repository.
+export const ENGINE_PICKER = `gpt is the default engine and runs gpt-6.1-sol (alias sol) for work in every repository.
 Head-launched reviews, consults and supervisors run gpt-6-astra (alias astra); a
 child lane never runs Astra. Gemini is for read-only consults, reviews and
 pre-reads; a Gemini work lane runs with a warning.
@@ -344,24 +353,24 @@ export function modelOf(parsed: Parsed, engine: Engine, role: "work" | "think" =
     if (value !== undefined) fail("--model applies to gpt lanes only; gemini always runs the configured gemini model");
     return undefined;
   }
-  if (value === undefined) return role === "think" && !isChild ? resolveCodexModel(config.thinkerModel ?? THINKER_MODEL) : config.model;
+  if (value === undefined) return role === "think" && !isChild ? resolveCodexModel(config.thinkerModel ?? THINKER_MODEL) : resolveCodexModel(config.model);
   const resolved = config.models?.[value] ?? DEFAULT_MODEL_ALIASES[value];
-  if (resolved) return resolved;
+  if (resolved) return current(resolved);
   if (!MODEL_ID.test(value)) {
     const aliases = modelAliases();
     fail(`--model must be a Codex model id${aliases ? ` or one of ${aliases}` : ""}, set in ${CONFIG_PATH}; got "${value}"`);
   }
-  return value;
+  return current(value);
 }
 
 export function laneModel(lane: Pick<Lane, "model"> | undefined): string {
-  return lane?.model ?? config.model;
+  return resolveCodexModel(lane?.model ?? config.model);
 }
 
 export function resolveCodexModel(model?: string, cfg?: { model?: string; models?: Record<string, string> }): string {
   const activeConfig = cfg ?? config;
   const raw = model ?? activeConfig.model ?? "";
-  return activeConfig.models?.[raw] ?? DEFAULT_MODEL_ALIASES[raw] ?? raw;
+  return current(activeConfig.models?.[raw] ?? DEFAULT_MODEL_ALIASES[raw] ?? raw);
 }
 
 export function checkChildAstraRefusal(

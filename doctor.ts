@@ -765,7 +765,7 @@ export async function doctorCommand(argv: string[]) {
         const detail = error instanceof Error ? error.message : String(error);
         const remedy = /auth|login|401|unauthorized/i.test(detail) ? "run `codex login`"
           : /model/i.test(detail) ? `model ${config.model} rejected; check \`codex features\` and account access`
-          : "check the 0.154.0 app-server schema, network, and `codex login status`";
+          : "check the 0.159.0 app-server schema, network, and `codex login status`";
         bad("probe", detail.slice(0, 240), remedy);
       }
     }

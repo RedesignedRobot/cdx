@@ -3,14 +3,14 @@ import { cappedEffort, parseConfig } from "./config.ts";
 
 test("shipped Astra cap is medium and configured caps can raise or lower defaults", () => {
   const defaults = parseConfig("{}");
-  expect(defaults.effortCaps).toEqual({ "gpt-6-astra": "medium", "gpt-6-sol": "high" });
+  expect(defaults.effortCaps).toEqual({ "gpt-6-astra": "medium", "gpt-6.1-sol": "high" });
   expect(cappedEffort("astra", "high", false, defaults)).toBe("medium");
   expect(() => cappedEffort("astra", "high", true, defaults)).toThrow("max medium");
 
   const configured = parseConfig(JSON.stringify({ effortCaps: {
-    "gpt-6-astra": "xhigh", "gpt-6-sol": "low", "gpt-6-luna": "max",
+    "gpt-6-astra": "xhigh", "gpt-6.1-sol": "low", "gpt-6-luna": "max",
   } }));
-  expect(configured.effortCaps).toEqual({ "gpt-6-astra": "xhigh", "gpt-6-sol": "low", "gpt-6-luna": "max" });
+  expect(configured.effortCaps).toEqual({ "gpt-6-astra": "xhigh", "gpt-6.1-sol": "low", "gpt-6-luna": "max" });
   expect(cappedEffort("astra", "xhigh", true, configured)).toBe("xhigh");
   expect(cappedEffort("sol", "medium", false, configured)).toBe("low");
   expect(() => cappedEffort("sol", "medium", true, configured)).toThrow("max low");

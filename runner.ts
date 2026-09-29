@@ -1040,7 +1040,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
         cwd: spec.cwd,
         approvalPolicy: "never",
         ...codexSandbox(spec, spec.fullAccess === true).turn,
-        ...(spec.mode === "spawn" ? { model: spec.model ?? config.model } : {}),
+        ...(spec.mode === "spawn" || spec.model ? { model: spec.model ?? config.model } : {}),
         effort: spec.effort,
         ...(includeRoundOptions && spec.outputSchema !== undefined ? { outputSchema: spec.outputSchema } : {}),
       });

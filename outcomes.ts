@@ -15,7 +15,8 @@ export interface OutcomeGroup {
 
 export interface Outcomes { byEngine: Record<string, OutcomeGroup>; byRepo: Record<string, OutcomeGroup> }
 
-const MODEL_LABELS: Record<string, string> = { "gpt-6-sol": "sol", "gpt-6-astra": "astra" };
+// GPT-6 Sol lanes keep their own label so first-round green compares 6.1 to 6.
+const MODEL_LABELS: Record<string, string> = { "gpt-6.1-sol": "sol", "gpt-6-sol": "sol-6", "gpt-6-astra": "astra" };
 
 function workRounds(lane: Lane): number {
   return lane.workRounds ?? (lane.kind === "work" ? lane.rounds : 0);

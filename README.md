@@ -56,7 +56,7 @@ There is no wait tool by design. The CLI keeps `cdx wait` for supervisors and pe
 
 ## Setup
 
-You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.156+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. `cdx panel` also needs the `claude` binary and macOS `sandbox-exec`.
+You need [Bun](https://bun.sh) and at least one engine. Install and sign in to [Codex CLI](https://github.com/openai/codex) 0.159+ for the default `gpt` engine, or install and authorize Google Antigravity CLI (`agy`) for `--engine gemini`. `cdx panel` also needs the `claude` binary and macOS `sandbox-exec`.
 
 ```bash
 git clone https://github.com/RedesignedRobot/cdx.git ~/.claude/skills/cdx && ln -s ~/.claude/skills/cdx/cdx.ts ~/.local/bin/cdx
@@ -83,7 +83,7 @@ Cloning into `~/.claude/skills/` loads the plugin in the next Claude Code sessio
 
 `--engine` is optional on spawn and review and defaults to `gpt`; omitting it prints `cdx: engine gpt (default)`. Resume inherits the lane engine.
 
-- **Sol direct is the default in every repository.** A new gpt work lane runs `model`, default `gpt-6-sol`. `repoRouting` defaults to `{}`.
+- **Sol direct is the default in every repository.** A new gpt work lane runs `model`, default `gpt-6.1-sol`. `repoRouting` defaults to `{}`. `gpt-6-sol` is retired: in config, on `--model` or stored on a lane it runs `gpt-6.1-sol`, and a resume moves the lane's thread to it.
 - **Astra thinks.** Head-launched review, consult and `--supervisor` lanes run `thinkerModel`, default `gpt-6-astra`. A child lane can never run `gpt-6-astra`; the refusal is checked on the resolved model before any account probe or process start.
 - **Gemini is for read-only work**: consults, reviews, pre-reads and crawls. A Gemini work lane prints `cdx: routing reserves Gemini for read-only work (consults, reviews, pre-reads); this work lane runs anyway`. Gemini always runs `gemini-3.8-flash-high` at effort `high`, gets a 90-minute `--max-runtime` unless the flag says otherwise, and warns on briefs over 1,500 words.
 - **Claude** runs only panel members and read-only consults. `--engine` on spawn and consult accepts only `gpt` and `gemini`.
@@ -307,7 +307,7 @@ A supervisor merges green children into its own branch with `cdx land <child>` o
 
 ### Panel
 
-`cdx panel <name> --cd <repo> [--pack <file>] ("<question>" | -)` asks Astra (`gpt-6-astra`), Sol (`gpt-6-sol`) and Claude Fable (`claude-fable-5-1`) the same question as read-only consult lanes `<name>-astra`, `<name>-sol` and `<name>-fable`. Each member gets one frozen prompt with the question, the pack path, and a fixed answer shape: recommendation, claims (`- verified|inferred | path:line or number | claim`), dissent, confidence. `--pack` is copied to `briefs/<name>-pack.md` so every member reads the same text.
+`cdx panel <name> --cd <repo> [--pack <file>] ("<question>" | -)` asks Astra (`gpt-6-astra`), Sol (`gpt-6.1-sol`) and Claude Fable (`claude-fable-5-1`) the same question as read-only consult lanes `<name>-astra`, `<name>-sol` and `<name>-fable`. Each member gets one frozen prompt with the question, the pack path, and a fixed answer shape: recommendation, claims (`- verified|inferred | path:line or number | claim`), dissent, confidence. `--pack` is copied to `briefs/<name>-pack.md` so every member reads the same text.
 
 A panel always runs detached, because it outlasts the ten-minute limit of a tool call or a lane's shell command. `cdx panel` prints the runner pid and the report path and returns; `--bg` is gone and refused. Each panel gets its own directory, so no panel name can overwrite a lane report or another panel's answer:
 
@@ -433,13 +433,13 @@ State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the 
 
 ```json
 {
-  "model": "gpt-6-sol",
+  "model": "gpt-6.1-sol",
   "thinkerModel": "gpt-6-astra",
-  "models": { "astra": "gpt-6-astra", "sol": "gpt-6-sol" },
+  "models": { "astra": "gpt-6-astra", "sol": "gpt-6.1-sol" },
   "repoRouting": {},
   "efforts": ["low", "medium", "high"],
   "defaultEffort": "medium",
-  "effortCaps": { "gpt-6-astra": "medium", "gpt-6-sol": "high" },
+  "effortCaps": { "gpt-6-astra": "medium", "gpt-6.1-sol": "high" },
   "expectMinutes": 15,
   "gateTimeoutMinutes": 60,
   "repoGateTimeoutMinutes": {},
