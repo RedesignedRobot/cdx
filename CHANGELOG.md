@@ -3,6 +3,7 @@
 ### Models
 
 - GPT-6.1 Sol replaces GPT-6 Sol (owner ruling 2026-09-29). OpenAI shipped `gpt-6.1-sol` on 2026-09-29 at Sol's price ($2/$10 per 1M tokens in/out), near Astra on agentic coding. The default `model`, the `sol` alias and the built-in `high` cap now name `gpt-6.1-sol`. `gpt-6-sol` is retired: in config, on `--model` or stored on a lane it resolves to `gpt-6.1-sol`. `thread/resume` and the resume turn now carry the lane's model, so resuming one of the 115 lanes recorded on `gpt-6-sol` moves its thread to 6.1 instead of pinning the old model. Resume only ever reattaches to a work thread, whose model is the lane's `model`; review and consult rounds start new threads, so an Astra reviewer is never switched.
+- No lane runs below effort `medium` (owner ruling 2026-09-29). The built-in `efforts` allowlist is `medium` and `high`, and config refuses `minimal` or `low` in `efforts` or `effortCaps`, so `--effort low` fails before a lane starts. GPT-6.1 Sol's own default effort is `low`; cdx always sends its effort, so the model default never applies.
 - The first-round green table labels `gpt-6-sol` lanes `sol-6`, so first-round green compares 6.1 against 6.
 - Verified against Codex CLI 0.159.0. The server catalog lists `gpt-6.1-sol` once a home is refreshed with `codex debug models` on 0.159.0; its entry needs client 0.153.0 or later.
 

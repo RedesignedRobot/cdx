@@ -437,7 +437,7 @@ State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the 
   "thinkerModel": "gpt-6-astra",
   "models": { "astra": "gpt-6-astra", "sol": "gpt-6.1-sol" },
   "repoRouting": {},
-  "efforts": ["low", "medium", "high"],
+  "efforts": ["medium", "high"],
   "defaultEffort": "medium",
   "effortCaps": { "gpt-6-astra": "medium", "gpt-6.1-sol": "high" },
   "expectMinutes": 15,
@@ -462,7 +462,7 @@ State lives under `$CDX_HOME`, default `~/.cdx`. `CDX_STATE_HOME` overrides the 
 
 The values shown are the defaults except `worktreeSetup`, which has none. Unknown keys refuse, and malformed JSON stops the command with a message naming the file; `cdx events` falls back to defaults so delivery continues.
 
-- `model` is the Codex model for work lanes; `thinkerModel` for head-launched review, consult and supervisor lanes. `models` adds `--model` aliases. `efforts` is the allowlist within `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; cdx refuses Codex's `ultra` because it delegates through native subagents.
+- `model` is the Codex model for work lanes; `thinkerModel` for head-launched review, consult and supervisor lanes. `models` adds `--model` aliases. `efforts` is the allowlist within `medium`, `high`, `xhigh`, `max`. No lane runs below `medium`, so config refuses `minimal` or `low` in `efforts` or `effortCaps`. cdx refuses Codex's `ultra` because it delegates through native subagents.
 - `effortCaps` maps a model id to its highest effort, checked after alias resolution on spawn, resume, review, consult and the doctor probe. An explicit effort above the cap fails; an inherited one clamps with a note.
 - `repoRouting` maps absolute canonical repository paths to `{ "model": ... }`. Default `{}`.
 - `expectMinutes` is the floor of the expected duration for lanes and jobs.

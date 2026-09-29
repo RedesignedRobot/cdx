@@ -11,6 +11,14 @@ import { isAbsolute, resolve } from "node:path";
 // native sub-agents; cdx lanes disable those, so ultra is not accepted.
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
+// Owner ruling 2026-09-29: no lane runs below medium, so neither the
+// allowlist nor a cap may name a cheaper effort.
+const EFFORT_FLOOR = "medium";
+
+function belowFloor(effort: string): boolean {
+  return EFFORT_ORDER.indexOf(effort) < EFFORT_ORDER.indexOf(EFFORT_FLOOR);
+}
+
 // Shipped ceilings. Configured caps may raise or lower either model's ceiling.
 const DEFAULT_EFFORT_CAPS: Record<string, string> = { "gpt-6-astra": "medium", "gpt-6.1-sol": "high" };
 
@@ -53,7 +61,7 @@ export function parseConfig(text: string): Config {
   const defaults: Config = {
     model: EXECUTOR_MODEL,
     thinkerModel: THINKER_MODEL,
-    efforts: ["low", "medium", "high"],
+    efforts: ["medium", "high"],
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,
@@ -103,6 +111,7 @@ export function parseConfig(text: string): Config {
   }
   if (new Set(efforts).size !== efforts.length) configError("efforts must not contain duplicates");
   if (efforts.some((effort) => !EFFORT_ORDER.includes(effort))) configError(`efforts must be among ${EFFORT_ORDER.join(", ")}`);
+  if (efforts.some(belowFloor)) configError(`efforts must be ${EFFORT_FLOOR} or above (owner ruling 2026-09-29)`);
 
   const defaultEffort = Object.hasOwn(input, "defaultEffort") ? input.defaultEffort : defaults.defaultEffort;
   if (typeof defaultEffort !== "string") configError("defaultEffort must be a string");
@@ -148,6 +157,7 @@ export function parseConfig(text: string): Config {
       if (typeof cap !== "string" || !EFFORT_ORDER.includes(cap)) {
         configError(`effortCaps.${modelId} must be one of ${EFFORT_ORDER.join(", ")}`);
       }
+      if (belowFloor(cap)) configError(`effortCaps.${modelId} must be ${EFFORT_FLOOR} or above (owner ruling 2026-09-29)`);
       effortCaps[modelId] = cap;
     }
   }
@@ -255,7 +265,7 @@ function readConfig(skipFile = false): Config {
   const defaults: Config = {
     model: EXECUTOR_MODEL,
     thinkerModel: THINKER_MODEL,
-    efforts: ["low", "medium", "high"],
+    efforts: ["medium", "high"],
     defaultEffort: "medium",
     rules: [],
     effortCaps: DEFAULT_EFFORT_CAPS,

@@ -8,12 +8,18 @@ test("shipped Astra cap is medium and configured caps can raise or lower default
   expect(() => cappedEffort("astra", "high", true, defaults)).toThrow("max medium");
 
   const configured = parseConfig(JSON.stringify({ effortCaps: {
-    "gpt-6-astra": "xhigh", "gpt-6.1-sol": "low", "gpt-6-luna": "max",
+    "gpt-6-astra": "xhigh", "gpt-6.1-sol": "medium", "gpt-6-luna": "max",
   } }));
-  expect(configured.effortCaps).toEqual({ "gpt-6-astra": "xhigh", "gpt-6.1-sol": "low", "gpt-6-luna": "max" });
+  expect(configured.effortCaps).toEqual({ "gpt-6-astra": "xhigh", "gpt-6.1-sol": "medium", "gpt-6-luna": "max" });
   expect(cappedEffort("astra", "xhigh", true, configured)).toBe("xhigh");
-  expect(cappedEffort("sol", "medium", false, configured)).toBe("low");
-  expect(() => cappedEffort("sol", "medium", true, configured)).toThrow("max low");
+  expect(cappedEffort("sol", "high", false, configured)).toBe("medium");
+  expect(() => cappedEffort("sol", "high", true, configured)).toThrow("max medium");
+});
+
+test("no effort below medium is allowed or capped to", () => {
+  expect(parseConfig("{}").efforts).toEqual(["medium", "high"]);
+  expect(() => parseConfig('{"efforts":["low","medium"],"defaultEffort":"medium"}')).toThrow("medium or above");
+  expect(() => parseConfig('{"effortCaps":{"gpt-6.1-sol":"low"}}')).toThrow("medium or above");
 });
 
 test("effort caps require model ids and supported effort values", () => {
