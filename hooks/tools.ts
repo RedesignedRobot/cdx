@@ -527,13 +527,11 @@ export async function formatToolOutput(exitCode: number, stdout: string, stderr:
   return text.slice(0, size) + marker + text.slice(-size);
 }
 
-// Only a failed cwd lookup can select the fallback, before any command runs.
+// A head whose cwd was a landed lane's worktree runs from the plugin root.
+// The check uses exists, not stat: the runtime's stat rejection carries ENOENT
+// only in its message, so a code test never matched. Only this check, before
+// any command runs, can select the fallback.
 export async function runFromCwd<T>(cwd: string, root: string,
-  stat: (path: string) => Promise<unknown>, run: (cwd: string) => Promise<T>): Promise<T> {
-  try { await stat(cwd); }
-  catch (error) {
-    if (cwd === root || !error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") throw error;
-    cwd = root;
-  }
-  return run(cwd);
+  exists: (path: string) => Promise<boolean>, run: (cwd: string) => Promise<T>): Promise<T> {
+  return run(await exists(cwd) ? cwd : root);
 }

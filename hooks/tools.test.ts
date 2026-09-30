@@ -166,20 +166,18 @@ test("cwd fallback precedes execution and never retries a thrown command", async
   const { runFromCwd } = await import("./tools");
   const ran: string[] = [];
   const execute = async (cwd: string) => { ran.push(cwd); return "ok"; };
-  const missing = async () => { throw Object.assign(new Error("missing cwd"), { code: "ENOENT" }); };
-  expect(await runFromCwd("/gone", "/plugin", missing, execute)).toBe("ok");
+  expect(await runFromCwd("/gone", "/plugin", async () => false, execute)).toBe("ok");
   expect(ran).toEqual(["/plugin"]);
   ran.length = 0;
-  await expect(runFromCwd("/work", "/plugin", async () => {}, async (cwd) => {
+  await expect(runFromCwd("/work", "/plugin", async () => true, async (cwd) => {
     ran.push(cwd);
     throw Object.assign(new Error("transport died after mutation"), { code: "ENOENT" });
   })).rejects.toThrow("transport died after mutation");
   expect(ran).toEqual(["/work"]);
   ran.length = 0;
-  await expect(runFromCwd("/work", "/plugin", async () => { throw { code: "EACCES" }; }, execute)).rejects.toEqual({ code: "EACCES" });
+  await expect(runFromCwd("//server/share", "/plugin", async () => { throw new Error("network location"); }, execute)).rejects.toThrow("network location");
   expect(ran).toEqual([]);
 });
-
 
 test("native admission refuses missing fields before argv conversion and reports command errors", () => {
   const spawn = TOOLS_BY_NAME.get("spawn")!;

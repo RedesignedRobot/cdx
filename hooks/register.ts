@@ -366,7 +366,7 @@ export function register(on: On) {
     }
     let res;
     try {
-      res = await runFromCwd(procInit.cwd, root, (path) => $.fs.stat(path),
+      res = await runFromCwd(procInit.cwd, root, (path) => $.fs.exists(path),
         (cwd) => $.process.run(CDX.concat(runSpec.argv), { ...procInit, cwd }));
     } catch (error) {
       return { isError: true, result: `cdx ${runSpec.argv[0]}: ${error instanceof Error ? error.message : String(error)}` };
