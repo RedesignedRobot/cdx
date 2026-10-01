@@ -23,14 +23,15 @@ type SandboxSpec = Pick<Spec, "cwd" | "additionalDirectories" | "reviewDir"> & {
 // so lane shells keep their package cache under TMPDIR, which every role may write.
 export const LANE_TOOL_ENV = { BUN_INSTALL_CACHE_DIR: join(tmpdir(), "cdx-bun-cache") };
 
-// An index counts only at or below the enclosing checkout; a cwd outside any
-// checkout gets none, so no lane reaches a shared parent index such as ~/code.
+// An index counts only at or below the enclosing checkout. A cwd outside any
+// checkout gets only an index at the cwd itself, never a shared parent index
+// such as ~/code.
 function indexedAncestor(start: string, exists: (path: string) => boolean): { index?: string; checkout?: string } {
   let index: string | undefined;
   for (let path = start; ; path = dirname(path)) {
     index ??= exists(join(path, ".codegraph", "codegraph.db")) ? path : undefined;
     if (exists(join(path, ".git"))) return { index, checkout: path };
-    if (dirname(path) === path) return {};
+    if (dirname(path) === path) return index === start ? { index } : {};
   }
 }
 
