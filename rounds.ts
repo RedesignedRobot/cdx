@@ -7,6 +7,7 @@ import {
   reconcileAccountHolds, requireAccountModel,
 } from "./accounts.ts";
 import { checkChildAstraRefusal, resolveCodexModel } from "./config.ts";
+import { LANE_SERVICE_TIER } from "./engines.ts";
 import { geminiAdmission, readGeminiUsageSnapshot, geminiQuotaState } from "./gemini-usage.ts";
 import { hookInstallState } from "./doctor.ts";
 import {
@@ -118,6 +119,7 @@ export async function openRound(lane: string, kind: "work" | "review", cwd: stri
         account,
         codexHome,
         roundAccount: activeAccount ? { ...activeAccount, demand } : undefined,
+        serviceTier: (kind === "review" ? opts?.engine ?? (existing ? laneEngine(existing) : engine) : roundEngineType) === "gpt" ? LANE_SERVICE_TIER : undefined,
         codexPid: undefined,
         ownerSession,
         ownerCwd,

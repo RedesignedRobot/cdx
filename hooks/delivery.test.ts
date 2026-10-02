@@ -34,31 +34,38 @@ describe("delivery rules", () => {
     const child = { ...parent, name: "child", parent: "parent", stage: "question", question: "Which branch?" };
     expect(orderedRows([child, parent]).map((row) => row.name)).toEqual(["parent", "child"]);
     const [, parentLine, childLine] = bandTable(orderedRows([child, parent]), now, 120).map(bandText);
-    expect(parentLine).toMatch(/^◆ parent +lane +sol +high +gate +2m3s +12 +3 +running bun test/);
-    expect(childLine).toMatch(/^\?   child +lane +sol +high +question +2m3s +12 +3 +question: Which branch\?$/);
+    expect(parentLine).toMatch(/^◆ parent +lane +sol +high +- +- +gate +2m3s +12 +3 +running bun test/);
+    expect(childLine).toMatch(/^\?   child +lane +sol +high +- +- +question +2m3s +12 +3 +question: Which branch\?$/);
   });
 
   const bandNow = Date.parse("2026-09-26T16:00:00Z");
   const bandRows: LiveRow[] = [
     { name: "m29-mixed", kind: "lane", engine: "gpt", model: "gpt-6-sol", effort: "high", stage: "working", startedAt: "2026-09-26T12:14:00Z",
+      account: "codex-2", serviceTier: "priority",
       steps: 374, files: 8, action: "commandExecution: bun test src/nonbonded/mixed-precision.test.ts --timeout 600000" },
     { name: "m29-unified", kind: "lane", engine: "gpt", model: "gpt-6-astra", effort: "medium", stage: "gate", startedAt: "2026-09-26T12:13:00Z",
+      account: "codex-1", serviceTier: "default",
       steps: 331, files: 0, action: "agentMessage: Dead: the migration left two readers behind" },
     { name: "m29-resident", kind: "lane", engine: "gpt", model: "gpt-6-astra", effort: "medium", stage: "question", startedAt: "2026-09-26T12:13:00Z",
       steps: 235, files: 10, action: "", question: "merge candidate A or keep both kernels?" },
     { name: "ship-r123", kind: "job", engine: "job", stage: "working", startedAt: "2026-09-26T15:04:00Z",
+      account: "codex-2", serviceTier: "priority",
       steps: 0, action: "publish-npm: + hsx@1.0.123" },
+    { name: "gemini-lane", kind: "lane", engine: "gemini", effort: "high", stage: "working", startedAt: "2026-09-26T15:04:00Z",
+      account: "codex-2", serviceTier: "priority", steps: 1, action: "reading source" },
   ];
   const columnStart = (line: string, title: string) => line.indexOf(title);
 
   test("band columns fit the widest value, align under the header and right-align counts", () => {
-    const lines = bandTable(bandRows, bandNow, 120).map(bandText);
-    expect(lines[0]).toStartWith("  NAME          KIND  ENGINE       EFFORT  STAGE     AGE    STEPS  FILES  NOW");
-    expect(lines[1]).toStartWith("● m29-mixed     lane  gpt-6-sol    high    working   3h46m    374      8  running bun test");
-    expect(lines[2]).toStartWith("◆ m29-unified   lane  gpt-6-astra  medium  gate      3h47m    331      0  agentMessage: Dead");
-    expect(lines[4]).toStartWith("● ship-r123     job   -            -       working   56m0s      -      -  publish-npm: + hsx@1.0.123");
+    const table = bandTable(bandRows, bandNow, 140);
+    const lines = table.map(bandText);
+    expect(lines[0]).toStartWith("  NAME          KIND  ENGINE       EFFORT  ACCOUNT  TIER  STAGE     AGE    STEPS  FILES  NOW");
+    expect(lines[1]).toStartWith("● m29-mixed     lane  gpt-6-sol    high    codex-2  fast  working   3h46m    374      8  running bun test");
+    expect(lines[2]).toStartWith("◆ m29-unified   lane  gpt-6-astra  medium  codex-1  std   gate      3h47m    331      0  agentMessage: Dead");
+    expect(lines[4]).toStartWith("● ship-r123     job   -            -       -        -     working   56m0s      -      -  publish-npm: + hsx@1.0.123");
+    for (const index of [3, 4, 5]) expect(table[index]!.slice(5, 7).map((cell) => cell.text.trim())).toEqual(["-", "-"]);
     for (const line of lines.slice(1)) expect(line.charAt(columnStart(lines[0]!, "STAGE") - 1)).toBe(" ");
-    expect(lines.every((line) => Array.from(line).length <= 120)).toBe(true);
+    expect(lines.every((line) => Array.from(line).length <= 140)).toBe(true);
   });
 
   test("NOW takes the rest of the width and truncates; NAME and ENGINE are capped", () => {
@@ -69,8 +76,14 @@ describe("delivery rules", () => {
     expect(lines[1]).toEndWith("…");
   });
 
-  test("a narrow band drops EFFORT, then ENGINE, then KIND, and never exceeds the width", () => {
+  test("a narrow band drops TIER, ACCOUNT, EFFORT, ENGINE, KIND, and never exceeds the width", () => {
     const at = (columns: number) => bandTable(bandRows, bandNow, columns).map(bandText);
+    expect(at(109)[0]).toContain("TIER");
+    expect(at(108)[0]).not.toContain("TIER");
+    expect(at(108)[0]).toContain("ACCOUNT");
+    expect(at(102)[0]).not.toContain("ACCOUNT");
+    expect(at(102)[0]).not.toContain("TIER");
+    expect(at(102)[0]).toContain("EFFORT");
     expect(at(94)[0]).toContain("EFFORT");
     expect(at(90)[0]).not.toContain("EFFORT");
     expect(at(90)[0]).toContain("ENGINE");
@@ -87,7 +100,7 @@ describe("delivery rules", () => {
   test("band colours: NAME bold, STAGE by state, EFFORT, AGE and NOW dim, header dim", () => {
     expect(["working", "gate", "review", "question", "stalled", "outage", "queued", "reporting"].map(stageColor))
       .toEqual(["green", "cyan", "cyan", "yellow", "yellow", "red", undefined, undefined]);
-    const [header, row] = bandTable([bandRows[2]!], bandNow, 140);
+    const [header, row] = bandTable([bandRows[2]!], bandNow, 160);
     expect(header!.every((cell) => cell.dim)).toBe(true);
     const cell = (prefix: string) => row!.find((item) => item.text.startsWith(prefix))!;
     expect(cell("?")).toMatchObject({ color: "yellow" });

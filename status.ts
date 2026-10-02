@@ -58,6 +58,8 @@ export interface LiveRow {
   engine: string;
   model?: string;
   effort?: string;
+  account?: string;
+  serviceTier?: "priority" | "default";
   stage: string;
   startedAt: string;
   steps: number;
@@ -93,8 +95,11 @@ export function liveRows(now = Date.now(), visible: (owner: string | undefined) 
       files.set(cwd, remaining > 0 ? changedFileCount(cwd, Math.min(remaining, 75)) : undefined);
     }
     const question = questions.find((record) => record.lane === name && record.round === entry.rounds && questionOpen(record));
-    rows.push({ name, parent: entry.parent, kind: "lane", engine: roundEngine(entry),
+    const engine = roundEngine(entry);
+    rows.push({ name, parent: entry.parent, kind: "lane", engine,
       model: entry.kind === "review" ? entry.reviewModel ?? entry.model : entry.fallbackModel ?? entry.model, effort: entry.effort,
+      account: engine === "gpt" ? entry.roundAccount?.name ?? entry.account : undefined,
+      serviceTier: engine === "gpt" ? entry.serviceTier : undefined,
       stage: question ? "question" : entry.outage ? "outage" : entry.queuedUntil && Date.parse(entry.queuedUntil) > now ? "queued"
         : now - Date.parse(entry.lastEventAt ?? entry.roundStartedAt ?? entry.createdAt) >= 300_000 ? "stalled" : entry.stage ?? "working",
       startedAt: entry.roundStartedAt ?? entry.createdAt, steps: entry.roundSteps ?? 0,
