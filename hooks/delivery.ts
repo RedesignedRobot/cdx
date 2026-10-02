@@ -77,6 +77,10 @@ function markOf(row: LiveRow): string {
 const plain = () => ({});
 const staged = (row: LiveRow) => ({ color: stageColor(row.stage) });
 const dim = () => ({ dim: true });
+// McLaren papaya, so a lane on the Fast service tier stands out at a glance.
+const FAST_ORANGE = "#FF8000";
+const tierStyle = (row: LiveRow) => row.kind === "lane" && row.engine === "gpt" && row.serviceTier === "priority"
+  ? { color: FAST_ORANGE, bold: true } : { dim: true };
 
 const BAND_COLUMNS: BandColumn[] = [
   { title: "", value: markOf, style: staged, gap: 1 },
@@ -85,7 +89,7 @@ const BAND_COLUMNS: BandColumn[] = [
   { title: "ENGINE", value: (row) => row.kind === "job" ? "-" : row.model ?? row.engine, style: plain, gap: 2, max: 18 },
   { title: "EFFORT", value: (row) => row.kind === "job" ? "-" : row.effort ?? "-", style: dim, gap: 2 },
   { title: "ACCOUNT", value: (row) => row.kind === "lane" && row.engine === "gpt" ? row.account ?? "-" : "-", style: dim, gap: 2 },
-  { title: "TIER", value: (row) => row.kind === "lane" && row.engine === "gpt" ? row.serviceTier === "priority" ? "fast" : row.serviceTier === "default" ? "std" : "-" : "-", style: dim, gap: 2 },
+  { title: "TIER", value: (row) => row.kind === "lane" && row.engine === "gpt" ? row.serviceTier === "priority" ? "fast" : row.serviceTier === "default" ? "std" : "-" : "-", style: tierStyle, gap: 2 },
   { title: "STAGE", value: (row) => row.stage, style: staged, gap: 2 },
   { title: "AGE", value: (row, now) => elapsed(row.startedAt, now), style: dim, gap: 2 },
   { title: "STEPS", value: (row) => row.kind === "job" ? "-" : String(row.steps), style: plain, gap: 2, right: true },

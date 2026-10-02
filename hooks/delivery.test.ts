@@ -64,6 +64,8 @@ describe("delivery rules", () => {
     expect(lines[2]).toStartWith("◆ m29-unified   lane  gpt-6-astra  medium  codex-1  std   gate      3h47m    331      0  agentMessage: Dead");
     expect(lines[4]).toStartWith("● ship-r123     job   -            -       -        -     working   56m0s      -      -  publish-npm: + hsx@1.0.123");
     for (const index of [3, 4, 5]) expect(table[index]!.slice(5, 7).map((cell) => cell.text.trim())).toEqual(["-", "-"]);
+    expect(table[1]![6]).toMatchObject({ color: "#FF8000", bold: true });
+    for (const index of [2, 4, 5]) expect(table[index]![6]!.color).toBeUndefined();
     for (const line of lines.slice(1)) expect(line.charAt(columnStart(lines[0]!, "STAGE") - 1)).toBe(" ");
     expect(lines.every((line) => Array.from(line).length <= 140)).toBe(true);
   });
