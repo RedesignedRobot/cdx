@@ -209,6 +209,8 @@ export interface Lane {
   // for it; its terminal event goes to the batch, not the head.
   batch?: string;
   account?: string;
+  // The service tier the current round started with.
+  serviceTier?: "priority" | "default";
   codexHome?: string;
   ownerSession?: string;
   ownerCwd?: string;

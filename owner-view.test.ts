@@ -1,9 +1,9 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import type { LiveRow } from "./hooks/delivery.ts";
 import { storeJob } from "./jobs.ts";
-import { type Lane, startSession, storeLane } from "./ledger.ts";
+import { type Lane, readLedger, startSession, storeLane } from "./ledger.ts";
 import { briefCommand, eventsCommand } from "./session-commands.ts";
-import { statusCommand } from "./status.ts";
+import { liveRows, statusCommand } from "./status.ts";
 import { db } from "./store.ts";
 
 const callerBefore = process.env.CLAUDE_CODE_SESSION_ID;
@@ -84,4 +84,25 @@ test("the brief shows a running lane's stage, so a lane past its last turn reads
   const brief = await printed(undefined, () => briefCommand([]));
   expect(brief).toContain("lane=stage-lane round=1 kind=work state=running report=- stage=gate");
   expect(brief).toContain("lane=stage-new round=1 kind=work state=running report=- stage=working");
+});
+
+test("live rows use the current GPT round's account and stored tier", () => {
+  const name = "round-metadata";
+  runningLane(name);
+  const entry = readLedger()[name]!;
+  const row = () => liveRows().find((item) => item.name === name)!;
+  storeLane(name, { ...entry, account: "codex-2", serviceTier: "priority" });
+  expect(row()).toMatchObject({ account: "codex-2", serviceTier: "priority" });
+  storeLane(name, { ...entry, account: "codex-1", kind: "review", reviewEngine: "gpt",
+    review: { state: "running", cwd: "/repo" }, roundAccount: { name: "codex-2", home: "/unused", demand: "light" }, serviceTier: "default" });
+  expect(row()).toMatchObject({ account: "codex-2", serviceTier: "default" });
+  storeLane(name, { ...entry, account: "codex-2" });
+  expect(row().serviceTier).toBeUndefined();
+  storeLane(name, { ...entry, engine: "gemini", account: "codex-2", serviceTier: "priority" });
+  expect(row().account).toBeUndefined();
+  expect(row().serviceTier).toBeUndefined();
+  runningJob("round-metadata-job");
+  const job = liveRows().find((item) => item.name === "round-metadata-job")!;
+  expect(job.account).toBeUndefined();
+  expect(job.serviceTier).toBeUndefined();
 });

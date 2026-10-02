@@ -6,6 +6,8 @@ export interface LiveRow {
   model?: string;
   // The current round's effort as openRound stored it on the lane.
   effort?: string;
+  account?: string;
+  serviceTier?: "priority" | "default";
   stage: string;
   startedAt: string;
   steps: number;
