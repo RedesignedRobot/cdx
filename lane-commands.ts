@@ -23,7 +23,7 @@ import {
   storedOwnership, supervisorLane, validLane, withLane, withLedger, workCwdOf,
 } from "./ledger.ts";
 import {
-  resumeRefusal, CODEGRAPH_RULE, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
+  resumeRefusal, CONSULT_FRAME, laneInstructions, conversationRules, houseRules, pendingTestsRefusal, promptRules, resumePrompt,
   REVIEW_FINDINGS_SCHEMA, reviewFrame,
 } from "./prompts.ts";
 import { logPathOf, partialReportPathOf, reportPathOf, specPathOf } from "./reports.ts";
@@ -34,12 +34,12 @@ import { openRound } from "./rounds.ts";
 import { chooseSpawnModel } from "./repo-routing.ts";
 import { runRound } from "./runner.ts";
 import {
-  color, fail, fmtAge, uncoloredChildEnv, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
+  color, fail, fmtAge, parseArgs, pidAlive, resolveBrief, ROOT, runnerEnv, SELF,
   settleHint,
 } from "./runtime.ts";
 import { VISIBILITY_DEFAULTS } from "./visibility.ts";
 import { childWorktreeTarget, createWorktree, mergeDirectories, storedDirectories, type WorktreeInfo } from "./worktrees.ts";
-import { geminiProfile } from "./sandbox.ts";
+import { codeLookup } from "./code-lookup.ts";
 import { spawn as nodeSpawn } from "node:child_process";
 import {
   existsSync, openSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
@@ -529,38 +529,6 @@ export function cleanCommand(argv: string[]) {
 export async function codeQuestionCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["cd"]);
   const question = await resolveBrief(parsed.rest.join(" "), "usage: cdx ask --cd <repo> <question>");
-  if (!question) fail("usage: cdx ask --cd <repo> <question>");
-  const permission = /^(?:please )?(?:(?:may|can|could|should|shall) (?:i|we) (?:run|rerun|edit|change|proceed)|(?:am i|are we) (?:allowed|permitted)|(?:is it|would it be) (?:ok|okay|allowed)|(?:requesting )?(?:permission|approval) (?:to|for))\b/i;
-  const approval = /^(?:please )?(?:approve|authori[sz]e|grant|permit)\b/i;
-  const allowance = /^(?:(?:i|we) )?(?:need|request|require) (?:(?:your )?(?:permission|approval)|(?:(?:\d+|one|two|three|a|an|another|more|extra|additional|focused|touched-spec-only) )*(?:test[- ]runs?|test invocations?|runs?))\b/i;
-  if (process.env.CDX_LANE && question.split(/[.!?]\s+|\n+/).some((sentence) =>
-    [permission, approval, allowance].some((pattern) => pattern.test(sentence.trim())))) {
-    fail('cdx ask cannot grant permission or approval; use cdx question "<question>" to ask the head (QUESTION event)');
-  }
-  if (!parsed.flags.cd) fail("usage: cdx ask --cd <repo> <question>");
-  if (process.env.CODEX_SANDBOX === "seatbelt") {
-    fail("cdx ask must run outside Seatbelt; use a plain cdx ask call so the lane home's lookup rule can apply (no wrapper, pipe, or redirect)");
-  }
-  const cwd = realpathSync(parsed.flags.cd);
-  const policy = config.gemini ?? geminiConfig();
-  requireGeminiQuota("gemini");
-  requireGeminiAgent(policy.reviewAgent, cwd);
-  // Keep this request read-only even when its shell tool tries to write.
-  if (process.platform !== "darwin" || !Bun.which("sandbox-exec")) fail("read-only ask requires macOS sandbox-exec");
-  const proc = Bun.spawn({ cmd: ["sandbox-exec", "-p", geminiProfile({ cwd, reviewDir: cwd }), "agy", "--print", `Answer this code question with file:line evidence. Read only. ${CODEGRAPH_RULE}\n${question}`,
-    "--model", policy.model, "--agent", policy.reviewAgent, "--output-format", "json", "--print-timeout", "90s", "--add-dir", cwd],
-    cwd, env: uncoloredChildEnv(), stdout: "pipe", stderr: "pipe" });
-  // agy owns the 90s deadline. Give it time to emit its final JSON and exit
-  // before the watchdog kills it; equal deadlines caused opaque exit 137s.
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; proc.kill("SIGKILL"); }, 95_000);
-  try {
-    const [exitCode, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
-    if (timedOut) fail("Gemini code lookup timed out after 90s plus 5s shutdown grace; use cdx question for head decisions");
-    if (exitCode) fail(safeText(stderr || `Gemini ask exited ${exitCode}`));
-    const value = JSON.parse(stdout);
-    const result = value.result && typeof value.result === "object" ? value.result : value;
-    if (result.error || result.status && result.status !== "SUCCESS" || typeof result.response !== "string" || !result.response.trim()) fail("Gemini ask returned no successful answer");
-    console.log(safeText(result.response));
-  } finally { clearTimeout(timer); }
+  if (!question || !parsed.flags.cd) fail("usage: cdx ask --cd <repo> <question>");
+  console.log(await codeLookup(realpathSync(parsed.flags.cd), question));
 }

@@ -1,3 +1,4 @@
+import { serveCodeLookups } from "./code-lookup.ts";
 import { createReviewSnapshot, removeReviewSnapshot, runFrozenGate } from "./snapshots.ts";
 import { codexSandbox, geminiProfile, indexIgnoreFingerprint, LANE_TOOL_ENV, plantedPermissionLayers, prepareSandboxDirs, reviewSandboxRefusal } from "./sandbox.ts";
 import { monitorOverruns } from "./session-commands.ts";
@@ -193,6 +194,12 @@ async function runRoundInner(lane: string, round: number): Promise<number> {
 }
 
 async function executeRound(lane: string, round: number, spec: Spec): Promise<number> {
+  const lookups = serveCodeLookups();
+  try { return await executeWorkerRound(lane, round, spec, lookups.url); }
+  finally { lookups.stop(); }
+}
+
+async function executeWorkerRound(lane: string, round: number, spec: Spec, lookupUrl: string): Promise<number> {
   let startingLane = readLedger()[lane];
   while (startingLane?.queuedUntil) {
     withLedger((ledger) => { ledger[lane]!.pid = process.pid; ledger[lane]!.lastAction = `queued until ${startingLane!.queuedUntil}`; });
@@ -263,7 +270,7 @@ async function executeRound(lane: string, round: number, spec: Spec): Promise<nu
       ? ["sandbox-exec", "-p", geminiProfile(spec, [agyLogPath, partialReportPathOf(lane, round), progressLogPathOf(lane, round)]), ...geminiArgs]
       : ["codex", "app-server", ...CODEX_DISABLE_NATIVE_SUBAGENTS, "--listen", "stdio://"],
     cwd: spec.cwd,
-    env: { ...laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine), ...LANE_TOOL_ENV },
+    env: { ...laneChildEnv(gemini ? undefined : laneCodexHome(spec.codexHome ?? defaultCodexHome(), role), { lane, round, owner: spec.ownerSession, supervisor: startingLane?.kind === "work" && Boolean(startingLane.supervisor) }, engine), ...LANE_TOOL_ENV, CDX_LOOKUP_URL: lookupUrl },
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

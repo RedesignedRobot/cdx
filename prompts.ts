@@ -20,7 +20,7 @@ const READ_ONLY = "The sandbox makes this lane read-only: commands and network w
 const WORK_REPORT = "Report the outcome, changed files, risks, child outcomes, and report paths in plain prose and short lists, without em dashes, filler, or praise.";
 const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and short lists, without em dashes or filler.";
 const SECRETS_RULE = "Never print or inline secrets; use environment lookups.";
-const ASK_RULE = 'Read available evidence, then use `cdx question "<question>"` to ask the head for missing answers, permission, or more test runs. This raises a QUESTION event. `cdx ask --cd <repo>` only returns a read-only Gemini code answer and cannot grant approval. Run code lookups as plain cdx ask calls with no wrapper, pipe, or redirect so the lookup rule runs them outside Seatbelt before applying their own read-only sandbox. Timeout is not approval; stop dependent work, continue authorized work, and report the unanswered question.';
+const ASK_RULE = 'Read available evidence, then use `cdx question "<question>"` to ask the head for missing answers, permission, or more test runs. This raises a QUESTION event. `cdx ask --cd <repo>` only returns a read-only Gemini code answer and cannot grant approval. The brief’s testRuns grants test runs up front. Timeout is not approval; stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
 // Chromium registers mach ports, which the Codex seatbelt denies; one process needs none.
