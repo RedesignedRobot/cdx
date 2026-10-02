@@ -374,7 +374,7 @@ export function geminiUsageRows(snapshot: GeminiUsageSnapshot | undefined, quota
       blockedUntil: w.windowDurationMins === 300 ? blockedUntil : null };
     row.available = row.available && !row.blockedUntil && Boolean(snapshot);
     row.reason = row.blockedUntil ? `hold until ${rateLimitResetDate(row.blockedUntil)}` : !row.available ? "usage unknown; window reset"
-      : row.hoursToExhaustion !== null ? "hold; projected exhaustion before reset" : heldPercent ? `${heldPercent}% held by running lanes` : "spend normally";
+      : row.hoursToExhaustion !== null ? "projected to empty before reset" : heldPercent ? `${heldPercent}% held by running lanes` : "spend normally";
     return snapshot ? row : { ...row, usedPercent: null, remainingPercent: null, checkedAt: null };
   });
 }

@@ -726,12 +726,12 @@ function usageFixture(account: string, usedPercent: number, resetHours: number, 
   return { window, history, standing: standingOf({ name: account, home: `/home/${account}` }, snapshot, history, usageNow) };
 }
 
-test("expiring capacity leads; projected exhaustion is light only; picks share admission", () => {
+test("expiring capacity leads; projected exhaustion never limits admission; picks share admission", () => {
   const estate = [usageFixture("later", 25, 144, 0), usageFixture("soon", 90, 1, 1), usageFixture("burning", 80, 2, 15)].map((f) => f.standing);
   expect(rankAccounts(estate, "work", usageNow).map((s) => s.choice.name)).toEqual(["soon", "later", "burning"]);
   const advice = accountAdvice(estate, usageNow);
   for (const demand of ["light", "work", "supervisor"] as const) expect(advice.picks[demand]).toBe(decideAccount(estate, demand, usageNow)?.choice.name ?? null);
-  expect(decideAccount([estate[2]], "work", usageNow)).toBeUndefined();
+  expect(decideAccount([estate[2]], "work", usageNow)?.choice.name).toBe("burning");
   expect(decideAccount([estate[2]], "light", usageNow)?.choice.name).toBe("burning");
   expect(accountAdvice([usageFixture("thin", 97, 1).standing, estate[0]], usageNow).picks.work).toBe("thin");
 });

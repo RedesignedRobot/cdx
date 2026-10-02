@@ -373,7 +373,7 @@ export function standingOf(choice: AccountChoice, snapshot: UsageSnapshot | unde
   const deadline = Math.min(...live.map((w) => w.resetsAt));
   const burn = projections.find((w) => w.resetsAt === deadline)!;
   return { ...base, reason: reached ? "hold; quota exhausted" : limiting
-    ? `light only; exhausts in ${limiting.hoursToExhaustion!.toFixed(1)}h`
+    ? `${Math.round(remainingPercent)}% left, exhausts in ${limiting.hoursToExhaustion!.toFixed(1)}h, before its reset`
     : `${Math.round(remainingPercent)}% left, reset ${fmtUntil(deadline, now)}, burn ${burn.burnPerHour === null ? "unknown" : `${burn.burnPerHour.toFixed(1)}%/h`}, at reset ${burn.projectedRemainingAtReset === null ? "unknown" : `${burn.projectedRemainingAtReset.toFixed(1)}%`}` };
 }
 
@@ -384,7 +384,7 @@ export function exhausting(standing: AccountStanding): boolean {
 function standingTier(standing: AccountStanding, demand: Demand): number {
   if (standing.reached) return 3;
   if (!standing.snapshot) return 2;
-  return !exhausting(standing) && accountEligible(standing, demand) ? 0 : 1;
+  return accountEligible(standing, demand) ? 0 : 1;
 }
 
 export function rankAccounts(standings: AccountStanding[], demand: Demand, now = Date.now()): AccountStanding[] {
@@ -407,9 +407,11 @@ export function rankAccounts(standings: AccountStanding[], demand: Demand, now =
 }
 
 // Eligibility is shared by launch and usage advice. Unknown evidence is a
-// fallback after sufficient known capacity; light turns admit with warnings.
+// fallback after sufficient known capacity. A projected exhaustion before the
+// reset never limits admission (owner ruling 2026-10-02): quota left at a
+// reset is forfeited, so cdx spends it; only a reached window holds.
 function accountEligible(standing: AccountStanding, demand: Demand): boolean {
-  if (standing.reached || (demand !== "light" && exhausting(standing))) return false;
+  if (standing.reached) return false;
   if (!standing.snapshot) return true;
   if (demand === "light") return standing.remainingPercent > 0;
   return standing.projections?.length
@@ -500,7 +502,7 @@ export function adviceLines(standings: AccountStanding[], now = Date.now()): str
   const lines = [`picks: ${Object.entries(advice.picks).map(([demand, name]) => `${demand} ${name ?? "none"}`).join(" | ")}`];
   const notes = standings.flatMap((s) => {
     const credit = advice.resetCredits.find((c) => c.account === s.choice.name)?.redeem;
-    const note = s.reached ? "hold; quota exhausted" : exhausting(s) ? "light only; projected exhaustion before reset"
+    const note = s.reached ? "hold; quota exhausted" : exhausting(s) ? "projected to empty before reset"
       : !s.snapshot ? s.reason : s.heldPercent ? `${s.heldPercent}% held by running lanes` : "";
     return note || credit ? [`${s.choice.name}: ${note}${credit ? "; redeem one reset credit" : ""}.`] : [];
   });
