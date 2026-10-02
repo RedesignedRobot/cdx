@@ -34,8 +34,8 @@ Engines:
 ${ENGINE_PICKER}
 
   land <lane> | land --batch <lane>...     Gate the merge result once (as a detached job), fast-forward the base, push, remove worktrees and branches, close
-  spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--scope-policy ask|extend|stop] [--max-runtime MIN] "<brief>"
-  resume <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] "<fix instructions>"
+  spawn  <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--account NAME] [--effort E] [--cd D] [--worktree P] [--test-runs N] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--scope-policy ask|extend|stop] [--max-runtime MIN] "<brief>"
+  resume <lane> --fix gate|review [--effort E] [--test-runs N] [--bg] [--max-runtime MIN] "<fix instructions>"
   review <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--uncommitted | --base B | --commit SHA] [--scope "files"] ["<intent>"]
   consult <lane> [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... "<question>"  # read-only advisor
   panel  <name> --cd D [--pack F] ("<question>" | -)  # Astra, Sol and Claude Fable answer; one merged report
@@ -46,8 +46,8 @@ ${ENGINE_PICKER}
   --supervisor (gpt only) lets the lane drive GPT or Gemini children and consults
   through cdx, one level deep; killing the supervisor kills its children.
   send   <lane> "<text>"  # steer the active work turn, or start an idle follow-up turn
-  ask    [--timeout MIN] "<question>"  # inside a lane: liaison
-  ask    --cd /repo "<question>"       # head: synchronous Gemini
+  question [--timeout MIN] "<question>"  # inside a lane: head, raises QUESTION
+  ask    --cd /repo "<question>"       # synchronous read-only Gemini
   reply  <lane> [--id SEQ] "<answer>"  questions [lane]
   msg    <lane|full-session-id> "<text>"  inbox [-n N]
   events [--json] [--peek] # unread feed events; the newest active Claude session is the head
@@ -114,7 +114,7 @@ export async function dispatch(command: string | undefined, argv: string[]) {
     if (supervisor && !SUPERVISOR_COMMANDS.has(command)) {
       fail(`supervisor ${supervisor} may run ${[...SUPERVISOR_COMMANDS].join(", ")} on its children; command "${command}" refused`);
     }
-    if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx ask for anything you need from the liaison`);
+    if (!supervisor) fail(`lane workers cannot drive the harness (command "${command}" refused inside lane ${process.env.CDX_LANE}); use cdx question for anything you need from the head`);
   }
   if (!process.env.CDX_LANE && command && DRIVING_COMMANDS.has(command)) markDriver(callerSession());
 switch (command) {
@@ -128,7 +128,8 @@ switch (command) {
   case "shots": await shotsCommand(argv); break;
   case "resume": await resumeCommand(argv); break;
   case "send": await sendCommand(argv); break;
-  case "ask": await (process.env.CDX_LANE ? askCommand(argv) : codeQuestionCommand(argv)); break;
+  case "ask": await codeQuestionCommand(argv); break;
+  case "question": await askCommand(argv); break;
   case "reply": await replyCommand(argv); break;
   case "questions": questionsCommand(argv); break;
   case "msg": await msgCommand(argv); break;

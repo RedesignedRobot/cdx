@@ -151,7 +151,7 @@ The MCP `spawn` tool takes `outcome`, `files[]`, `acceptance`, `outOfScope` and 
 - `stop`: the lane does not edit outside Files; it names the file and the reason in its report and ends the round.
 - `ask`: the lane asks the head.
 
-Under extend and stop, a `cdx ask` that reads as a scope-permission question ("may I edit outside my files") gets an immediate answer from cdx. The question is stored as answered and the head is not woken. The classifier is keyword-based.
+Under extend and stop, a `cdx question` that reads as a scope-permission question ("may I edit outside my files") gets an immediate answer from cdx. The question is stored as answered and the head is not woken. The classifier is keyword-based.
 
 A no-op gate is refused when the repository has `.cdx-gate`, at spawn and at `cdx gate`: `true`, `:`, `exit`, `exit 0`, `/bin/true`, `/usr/bin/true`, and a bare `echo ...`.
 
@@ -172,8 +172,8 @@ The brief's `Ground rules:` block is a pointer, not a copy: the role's lane home
 | `cdx gate <lane> "<cmd>"` / `--clear` | Set or clear an inactive lane's gate |
 | `cdx gate-receipt <lane> [--json]` | Content proof for the latest work round |
 | `cdx send <lane> "<text>"` | Steer the active turn, or queue a follow-up turn |
-| `cdx ask "<question>"` | Inside a lane: ask the head and wait for the answer |
-| `cdx ask --cd /repo "<question>"` | From the head: synchronous read-only Gemini answer, no lane |
+| `cdx question "<question>"` | Inside a lane: raise a QUESTION event and wait for the head |
+| `cdx ask --cd /repo "<question>"` | Synchronous read-only Gemini code answer, no lane; cannot grant approval |
 | `cdx reply <lane> "<answer>"` / `cdx questions [lane]` | Answer or list open questions |
 | `cdx msg <lane\|full-session-id> "<text>"` / `cdx inbox` | Message the head or a session; read messages |
 | `cdx events` | Unread actionable events for the calling session |
@@ -189,8 +189,8 @@ The brief's `Ground rules:` block is a pointer, not a copy: the role's lane home
 <summary><b>Full flag reference</b></summary>
 
 ```
-cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--account NAME] [--effort E] [--cd D] [--worktree P] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--pre CMD] [--max-runtime MIN] [--expect MIN] ("<brief>" | -)
-cdx resume  <lane> --fix gate|review [--effort E] [--bg] [--max-runtime MIN] [--expect MIN] ("<fix instructions>" | -)
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--account NAME] [--effort E] [--cd D] [--worktree P] [--test-runs N] [--bg] [--add-dir D]... [--schema F] [--image F]... [--gate CMD] [--pre CMD] [--max-runtime MIN] [--expect MIN] ("<brief>" | -)
+cdx resume  <lane> --fix gate|review [--effort E] [--test-runs N] [--bg] [--max-runtime MIN] [--expect MIN] ("<fix instructions>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--account NAME] [--effort E] [--cd D] [--bg] [--image F]... ("<question>" | -)
 cdx panel   <name> --cd D [--pack F] ("<question>" | -)
@@ -200,8 +200,8 @@ cdx land    <lane> | cdx land --batch <lane>...
 cdx gate    <lane> ("<cmd>" | --clear)
 cdx gate-receipt <lane> [--json]
 cdx send    <lane> ("<text>" | -)
-cdx ask     [--timeout MIN] "<question>"   # inside a lane
-cdx ask     --cd /repo "<question>"        # from the head
+cdx question [--timeout MIN] "<question>"  # inside a lane: head, raises QUESTION
+cdx ask     --cd /repo "<question>"        # synchronous read-only code answer
 cdx reply   <lane> [--id SEQ] ("<answer>" | -)
 cdx questions [lane]
 cdx msg     <lane|full-session-id> ("<text>" | -)
@@ -243,7 +243,7 @@ Every lane runs sandboxed. cdx builds the writable roots once and hands them to 
 
 `"fullAccess": true` in `config.json` runs Codex work lanes and supervisors with `danger-full-access`: no seatbelt, so they reach the GPU, Metal compilers, `ps` and `.git`. Reviews and consults keep the read-only profile, because review proof depends on it. Lane rules still forbid commits; cdx land commits.
 
-Nothing else under `~/.cdx` is writable from a lane: not `config.json`, not hooks, not the cdx source. Head-side `cdx ask` uses the read-only Gemini profile. Gates run outside the sandbox in their snapshot.
+Nothing else under `~/.cdx` is writable from a lane: not `config.json`, not hooks, not the cdx source. `cdx ask` uses the read-only Gemini profile in every context. Lane instructions route permissions and run approvals to `cdx question`, which raises the head’s QUESTION event; the brief’s `testRuns` grants runs up front. Gates run outside the sandbox in their snapshot.
 
 Supervisors run from their own Codex home, `<account>/cdx-supervisor`, which holds `rules/cdx.rules` with one exec-policy rule, `prefix_rule(pattern = ["cdx"], decision = "allow")`. Codex runs a matching `cdx ...` call outside the sandbox, because Seatbelt does not nest and each child lane needs its own sandbox. Everything that call writes (specs, briefs, logs, reports, `usage.json`, git state for land) comes from that unsandboxed process. Codex skips the rule for commands with a redirect, `$(...)`, an env assignment or a wildcard, so supervisors call `cdx` plainly and leave git writes to cdx. A double-quoted brief with backticks, or a `'\''` splice, also misses the rule and runs sandboxed, so the supervisor rules tell it to single-quote every brief, gate and question and keep apostrophes out of them.
 
@@ -301,7 +301,7 @@ A supervisor merges green children into its own branch with `cdx land <child>` o
 
 ## Reviews, consults and panels
 
-`cdx review <lane>` runs an adversarial review in a fresh read-only session over a private snapshot of the recorded HEAD and dirty tree. A target flag (`--uncommitted`, `--base B`, `--commit SHA`) selects that diff; otherwise the intent does, optionally limited by `--scope`. Both engines return structured findings with severity, file, line and failure mechanism. cdx hashes the review tree before and after the round; a moved hash fails the round with "review tree changed despite the read-only sandbox". A second reviewer for the same tree and target is refused (a `--commit` or `--base` review keys on the resolved commit, so two commits reviewed from one checkout are two reviews), and re-reviews receive only the fix diff and prior findings. A P3-only verdict closes the loop: another review of the same tree is refused with "reuse its report", while a changed tree gets a fresh full review. Snapshots symlink ignored entries such as `node_modules`; the sandbox blocks writes through those links. `cdx doctor --fix` removes crash leftovers.
+`cdx review <lane>` runs an adversarial review in a fresh read-only session over a private snapshot of the recorded HEAD and dirty tree. `--base B` refuses a dirty worktree because it reviews committed code only; use `--uncommitted` to review staged, unstaged and untracked work. A target flag (`--uncommitted`, `--base B`, `--commit SHA`) selects that diff; otherwise the intent does, optionally limited by `--scope`. Both engines return structured findings with severity, file, line and failure mechanism. cdx hashes the review tree before and after the round; a moved hash fails the round with "review tree changed despite the read-only sandbox". A second reviewer for the same tree and target is refused (a `--commit` or `--base` review keys on the resolved commit, so two commits reviewed from one checkout are two reviews), and re-reviews receive only the fix diff and prior findings. A P3-only verdict closes the loop: another review of the same tree is refused with "reuse its report", while a changed tree gets a fresh full review. Snapshots symlink ignored entries such as `node_modules`; the sandbox blocks writes through those links. `cdx doctor --fix` removes crash leftovers.
 
 `cdx consult <lane> "<question>"` runs a read-only Astra advisor that may challenge the premise and closes with decisions for the caller. `--engine gemini` makes a Gemini helper, and `--supervisor` lets the consult start owned read-only Gemini helpers only. A consult lane keeps its name for consults; a follow-up uses a fresh consult. `consult` and `review` accept `--image F` on gpt.
 
@@ -328,9 +328,15 @@ The `claude` engine calls the real binary (PATH `claude`, else `~/.local/bin/cla
 
 `cdx shots grade <dir> --rubric <file> [--engine gpt|gemini] [--model M] [--downscale]` starts job `shots-<dir>` and returns, because a folder of 60 shots takes longer than a tool call may run. The job grades every png or jpg in `<dir>` in sequential consults of at most 8 shots, each on a fresh lane `shots-<dir>-<n>` (Sol by default, images attached for gpt). It writes one `<dir>/verdict.json` (per screen: pass or fail and one line; `reports` lists each batch's report) and prints `failed: ...` and `verdict: <path>` to the job log. The job's `job-exit` is the one event that wakes the head; the batch consults stay quiet. Read `verdict.json` after it. A screen the grader skips fails, and a failed batch fails its screens. `--downscale` writes 1000 px copies of failed shots to `<dir>/downscaled/` with `sips -Z 1000`. `context` and `shots` are refused inside lanes.
 
+Spawn and resume accept `testRuns: 6` through MCP or `--test-runs 6` through the CLI. The positive integer replaces `visibility.testRuns` (default 3) in the round's standing rule and test counter, including its gate. Each round gets its own allowance; a resume without the field uses the configured default.
+
+A respawn with an explicit `account` or `--account` warns and uses the lane's pinned account, even if the requested name is unknown. Fresh lanes still validate the requested account.
+
 ## Questions, steering and messages
 
-A worker runs `cdx ask [--timeout MIN] "<question>"`. The runner exports `CDX_LANE`, `CDX_ROUND` and `CDX_OWNER` so `ask` finds its lane. The question lands in the database, a `question` event wakes the head, and `ask` polls for the answer; the default and maximum timeout is 30 minutes. On timeout `ask` exits 0: the worker reports the unresolved dependency and continues independent work. `cdx reply <lane> "<answer>"` answers the oldest open question of the lane's current round, or `--id <seq>` a specific one. When the engine's last turn of a round ends, every question still open in that round expires, since an `ask` left running then prints to an exec the engine never reads again; `cdx reply` to it is refused and says so. A `cdx send` in that window is refused with the lane's stage, usually the gate. While a question is open, `cdx status` shows `waiting on question #<seq>`.
+`cdx ask --cd /repo "<question>"` answers every question through a read-only Gemini lookup. Codex and Gemini workers send lookups to their runner, which applies the read-only profile outside the worker’s Seatbelt sandbox. No command escape rule is needed for worker lookups. Gemini gets 90 seconds plus five seconds to emit its final result before the watchdog reports a timeout. Lane instructions direct permission and run-approval questions to `cdx question`, which raises the head’s QUESTION event. A brief’s `testRuns` grants runs up front.
+
+A worker runs `cdx question [--timeout MIN] "<question>"` for head decisions, permission, or more test runs. The runner exports `CDX_LANE`, `CDX_ROUND` and `CDX_OWNER` so `question` finds its lane. The question lands in the database, a `question` event wakes the head, and `question` polls for the answer; the default and maximum timeout is 30 minutes. On timeout `question` exits 0: the worker reports the unresolved dependency and continues independent work. `cdx reply <lane> "<answer>"` answers the oldest open question of the lane's current round, or `--id <seq>` a specific one. When the engine's last turn of a round ends, every question still open in that round expires, since an `ask` left running then prints to an exec the engine never reads again; `cdx reply` to it is refused and says so. A `cdx send` in that window is refused with the lane's stage, usually the gate. While a question is open, `cdx status` shows `waiting on question #<seq>`.
 
 `cdx send <lane> "<text>"` appends a control record. GPT steers the active turn when possible and starts a follow-up turn otherwise. Gemini receives it through the `cdx hook pre-invocation` entry `doctor --fix` installs in `~/.gemini/config/hooks.json`; without the hook, sends become follow-up turns. `send` refuses review lanes.
 

@@ -58,6 +58,7 @@ export const TOOLS: ToolDefinition[] = [
         outOfScope: { type: "string", description: "What the lane must not do or touch" },
         children: { type: "array", items: { type: "string" }, description: "Supervisor only: one child file set per item, two or more" },
         scopePolicy: { type: "string", enum: ["ask", "extend", "stop"], description: "Files outside the brief: extend edits and lists them (default), stop ends the round, ask asks the head" },
+        testRuns: { type: "integer", minimum: 1, description: "Test invocations allowed this round, including the gate; defaults to visibility.testRuns or 3" },
         engine: { type: "string", enum: ["gpt", "gemini"], description: "Execution engine" },
         model: { type: "string", description: "Model alias or id" },
         supervisor: { type: "boolean", description: "Run lane as supervisor" },
@@ -81,6 +82,7 @@ export const TOOLS: ToolDefinition[] = [
       if (input.model) argv.push("--model", String(input.model));
       if (input.supervisor) argv.push("--supervisor");
       if (input.scopePolicy) argv.push("--scope-policy", String(input.scopePolicy));
+      if (input.testRuns != null) argv.push("--test-runs", String(input.testRuns));
       if (input.cd) argv.push("--cd", String(input.cd));
       if (input.worktree) argv.push("--worktree", String(input.worktree));
       if (input.gate) argv.push("--gate", String(input.gate));
@@ -112,6 +114,7 @@ export const TOOLS: ToolDefinition[] = [
       properties: {
         lane: { type: "string", description: "Name of the lane to resume" },
         followUp: { type: "string", description: "Fix instructions for the same diff" },
+        testRuns: { type: "integer", minimum: 1, description: "Test invocations allowed this round, including the gate; defaults to visibility.testRuns or 3" },
         fix: { type: "string", enum: ["gate", "review"], description: "Evidence being repaired" },
         effort: { type: "string", description: "Reasoning effort" },
         maxRuntime: { type: "number", description: "Maximum runtime in minutes" },
@@ -121,6 +124,7 @@ export const TOOLS: ToolDefinition[] = [
     },
     run: (input) => {
       const argv = ["resume", String(input.lane), "--fix", String(input.fix)];
+      if (input.testRuns != null) argv.push("--test-runs", String(input.testRuns));
       if (input.effort) argv.push("--effort", String(input.effort));
       if (input.maxRuntime != null) argv.push("--max-runtime", String(input.maxRuntime));
       if (input.expect != null) argv.push("--expect", String(input.expect));

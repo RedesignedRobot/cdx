@@ -104,14 +104,15 @@ Before you look at any screenshot, run `cdx shots grade <dir> --rubric <file>`. 
 ## Commands
 
 ```bash
-cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--cd D] [--worktree P] [--bg] [--gate CMD] [--pre CMD] [--add-dir D]... [--image F]... ("<brief>" | -)
-cdx resume  <lane> --fix gate|review [--effort E] [--bg] ("<fix instructions>" | -)
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--cd D] [--worktree P] [--test-runs N] [--bg] [--gate CMD] [--pre CMD] [--add-dir D]... [--image F]... ("<brief>" | -)
+cdx resume  <lane> --fix gate|review [--effort E] [--test-runs N] [--bg] ("<fix instructions>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--cd D] [--bg] [--image F]... [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--cd D] [--bg] [--image F]... ("<question>" | -)
 cdx panel   <name> --cd D [--pack F] ("<question>" | -)
 cdx context <repo> [--model M]
 cdx shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]
 cdx land    <lane> | cdx land --batch <lane>...
+cdx question [--timeout MIN] "<question>"  # lane to head, raises QUESTION
 cdx ask     --cd /repo "<question>"        # synchronous read-only Gemini answer, no lane
 cdx reply   <lane> [--id SEQ] ("<answer>" | -) | cdx questions [lane] | cdx send <lane> ("<text>" | -)
 cdx msg     <lane|full-session-id> ("<text>" | -) | cdx inbox [-n N]
@@ -121,3 +122,9 @@ cdx usage   [--json] [--totals] | cdx doctor [--fix] [--probe] [--days N] | cdx 
 ```
 
 If `cdx doctor` fails `codex models`, run `codex update`, then `codex debug models`.
+
+`cdx ask --cd /repo "<question>"` answers every question through a read-only Gemini lookup. Codex and Gemini workers send lookups to their runner, which applies the read-only profile outside the worker’s Seatbelt sandbox. No command escape rule is needed for worker lookups. Gemini gets 90 seconds plus five seconds to emit its final result before the watchdog reports a timeout. Lane instructions direct permission and run-approval questions to `cdx question`, which raises the head’s QUESTION event. A brief’s `testRuns` grants runs up front.
+
+Spawn and resume accept `testRuns: 6` or CLI `--test-runs 6`. This positive integer grants that round six test invocations including its gate, replacing the configured default of three in its standing rule and test counter. A resume without the field uses the configured default.
+
+A base review refuses a dirty lane worktree because `--base` only covers committed code. Use `--uncommitted` to review pending changes. Respawn with an explicit account warns and retains the pinned account, including when the requested name is unknown.

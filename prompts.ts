@@ -20,13 +20,13 @@ const READ_ONLY = "The sandbox makes this lane read-only: commands and network w
 const WORK_REPORT = "Report the outcome, changed files, risks, child outcomes, and report paths in plain prose and short lists, without em dashes, filler, or praise.";
 const REVIEW_REPORT = "Report your conclusion and evidence in plain prose and short lists, without em dashes or filler.";
 const SECRETS_RULE = "Never print or inline secrets; use environment lookups.";
-const ASK_RULE = 'Read available evidence, then use `cdx ask "<question>"` for missing answers that change outcome or authorization; timeout is not approval, so stop dependent work, continue authorized work, and report the unanswered question.';
+const ASK_RULE = 'Read available evidence, then use `cdx question "<question>"` to ask the head for missing answers, permission, or more test runs. This raises a QUESTION event. `cdx ask --cd <repo>` only returns a read-only Gemini code answer and cannot grant approval. The brief’s testRuns grants test runs up front. Timeout is not approval; stop dependent work, continue authorized work, and report the unanswered question.';
 const WORKER_BAN = "Workers cannot drive cdx lanes or jobs or spawn subagents; ask the supervisor or liaison for dependencies.";
 const STANDARD_RULE = "Read source, fix causes with the simplest design, and delete unnecessary code and tests.";
 // Chromium registers mach ports, which the Codex seatbelt denies; one process needs none.
 const BROWSER_RULE = "Chromium starts in this sandbox only with the --single-process flag (for Playwright, pass it in the launch args); sandboxed shells have CODEX_SANDBOX=seatbelt.";
 export const CODEGRAPH_RULE = `In a repository with .codegraph/, \`${CODEGRAPH_EXPLORE} "<question>"\` is the first tool for every code question, before grep, rg, find, ls, cat or file reads. Text tools are only for literal sweeps, non-code assets, logs and file-existence checks. Codegraph returns source; do not reread the same source with text tools. If codegraph is missing, the repository is unindexed, or the call times out (exit 142) or fails, fall back to rg and file reads and note it in the report.`;
-const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx ask before changing scope, and report unresolved disagreement.";
+const CHALLENGE_RULE = "Own technical judgment, challenge a wrong brief through cdx question before changing scope, and report unresolved disagreement.";
 const TOKEN_ECONOMY = "Reuse evidence, target reads, keep output compact, and skip polling, timers, or status checks that add no information.";
 const GPT_RULES = [
   TOKEN_ECONOMY,
@@ -54,14 +54,14 @@ const SUPERVISOR_RULES = [
 ];
 
 const roleTitle = (role: LaneRole) => role.review ? "review lane" : role.supervisor ? "supervisor lane" : "work lane";
-const testRunRule = () => `Keep test invocations within ${config.visibility?.testRuns ?? VISIBILITY_DEFAULTS.testRuns} this round, including the lane gate. Run each touched spec once; ask the supervisor if the gate needs more.`;
+const testRunRule = (testRuns = config.visibility?.testRuns ?? VISIBILITY_DEFAULTS.testRuns) => `Keep test invocations within ${testRuns} this round, including the lane gate. Run each touched spec once; use cdx question to ask the head if the gate needs more.`;
 const ownerRules = () => config.rules.filter((rule) => !retiredLaneRule(rule));
 
 // The AGENTS.md cdx writes into each role's Codex lane home.
-export function laneInstructions(role: LaneRole = {}): string {
+export function laneInstructions(role: LaneRole & { testRuns?: number } = {}): string {
   const rules = role.review ? [LANE_ROLE, READ_ONLY, REVIEW_REPORT, SECRETS_RULE, CODEGRAPH_RULE]
     : [LANE_ROLE, WORK_LIMITS, WORK_REPORT, SECRETS_RULE, CODEGRAPH_RULE, BROWSER_RULE, ...(role.supervisor ? SUPERVISOR_RULES : GPT_WORKER_RULES),
-      VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule()])];
+      VERIFICATION_RULE, ...(role.supervisor ? [] : [testRunRule(role.testRuns)])];
   const owner = ownerRules();
   return [`# cdx ${roleTitle(role)}`, "", "These are your standing rules as a cdx lane. The brief carries the task and the facts for this lane.", "",
     ...rules.map((rule) => `- ${rule}`), ...(owner.length ? ["", "## Owner rules", "", ...owner.map((rule) => `- ${rule}`)] : [])].join("\n") + "\n";
@@ -117,12 +117,13 @@ export function withCodegraphFact(prompt: string, cwd: string): string {
   return `${prompt}\n\nCodegraph: this worktree has no index of its own; run \`${CODEGRAPH_EXPLORE} -p ${index} "<question>"\`. It answers from the primary checkout at ${index}, so read files you changed from the worktree.`;
 }
 
-export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean } = {}): string {
+export function houseRules(cwd: string, reviewOnly: boolean, engine: Engine = "gpt", opts: { supervisor?: boolean; testRuns?: number } = {}): string {
   const role = { review: reviewOnly, supervisor: Boolean(opts.supervisor) && engine === "gpt" };
   const facts = [engine === "gpt"
     ? `Standing rules: the "cdx ${roleTitle(role)}" AGENTS.md from your lane home.`
     : `Standing rules: your cdx agent file.`];
-  if (engine !== "gpt") facts.push(...ownerRules(), ...(reviewOnly ? [] : [testRunRule()]));
+  if (engine !== "gpt") facts.push(...ownerRules());
+  if (!reviewOnly && !role.supervisor) facts.push(testRunRule(opts.testRuns));
   const projectRules = `${cwd}/.cdx-rules.md`;
   if (existsSync(projectRules) && readFileSync(projectRules, "utf8").trim()) facts.push(`Project rules: read ${projectRules} before starting.`);
   const digest = digestLine(contextDigest(cwd));

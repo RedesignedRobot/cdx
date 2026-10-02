@@ -281,6 +281,7 @@ export interface Lane {
 }
 
 export interface Spec {
+  testRuns?: number;
   expectMinutes?: number;
   // Copied from config at launch; the runner reads no config file.
   fullAccess?: boolean;

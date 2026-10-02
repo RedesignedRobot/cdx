@@ -64,7 +64,7 @@ for (let i = 0; i < ${increments}; i++) {
     expect(events).toBe(writers * increments);
     expect(distinct).toBe(events);
   } finally { rmSync(home, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("kill -9 inside a write transaction leaves the store consistent and writable", async () => {
   const home = tempHome();

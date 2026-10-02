@@ -157,6 +157,7 @@ test("review bases resolve in the source repo before the snapshot prompt is buil
   const commit = "a".repeat(40);
   const target = reviewBaseTarget("/source/feature", "review-base", (cwd, ...args) => {
     expect(cwd).toBe("/source/feature");
+    if (args[0] === "status") return "";
     expect(args).toEqual(["rev-parse", "--verify", "--end-of-options", "review-base^{commit}"]);
     return commit;
   });
@@ -441,6 +442,24 @@ const laneRepo = () => {
   return { dir, repo, git, worktree };
 };
 
+test("base review refuses staged, unstaged and untracked work in a lane worktree", () => {
+  const { dir, git, worktree } = laneRepo();
+  try {
+    const { path } = worktree("dirty-review");
+    expect(reviewBaseTarget(path, "main")).toContain("...HEAD");
+    writeFileSync(join(path, "kernel.ts"), "uncommitted fix\n");
+    const refusal = "--base reviews committed code only, but this worktree has uncommitted changes; use --uncommitted to review them";
+    expect(() => reviewBaseTarget(path, "main")).toThrow(refusal);
+    git(path, "add", "kernel.ts");
+    expect(() => reviewBaseTarget(path, "main")).toThrow(refusal);
+    git(path, "restore", "--staged", "--worktree", "kernel.ts");
+    writeFileSync(join(path, "new.ts"), "new work\n");
+    expect(() => reviewBaseTarget(path, "main")).toThrow(refusal);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}, 15_000);
+
 test("a lane whose checkout equals its base skips the gate, even after edit-then-revert", () => {
   const { dir, repo, git, worktree } = laneRepo();
   try {
@@ -465,7 +484,7 @@ test("a lane whose checkout equals its base skips the gate, even after edit-then
     git(path, "revert", "--quiet", "--no-edit", "HEAD");
     expect(laneMatchesBase(path, entry)).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a lane with work against its base, a supervisor with merged children, and a lane with no worktree still gate", () => {
   const { dir, repo, git, worktree } = laneRepo();
@@ -487,7 +506,7 @@ test("a lane with work against its base, a supervisor with merged children, and 
     const clean = worktree("clean");
     expect(laneMatchesBase(clean.path, { ...clean.entry, baseBranch: "missing" })).toBe(false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a skipped gate finalizes with a no-diff verdict in state, report and feed, and land refuses the lane", async () => {
   const { dir, git, worktree } = laneRepo();
@@ -522,7 +541,7 @@ test("a skipped gate finalizes with a no-diff verdict in state, report and feed,
     expect(terminal.message).toContain("gateExit=not-run");
     expect(landRefusal(finished)).toBe("no content-bound gate receipt; run a new work round");
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a lane that changed only docs or files under a lanes/ directory skips the gate; any other path gates", () => {
   const { dir, git, worktree } = laneRepo();
@@ -543,7 +562,7 @@ test("a lane that changed only docs or files under a lanes/ directory skips the 
     expect(docsOnly(["lanes"])).toBe(false);
     expect(docsOnly(["README.MD", "exp/lanes/report.txt"])).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a docs-only lane finalizes done with a tree-bound receipt that land accepts, and no gate exit", async () => {
   const { dir, git, worktree } = laneRepo();

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { Database } from "bun:sqlite";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { safeJSON, safeText } from "./safe-text.ts";
@@ -81,6 +81,8 @@ test("lane home installation is idempotent and preserves the interactive instruc
       PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: "unrelated-hook" }] }] } };
     writeFileSync(join(home, "hooks.json"), JSON.stringify(original));
     const lane = installLaneHome(home, "lane instructions");
+    mkdirSync(join(lane, "rules"), { recursive: true });
+    writeFileSync(join(lane, "rules", "cdx.rules"), SUPERVISOR_RULES);
     expect(installLaneHome(home, "lane instructions")).toBe(lane);
     expect(readFileSync(join(home, "AGENTS.md"), "utf8")).toBe("interactive instructions");
     expect(readFileSync(join(lane, "AGENTS.md"), "utf8")).toBe("lane instructions");
@@ -88,11 +90,11 @@ test("lane home installation is idempotent and preserves the interactive instruc
     const installed = JSON.parse(readFileSync(join(lane, "hooks.json"), "utf8"));
     expect(installed).toEqual(withCapHook(laneHooks(original)));
     expect(installed.hooks.PreToolUse.map((group: any) => group.hooks[0].command)).toEqual(["unrelated-hook", CAP_HOOK_COMMAND]);
-    expect(existsSync(join(lane, "rules"))).toBe(false);
+    expect(existsSync(join(lane, "rules", "cdx.rules"))).toBe(false);
     const supervisor = installLaneHome(home, "lane instructions", { supervisor: true });
     expect(supervisor).toBe(laneCodexHome(home, { supervisor: true }));
     expect(installLaneHome(home, "review instructions", { review: true })).toBe(join(home, "cdx-review"));
-    expect(existsSync(join(home, "cdx-review", "rules"))).toBe(false);
+    expect(existsSync(join(home, "cdx-review", "rules", "cdx.rules"))).toBe(false);
     expect(readFileSync(join(supervisor, "rules", "cdx.rules"), "utf8")).toBe(SUPERVISOR_RULES);
     expect(laneHooks(laneHooks(original))).toEqual(laneHooks(original));
     expect(laneHooks(original).hooks.UserPromptSubmit[0].hooks[0].command).toContain('CDX_LANE');

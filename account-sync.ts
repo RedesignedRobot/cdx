@@ -28,7 +28,7 @@ function readText(path: string): string | undefined {
 
 // Each account keeps its interactive instructions. Lane processes use one home
 // per role: Codex loads the home's AGENTS.md as the standing lane rules, and
-// only supervisors carry the cdx exec-policy rule.
+// workers escape only for read-only code lookups; supervisors may also drive cdx.
 export interface LaneRole { review?: boolean; supervisor?: boolean }
 
 export function laneCodexHome(home: string, role: LaneRole = {}): string {
@@ -76,7 +76,9 @@ export function installLaneHome(home: string, instructions: string, role: LaneRo
   const text = JSON.stringify(withCapHook(hooks ? laneHooks(JSON.parse(hooks)) : {}), null, 2) + "\n";
   if (readText(join(target, "hooks.json")) !== text) atomicWrite(join(target, "hooks.json"), text);
   const rules = join(target, "rules", "cdx.rules");
-  if (role.supervisor && readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
+  if (role.supervisor) {
+    if (readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
+  } else if (existsSync(rules)) unlinkSync(rules);
   return target;
 }
 

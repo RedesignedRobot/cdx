@@ -1,7 +1,22 @@
 import { expect, test } from "bun:test";
 import { dispatch } from "./commands.ts";
-import { type Lane, storeLane } from "./ledger.ts";
+import { type Lane, storeLane, recentEvents } from "./ledger.ts";
 import { expireRoundQuestions, readQuestions, storeQuestion } from "./questions.ts";
+
+test("lane question raises the head event", async () => {
+  const previous = { CDX_LANE: process.env.CDX_LANE, CDX_ROUND: process.env.CDX_ROUND };
+  process.env.CDX_LANE = "test-allowance-question";
+  process.env.CDX_ROUND = "1";
+  try {
+    await dispatch("question", ["--timeout", "0.0001", "May I run one more test?"]);
+    expect(recentEvents(1)[0]).toMatchObject({ kind: "question", lane: "test-allowance-question" });
+    expect(readQuestions("test-allowance-question")[0]?.question).toBe("May I run one more test?");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
 
 // A lane whose engine finished its last turn and is waiting on its gate: the
 // runner is alive, steering is closed.

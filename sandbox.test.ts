@@ -9,6 +9,16 @@ import { join } from "node:path";
 
 const env = { CDX_LANE: "w", CDX_ROUND: "2", CDX_HOME: "/state" };
 
+test("a round's test allowance replaces the default in its home and brief", () => {
+  const rules = laneInstructions({ testRuns: 6 });
+  expect(rules).toContain("Keep test invocations within 6 this round");
+  expect(rules).not.toContain("Keep test invocations within 3 this round");
+  expect(rules).toContain("cdx question");
+  for (const engine of ["gpt", "gemini"] as const) {
+    expect(houseRules("/repo", false, engine, { testRuns: 6 })).toContain("Keep test invocations within 6 this round");
+  }
+});
+
 test("codex reviews write only TMPDIR and the index; work lanes write only their roots", () => {
   expect(codexSandbox({ cwd: "/repo", reviewDir: "/repo", lane: "r", round: 1 })).toEqual({ thread: {}, turn: {}, config: { default_permissions: REVIEW_PROFILE,
     permissions: { [REVIEW_PROFILE]: { filesystem: { ":root": "read", ":tmpdir": "write" }, network: { enabled: true } } } } });
