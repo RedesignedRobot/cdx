@@ -49,14 +49,18 @@ const AGY_RETRY_LINE = /Run: attempt (\d+) failed \((.*)\), retrying in (\S+)$/;
 export const AGY_RETRY_WAKE_ATTEMPT = 3;
 
 // Every codex process cdx starts carries these overrides. Native subagents are
-// off because lanes fan out through cdx, and the service tier is pinned to
-// standard: the ChatGPT app writes `service_tier = "priority"` (Fast mode,
-// "1.5x speed, increased usage") into each codex home's config.toml, and a
-// lane running at that tier drains the weekly window faster for no gain in
-// a background job (usage study 2026-09-16).
+// off because lanes fan out through cdx, and cdx pins the service tier so the
+// ChatGPT app's `service_tier = "priority"` in config.toml never decides it.
+// Standard ("default") is the normal pin: Fast mode ("priority", about 1.5x
+// speed at 2.5x weekly usage) drains the window for no gain in a background
+// job (usage study 2026-09-16).
+// TEMPORARY, owner ruling 2026-10-02: Fast while the global Codex reset leaves
+// quota that would otherwise forfeit. Revert to "default" on Sun 2026-10-04.
+export const LANE_SERVICE_TIER = "priority";
+
 export const CODEX_DISABLE_NATIVE_SUBAGENTS = [
   "-c", "agents.enabled=false",
-  "-c", 'service_tier="default"',
+  "-c", `service_tier="${LANE_SERVICE_TIER}"`,
   "--disable", "multi_agent",
   "--disable", "multi_agent_v2",
 ];
@@ -249,7 +253,7 @@ export function appThreadParams(spec: Spec): Record<string, unknown> {
     memories: { use_memories: false, generate_memories: false },
     skills: { include_instructions: false },
     mcp_servers: laneMcpServers(spec.codexHome || process.env.CODEX_HOME || `${HOME}/.codex`),
-    service_tier: "default",
+    service_tier: LANE_SERVICE_TIER,
     // Every role, reviews and supervisors included, gets the same caps.
     model_auto_compact_token_limit: spec.model_auto_compact_token_limit ?? 150_000,
     tool_output_token_limit: spec.tool_output_token_limit ?? 6_000,
