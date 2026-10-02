@@ -1,7 +1,34 @@
 import { expect, test } from "bun:test";
 import { dispatch } from "./commands.ts";
-import { type Lane, storeLane } from "./ledger.ts";
+import { type Lane, storeLane, recentEvents } from "./ledger.ts";
 import { expireRoundQuestions, readQuestions, storeQuestion } from "./questions.ts";
+
+test("lane ask refuses test approval and question raises the head event", async () => {
+  const previous = { CDX_LANE: process.env.CDX_LANE, CDX_ROUND: process.env.CDX_ROUND };
+  process.env.CDX_LANE = "test-allowance-question";
+  process.env.CDX_ROUND = "1";
+  try {
+    for (const question of [
+      "Three test invocations are used. May I run it?",
+      "I need one more test-run after correcting the failure.",
+      "Please approve another test invocation.",
+      "Requesting permission to rerun the gate.",
+    ]) {
+      await expect(dispatch("ask", [question])).rejects.toThrow('use cdx question "<question>" to ask the head (QUESTION event)');
+      await expect(dispatch("ask", ["--cd", "/repo", question])).rejects.toThrow("cdx ask cannot grant permission");
+    }
+    expect(readQuestions("test-allowance-question")).toHaveLength(0);
+    // A code question about permissions still reaches the code lookup's validation.
+    await expect(dispatch("ask", ["Where is the permission check implemented?"])).rejects.toThrow("usage: cdx ask --cd");
+    await dispatch("question", ["--timeout", "0.0001", "May I run one more test?"]);
+    expect(recentEvents(1)[0]).toMatchObject({ kind: "question", lane: "test-allowance-question" });
+    expect(readQuestions("test-allowance-question")[0]?.question).toBe("May I run one more test?");
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key]; else process.env[key] = value;
+    }
+  }
+});
 
 // A lane whose engine finished its last turn and is waiting on its gate: the
 // runner is alive, steering is closed.

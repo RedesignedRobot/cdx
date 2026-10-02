@@ -56,9 +56,13 @@ export function accountSpec(account?: AccountChoice): Pick<Spec, "account" | "co
   };
 }
 
-export function rejectPinnedAccountFlag(laneName: string, lane: Lane, requested?: string): void {
+export function rejectPinnedAccountFlag(laneName: string, lane: Lane, requested?: string, opts: { respawn?: boolean } = {}): void {
   if (requested === undefined) return;
   const pinned = lane.account ? `account "${lane.account}"` : `the default account at ${displayPath(defaultCodexHome())}`;
+  if (opts.respawn) {
+    console.error(`cdx: lane "${laneName}" is pinned to ${pinned}; ignoring --account "${requested}" on respawn`);
+    return;
+  }
   fail(`--account is not valid for lane "${laneName}"; lane "${laneName}" is pinned to ${pinned}`);
 }
 

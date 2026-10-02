@@ -142,12 +142,12 @@ export async function sendCommand(argv: string[]): Promise<void> {
 export async function askCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["timeout"]);
   const question = singleLine(parsed.rest.join(" "));
-  if (!question) fail('usage: cdx ask [--timeout <min>] "<question>"');
+  if (!question) fail('usage: cdx question [--timeout <min>] "<question>"');
   const lane = process.env.CDX_LANE?.trim();
   const round = Number(process.env.CDX_ROUND);
   const owner = process.env.CDX_OWNER?.trim();
   if (!lane || !Number.isInteger(round) || round < 1) {
-    fail("cdx ask must run inside a cdx work lane with CDX_LANE and CDX_ROUND set");
+    fail("cdx question must run inside a cdx work lane with CDX_LANE and CDX_ROUND set");
   }
   const requestedTimeout = Number(parsed.flags.timeout ?? 30);
   if (!Number.isFinite(requestedTimeout) || requestedTimeout <= 0) fail("--timeout must be a positive number of minutes");
@@ -186,7 +186,7 @@ export async function askCommand(argv: string[]): Promise<void> {
       return;
     }
     if (current?.expiredAt) {
-      console.log("cdx ask expired because the round ended. Take the conservative reading, record the deviation in the lane report, and continue.");
+      console.log("cdx question expired because the round ended. Take the conservative reading, record the deviation in the lane report, and continue.");
       return;
     }
     await Bun.sleep(Math.min(1000, Math.max(10, deadline - Date.now())));
@@ -202,7 +202,7 @@ export async function askCommand(argv: string[]): Promise<void> {
     console.log(outcome.answer ?? "");
     return;
   }
-  console.log("cdx ask timed out. No approval was received. Continue independent authorized work and report the unresolved dependency; do not guess a required answer.");
+  console.log("cdx question timed out. No approval was received. Continue independent authorized work and report the unresolved dependency; do not guess a required answer.");
 }
 
 export async function replyCommand(argv: string[]): Promise<void> {

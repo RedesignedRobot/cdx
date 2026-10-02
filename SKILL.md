@@ -104,14 +104,15 @@ Before you look at any screenshot, run `cdx shots grade <dir> --rubric <file>`. 
 ## Commands
 
 ```bash
-cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--cd D] [--worktree P] [--bg] [--gate CMD] [--pre CMD] [--add-dir D]... [--image F]... ("<brief>" | -)
-cdx resume  <lane> --fix gate|review [--effort E] [--bg] ("<fix instructions>" | -)
+cdx spawn   <lane> [--engine gpt|gemini] [--model M] [--supervisor] [--scope-policy ask|extend|stop] [--cd D] [--worktree P] [--test-runs N] [--bg] [--gate CMD] [--pre CMD] [--add-dir D]... [--image F]... ("<brief>" | -)
+cdx resume  <lane> --fix gate|review [--effort E] [--test-runs N] [--bg] ("<fix instructions>" | -)
 cdx review  <lane> [--engine gpt|gemini] [--model M] [--cd D] [--bg] [--image F]... [--uncommitted | --base B | --commit SHA] [--scope "<files>"] ["<intent>" | -]
 cdx consult <lane> [--engine gpt|gemini] [--supervisor] [--model M] [--cd D] [--bg] [--image F]... ("<question>" | -)
 cdx panel   <name> --cd D [--pack F] ("<question>" | -)
 cdx context <repo> [--model M]
 cdx shots grade <dir> --rubric F [--engine gpt|gemini] [--model M] [--downscale]
 cdx land    <lane> | cdx land --batch <lane>...
+cdx question [--timeout MIN] "<question>"  # lane to head, raises QUESTION
 cdx ask     --cd /repo "<question>"        # synchronous read-only Gemini answer, no lane
 cdx reply   <lane> [--id SEQ] ("<answer>" | -) | cdx questions [lane] | cdx send <lane> ("<text>" | -)
 cdx msg     <lane|full-session-id> ("<text>" | -) | cdx inbox [-n N]
@@ -121,3 +122,9 @@ cdx usage   [--json] [--totals] | cdx doctor [--fix] [--probe] [--days N] | cdx 
 ```
 
 If `cdx doctor` fails `codex models`, run `codex update`, then `codex debug models`.
+
+Workers send head decisions, permissions and requests for more test runs through `cdx question`. `cdx ask --cd /repo` only returns a read-only Gemini code answer; it refuses permission requests inside lanes. Its 90-second lookup deadline has five seconds of shutdown grace.
+
+Spawn and resume accept `testRuns: 6` or CLI `--test-runs 6`. This positive integer grants that round six test invocations including its gate, replacing the configured default of three in its standing rule and test counter. A resume without the field uses the configured default.
+
+A base review refuses a dirty lane worktree because `--base` only covers committed code. Use `--uncommitted` to review pending changes. Respawn with an explicit account warns and retains the pinned account, including when the requested name is unknown.

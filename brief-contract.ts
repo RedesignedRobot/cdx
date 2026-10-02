@@ -89,7 +89,7 @@ export function isNoOpGate(command: string): boolean {
 export function scopeRule(policy: ScopePolicy): string {
   if (policy === "extend") return 'Scope policy extend: edit any file the outcome needs, inside or outside the Files section, without asking. List every file outside it under "## Scope extensions" in your report, one line each with the reason.';
   if (policy === "stop") return "Scope policy stop: if the outcome needs a file outside the Files section, do not edit it and do not ask. Stop, name the file and the reason in your report, and end the round.";
-  return "Scope policy ask: before editing a file outside the Files section, ask with cdx ask and wait for the answer.";
+  return "Scope policy ask: before editing a file outside the Files section, ask with cdx question and wait for the answer.";
 }
 
 export function scopeAnswer(policy: ScopePolicy): string {

@@ -1,6 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import { nativeToolResult, formatToolOutput, MAX_PROCESS_TIMEOUT_MS, TOOLS, TOOLS_BY_NAME } from "./tools";
 
+test("spawn and resume pass an upfront test allowance to the CLI", () => {
+  for (const name of ["spawn", "resume"]) {
+    const tool = TOOLS_BY_NAME.get(name)!;
+    expect(tool.inputSchema.properties).toHaveProperty("testRuns", expect.objectContaining({ type: "integer", minimum: 1 }));
+    const { argv } = tool.run({ lane: "allowed", cd: "/repo", brief: "task", followUp: "fix", fix: "gate", testRuns: 6 });
+    expect(argv.slice(argv.indexOf("--test-runs"), argv.indexOf("--test-runs") + 2)).toEqual(["--test-runs", "6"]);
+  }
+});
+
 describe("tool rules", () => {
   test("a tool bound never exceeds the process.run ceiling the others run with", () => {
     const bounds = TOOLS.map((tool) => tool.run({ lane: "a", cd: "/repo", question: "q", brief: "b", followUp: "f", fix: "gate",

@@ -439,7 +439,7 @@ export function gateCommand(argv: string[]): void {
   if (!parsed.bools.has("clear") && command!.trim() === "") fail("gate command cannot be empty; use --clear");
   const before = readLane(lane);
   requireOwnChild(lane, before);
-  if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the liaison's acceptance check (cdx ask if it is wrong)`);
+  if (supervisorLane()) fail(`supervisor ${supervisorLane()} may not change a child's gate; the gate is the liaison's acceptance check (cdx question if it is wrong)`);
   if (laneRunning(before) && pidAlive(before.pid)) fail(`lane "${lane}" is running; stop it before changing the gate`);
   const next = parsed.bools.has("clear") ? undefined : command;
   if (next && isNoOpGate(next) && repositoryGate(before.work.cwd)) fail(`gate "${next}" checks nothing and this repository has .cdx-gate; clear the gate or pass a real check`);
