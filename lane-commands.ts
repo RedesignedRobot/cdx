@@ -530,13 +530,17 @@ export async function codeQuestionCommand(argv: string[]): Promise<void> {
   const parsed = parseArgs(argv, ["cd"]);
   const question = await resolveBrief(parsed.rest.join(" "), "usage: cdx ask --cd <repo> <question>");
   if (!question) fail("usage: cdx ask --cd <repo> <question>");
-  const permission = /\b(?:(?:may|can|could|should|shall) (?:i|we) (?:run|rerun|edit|change|proceed|have|use)|(?:am i|are we) (?:allowed|permitted)|(?:is it|would it be) (?:ok|okay|allowed)|(?:permission|approval) (?:to|for))\b/i;
-  const approval = /\b(?:approve|authori[sz]e|grant|permit) (?:me|us|another|more|extra|additional|this|the|\d+)\b/i;
-  const allowance = /\b(?:i|we) (?:need|request|require)\b[^.!?\n]*\b(?:permission|approval|test[- ]runs?|test invocations?|more runs|another run)\b/i;
-  if (process.env.CDX_LANE && [permission, approval, allowance].some((pattern) => pattern.test(question))) {
+  const permission = /^(?:please )?(?:(?:may|can|could|should|shall) (?:i|we) (?:run|rerun|edit|change|proceed)|(?:am i|are we) (?:allowed|permitted)|(?:is it|would it be) (?:ok|okay|allowed)|(?:requesting )?(?:permission|approval) (?:to|for))\b/i;
+  const approval = /^(?:please )?(?:approve|authori[sz]e|grant|permit)\b/i;
+  const allowance = /^(?:(?:i|we) )?(?:need|request|require) (?:(?:your )?(?:permission|approval)|(?:(?:\d+|one|two|three|a|an|another|more|extra|additional|focused|touched-spec-only) )*(?:test[- ]runs?|test invocations?|runs?))\b/i;
+  if (process.env.CDX_LANE && question.split(/[.!?]\s+|\n+/).some((sentence) =>
+    [permission, approval, allowance].some((pattern) => pattern.test(sentence.trim())))) {
     fail('cdx ask cannot grant permission or approval; use cdx question "<question>" to ask the head (QUESTION event)');
   }
   if (!parsed.flags.cd) fail("usage: cdx ask --cd <repo> <question>");
+  if (process.env.CODEX_SANDBOX === "seatbelt") {
+    fail("cdx ask must run outside Seatbelt; use a plain cdx ask call so the lane home's lookup rule can apply (no wrapper, pipe, or redirect)");
+  }
   const cwd = realpathSync(parsed.flags.cd);
   const policy = config.gemini ?? geminiConfig();
   requireGeminiQuota("gemini");

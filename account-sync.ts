@@ -28,7 +28,7 @@ function readText(path: string): string | undefined {
 
 // Each account keeps its interactive instructions. Lane processes use one home
 // per role: Codex loads the home's AGENTS.md as the standing lane rules, and
-// only supervisors carry the cdx exec-policy rule.
+// workers escape only for read-only code lookups; supervisors may also drive cdx.
 export interface LaneRole { review?: boolean; supervisor?: boolean }
 
 export function laneCodexHome(home: string, role: LaneRole = {}): string {
@@ -40,6 +40,7 @@ export function laneCodexHome(home: string, role: LaneRole = {}): string {
 // not sandbox its own commands. Codex runs a command that matches an allow rule
 // outside the sandbox, so a supervisor's cdx calls start children normally.
 export const SUPERVISOR_RULES = 'prefix_rule(pattern = ["cdx"], decision = "allow", justification = "cdx starts each child lane in its own sandbox")\n';
+export const LOOKUP_RULES = 'prefix_rule(pattern = ["cdx", "ask"], decision = "allow", justification = "cdx ask applies its own read-only sandbox; Seatbelt cannot nest")\n';
 
 const quote = (value: string) => "'" + value.replaceAll("'", "'\"'\"'") + "'";
 export const CAP_HOOK_COMMAND = `${quote(process.execPath)} ${quote(join(import.meta.dir, "cap.ts"))} codex-pre-tool`;
@@ -76,7 +77,8 @@ export function installLaneHome(home: string, instructions: string, role: LaneRo
   const text = JSON.stringify(withCapHook(hooks ? laneHooks(JSON.parse(hooks)) : {}), null, 2) + "\n";
   if (readText(join(target, "hooks.json")) !== text) atomicWrite(join(target, "hooks.json"), text);
   const rules = join(target, "rules", "cdx.rules");
-  if (role.supervisor && readText(rules) !== SUPERVISOR_RULES) atomicWrite(rules, SUPERVISOR_RULES);
+  const policy = role.supervisor ? SUPERVISOR_RULES : LOOKUP_RULES;
+  if (readText(rules) !== policy) atomicWrite(rules, policy);
   return target;
 }
 

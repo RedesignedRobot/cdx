@@ -70,7 +70,7 @@ test("stream redaction holds split assignments and UTF-8 before persistence", as
   expect(stored).toBe("é CONTEXT7_API_KEY=[redacted]\nlast TOKEN=[redacted]");
 });
 
-import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome, laneHooks, retiredLaneRule, SUPERVISOR_RULES, withCapHook } from "./account-sync.ts";
+import { CAP_HOOK_COMMAND, installLaneHome, laneCodexHome, laneHooks, retiredLaneRule, LOOKUP_RULES, SUPERVISOR_RULES, withCapHook } from "./account-sync.ts";
 
 test("lane home installation is idempotent and preserves the interactive instruction source", () => {
   const home = mkdtempSync(join(tmpdir(), "cdx-lane-home-"));
@@ -88,11 +88,11 @@ test("lane home installation is idempotent and preserves the interactive instruc
     const installed = JSON.parse(readFileSync(join(lane, "hooks.json"), "utf8"));
     expect(installed).toEqual(withCapHook(laneHooks(original)));
     expect(installed.hooks.PreToolUse.map((group: any) => group.hooks[0].command)).toEqual(["unrelated-hook", CAP_HOOK_COMMAND]);
-    expect(existsSync(join(lane, "rules"))).toBe(false);
+    expect(readFileSync(join(lane, "rules", "cdx.rules"), "utf8")).toBe(LOOKUP_RULES);
     const supervisor = installLaneHome(home, "lane instructions", { supervisor: true });
     expect(supervisor).toBe(laneCodexHome(home, { supervisor: true }));
     expect(installLaneHome(home, "review instructions", { review: true })).toBe(join(home, "cdx-review"));
-    expect(existsSync(join(home, "cdx-review", "rules"))).toBe(false);
+    expect(readFileSync(join(home, "cdx-review", "rules", "cdx.rules"), "utf8")).toBe(LOOKUP_RULES);
     expect(readFileSync(join(supervisor, "rules", "cdx.rules"), "utf8")).toBe(SUPERVISOR_RULES);
     expect(laneHooks(laneHooks(original))).toEqual(laneHooks(original));
     expect(laneHooks(original).hooks.UserPromptSubmit[0].hooks[0].command).toContain('CDX_LANE');

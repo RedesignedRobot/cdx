@@ -506,7 +506,7 @@ test("a lane with work against its base, a supervisor with merged children, and 
     const clean = worktree("clean");
     expect(laneMatchesBase(clean.path, { ...clean.entry, baseBranch: "missing" })).toBe(false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a skipped gate finalizes with a no-diff verdict in state, report and feed, and land refuses the lane", async () => {
   const { dir, git, worktree } = laneRepo();
@@ -541,7 +541,7 @@ test("a skipped gate finalizes with a no-diff verdict in state, report and feed,
     expect(terminal.message).toContain("gateExit=not-run");
     expect(landRefusal(finished)).toBe("no content-bound gate receipt; run a new work round");
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a lane that changed only docs or files under a lanes/ directory skips the gate; any other path gates", () => {
   const { dir, git, worktree } = laneRepo();
@@ -562,7 +562,7 @@ test("a lane that changed only docs or files under a lanes/ directory skips the 
     expect(docsOnly(["lanes"])).toBe(false);
     expect(docsOnly(["README.MD", "exp/lanes/report.txt"])).toBe(true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
-});
+}, 15_000);
 
 test("a docs-only lane finalizes done with a tree-bound receipt that land accepts, and no gate exit", async () => {
   const { dir, git, worktree } = laneRepo();

@@ -123,7 +123,7 @@ cdx usage   [--json] [--totals] | cdx doctor [--fix] [--probe] [--days N] | cdx 
 
 If `cdx doctor` fails `codex models`, run `codex update`, then `codex debug models`.
 
-Workers send head decisions, permissions and requests for more test runs through `cdx question`. `cdx ask --cd /repo` only returns a read-only Gemini code answer; it refuses permission requests inside lanes. Its 90-second lookup deadline has five seconds of shutdown grace.
+Workers send head decisions, permissions and requests for more test runs through `cdx question`. `cdx ask --cd /repo` only returns a read-only Gemini code answer; it refuses permission requests inside lanes. Its 90-second lookup deadline has five seconds of shutdown grace. Workers call `cdx ask` plainly, without wrappers, pipes or redirects. Their lane home allows only this lookup command to run outside Seatbelt, where it applies its own read-only profile; other worker commands gain no escape rule. A lookup still inside Seatbelt refuses before starting a nested sandbox. Technical usage questions such as "How can I use the parser" remain code lookups.
 
 Spawn and resume accept `testRuns: 6` or CLI `--test-runs 6`. This positive integer grants that round six test invocations including its gate, replacing the configured default of three in its standing rule and test counter. A resume without the field uses the configured default.
 

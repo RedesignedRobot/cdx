@@ -10,6 +10,7 @@ test("lane ask refuses test approval and question raises the head event", async 
   try {
     for (const question of [
       "Three test invocations are used. May I run it?",
+      "Can I run the tests?",
       "I need one more test-run after correcting the failure.",
       "Please approve another test invocation.",
       "Requesting permission to rerun the gate.",
@@ -18,8 +19,17 @@ test("lane ask refuses test approval and question raises the head event", async 
       await expect(dispatch("ask", ["--cd", "/repo", question])).rejects.toThrow("cdx ask cannot grant permission");
     }
     expect(readQuestions("test-allowance-question")).toHaveLength(0);
-    // A code question about permissions still reaches the code lookup's validation.
-    await expect(dispatch("ask", ["Where is the permission check implemented?"])).rejects.toThrow("usage: cdx ask --cd");
+    // Technical usage and permission-model questions reach lookup validation.
+    for (const question of [
+      "Where is the permission check implemented?",
+      "How can I use the parser to read a quoted argument?",
+      "Can I use the parser to read a quoted argument?",
+      "How does permission to edit get checked?",
+      "Where is parser.approve defined?",
+      "I need to understand how permission is checked.",
+    ]) {
+      await expect(dispatch("ask", [question])).rejects.toThrow("usage: cdx ask --cd");
+    }
     await dispatch("question", ["--timeout", "0.0001", "May I run one more test?"]);
     expect(recentEvents(1)[0]).toMatchObject({ kind: "question", lane: "test-allowance-question" });
     expect(readQuestions("test-allowance-question")[0]?.question).toBe("May I run one more test?");
